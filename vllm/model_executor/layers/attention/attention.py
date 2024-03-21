@@ -32,6 +32,7 @@ class Attention(nn.Module):
         num_kv_heads: Optional[int] = None,
         alibi_slopes: Optional[List[float]] = None,
         sliding_window: Optional[int] = None,
+        cpu_offload_weight: bool = False,
     ) -> None:
         super().__init__()
         if _use_flash_attn():

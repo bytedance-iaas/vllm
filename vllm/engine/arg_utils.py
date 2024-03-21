@@ -48,6 +48,7 @@ class EngineArgs:
     max_cpu_loras: Optional[int] = None
     device: str = 'auto'
     ray_workers_use_nsight: bool = False
+    cpu_offload_weight: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -287,6 +288,11 @@ class EngineArgs:
                             default=EngineArgs.device,
                             choices=["auto", "cuda", "neuron"],
                             help='Device type for vLLM execution.')
+        parser.add_argument('--cpu-offload-weight',
+                            action='store_true',
+                            default=EngineArgs.cpu_offload_weight,
+                            help='Whether to offload the model weights to CPU '
+                            'memory.')
         return parser
 
     @classmethod
@@ -313,7 +319,8 @@ class EngineArgs:
                                    self.gpu_memory_utilization,
                                    self.swap_space, self.kv_cache_dtype,
                                    model_config.get_sliding_window(),
-                                   self.enable_prefix_caching)
+                                   self.enable_prefix_caching,
+                                   self.cpu_offload_weight)
         parallel_config = ParallelConfig(self.pipeline_parallel_size,
                                          self.tensor_parallel_size,
                                          self.worker_use_ray,

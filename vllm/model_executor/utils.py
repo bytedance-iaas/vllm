@@ -44,9 +44,10 @@ def set_weight_attrs(
 
 
 def get_model(model_config: ModelConfig, device_config: DeviceConfig,
+              cpu_offload_weight: bool = False,
               **kwargs) -> torch.nn.Module:
     model_loader_module = DEVICE_TO_MODEL_LOADER_MAP[device_config.device_type]
     imported_model_loader = importlib.import_module(
         f"vllm.model_executor.{model_loader_module}")
     get_model_fn = imported_model_loader.get_model
-    return get_model_fn(model_config, device_config, **kwargs)
+    return get_model_fn(model_config, device_config, cpu_offload_weight, **kwargs)

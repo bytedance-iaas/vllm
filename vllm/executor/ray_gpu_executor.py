@@ -197,6 +197,7 @@ class RayGPUExecutor(ExecutorBase):
             lora_config=self.lora_config,
             kv_cache_dtype=kv_cache_dtype,
             is_driver_worker=True,
+            cpu_offload_weight=self.cache_config.cpu_offload_weight,
         )
 
         # FIXME(woosuk): We are not properly initializing cupy NCCL when

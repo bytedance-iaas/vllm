@@ -40,9 +40,9 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+from vllm.offload.cpu_offload import SupportCpuOffLoadWeight
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
 
@@ -65,6 +65,7 @@ class OPTAttention(nn.Module):
         num_heads: int,
         bias: bool = True,
         linear_method: Optional[LinearMethodBase] = None,
+        cpu_offload_weight: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -82,29 +83,35 @@ class OPTAttention(nn.Module):
             total_num_heads,
             bias=bias,
             linear_method=linear_method,
+            cpu_offload_weight=cpu_offload_weight,
         )
         self.out_proj = RowParallelLinear(
             embed_dim,
             embed_dim,
             bias=bias,
             linear_method=linear_method,
+            cpu_offload_weight=cpu_offload_weight,
         )
         self.attn = Attention(self.num_heads,
                               self.head_dim,
-                              scale=self.scaling)
-
+                              scale=self.scaling,
+                              cpu_offload_weight=cpu_offload_weight)
+    
+    @SupportCpuOffLoadWeight(["qkv_proj", "out_proj"], "hidden_states")
     def forward(
         self,
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         key_cache, value_cache = kv_cache
         attn_output = self.attn(q, k, v, key_cache, value_cache,
                                 input_metadata)
         output, _ = self.out_proj(attn_output)
+        
         return output
 
 
@@ -114,6 +121,7 @@ class OPTDecoderLayer(nn.Module):
         self,
         config: OPTConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        cpu_offload_weight: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -123,6 +131,7 @@ class OPTDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             bias=config.enable_bias,
             linear_method=linear_method,
+            cpu_offload_weight=cpu_offload_weight,
         )
         self.do_layer_norm_before = config.do_layer_norm_before
 
@@ -134,6 +143,7 @@ class OPTDecoderLayer(nn.Module):
             config.ffn_dim,
             bias=config.enable_bias,
             linear_method=linear_method,
+            cpu_offload_weight=cpu_offload_weight,
         )
         quant_config = getattr(linear_method, "quant_config", None)
         self.activation_fn = get_act_fn(config.activation_function,
@@ -143,11 +153,13 @@ class OPTDecoderLayer(nn.Module):
             self.embed_dim,
             bias=config.enable_bias,
             linear_method=linear_method,
+            cpu_offload_weight=cpu_offload_weight,
         )
         self.final_layer_norm = nn.LayerNorm(
             self.embed_dim,
             elementwise_affine=config.layer_norm_elementwise_affine)
 
+    @SupportCpuOffLoadWeight(["self_attn", "fc1", "fc2"],0)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -157,6 +169,7 @@ class OPTDecoderLayer(nn.Module):
         # Self Attention
         residual = hidden_states
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+
         if self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states=hidden_states,
@@ -179,6 +192,7 @@ class OPTDecoderLayer(nn.Module):
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
+
         return hidden_states
 
 
@@ -188,6 +202,7 @@ class OPTDecoder(nn.Module):
         self,
         config: OPTConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        cpu_offload_weight: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -232,10 +247,11 @@ class OPTDecoder(nn.Module):
             self.final_layer_norm = None
 
         self.layers = nn.ModuleList([
-            OPTDecoderLayer(config, linear_method)
+            OPTDecoderLayer(config, linear_method, cpu_offload_weight)
             for _ in range(config.num_hidden_layers)
         ])
 
+    @SupportCpuOffLoadWeight(["embed_tokens", "embed_positions", "final_layer_norm"], 0)  
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -243,6 +259,7 @@ class OPTDecoder(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+
         inputs_embeds = self.embed_tokens(input_ids)
         pos_embeds = self.embed_positions(positions)
         if self.project_in is not None:
@@ -257,6 +274,7 @@ class OPTDecoder(nn.Module):
             hidden_states = self.final_layer_norm(hidden_states)
         if self.project_out is not None:
             hidden_states, _ = self.project_out(hidden_states)
+
         return hidden_states
 
 
@@ -266,9 +284,10 @@ class OPTModel(nn.Module):
         self,
         config: OPTConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        cpu_offload_weight: bool = False,   
     ):
         super().__init__()
-        self.decoder = OPTDecoder(config, linear_method)
+        self.decoder = OPTDecoder(config, linear_method, cpu_offload_weight)
 
     def forward(
         self,
@@ -286,11 +305,12 @@ class OPTForCausalLM(nn.Module):
         self,
         config,
         linear_method: Optional[LinearMethodBase] = None,
+        cpu_offload_weight: bool = False,
     ):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = OPTModel(config, linear_method)
+        self.model = OPTModel(config, linear_method, cpu_offload_weight)
         self.lm_head_weight = self.model.decoder.embed_tokens.weight
         self.sampler = Sampler(config.vocab_size)
 
@@ -310,15 +330,24 @@ class OPTForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
+        cpu_offload = False
+        if self.lm_head_weight.device.type == 'cpu':
+            cpu_offload = True
+            self.lm_head_weight.data = self.lm_head_weight.data.cuda(device=hidden_states.device)
+
         next_tokens = self.sampler(self.lm_head_weight, hidden_states,
                                    sampling_metadata)
+
+        if cpu_offload:
+            self.lm_head_weight.data = self.lm_head_weight.data.cpu()
         return next_tokens
 
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
-                     revision: Optional[str] = None):
+                     revision: Optional[str] = None,
+                     cpu_offload_weight: bool = False):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -352,3 +381,5 @@ class OPTForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+

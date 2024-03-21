@@ -44,12 +44,14 @@ class ModelRunner:
         lora_config: Optional[LoRAConfig],
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
+        cpu_offload_weight: Optional[bool] = False,
     ):
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
         self.is_driver_worker = is_driver_worker
+        self.cpu_offload_weight = cpu_offload_weight
 
         # model_config can be None in tests/samplers/test_sampler.py.
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
@@ -90,7 +92,9 @@ class ModelRunner:
                                    self.device_config,
                                    lora_config=self.lora_config,
                                    parallel_config=self.parallel_config,
-                                   scheduler_config=self.scheduler_config)
+                                   scheduler_config=self.scheduler_config,
+                                   cpu_offload_weight=self.cpu_offload_weight,
+                                   )
 
         self.model_memory_usage = m.consumed_memory
         logger.info(f"Loading model weights took "
@@ -582,7 +586,7 @@ class ModelRunner:
             self.set_active_loras(lora_requests, lora_mapping)
 
         # Execute the model.
-        if input_metadata.use_cuda_graph:
+        if input_metadata.use_cuda_graph and self.cpu_offload_weight == False:
             graph_batch_size = input_tokens.shape[0]
             model_executable = self.graph_runners[graph_batch_size]
         else:

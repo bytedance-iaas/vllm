@@ -38,6 +38,7 @@ def _get_model_architecture(model_config: ModelConfig) -> Type[nn.Module]:
 
 
 def get_model(model_config: ModelConfig, device_config: DeviceConfig,
+                cpu_offload_weight: bool = False,
               **kwargs) -> nn.Module:
     lora_config = kwargs.get("lora_config", None)
     model_class = _get_model_architecture(model_config)
@@ -76,7 +77,7 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
                     "be added in the future. If this is important to you, "
                     "please open an issue on github.")
             else:
-                model = model_class(model_config.hf_config, linear_method)
+                model = model_class(model_config.hf_config, linear_method, cpu_offload_weight)
         if model_config.load_format == "dummy":
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
@@ -84,5 +85,6 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
         else:
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
-                               model_config.load_format, model_config.revision)
+                               model_config.load_format, model_config.revision,
+                               cpu_offload_weight)
     return model.eval()
