@@ -650,7 +650,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return hf_weights_files, matched_pattern == "*.safetensors"
 
     def _get_quantized_weights_iterator(
-        self, model_name_or_path: str, revision: Optional[str]
+        self, model_name_or_path: str, revision: Optional[str], pre_quant: bool
     ) -> Tuple[Generator[Tuple[str, torch.Tensor], None, None], Dict[str,
                                                                      Any]]:
         """Get an iterator to the model weights with bitsandbytes quantization,
@@ -659,6 +659,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         # only load the bitsandbytes module when needed
         try:
             import bitsandbytes
+            from bitsandbytes.functional import QuantState
             if bitsandbytes.__version__ < "0.42.0":
                 raise ImportError("bitsandbytes version is wrong. Please "
                                   "install bitsandbytes>=0.42.0.")
@@ -677,7 +678,40 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         else:
             weight_iterator = pt_weights_iterator(hf_weights_files)
 
-        def generator():
+        def prequant_generator() -> Generator:
+            state_dict = {}
+            for weight_name, weight_tensor in weight_iterator:
+                state_dict[weight_name] = weight_tensor
+            
+            def _parse_quant_state(param_name: str, state_dict: Dict[str, torch.Tensor]) -> QuantState:
+                quant_state = {}
+                for k in state_dict.keys():
+                    if param_name + "." in k:
+                        quant_state[k] = state_dict[k]
+                #bitsandbytes requires data weight.quant_state.bitsandbytes__nf4 in CPU
+                quant_state[param_name+".quant_state.bitsandbytes__nf4"] = quant_state[param_name+".quant_state.bitsandbytes__nf4"].cpu().data
+                import pdb
+                #pdb.set_trace()
+                with set_default_torch_dtype(torch.float32):
+                    a= QuantState.from_dict(quant_state, device="cuda")
+                return a
+
+            for weight_name, weight_tensor in state_dict.items():
+                #filter out all weights whose suffix is not ".weight"
+                if not weight_name.endswith(".weight"):
+                    continue
+                if weight_name + ".quant_state.bitsandbytes__nf4" in state_dict:
+                    quant_state = _parse_quant_state(weight_name, state_dict)
+                    qweight_name = weight_name.replace(".weight", ".qweight")
+                    quant_state_dict[qweight_name] = quant_state
+                    # import pdb
+                    # if qweight_name == "model.layers.10.self_attn.o_proj.qweight":
+                    #     pdb.set_trace()
+                    yield qweight_name, weight_tensor
+                else:
+                    yield weight_name, weight_tensor   
+
+        def generator() -> Generator:
             for weight_name, weight_tensor in weight_iterator:
                 if any(target_module in weight_name
                        for target_module in self.target_modules):
@@ -696,6 +730,8 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
                 yield weight_name, processed_weight
 
+        if pre_quant:
+            return prequant_generator(), quant_state_dict
         return generator(), quant_state_dict
 
     def _load_weights(self, model_config: ModelConfig,
@@ -713,13 +749,23 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         logger.info("Loading weights with BitsAndBytes quantization. "
                     " May take a while ...")
 
-        qweight_iterator, quant_state_dict = (
-            self._get_quantized_weights_iterator(model_config.model,
-                                                 model_config.revision))
+
+        pre_quant = False
+        quant_config = getattr(model_config.hf_config, "quantization_config", None)
+        if quant_config is not None and quant_config.get('quant_method') == "bitsandbytes":
+            pre_quant = True
+
+
+   
+        qweight_iterator, quant_state_dict = self._get_quantized_weights_iterator(model_config.model,
+                                                 model_config.revision, pre_quant)
 
         model.load_weights(qweight_iterator)
 
+      
         param_dict = dict(model.named_parameters())
+        import pdb
+        #pdb.set_trace()
         stacked_quant_state_dict: Dict[str, Dict[int, Any]] = {}
         for quant_param_name in quant_state_dict:
             non_stacked_param_name = quant_param_name
@@ -743,7 +789,8 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
             stacked_quant_state_dict[quant_param_name][shard_index] = (
                 quant_state_dict[non_stacked_param_name])
-
+        
+        
         # save quant_states and offsets as the attributes of the parameters
         for param_name, param in param_dict.items():
             if param_name in stacked_quant_state_dict:
@@ -755,10 +802,11 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     raise ValueError(
                         f"pack_factor not set for parameter {param_name}.")
 
+                #pdb.set_trace()
                 num_elements = [0] * len(quant_states)
-                for seq, quant_state in enumerate(quant_states.items()):
+                for seq, quant_state in sorted(quant_states.items()):
                     num_elements[seq] = math.prod(
-                        quant_state[1].shape) // pack_ratio
+                        quant_state.shape) // pack_ratio
 
                 offsets = np.concatenate(([0], np.cumsum(num_elements)))
                 set_weight_attrs(param, {"bnb_shard_offsets": offsets})

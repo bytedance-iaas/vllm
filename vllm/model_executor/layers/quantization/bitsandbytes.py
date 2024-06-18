@@ -49,6 +49,12 @@ class BitsAndBytesConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "BitsAndBytesConfig":
+
+        if cls.get_from_keys(config, ["quant_method"]) == "bitsandbytes":
+            #pre quantization model, 
+            #FIXME:
+            return cls("", [])
+        
         adapter_name = cls.get_from_keys(config, ["adapter_name_or_path"])
         default_target_modules = [
             "gate_proj", "down_proj", "up_proj", "q_proj", "k_proj", "v_proj",
@@ -143,6 +149,8 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         original_type = x.dtype
         bf_x = x.to(torch.bfloat16)
 
+        import pdb
+        #pdb.set_trace()
         qweight = layer.qweight
         quant_states = qweight.bnb_quant_state
         offsets = qweight.bnb_shard_offsets
