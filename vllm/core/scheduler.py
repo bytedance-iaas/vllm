@@ -123,6 +123,8 @@ class SchedulerOutputs:
     blocks_to_swap_out: List[Tuple[int, int]]
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]]
+    # Blocks to sparse copy. Source blocks and dest blocks.
+    blocks_to_sparse_copy: List[List[List[int]]]
     # Sequence groups that are going to be ignored.
     ignored_seq_groups: List[SequenceGroup]
     # The number of slots for lookahead decoding.
@@ -178,6 +180,8 @@ class SchedulerRunningOutputs:
     blocks_to_swap_out: List[Tuple[int, int]]
     # The blocks to copy.
     blocks_to_copy: List[Tuple[int, int]]
+    # The blocks to sparse copy.
+    blocks_to_sparse_copy: List[List[List[int]]]
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
 
@@ -190,6 +194,7 @@ class SchedulerRunningOutputs:
             swapped_out=[],
             blocks_to_swap_out=[],
             blocks_to_copy=[],
+            blocks_to_sparse_copy=[],
             num_lookahead_slots=0,
         )
 
@@ -210,6 +215,8 @@ class SchedulerSwappedInOutputs:
     blocks_to_swap_in: List[Tuple[int, int]]
     # The blocks to copy.
     blocks_to_copy: List[Tuple[int, int]]
+    # The blocks to sparse copy.
+    blocks_to_sparse_copy: List[List[List[int]]]
     # The number of slots for lookahead decoding.
     num_lookahead_slots: int
     # Infeasible sequence groups.
@@ -222,6 +229,7 @@ class SchedulerSwappedInOutputs:
             prefill_seq_groups=[],
             blocks_to_swap_in=[],
             blocks_to_copy=[],
+            blocks_to_sparse_copy=[],
             num_lookahead_slots=0,
             infeasible_seq_groups=[],
         )
@@ -396,11 +404,13 @@ class Scheduler:
         # Blocks that need to be swapped or copied before model execution.
         blocks_to_swap_out: List[Tuple[int, int]] = []
         blocks_to_copy: List[Tuple[int, int]] = []
+        blocks_to_sparse_copy: List[List[List[int]]] = []
 
         decode_seq_groups: List[ScheduledSequenceGroup] = []
         prefill_seq_groups: List[ScheduledSequenceGroup] = []
         preempted: List[SequenceGroup] = []
         swapped_out: List[SequenceGroup] = []
+        blocks_to_free: List[int] = []
 
         # NOTE(woosuk): Preemption happens only when there is no available slot
         # to keep all the sequence groups in the RUNNING state.
@@ -448,7 +458,7 @@ class Scheduler:
                         swapped_out.append(seq_group)
                     break
             else:
-                self._append_slots(seq_group, blocks_to_copy)
+                blocks_to_free.extend(self._append_slots(seq_group, blocks_to_copy, blocks_to_sparse_copy))
                 is_prefill = seq_group.is_prefill()
                 if is_prefill:
                     prefill_seq_groups.append(
@@ -470,7 +480,8 @@ class Scheduler:
                     budget.add_num_seqs(seq_group.request_id, num_running_seqs)
                 if curr_loras is not None and seq_group.lora_int_id > 0:
                     curr_loras.add(seq_group.lora_int_id)
-
+        for free_block in blocks_to_free:
+            self.block_manager.gpu_allocator.free(free_block)
         return running_queue, SchedulerRunningOutputs(
             decode_seq_groups=decode_seq_groups,
             prefill_seq_groups=prefill_seq_groups,
@@ -478,6 +489,7 @@ class Scheduler:
             swapped_out=swapped_out,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
+            blocks_to_sparse_copy=blocks_to_sparse_copy,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=False))
 
@@ -515,8 +527,10 @@ class Scheduler:
         # Blocks that need to be swapped or copied before model execution.
         blocks_to_swap_in: List[Tuple[int, int]] = []
         blocks_to_copy: List[Tuple[int, int]] = []
+        blocks_to_sparse_copy: List[List[List[int]]] = []
         decode_seq_groups: List[ScheduledSequenceGroup] = []
         prefill_seq_groups: List[ScheduledSequenceGroup] = []
+        blocks_to_free: List[int] = []
         now = time.time()
         swapped_queue = policy.sort_by_priority(now, swapped_queue)
         infeasible_seq_groups: List[SequenceGroup] = []
@@ -571,7 +585,7 @@ class Scheduler:
                 curr_loras.add(lora_int_id)
             swapped_queue.popleft()
             self._swap_in(seq_group, blocks_to_swap_in)
-            self._append_slots(seq_group, blocks_to_copy)
+            blocks_to_free.extend(self._append_slots(seq_group, blocks_to_copy, blocks_to_sparse_copy))
             is_prefill = seq_group.is_prefill()
             if is_prefill:
                 prefill_seq_groups.append(
@@ -585,11 +599,15 @@ class Scheduler:
 
         swapped_queue.extendleft(leftover_swapped)
 
+        for free_block in blocks_to_free:
+            self.block_manager.gpu_allocator.free(free_block)
+
         return swapped_queue, SchedulerSwappedInOutputs(
             decode_seq_groups=decode_seq_groups,
             prefill_seq_groups=prefill_seq_groups,
             blocks_to_swap_in=blocks_to_swap_in,
             blocks_to_copy=blocks_to_copy,
+            blocks_to_sparse_copy=blocks_to_sparse_copy,
             num_lookahead_slots=self._get_num_lookahead_slots(
                 is_prefill=False),
             infeasible_seq_groups=infeasible_seq_groups,
@@ -818,6 +836,7 @@ class Scheduler:
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
+            blocks_to_sparse_copy=running_scheduled.blocks_to_sparse_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
             swapped_in.infeasible_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
@@ -907,6 +926,7 @@ class Scheduler:
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
+            blocks_to_sparse_copy=running_scheduled.blocks_to_sparse_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
             swapped_in.infeasible_seq_groups,
             num_lookahead_slots=running_scheduled.num_lookahead_slots,
@@ -935,6 +955,16 @@ class Scheduler:
 
         # Appending slots only occurs in decoding.
         is_prefill = False
+
+        # Add a condition check in while loop based on the newly created KV cache to see if there is enough slots or not.
+        # if use sparse-kv-cache flag and there is i%n==0 step.
+        # We could consider reserve some KV blocks for contain these blocks.
+        # Is it possible to have unncessary more slots?
+        if self.cache_config.sparse_cache_type == "h2o" and seq_group.n_times % self.cache_config.sparse_interval == 0:
+            return self.block_manager.can_append_slots_sparse_cache(
+                seq_group=seq_group,
+                num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
+            )
 
         return self.block_manager.can_append_slots(
             seq_group=seq_group,
@@ -1006,8 +1036,10 @@ class Scheduler:
                 # `multi_modal_data` will be None.
                 multi_modal_data=seq_group.multi_modal_data
                 if scheduler_outputs.num_prefill_groups > 0 else None,
+                n_times=seq_group.n_times,
             )
             seq_group_metadata_list.append(seq_group_metadata)
+            seq_group.n_times += 1
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
@@ -1039,7 +1071,8 @@ class Scheduler:
         self,
         seq_group: SequenceGroup,
         blocks_to_copy: List[Tuple[int, int]],
-    ) -> None:
+        blocks_to_sparse_copy: List[List[List[int]]],
+    ) -> List[int]:
         """Appends new slots to the sequences in the given sequence group.
 
         Args:
@@ -1053,9 +1086,23 @@ class Scheduler:
         """
         num_lookahead_slots = self._get_num_lookahead_slots(is_prefill=False)
 
+        free_blocks : List = []
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            # If use sparse-kv-cache flag and there is i%n==0 step.
+            # Get the original KV blocks
+            # original_blocks = self.block_manager.get_block_table(seq)
+            # Add a new block manager method "create_new_slots" similar to append_slots but to create new KV cache slots, rather than append_slots.
+            # cows: List[Tuple[int, int]] = []
+            # sparse_cows: List[List[int]] = []
             cows = self.block_manager.append_slots(seq, num_lookahead_slots)
             blocks_to_copy.extend(cows)
+            if self.cache_config.sparse_cache_type == "h2o" and seq_group.n_times % self.cache_config.sparse_interval == 0:
+                sparse_cows, free_block = self.block_manager.create_new_slots(seq, self.cache_config.sparse_percentage)
+                free_blocks.extend(free_block)
+                blocks_to_sparse_copy.append(sparse_cows)
+            # copy the KV blocks from the original KV cache to the new KV cache with the attention score or other tokens priority.
+            # Add a new ops method to copy all the KV cache from original to the new one.
+        return free_blocks
 
     def _preempt(
         self,
