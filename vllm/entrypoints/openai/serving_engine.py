@@ -223,9 +223,11 @@ class OpenAIServing:
         prompt_ids: List[int],
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
     ) -> TextTokensPrompt:
+        print(f"HCD _normalize_prompt_tokens_to_input()")
         if truncate_prompt_tokens is None:
             input_ids = prompt_ids
         else:
+            print(f"HCD input_ids = prompt_ids[-truncate_prompt_tokens:]")
             input_ids = prompt_ids[-truncate_prompt_tokens:]
 
         input_text = tokenizer.decode(input_ids)

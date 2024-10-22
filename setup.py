@@ -134,6 +134,7 @@ class cmake_build_ext(build_ext):
                 nvcc_threads = 1
             num_jobs = max(1, num_jobs // nvcc_threads)
 
+        print(f"num_jobs = {num_jobs}, nvcc_threads = {nvcc_threads} ")
         return num_jobs, nvcc_threads
 
     #
@@ -496,8 +497,8 @@ setup(
     ],
     packages=find_packages(exclude=("benchmarks", "csrc", "docs", "examples",
                                     "tests*")),
-    python_requires=">=3.8",
-    install_requires=get_requirements(),
+    #python_requires=">=3.8",
+    #install_requires=get_requirements(),
     ext_modules=ext_modules,
     extras_require={
         "tensorizer": ["tensorizer>=2.9.0"],

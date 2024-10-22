@@ -415,6 +415,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
     ) -> None:
+        # print("HCD (XFormersImpl): __init__(): XFORMER enter")
         if blocksparse_params is not None:
             raise ValueError(
                 "XFormers does not support block-sparse attention.")
@@ -444,6 +445,10 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         self,
         query: torch.Tensor,
         key: Optional[torch.Tensor],
+        #query: torch.Tensor,
+        #key: torch.Tensor,
+        #query_ori: torch.Tensor,
+        #key_ori: Optional[torch.Tensor],
         value: Optional[torch.Tensor],
         kv_cache: Optional[torch.Tensor],
         attn_metadata: "XFormersMetadata",
@@ -497,7 +502,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-
+        # print("HCD (XFormersImpl): XFORMER forward()")
         # Check that appropriate attention metadata attributes are
         # selected for the desired attention type
         if (attn_type == AttentionType.ENCODER
@@ -532,6 +537,8 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             # i.e. for later use by paged attention
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
+            # print(f"HCD self.num_kv_heads: {self.num_kv_heads} "
+            #         f"self.head_size: {self.head_size}")
 
             if (key is not None) and (value is not None):
 
@@ -548,6 +555,11 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 # profiling run.
+                # print(f"HCD updated_slot_mapping: {updated_slot_mapping}")
+                # print(f"HCD self.kv_cache_dtype: {self.kv_cache_dtype}")
+                # print(f"HCD k_scale: {k_scale} v_scale: {v_scale}")
+                # print(key.shape, value.shape, key_cache.shape)
+                #PagedAttention.write_to_paged_cache(query_ori, value, key_cache,
                 PagedAttention.write_to_paged_cache(key, value, key_cache,
                                                     value_cache,
                                                     updated_slot_mapping,

@@ -323,6 +323,9 @@ class LLM:
         else:
             inputs = cast(Union[PromptInputs, Sequence[PromptInputs]], prompts)
 
+        # print(f"HCD prompts: {prompts}")
+        # print(f"HCD inputs: {inputs}")
+
         if isinstance(guided_options_request, dict):
             if len(guided_options_request) > 1:
                 raise ValueError(

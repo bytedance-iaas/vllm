@@ -53,7 +53,8 @@ from vllm.utils import is_hip
 
 from .interfaces import SupportsLoRA
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
-
+from vllm.attention.ops.paged_attn import (PagedAttention,
+                                           PagedAttentionMetadata)
 
 class LlamaMLP(nn.Module):
 
@@ -88,7 +89,6 @@ class LlamaMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
 
 class LlamaAttention(nn.Module):
 
@@ -168,6 +168,7 @@ class LlamaAttention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config)
 
+    # import traceback
     def forward(
         self,
         positions: torch.Tensor,
@@ -175,10 +176,50 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        # print(hidden_states.shape)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # print(f"HCD positions {positions}")
+        # print(f"HCD q {q.shape}")
+        # print(f"HCD q {q}")
+        # print(f"HCD k {k.shape}")
+        # print(f"HCD v {v.shape}")
+        # traceback.print_stack()
+        #  key: shape = [num_tokens, num_kv_heads * head_size]
+        #     value: shape = [num_tokens, num_kv_heads * head_size]
+        #     kv_cache = [2, num_blocks, block_size * num_kv_heads * head_size]
+        # torch.Size([4, 4096]) torch.Size([4, 4096]) torch.Size([864, 32, 16, 16, 8])
+
+
+        # AS patent - double buffering
+        if kv_cache is not None and attn_metadata.decode_metadata:
+            # attn_type != AttentionType.ENCODER and
+            # print(f"self.total_num_kv_heads: {self.total_num_kv_heads}")
+            # print(f"self.head_dim: {self.head_dim}")
+            num_kv_heads = self.total_num_kv_heads # 32
+            head_size = self.head_dim # 128
+
+            k_as = k.view(-1, num_kv_heads, head_size)
+            v_as = v.view(-1, num_kv_heads, head_size)
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                                        kv_cache, num_kv_heads, head_size)
+            updated_slot_mapping_as = torch.tensor([5001, 5002, 5003, 5004], device='cuda:0')
+            kv_cache_dtype = 'auto'
+            k_scale = 1.0
+            v_scale = 1.0
+
+            # print(f"HCD k.shape: {k.shape}, v.shape: {v.shape}, key_cache.shape: {key_cache.shape}")
+            PagedAttention.write_to_paged_cache(k_as, v_as, key_cache,
+                                                    value_cache,
+                                                    updated_slot_mapping_as,
+                                                    kv_cache_dtype,
+                                                    k_scale, v_scale)
+
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        #q_rope, k_rope = self.rotary_emb(positions, q, k)
+        #attn_output = self.attn(q_rope, k_rope, q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -196,6 +237,8 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
+
+        #print(f"HCD rope_scaling: {rope_scaling}")
         if rope_scaling is not None and getattr(
                 config, "original_max_position_embeddings", None):
             rope_scaling["original_max_position_embeddings"] = (
@@ -324,6 +367,9 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        # print(f"HCD input_ids = {input_ids}")
+        if hidden_states.shape[0] > 4:
+            print(f"HCD [prefill] hidden_states.shape = {hidden_states.shape}")
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
