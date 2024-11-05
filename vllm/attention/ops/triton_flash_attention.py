@@ -105,6 +105,7 @@ def _attn_fwd_inner(
     RETURN_ENCODED_SOFTMAX: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
 ):
+    # print("Triton _attn_fwd_inner starts")
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # For padded blocks, we will overrun the tensor size if
@@ -204,6 +205,7 @@ def _attn_fwd_inner(
         if RETURN_ENCODED_SOFTMAX:
             encoded_softmax_block_ptr = tl.advance(encoded_softmax_block_ptr,
                                                    (0, BLOCK_N))
+    # print("Triton _attn_fwd_inner ends")
     return acc, l_i, m_i
 
 
@@ -213,7 +215,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 256,
                 "BLOCK_N": 64,
-                "waves_per_eu": 2,
+                # "waves_per_eu": 2,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -223,7 +225,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 128,
                 "BLOCK_N": 128,
-                "waves_per_eu": 2,
+                # "waves_per_eu": 2,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -233,7 +235,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 256,
                 "BLOCK_N": 128,
-                "waves_per_eu": 2,
+                # "waves_per_eu": 2,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -243,7 +245,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 128,
                 "BLOCK_N": 64,
-                "waves_per_eu": 1,
+                # "waves_per_eu": 1,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -253,7 +255,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 128,
                 "BLOCK_N": 64,
-                "waves_per_eu": 3,
+                # "waves_per_eu": 3,
                 "PRE_LOAD_V": True,
             },
             num_stages=1,
@@ -263,7 +265,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 128,
                 "BLOCK_N": 64,
-                "waves_per_eu": 3,
+                # "waves_per_eu": 3,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -273,7 +275,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 64,
                 "BLOCK_N": 64,
-                "waves_per_eu": 4,
+                # "waves_per_eu": 4,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -283,7 +285,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 32,
                 "BLOCK_N": 32,
-                "waves_per_eu": 4,
+                # "waves_per_eu": 4,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -296,7 +298,7 @@ def _attn_fwd_inner(
             {
                 "BLOCK_M": 16,
                 "BLOCK_N": 16,
-                "waves_per_eu": 1,
+                # "waves_per_eu": 1,
                 "PRE_LOAD_V": False,
             },
             num_stages=1,
@@ -672,6 +674,12 @@ def check_args(
     cu_seqlens_q=None,
     cu_seqlens_k=None,
 ):
+    # print(q.dim())
+    # print(q)
+    print(k.dim())
+    # print(k)
+    # print(v.dim())
+    # print(v)
     assert q.dim() == k.dim() and q.dim() == v.dim()
     if varlen:
         assert q.dim() == 3
@@ -711,9 +719,14 @@ class _attention(torch.autograd.Function):
         sm_scale=1.0,
         bias=None,
     ):
+        print("Triton forward starts")
         if o is None:
             o = torch.empty_like(q, dtype=v.dtype)
 
+        print(cu_seqlens_q.dim())
+        print(cu_seqlens_k.dim())
+        #print(max_seqlens_q.dim())
+        #print(max_seqlens_k.dim())
         check_args(
             q,
             k,

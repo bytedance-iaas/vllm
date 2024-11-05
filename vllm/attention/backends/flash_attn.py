@@ -540,6 +540,15 @@ class FlashAttentionImpl(AttentionImpl):
             raise ValueError(
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
+        
+        # if self.use_triton_flash_attn:
+        #     from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
+        #         triton_attention)
+        #     self.attn_func = triton_attention
+        #     # logger.debug("Using Triton FA in ROCmBackend")
+        # from vllm.attention.ops.triton_flash_attention import triton_attention
+        # self.attn_func = triton_attention
+        # print("Set Triton attention func")
 
     def forward(
         self,
@@ -575,6 +584,11 @@ class FlashAttentionImpl(AttentionImpl):
         assert k_scale == 1.0 and v_scale == 1.0, (
             "key/v_scale is not supported in FlashAttention.")
 
+        # from vllm.attention.ops.triton_flash_attention import triton_attention
+        # self.attn_func = triton_attention
+        # print("Set Triton attention func")
+
+        # output = triton_attention()
         output = torch.ops.vllm.unified_flash_attention(
             query,
             key,
@@ -663,6 +677,7 @@ def unified_flash_attention(
     prefill_output: Optional[torch.Tensor] = None
     decode_output: Optional[torch.Tensor] = None
 
+    from vllm.attention.ops.triton_flash_attention import triton_attention
     if prefill_meta := attn_metadata.prefill_metadata:
         # Prompt run.
         if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
@@ -670,39 +685,95 @@ def unified_flash_attention(
             # normal attention
             # When block_tables are not filled, it means q and k are the
             # prompt, and they have the same length.
-            prefill_output = flash_attn_varlen_func(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=prefill_meta.seq_start_loc,
-                cu_seqlens_k=prefill_meta.seq_start_loc,
-                max_seqlen_q=prefill_meta.max_prefill_seq_len,
-                max_seqlen_k=prefill_meta.max_prefill_seq_len,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                softcap=logits_soft_cap,
+            attn_masks = None
+            if alibi_slopes is not None:
+                attn_masks = _make_alibi_bias(
+                    alibi_slopes,
+                    query.dtype,
+                    attn_metadata.seq_lens,
+                    make_attn_mask=False)  # type: ignore
+            print("triton_attention prefill 1")
+            print(prefill_meta.seq_start_loc)
+            print(prefill_meta.max_prefill_seq_len)
+            prefill_output, _ = triton_attention(
+                query,
+                key,
+                value,
+                None,
+                prefill_meta.seq_start_loc,
+                prefill_meta.seq_start_loc,
+                prefill_meta.max_prefill_seq_len,
+                prefill_meta.max_prefill_seq_len,
+                True,
+                softmax_scale,
+                attn_masks[0][None]
+                if attn_masks is not None else None,
             )
+            # prefill_output = triton_attention(
+            #     q=query,
+            #     k=key,
+            #     v=value,
+            #     o=None,
+            #     cu_seqlens_q=prefill_meta.seq_start_loc,
+            #     cu_seqlens_k=prefill_meta.seq_start_loc,
+            #     max_seqlen_q=prefill_meta.max_prefill_seq_len,
+            #     max_seqlen_k=prefill_meta.max_prefill_seq_len,
+            #     # softmax_scale=softmax_scale,
+            #     causal=True,
+            #     sm_scale=1.0,
+            #     bias=None,
+            #     # window_size=window_size,
+            #     # alibi_slopes=alibi_slopes,
+            #     # softcap=logits_soft_cap,
+            # )
+            # prefill_output = flash_attn_varlen_func(
+            #     q=query,
+            #     k=key,
+            #     v=value,
+            #     cu_seqlens_q=prefill_meta.seq_start_loc,
+            #     cu_seqlens_k=prefill_meta.seq_start_loc,
+            #     max_seqlen_q=prefill_meta.max_prefill_seq_len,
+            #     max_seqlen_k=prefill_meta.max_prefill_seq_len,
+            #     softmax_scale=softmax_scale,
+            #     causal=True,
+            #     window_size=window_size,
+            #     alibi_slopes=alibi_slopes,
+            #     softcap=logits_soft_cap,
+            # )
         else:
             # prefix-enabled attention
+            print("triton_attention prefill 2")
             assert prefill_meta.seq_lens is not None
             max_seq_len = max(prefill_meta.seq_lens)
-            prefill_output = flash_attn_varlen_func(  # noqa
-                q=query,
-                k=key_cache,
-                v=value_cache,
-                cu_seqlens_q=prefill_meta.query_start_loc,
-                max_seqlen_q=prefill_meta.max_query_len,
-                cu_seqlens_k=prefill_meta.seq_start_loc,
-                max_seqlen_k=max_seq_len,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                block_table=prefill_meta.block_tables,
-                softcap=logits_soft_cap,
+            prefill_output, _ = triton_attention(
+                query,
+                key,
+                value,
+                None,
+                prefill_meta.seq_start_loc,
+                prefill_meta.seq_start_loc,
+                prefill_meta.max_prefill_seq_len,
+                prefill_meta.max_prefill_seq_len,
+                True,
+                softmax_scale,
+                None,
+                None,
             )
+            # prefill_output = flash_attn_varlen_func(  # noqa
+            #     q=query,
+            #     k=key_cache,
+            #     v=value_cache,
+            #     cu_seqlens_q=prefill_meta.query_start_loc,
+            #     max_seqlen_q=prefill_meta.max_query_len,
+            #     cu_seqlens_k=prefill_meta.seq_start_loc,
+            #     max_seqlen_k=max_seq_len,
+            #     softmax_scale=softmax_scale,
+            #     causal=True,
+            #     window_size=window_size,
+            #     alibi_slopes=alibi_slopes,
+            #     block_table=prefill_meta.block_tables,
+            #     softcap=logits_soft_cap,
+            # )
 
     if decode_meta := attn_metadata.decode_metadata:
         # Decoding run.
@@ -710,23 +781,96 @@ def unified_flash_attention(
         # because different queries might have different lengths.
         assert decode_meta.max_decode_query_len is not None
         if decode_meta.max_decode_query_len > 1:
-            decode_output = flash_attn_varlen_func(
-                q=decode_query,
-                k=key_cache,
-                v=value_cache,
-                cu_seqlens_q=decode_meta.query_start_loc,
-                max_seqlen_q=decode_meta.max_decode_query_len,
-                cu_seqlens_k=decode_meta.seq_start_loc,
-                max_seqlen_k=decode_meta.max_decode_seq_len,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                softcap=logits_soft_cap,
-                block_table=decode_meta.block_tables,
+            print("triton_attention decode 1")
+            decode_output, _ = triton_attention(
+                decode_query,
+                key_cache,
+                value_cache,
+                None,
+                decode_meta.query_start_loc,
+                decode_meta.seq_start_loc,
+                decode_meta.max_decode_seq_len,
+                decode_meta.max_decode_seq_len,
+                True,
+                softmax_scale,
+                None,
+                # None,
             )
+            # decode_output = flash_attn_varlen_func(
+            #     q=decode_query,
+            #     k=key_cache,
+            #     v=value_cache,
+            #     cu_seqlens_q=decode_meta.query_start_loc,
+            #     max_seqlen_q=decode_meta.max_decode_query_len,
+            #     cu_seqlens_k=decode_meta.seq_start_loc,
+            #     max_seqlen_k=decode_meta.max_decode_seq_len,
+            #     softmax_scale=softmax_scale,
+            #     causal=True,
+            #     window_size=window_size,
+            #     alibi_slopes=alibi_slopes,
+            #     softcap=logits_soft_cap,
+            #     block_table=decode_meta.block_tables,
+            # )
         else:
             # Use flash_attn_with_kvcache for normal decoding.
+            from vllm.attention.ops.flash import triton_flag_attention
+            print("triton_attention decode 2")
+            print(decode_meta.query_start_loc)
+            print(decode_meta.seq_lens_tensor)
+            print(decode_meta.seq_lens)
+            print(decode_meta.seq_start_loc)
+            print(decode_meta.max_decode_query_len)
+            print(decode_meta.max_decode_seq_len)
+            print(decode_meta.max_decode_seq_len)
+            print(decode_meta.max_query_len)
+            print(decode_meta.max_prefill_seq_len)
+            print(decode_meta.seq_lens)
+            print(decode_meta.query_start_loc)
+            # print(prefill_meta.max_prefill_seq_len)
+            #print(decode_meta.)
+            # decode_output, _ = triton_attention(
+            #     decode_query,
+            #     # key_cache,
+            #     # value_cache,
+            #     key,
+            #     value,
+            #     None,
+            #     # decode_meta.query_start_loc,
+            #     # decode_meta.seq_start_loc,
+            #     decode_meta.seq_lens_tensor,
+            #     decode_meta.seq_lens_tensor,
+            #     decode_meta.max_decode_seq_len,
+            #     decode_meta.max_decode_seq_len,
+            #     True,
+            #     softmax_scale,
+            #     None,
+            #     # None,
+            # )
+            # decode_output, _ = triton_flag_attention(
+            #     decode_query,
+            #     # key_cache,
+            #     # value_cache,
+            #     key,
+            #     value,
+            #     True,
+            #     softmax_scale,
+            #     0,
+            #     False,
+            #     False,
+            #     False,
+            #     # decode_meta.query_start_loc,
+            #     # decode_meta.seq_start_loc,
+            #     # decode_meta.seq_lens_tensor,
+            #     # decode_meta.seq_lens_tensor,
+            #     # decode_meta.max_decode_seq_len,
+            #     # decode_meta.max_decode_seq_len,
+            #     # True,
+            #     # softmax_scale,
+            #     # None,
+            #     # None,
+            # )
+
+            
             decode_output = flash_attn_with_kvcache(
                 q=decode_query.unsqueeze(1),
                 k_cache=key_cache,
@@ -773,3 +917,33 @@ def _(
     logits_soft_cap: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+def _make_alibi_bias(alibi_slopes: torch.Tensor,
+                     dtype: torch.dtype,
+                     seq_lens: Optional[List[int]],
+                     make_attn_mask: bool = True) -> List[torch.Tensor]:
+    attn_biases = []
+    if seq_lens:
+        for seq_len in seq_lens:
+            bias = torch.arange(seq_len, dtype=dtype)
+            # NOTE(zhuohan): HF uses
+            #     `bias = bias[None, :].repeat(seq_len, 1)`
+            # here. We find that both biases give the same results, but
+            # the bias below more accurately follows the original ALiBi
+            # paper.
+            bias = bias[None, :] - bias[:, None]
+
+            num_heads = alibi_slopes.shape[0]
+            bias = bias[None, :].repeat(
+                (num_heads, 1, 1)).to(alibi_slopes.device)
+            bias.mul_(alibi_slopes[:, None, None])
+            if make_attn_mask:
+                inf_mask = torch.empty(
+                    (1, seq_len, seq_len),
+                    dtype=bias.dtype).fill_(-torch.inf).triu_(diagonal=1).to(
+                        alibi_slopes.device)
+                attn_biases.append((bias + inf_mask).to(dtype))
+            else:
+                attn_biases.append(bias.to(dtype))
+
+    return attn_biases

@@ -1,4 +1,13 @@
+import os
 from vllm import LLM, SamplingParams
+
+# os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "True"
+
+# Set CUDA_LAUNCH_BLOCKING to 1 for debugging
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+# Optionally, enable device-side assertions if needed
+os.environ['TORCH_USE_CUDA_DSA'] = '1'
 
 # Sample prompts.
 prompts = [
@@ -11,7 +20,7 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-llm = LLM(model="facebook/opt-125m")
+llm = LLM(model="facebook/opt-125m", enforce_eager=True)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)
