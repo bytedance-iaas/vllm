@@ -5,6 +5,7 @@ from vllm.model_executor.sampling_metadata import (SamplingMetadata,
 from vllm.model_executor.utils import set_random_seed
 
 __all__ = [
+    "libentry",
     "SamplingMetadata",
     "SamplingMetadataCache",
     "set_random_seed",
