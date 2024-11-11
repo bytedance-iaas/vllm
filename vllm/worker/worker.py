@@ -220,7 +220,8 @@ class Worker(LocalOrDistributedWorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        self.model_runner.profile_run()
+        # disable profile_run()
+        # self.model_runner.profile_run()
         torch.cuda.synchronize()
 
         self._assert_memory_footprint_increased_during_profiling()
