@@ -870,6 +870,24 @@ def unified_flash_attention(
             #     # None,
             # )
 
+            # sglang
+
+            # from vllm.attention.ops.decode_attention import decode_attention_fwd_normal
+            # decode_output = torch.empty_like(decode_query)
+            # decode_attention_fwd_normal(
+            #     decode_query.unsqueeze(1),
+            #     key_cache,
+            #     value_cache,
+            #     decode_output,
+            #     req_to_token,
+            #     b_req_idx,
+            #     b_start_loc,
+            #     b_seq_len,
+            #     attn_logits,
+            #     max_len_in_batch,
+            #     sm_scale,
+            #     logit_cap,
+            # )
             
             decode_output = flash_attn_with_kvcache(
                 q=decode_query.unsqueeze(1),
