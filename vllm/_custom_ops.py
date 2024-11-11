@@ -192,8 +192,8 @@ def apply_rotary_pos_emb(
     assert (
         cos.shape[-1] * 2 == q.shape[-1]
     ), f"cos/sin dim must be half of q/k dim, got {cos.shape} and {q.shape}"
-    print("TEMPTEMPTEMP")
-    print(cos.stride(-1))
+    # print("TEMPTEMPTEMP")
+    # print(cos.stride(-1))
     assert cos.stride(-1) == 1, "cos must be contiguous at the last dimension"
     assert sin.stride(-1) == 1, "sin must be contiguous at the last dimension"
 
@@ -209,6 +209,9 @@ def apply_rotary_pos_emb(
         ), f"q must have 4 dimensions if position_ids is not provided, got {q.shape}"
         seq_len = q.shape[-3]
     else:
+        print("TEMPTEMPTEMP")
+        print(position_ids.shape)
+        print(q.shape[:-2])
         assert (
             position_ids.shape == q.shape[:-2]
         ), f"position_ids must have the same length as q, got {position_ids.shape} and {q.shape[:-2]}"
@@ -400,10 +403,11 @@ def rotary_embedding(
         # sin: (max_seq_len, head_dim // 2)
         # position_ids: (*, ), optional, position ids for each token
         # rotary_interleaved: whether the head_dim is rotated in an interleaved way
+    # cos_cache, sin_cache = torch.split(cos_sin_cache, 64, dim=1)
+
     # transposed = cos_sin_cache.transpose(0, 1)
     # cos_cache, sin_cache = torch.chunk(transposed, 2, dim=1)
-    # cos_cache, sin_cache = torch.split(cos_sin_cache, 64, dim=1)
-    # apply_rotary_pos_emb(query, key, cos_cache, sin_cache, positions, False)
+    # apply_rotary_pos_emb(query, key, cos_cache.contiguous(), sin_cache.contiguous(), positions, False)
     torch.ops._C.rotary_embedding(positions, query, key, head_size,
                                   cos_sin_cache, is_neox)
 
