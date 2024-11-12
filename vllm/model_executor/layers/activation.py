@@ -13,6 +13,61 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils import LazyDict
 
+import triton
+import triton.language as tl
+
+# from ..utils import pointwise_dynamic
+
+
+# @pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
+# @triton.jit
+# def silu_and_mul_kernel(x, y):
+#     x_fp32 = x.to(tl.float32)
+#     x_silu = tl.fdiv(x_fp32, (1.0 + tl.exp(-x_fp32)))
+#     return x_silu * y
+
+
+# class SiluAndMul(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx, A, B):
+#         return silu_and_mul_kernel(A, B)
+
+
+# def silu_and_mul(A, B):
+#     return SiluAndMul.apply(A, B)
+
+@triton.jit
+def silu_and_mul_kernel(out_ptr, x_ptr, d: tl.constexpr):
+    token_idx = tl.program_id(0)
+    idx = tl.arange(0, d)
+    
+    # Load A and B from x
+    x_a = tl.load(x_ptr + token_idx * 2 * d + idx, mask=idx < d)
+    x_b = tl.load(x_ptr + token_idx * 2 * d + d + idx, mask=idx < d)
+    
+    # SiLU activation on A and element-wise multiplication with B
+    x_a_fp32 = x_a.to(tl.float32)
+    x_silu = x_a_fp32 / (1.0 + tl.exp(-x_a_fp32))
+    result = x_silu * x_b
+    
+    # Write result to output
+    tl.store(out_ptr + token_idx * d + idx, result, mask=idx < d)
+
+
+class SiluAndMul2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, out, x):
+        print("silusilu")
+        d = x.shape[-1] // 2
+        num_tokens = x.shape[0]
+        
+        # Launch the Triton kernel
+        silu_and_mul_kernel[(num_tokens,)](out, x, d=d)
+
+
+def silu_and_mul(out, x):
+    SiluAndMul2.apply(out, x)
+
 
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -64,7 +119,10 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        print(x.shape)
+        print(x)
         ops.silu_and_mul(out, x)
+        print("SiluAndMul forward_cuda")
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -107,8 +165,10 @@ class GeluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if self.approximate == "none":
             ops.gelu_and_mul(out, x)
+            print("GeluAndMul forward_cuda gelu_and_mul")
         elif self.approximate == "tanh":
             ops.gelu_tanh_and_mul(out, x)
+            print("GeluAndMul forward_cuda gelu_tanh_and_mul")
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
