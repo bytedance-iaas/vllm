@@ -37,13 +37,14 @@ import triton.language as tl
 #     return SiluAndMul.apply(A, B)
 
 @triton.jit
-def silu_and_mul_kernel(out_ptr, x_ptr, d: tl.constexpr):
+def silu_and_mul_kernel(out_ptr, x_ptr, d: tl.constexpr, d_padded: tl.constexpr):
     token_idx = tl.program_id(0)
-    idx = tl.arange(0, d)
+    idx = tl.arange(0, d_padded)
     
     # Load A and B from x
-    x_a = tl.load(x_ptr + token_idx * 2 * d + idx, mask=idx < d)
-    x_b = tl.load(x_ptr + token_idx * 2 * d + d + idx, mask=idx < d)
+    mask = idx < d  # Mask for values within the original range of d
+    x_a = tl.load(x_ptr + token_idx * 2 * d + idx, mask=mask, other=0.0)
+    x_b = tl.load(x_ptr + token_idx * 2 * d + d + idx, mask=mask, other=0.0)
     
     # SiLU activation on A and element-wise multiplication with B
     x_a_fp32 = x_a.to(tl.float32)
@@ -51,18 +52,18 @@ def silu_and_mul_kernel(out_ptr, x_ptr, d: tl.constexpr):
     result = x_silu * x_b
     
     # Write result to output
-    tl.store(out_ptr + token_idx * d + idx, result, mask=idx < d)
+    tl.store(out_ptr + token_idx * d + idx, result, mask=mask)
 
 
 class SiluAndMul2(torch.autograd.Function):
     @staticmethod
     def forward(ctx, out, x):
-        print("silusilu")
         d = x.shape[-1] // 2
+        d_padded = 1 << (d - 1).bit_length()  # Calculate d_padded in Python
         num_tokens = x.shape[0]
         
         # Launch the Triton kernel
-        silu_and_mul_kernel[(num_tokens,)](out, x, d=d)
+        silu_and_mul_kernel[(num_tokens,)](out, x, d=d, d_padded=d_padded)
 
 
 def silu_and_mul(out, x):
@@ -119,9 +120,9 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        print(x.shape)
-        print(x)
-        ops.silu_and_mul(out, x)
+        # print(x.shape)
+        # print(x)
+        silu_and_mul(out, x)
         print("SiluAndMul forward_cuda")
         return out
 

@@ -126,7 +126,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        print("forward_native")
+        print("rotary embedding forward_native")
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
             positions = positions + offsets
@@ -157,8 +157,8 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        print("forward_cuda")
-        print(offsets)
+        print("rotary embedding forward_cuda")
+        # print(offsets)
         from vllm import _custom_ops as ops
 
         self.cos_sin_cache = self.cos_sin_cache.to(query.device,

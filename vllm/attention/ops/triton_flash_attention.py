@@ -676,7 +676,7 @@ def check_args(
 ):
     # print(q.dim())
     # print(q)
-    print(k.dim())
+    # print(k.dim())
     # print(k)
     # print(v.dim())
     # print(v)
@@ -723,8 +723,8 @@ class _attention(torch.autograd.Function):
         if o is None:
             o = torch.empty_like(q, dtype=v.dtype)
 
-        print(cu_seqlens_q.dim())
-        print(cu_seqlens_k.dim())
+        # print(cu_seqlens_q.dim())
+        # print(cu_seqlens_k.dim())
         #print(max_seqlens_q.dim())
         #print(max_seqlens_k.dim())
         check_args(

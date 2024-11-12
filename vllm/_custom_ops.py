@@ -209,9 +209,9 @@ def apply_rotary_pos_emb(
         ), f"q must have 4 dimensions if position_ids is not provided, got {q.shape}"
         seq_len = q.shape[-3]
     else:
-        print("TEMPTEMPTEMP")
-        print(position_ids.shape)
-        print(q.shape[:-2])
+        # print("TEMPTEMPTEMP")
+        # print(position_ids.shape)
+        # print(q.shape[:-2])
         assert (
             position_ids.shape == q.shape[:-2]
         ), f"position_ids must have the same length as q, got {position_ids.shape} and {q.shape[:-2]}"
