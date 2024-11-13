@@ -391,11 +391,9 @@ def rotary_embedding(
     is_neox: bool,
 ) -> None:
     print("rotary_embedding")
-    print(query.shape)
-    print(key.shape)
-    print(cos_sin_cache.shape)
-    
-    # torch.Size([4096, 128])
+    print(query.shape) # torch.Size([4, 4096])
+    print(key.shape) # torch.Size([4, 4096])
+    print(cos_sin_cache.shape) # torch.Size([4096, 128])
 
         #     q: (*, q_heads, head_dim)
         # k: (*, k_heads, head_dim)

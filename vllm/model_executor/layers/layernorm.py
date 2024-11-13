@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 from vllm.model_executor.utils import libentry
 
+
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_kernel(
@@ -62,6 +63,7 @@ class RmsNorm(torch.autograd.Function):
 def rms_norm(x, normalized_shape, weight, eps=1e-5):
     return RmsNorm.apply(x, normalized_shape, weight, eps)
 
+
 @triton.jit
 def fused_add_rms_norm_kernel(
     input_ptr,   # [..., hidden_size]
@@ -86,6 +88,7 @@ def fused_add_rms_norm_kernel(
     x = tl.load(input_ptr + cols * x_stride_c, mask, other=0.0).to(tl.float32)
     r = tl.load(residual_ptr + cols * x_stride_c, mask, other=0.0).to(tl.float32)
     z = x + r
+    tl.store(residual_ptr + cols * y_stride_c, z, mask=mask)
 
     # Compute variance
     var = tl.sum(z * z, axis=0) / N
@@ -112,9 +115,10 @@ class FusedAddRMSNorm(torch.autograd.Function):
         weight = weight.contiguous()
 
         # Launch the Triton kernel
-        fused_add_rms_norm_kernel[(M,)](
-            input, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
-        )
+        with torch.cuda.device(input.device):
+            fused_add_rms_norm_kernel[(M,)](
+                input, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
+            )
         return input
 
 
