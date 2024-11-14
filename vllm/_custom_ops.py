@@ -71,6 +71,120 @@ def hint_on_error(fn):
 
     return wrapper
 
+
+# activation ops
+def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    torch.ops._C.silu_and_mul(out, x)
+
+
+def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    torch.ops._C.gelu_and_mul(out, x)
+
+
+def gelu_tanh_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    torch.ops._C.gelu_tanh_and_mul(out, x)
+
+
+def gelu_fast(out: torch.Tensor, x: torch.Tensor) -> None:
+    torch.ops._C.gelu_fast(out, x)
+
+
+def gelu_new(out: torch.Tensor, x: torch.Tensor) -> None:
+    torch.ops._C.gelu_new(out, x)
+
+
+def gelu_quick(out: torch.Tensor, x: torch.Tensor) -> None:
+    torch.ops._C.gelu_quick(out, x)
+
+
+# page attention ops
+def paged_attention_v1(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    tp_rank: int = 0,
+    blocksparse_local_blocks: int = 0,
+    blocksparse_vert_stride: int = 0,
+    blocksparse_block_size: int = 64,
+    blocksparse_head_sliding_step: int = 0,
+) -> None:
+    torch.ops._C.paged_attention_v1(
+        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
+        seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
+        k_scale, v_scale, tp_rank, blocksparse_local_blocks,
+        blocksparse_vert_stride, blocksparse_block_size,
+        blocksparse_head_sliding_step)
+
+
+def paged_attention_v2(
+    out: torch.Tensor,
+    exp_sum: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    tp_rank: int = 0,
+    blocksparse_local_blocks: int = 0,
+    blocksparse_vert_stride: int = 0,
+    blocksparse_block_size: int = 64,
+    blocksparse_head_sliding_step: int = 0,
+) -> None:
+    torch.ops._C.paged_attention_v2(
+        out, exp_sum, max_logits, tmp_out, query, key_cache, value_cache,
+        num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len,
+        alibi_slopes, kv_cache_dtype, k_scale, v_scale, tp_rank,
+        blocksparse_local_blocks, blocksparse_vert_stride,
+        blocksparse_block_size, blocksparse_head_sliding_step)
+
+
+def paged_attention_rocm(
+    out: torch.Tensor,
+    exp_sum: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+) -> None:
+    torch.ops._rocm_C.paged_attention(out, exp_sum, max_logits, tmp_out, query,
+                                      key_cache, value_cache, num_kv_heads,
+                                      scale, block_tables, seq_lens,
+                                      block_size, max_seq_len, alibi_slopes,
+                                      kv_cache_dtype, k_scale, v_scale)
+
+
 @libentry()
 @triton.jit
 def apply_rotary_pos_emb_kernel(
@@ -268,119 +382,6 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-# activation ops
-def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.silu_and_mul(out, x)
-
-
-def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.gelu_and_mul(out, x)
-
-
-def gelu_tanh_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.gelu_tanh_and_mul(out, x)
-
-
-def gelu_fast(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.gelu_fast(out, x)
-
-
-def gelu_new(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.gelu_new(out, x)
-
-
-def gelu_quick(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.gelu_quick(out, x)
-
-
-# page attention ops
-def paged_attention_v1(
-    out: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    num_kv_heads: int,
-    scale: float,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-    max_seq_len: int,
-    alibi_slopes: Optional[torch.Tensor],
-    kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-    tp_rank: int = 0,
-    blocksparse_local_blocks: int = 0,
-    blocksparse_vert_stride: int = 0,
-    blocksparse_block_size: int = 64,
-    blocksparse_head_sliding_step: int = 0,
-) -> None:
-    torch.ops._C.paged_attention_v1(
-        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
-        seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
-        k_scale, v_scale, tp_rank, blocksparse_local_blocks,
-        blocksparse_vert_stride, blocksparse_block_size,
-        blocksparse_head_sliding_step)
-
-
-def paged_attention_v2(
-    out: torch.Tensor,
-    exp_sum: torch.Tensor,
-    max_logits: torch.Tensor,
-    tmp_out: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    num_kv_heads: int,
-    scale: float,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-    max_seq_len: int,
-    alibi_slopes: Optional[torch.Tensor],
-    kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-    tp_rank: int = 0,
-    blocksparse_local_blocks: int = 0,
-    blocksparse_vert_stride: int = 0,
-    blocksparse_block_size: int = 64,
-    blocksparse_head_sliding_step: int = 0,
-) -> None:
-    torch.ops._C.paged_attention_v2(
-        out, exp_sum, max_logits, tmp_out, query, key_cache, value_cache,
-        num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len,
-        alibi_slopes, kv_cache_dtype, k_scale, v_scale, tp_rank,
-        blocksparse_local_blocks, blocksparse_vert_stride,
-        blocksparse_block_size, blocksparse_head_sliding_step)
-
-
-def paged_attention_rocm(
-    out: torch.Tensor,
-    exp_sum: torch.Tensor,
-    max_logits: torch.Tensor,
-    tmp_out: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    num_kv_heads: int,
-    scale: float,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-    max_seq_len: int,
-    alibi_slopes: Optional[torch.Tensor],
-    kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-) -> None:
-    torch.ops._rocm_C.paged_attention(out, exp_sum, max_logits, tmp_out, query,
-                                      key_cache, value_cache, num_kv_heads,
-                                      scale, block_tables, seq_lens,
-                                      block_size, max_seq_len, alibi_slopes,
-                                      kv_cache_dtype, k_scale, v_scale)
-
-
 # pos encoding ops
 def rotary_embedding(
     positions: torch.Tensor,
@@ -394,17 +395,13 @@ def rotary_embedding(
     print(query.shape) # torch.Size([4, 4096])
     print(key.shape) # torch.Size([4, 4096])
     print(cos_sin_cache.shape) # torch.Size([4096, 128])
-
-        #     q: (*, q_heads, head_dim)
-        # k: (*, k_heads, head_dim)
-        # cos: (max_seq_len, head_dim // 2)
-        # sin: (max_seq_len, head_dim // 2)
-        # position_ids: (*, ), optional, position ids for each token
-        # rotary_interleaved: whether the head_dim is rotated in an interleaved way
     # cos_cache, sin_cache = torch.split(cos_sin_cache, 64, dim=1)
 
     # transposed = cos_sin_cache.transpose(0, 1)
     # cos_cache, sin_cache = torch.chunk(transposed, 2, dim=1)
+    # apply_rotary_pos_emb(query, key, cos_cache.contiguous(), sin_cache.contiguous(), positions, False)
+    
+    # cos_cache, sin_cache = torch.chunk(cos_sin_cache.transpose(0, 1), 2, dim=1)
     # apply_rotary_pos_emb(query, key, cos_cache.contiguous(), sin_cache.contiguous(), positions, False)
     torch.ops._C.rotary_embedding(positions, query, key, head_size,
                                   cos_sin_cache, is_neox)

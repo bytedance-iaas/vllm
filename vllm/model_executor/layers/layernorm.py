@@ -64,7 +64,8 @@ def rms_norm(x, normalized_shape, weight, eps=1e-5):
     return RmsNorm.apply(x, normalized_shape, weight, eps)
 
 
-@triton.jit
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
 def fused_add_rms_norm_kernel(
     input_ptr,   # [..., hidden_size]
     residual_ptr,  # [..., hidden_size]
