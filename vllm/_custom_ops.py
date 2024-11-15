@@ -298,16 +298,14 @@ def apply_rotary_pos_emb(
         k_embed: (*, k_heads, head_dim)
     """
     assert (
-        k.shape[-1] == q.shape[-1]
+        k.shape[-1] == q.shape[-1] # 128
     ), f"q and k must have the same last dimension, got {q.shape} and {k.shape}"
     assert (
-        cos.shape[-1] == sin.shape[-1]
+        cos.shape[-1] == sin.shape[-1] # 128 / 2 = 64
     ), f"cos and sin must have the same last dimension, got {cos.shape} and {sin.shape}"
     assert (
-        cos.shape[-1] * 2 == q.shape[-1]
+        cos.shape[-1] * 2 == q.shape[-1] # 128
     ), f"cos/sin dim must be half of q/k dim, got {cos.shape} and {q.shape}"
-    # print("TEMPTEMPTEMP")
-    # print(cos.stride(-1))
     assert cos.stride(-1) == 1, "cos must be contiguous at the last dimension"
     assert sin.stride(-1) == 1, "sin must be contiguous at the last dimension"
 
@@ -323,11 +321,8 @@ def apply_rotary_pos_emb(
         ), f"q must have 4 dimensions if position_ids is not provided, got {q.shape}"
         seq_len = q.shape[-3]
     else:
-        # print("TEMPTEMPTEMP")
-        # print(position_ids.shape)
-        # print(q.shape[:-2])
         assert (
-            position_ids.shape == q.shape[:-2]
+            position_ids.shape == q.shape[:-2] # num_head 32
         ), f"position_ids must have the same length as q, got {position_ids.shape} and {q.shape[:-2]}"
 
         position_ids = position_ids.view(-1)
@@ -392,17 +387,29 @@ def rotary_embedding(
     is_neox: bool,
 ) -> None:
     print("rotary_embedding")
-    print(query.shape) # torch.Size([4, 4096])
-    print(key.shape) # torch.Size([4, 4096])
-    print(cos_sin_cache.shape) # torch.Size([4096, 128])
+    print(f"positions {positions.shape}")
+    print(positions)
+    print(f"query {query.shape}") # torch.Size([4, 4096])
+    # print(query)
+    print(f"key {key.shape}") # torch.Size([4, 4096])
+    # print(key)
+    print(f"cos_sin_cache {cos_sin_cache.shape}")  # torch.Size([4096, 128])
+    # print(cos_sin_cache)
+    print(head_size) # 128
     # cos_cache, sin_cache = torch.split(cos_sin_cache, 64, dim=1)
-
     # transposed = cos_sin_cache.transpose(0, 1)
-    # cos_cache, sin_cache = torch.chunk(transposed, 2, dim=1)
+    # cos_cache, sin_cache = torch.chunk(cos_sin_cache, 2, dim=1)
     # apply_rotary_pos_emb(query, key, cos_cache.contiguous(), sin_cache.contiguous(), positions, False)
-    
     # cos_cache, sin_cache = torch.chunk(cos_sin_cache.transpose(0, 1), 2, dim=1)
     # apply_rotary_pos_emb(query, key, cos_cache.contiguous(), sin_cache.contiguous(), positions, False)
+
+    cos_cache, sin_cache = torch.chunk(cos_sin_cache, chunks=2, dim=-1)
+    reshaped_query = query.reshape(-1, 32, 128)
+    reshaped_key = key.reshape(-1, 32, 128)
+    print(f"reshaped_query {reshaped_query.shape}") # torch.Size([4, 4096])
+    print(f"reshaped_key {reshaped_key.shape}") # torch.Size([4, 4096])
+    # TODO(fix): The result is OK but sometimes wierd for llama2-7b using RoPE. Need fixing.
+    # apply_rotary_pos_emb(reshaped_query, reshaped_key, cos_cache, sin_cache, positions, False)
     torch.ops._C.rotary_embedding(positions, query, key, head_size,
                                   cos_sin_cache, is_neox)
 

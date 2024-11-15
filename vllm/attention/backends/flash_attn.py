@@ -1140,7 +1140,7 @@ def unified_flash_attention(
                     attn_metadata.seq_lens,
                     make_attn_mask=False)  # type: ignore
             print("triton_attention prefill 1")
-            print(prefill_meta.seq_start_loc)
+            # print(prefill_meta.seq_start_loc)
             print(prefill_meta.max_prefill_seq_len)
             prefill_output, _ = triton_attention(
                 query,
@@ -1262,19 +1262,18 @@ def unified_flash_attention(
             # Use flash_attn_with_kvcache for normal decoding.
             from vllm.attention.ops.flash import triton_flag_attention
             print("triton_attention decode 2")
-            print(decode_meta.query_start_loc)
-            print(decode_meta.seq_lens_tensor)
-            print(decode_meta.seq_lens)
-            print(decode_meta.seq_start_loc)
-            print(decode_meta.max_decode_query_len)
-            print(decode_meta.max_decode_seq_len)
-            print(decode_meta.max_decode_seq_len)
-            print(decode_meta.max_query_len)
-            print(decode_meta.max_prefill_seq_len)
-            print(decode_meta.seq_lens)
-            print(decode_meta.query_start_loc)
+            # print(decode_meta.query_start_loc)
+            # print(decode_meta.seq_lens_tensor)
+            # print(decode_meta.seq_lens)
+            # print(decode_meta.seq_start_loc)
+            # print(decode_meta.max_decode_query_len)
+            # print(decode_meta.max_decode_seq_len)
+            # print(decode_meta.max_decode_seq_len)
+            # print(decode_meta.max_query_len)
+            # print(decode_meta.max_prefill_seq_len)
+            # print(decode_meta.seq_lens)
+            # print(decode_meta.query_start_loc)
             # print(prefill_meta.max_prefill_seq_len)
-            #print(decode_meta.)
             # decode_output, _ = triton_attention(
             #     decode_query,
             #     # key_cache,

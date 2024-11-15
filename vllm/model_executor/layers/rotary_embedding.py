@@ -171,6 +171,7 @@ class RotaryEmbedding(CustomOp):
                                          self.is_neox_style, self.rotary_dim,
                                          offsets)
         else:
+            print("ops is None for RotaryEmbedding")
             ops.rotary_embedding(positions, query, key, self.head_size,
                                  self.cos_sin_cache, self.is_neox_style)
         return query, key
@@ -921,10 +922,13 @@ def get_rope(
         return _ROPE_DICT[key]
 
     if rope_scaling is None:
+        print("rope_scaling None")
         rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base,
                                      is_neox_style, dtype)
     else:
         scaling_type = rope_scaling["rope_type"]
+        print("rope_scaling")
+        print(scaling_type)
 
         if scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]

@@ -725,8 +725,8 @@ class _attention(torch.autograd.Function):
 
         # print(cu_seqlens_q.dim())
         # print(cu_seqlens_k.dim())
-        #print(max_seqlens_q.dim())
-        #print(max_seqlens_k.dim())
+        # print(max_seqlens_q.dim())
+        # print(max_seqlens_k.dim())
         check_args(
             q,
             k,
