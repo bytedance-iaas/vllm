@@ -1336,13 +1336,13 @@ def unified_flash_attention(
             #     logit_cap,
             # )
             
-            # example code for 11/14/2024 version
+            # example code for 11/14/2024 version, this may work fine with correct memory layout for reshape_and_cache_flash_kernel triton version.
             # decode_output = triton_flash_flag_attention(
             #     query=decode_query, 
             #     key_cache=key_cache, 
             #     value_cache=value_cache, 
             #     context_lens=decode_meta.seq_lens_tensor, 
-            #     block_tables=decode_meta.block_table, 
+            #     block_tables=decode_meta.block_tables, 
             #     attn_scale=softmax_scale,
             #     max_context_len=4096,
             #     num_splits=0,
@@ -1353,7 +1353,7 @@ def unified_flash_attention(
             #     key_cache=key_cache, 
             #     value_cache=value_cache, 
             #     context_lens=decode_meta.seq_lens_tensor, 
-            #     block_tables=decode_meta.block_table, 
+            #     block_tables=decode_meta.block_tables, 
             #     attn_scale=softmax_scale,
             #     max_context_len=4096,
             #     num_splits=0,

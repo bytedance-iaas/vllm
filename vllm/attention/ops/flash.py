@@ -2,9 +2,9 @@ import math
 import torch
 import triton
 import triton.language as tl
-from flag_attn.total import _total_attention_kernel
-from flag_attn.split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
-from flag_attn.split_kv import get_fwd_config as get_fwd_config_kv_split
+# from flag_attn.total import _total_attention_kernel
+# from flag_attn.split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
+# from flag_attn.split_kv import get_fwd_config as get_fwd_config_kv_split
 
 from .dropout import philox_cuda_seed_offset
 
