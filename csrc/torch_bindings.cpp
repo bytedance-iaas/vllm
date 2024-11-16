@@ -387,6 +387,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                        float k_scale, float v_scale) -> ()");
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
+  cache_ops.def(
+      "reshape_and_cache_flash_transpose(Tensor key, Tensor value,"
+      "                        Tensor! key_cache,"
+      "                        Tensor! value_cache,"
+      "                        Tensor slot_mapping,"
+      "                        str kv_cache_dtype,"
+      "                        float k_scale, float v_scale) -> ()");
+  cache_ops.impl("reshape_and_cache_flash_transpose", torch::kCUDA,
+                 &reshape_and_cache_flash_transpose);
 
   // Convert the key and value cache to fp8 data type.
   cache_ops.def(

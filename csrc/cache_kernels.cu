@@ -329,6 +329,34 @@ void reshape_and_cache_flash(
                              CALL_RESHAPE_AND_CACHE_FLASH);
 }
 
+void reshape_and_cache_flash_transpose(
+    torch::Tensor& key,        // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,  // [num_blocks, num_heads, block_size, head_size]
+    torch::Tensor&
+        value_cache,  // [num_blocks, num_heads, block_size, head_size]
+    torch::Tensor& slot_mapping,  // [num_tokens]
+    const std::string& kv_cache_dtype, const double k_scale,
+    const double v_scale) {
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int block_size = key_cache.size(2);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+  int block_stride = key_cache.stride(0);
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
+                             CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
 namespace vllm {
 
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
