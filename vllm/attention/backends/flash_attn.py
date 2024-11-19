@@ -1321,15 +1321,18 @@ def unified_flash_attention(
 
         print("flash_attn v2")
         # reshape_and_cache_flash_transposed(
-        #     key,
-        #     value,
-        #     kv_cache[0],
-        #     kv_cache[1],
-        #     attn_metadata.slot_mapping.flatten(),
-        #     k_scale,
-        #     v_scale,
-        #     0,
-        # )
+        # torch.ops._C_cache_ops.reshape_and_cache_flash(
+        # torch.ops._C_cache_ops.reshape_and_cache_flash_transposed(
+        torch.ops._C_cache_ops.reshape_and_cache_flash_transpose(
+            key,
+            value,
+            kv_cache[0],
+            kv_cache[1],
+            attn_metadata.slot_mapping.flatten(),
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
 
         # reshape_and_cache_flash_torch(
         #     key,
@@ -1345,16 +1348,16 @@ def unified_flash_attention(
         # Reshape the input keys and values and store them in the cache.
         # If kv_cache is not provided, the new key and value tensors are
         # not cached. This happens during the initial memory profiling run.
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key,
-            value,
-            kv_cache[0],
-            kv_cache[1],
-            attn_metadata.slot_mapping.flatten(),
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-        )
+        # torch.ops._C_cache_ops.reshape_and_cache_flash(
+        #     key,
+        #     value,
+        #     kv_cache[0],
+        #     kv_cache[1],
+        #     attn_metadata.slot_mapping.flatten(),
+        #     kv_cache_dtype,
+        #     k_scale,
+        #     v_scale,
+        # )
 
     num_prefill_tokens = attn_metadata.num_prefill_tokens
     num_decode_tokens = attn_metadata.num_decode_tokens
@@ -1588,16 +1591,16 @@ def unified_flash_attention(
             # )
             
             # example code for 11/14/2024 version, this may work fine with correct memory layout for reshape_and_cache_flash_kernel triton version.
-            # decode_output = triton_flash_flag_attention(
-            #     query=decode_query, 
-            #     key_cache=key_cache, 
-            #     value_cache=value_cache, 
-            #     context_lens=decode_meta.seq_lens_tensor, 
-            #     block_tables=decode_meta.block_tables, 
-            #     attn_scale=softmax_scale,
-            #     max_context_len=4096,
-            #     num_splits=0,
-            # )
+            decode_output = triton_flash_flag_attention(
+                query=decode_query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                context_lens=decode_meta.seq_lens_tensor,
+                block_tables=decode_meta.block_tables,
+                attn_scale=softmax_scale,
+                max_context_len=4096,
+                num_splits=0,
+            )
 
             # decode_output = triton_flag_attention_flash_attention(
             #     query=decode_query, 
@@ -1610,18 +1613,18 @@ def unified_flash_attention(
             #     num_splits=0,
             # )
 
-            decode_output = flash_attn_with_kvcache(
-                q=decode_query.unsqueeze(1),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                block_table=decode_meta.block_tables,
-                cache_seqlens=decode_meta.seq_lens_tensor,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                softcap=logits_soft_cap,
-            ).squeeze(1)
+            # decode_output = flash_attn_with_kvcache(
+            #     q=decode_query.unsqueeze(1),
+            #     k_cache=key_cache,
+            #     v_cache=value_cache,
+            #     block_table=decode_meta.block_tables,
+            #     cache_seqlens=decode_meta.seq_lens_tensor,
+            #     softmax_scale=softmax_scale,
+            #     causal=True,
+            #     window_size=window_size,
+            #     alibi_slopes=alibi_slopes,
+            #     softcap=logits_soft_cap,
+            # ).squeeze(1)
 
     if prefill_output is None:
         assert decode_output is not None
