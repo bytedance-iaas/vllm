@@ -15,6 +15,9 @@ prompts = [
     "The president of the United States is",
     "The capital of France is",
     "The future of AI is",
+    # "The capital of United State is",
+    # "The capital of China is",
+    # "The capital of Japan is",
 ]
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)

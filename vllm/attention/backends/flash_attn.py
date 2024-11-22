@@ -1155,6 +1155,7 @@ def reshape_and_cache_flash_kernel(
     value_stride: tl.constexpr,
     block_stride: tl.constexpr,
     kv_dt: tl.constexpr,  # Fp8KVCacheDataType
+    hidden_size: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     if token_idx >= num_tokens:
@@ -1171,7 +1172,7 @@ def reshape_and_cache_flash_kernel(
 
     # Compute the global memory indices
     n = num_heads * head_size
-    offsets = tl.arange(0, 32*64)
+    offsets = tl.arange(0, hidden_size)
     src_key_idx = token_idx * key_stride + offsets
     src_value_idx = token_idx * value_stride + offsets
 
@@ -1249,6 +1250,7 @@ def reshape_and_cache_flash(
         value_stride=value_stride,
         block_stride=block_stride,
         kv_dt=kv_dt,
+        hidden_size=num_heads*head_size,
     )
 
 
