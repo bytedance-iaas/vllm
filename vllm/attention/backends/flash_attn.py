@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
+import triton
+import triton.language as tl
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -26,8 +28,7 @@ from vllm.vllm_flash_attn import (flash_attn_varlen_func,
 # from flag_attn.paged import attention as triton_flag_attention_flash_attention
 # from flag_attn.split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
 # from flag_attn.split_kv import get_fwd_config as get_fwd_config_kv_split
-import triton
-import triton.language as tl
+
 
 # Requires triton 2.2.0
 def triton_flash_flag_attention(
@@ -466,9 +467,6 @@ def _paged_attn_v2_reduce_kernel(
         + group_head_offset * stride_o2
     )
     tl.store(out_ptr + out_offset, out)
-
-
-
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -1140,152 +1138,8 @@ def reshape_and_cache_flash_transposed(
     )
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_HEAD_SIZE": 32, "BLOCK_TOKEN_SIZE": 32}, num_warps=4),
-#         triton.Config({"BLOCK_HEAD_SIZE": 64, "BLOCK_TOKEN_SIZE": 64}, num_warps=8),
-#     ],
-#     key=["head_size", "block_size"],
-# )
-# @triton.jit
-# def reshape_and_cache_flash_kernel(
-#     key_ptr, value_ptr, key_cache_ptr, value_cache_ptr, slot_mapping_ptr,
-#     num_heads, head_size, block_size, num_tokens, num_blocks,
-#     k_scale, v_scale, KV_DTYPE: tl.constexpr, BLOCK_HEAD_SIZE: tl.constexpr,
-#     BLOCK_TOKEN_SIZE: tl.constexpr,
-# ):
-#     # 获取线程 ID 和全局 token 索引
-#     token_idx = tl.program_id(0)  # 一个 block 对应一个 token
-#     head_idx = tl.program_id(1)  # 每个 block 处理多个 head
-#     offset_within_head = tl.arange(0, BLOCK_HEAD_SIZE)  # 每个线程块处理 head_size 中的一部分
-
-#     # 获取 slot_mapping
-#     slot_idx = tl.load(slot_mapping_ptr + token_idx, mask=token_idx < num_tokens, other=-1)
-#     if slot_idx < 0:  # Padding token，跳过处理
-#         return
-
-#     # 计算 block 和 offset
-#     block_idx = slot_idx // block_size
-#     block_offset = slot_idx % block_size
-
-#     # 计算 key 和 value 的起始偏移
-#     key_offset = token_idx * (num_heads * head_size) + head_idx * head_size
-#     value_offset = key_offset  # 相同的布局
-
-#     # 计算目标 key_cache 和 value_cache 的偏移
-#     cache_key_offset = (
-#         block_idx * (block_size * num_heads * head_size) +
-#         block_offset * (num_heads * head_size) +
-#         head_idx * head_size
-#     )
-#     cache_value_offset = cache_key_offset  # 相同的布局
-
-#     # 加载 key 和 value
-#     key = tl.load(key_ptr + key_offset + offset_within_head, mask=offset_within_head < head_size, other=0.0)
-#     value = tl.load(value_ptr + value_offset + offset_within_head, mask=offset_within_head < head_size, other=0.0)
-
-#     # 缩放并存储到 key_cache 和 value_cache
-#     if KV_DTYPE == 0:  # 无 FP8 缩放
-#         tl.store(key_cache_ptr + cache_key_offset + offset_within_head, key, mask=offset_within_head < head_size)
-#         tl.store(value_cache_ptr + cache_value_offset + offset_within_head, value, mask=offset_within_head < head_size)
-#     else:  # FP8 缩放
-#         scaled_key = key * k_scale
-#         scaled_value = value * v_scale
-#         tl.store(key_cache_ptr + cache_key_offset + offset_within_head, scaled_key.to(tl.float16), mask=offset_within_head < head_size)
-#         tl.store(value_cache_ptr + cache_value_offset + offset_within_head, scaled_value.to(tl.float16), mask=offset_within_head < head_size)
-
-# def reshape_and_cache_flash_torch(
-#     key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale, KV_DTYPE
-# ):
-#     num_tokens, num_heads, head_size = key.shape
-#     num_blocks, block_size, _, _ = key_cache.shape
-
-#     # Triton 的网格大小
-#     grid = (num_tokens, )
-#     BLOCK_SIZE = min(num_heads * head_size, 512)
-
-#     # 调用 Triton 内核
-#     reshape_and_cache_flash_kernel[grid](
-#         key, value, key_cache, value_cache, slot_mapping,
-#         num_heads, head_size, block_size, num_tokens, num_blocks,
-#         k_scale, v_scale, KV_DTYPE,
-#         BLOCK_SIZE=BLOCK_SIZE
-#         # BLOCK_HEAD_SIZE=16  # 根据性能需求调整
-#     )
-
-
 @triton.jit
 def reshape_and_cache_flash_kernel(
-    key_ptr, value_ptr, key_cache_ptr, value_cache_ptr, slot_mapping_ptr,
-    num_heads, head_size, block_size, num_tokens, block_stride, key_stride, value_stride,
-    k_scale, v_scale, kv_dtype: tl.constexpr
-):
-    token_idx = tl.program_id(0)  # 每个 block 对应一个 token
-    thread_idx = tl.arange(0, 1024)  # 假设每个 block 最大有 1024 个线程
-
-    # 获取 slot_mapping
-    slot_idx = tl.load(slot_mapping_ptr + token_idx)
-    if slot_idx < 0:  # Padding token
-        return
-
-    # 计算 block 和 offset
-    block_idx = slot_idx // block_size
-    block_offset = slot_idx % block_size
-    n = num_heads * head_size
-
-    # 计算 key 和 value 的偏移
-    src_key_offset = token_idx * key_stride
-    src_value_offset = token_idx * value_stride
-
-    # 计算目标 key_cache 和 value_cache 的偏移
-    tgt_offset = (
-        block_idx * block_stride +
-        block_offset * n
-    )
-
-    # 循环加载和存储数据
-    for i in range(0, n, 1024):  # 处理 head_size
-        mask = thread_idx + i < n
-        src_key_idx = src_key_offset + thread_idx + i
-        src_value_idx = src_value_offset + thread_idx + i
-        tgt_idx = tgt_offset + thread_idx + i
-
-        key = tl.load(key_ptr + src_key_idx, mask=mask, other=0.0)
-        value = tl.load(value_ptr + src_value_idx, mask=mask, other=0.0)
-
-        if kv_dtype == "auto":
-            tl.store(key_cache_ptr + tgt_idx, key, mask=mask)
-            tl.store(value_cache_ptr + tgt_idx, value, mask=mask)
-        else:  # FP8 缩放
-            scaled_key = key * k_scale
-            scaled_value = value * v_scale
-            tl.store(key_cache_ptr + tgt_idx, scaled_key.to(tl.float16), mask=mask)
-            tl.store(value_cache_ptr + tgt_idx, scaled_value.to(tl.float16), mask=mask)
-
-def reshape_and_cache_flash_torch(
-    key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale, kv_dtype
-):
-    num_tokens, num_heads, head_size = key.shape
-    num_blocks, block_size, _, _ = key_cache.shape
-
-    key_stride = key.stride(0)
-    value_stride = value.stride(0)
-    block_stride = key_cache.stride(0)
-
-    grid = (num_tokens,)  # 每个 token 一个线程块
-
-    reshape_and_cache_flash_kernel[grid](
-        key, value, key_cache, value_cache, slot_mapping,
-        num_heads, head_size, block_size, num_tokens,
-        block_stride, key_stride, value_stride,
-        k_scale, v_scale, kv_dtype,
-        num_warps=4,  # 根据需求调整
-        num_threads=1024,  # 假设最大线程数
-    )
-
-
-@triton.jit
-def reshape_and_cache2_flash_kernel(
     key_ptr,          # [num_tokens, num_heads, head_size]
     value_ptr,        # [num_tokens, num_heads, head_size]
     key_cache_ptr,    # [num_blocks, block_size, num_heads, head_size]
@@ -1329,7 +1183,6 @@ def reshape_and_cache2_flash_kernel(
     #     + head_idx * head_size + head_offset
     #     # + offsets
     # )
-    # jack
     tgt_key_value_idx = (
     block_idx * block_stride
     + head_idx * block_size * head_size
@@ -1350,21 +1203,20 @@ def reshape_and_cache2_flash_kernel(
     #     tgt_value = triton.language.fp8.scaled_convert(value, v_scale, kv_dt)
     tgt_key = key
     tgt_value = value
-    # 确保转换后的结果是 fp16 类型
+
     # tgt_key = tl.cast(tgt_key, tl.float16)* k_scale
     # tgt_value = tl.cast(tgt_value, tl.float16)* v_scale
 
     # key_cache_ptr = tl.cast(key_cache_ptr, tl.pointer(tl.float16))
     # value_cache_ptr = tl.cast(value_cache_ptr, tl.pointer(tl.float16))
 
-    # 将结果存储到缓存中
     tl.store(key_cache_ptr + tgt_key_value_idx, tgt_key.to(tl.float16), mask=offsets < n)
     tl.store(value_cache_ptr + tgt_key_value_idx, tgt_value.to(tl.float16), mask=offsets < n)
     # tl.store(key_cache_ptr + tgt_key_value_idx, tgt_key, mask=offsets < n)
     # tl.store(value_cache_ptr + tgt_key_value_idx, tgt_value, mask=offsets < n)
 
 
-def reshape_and_cache2_flash(
+def reshape_and_cache_flash(
     key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale, kv_dt
 ):
     num_tokens, num_heads, head_size = key.shape
@@ -1381,7 +1233,7 @@ def reshape_and_cache2_flash(
     # print(block_stride)
 
     # Launch Triton kernel
-    reshape_and_cache2_flash_kernel[grid](
+    reshape_and_cache_flash_kernel[grid](
         key,
         value,
         key_cache,
@@ -1418,7 +1270,7 @@ def unified_flash_attention(
     alibi_slopes: Optional[torch.Tensor] = None,
     logits_soft_cap: Optional[float] = None,
 ) -> torch.Tensor:
-    print("v2v2v2")
+    print("unified_flash_attention v2")
     current_metadata = get_forward_context()
     assert current_metadata is not None
     assert isinstance(current_metadata, FlashAttentionMetadata)
@@ -1433,34 +1285,6 @@ def unified_flash_attention(
     if kv_cache.numel() > 0:
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]
-
-        print("flash_attn v2")
-        # reshape_and_cache_flash_transposed(
-        #     key,
-        #     value,
-        #     kv_cache[0],
-        #     kv_cache[1],
-        #     attn_metadata.slot_mapping.flatten(),
-        #     k_scale,
-        #     v_scale,
-        #     0,
-        # )
-
-        # reshape_and_cache_flash_torch(
-        #     key,
-        #     value,
-        #     kv_cache[0],
-        #     kv_cache[1],
-        #     attn_metadata.slot_mapping.flatten(),
-        #     k_scale,
-        #     v_scale,
-        #     0,
-        # )
-
-        #print(f'FlashAttentionImpl: unified_flash_attention(): OOO')
-        #print(f'kv_cache[0]:{kv_cache[0]}')
-        #print(f'kv_cache[0].shape:{kv_cache[0].shape}') # [num_blocks, block_size, num_heads, head_size]
-
         # Reshape the input keys and values and store them in the cache.
         # If kv_cache is not provided, the new key and value tensors are
         # not cached. This happens during the initial memory profiling run.
@@ -1474,8 +1298,7 @@ def unified_flash_attention(
         #     k_scale,
         #     v_scale,
         # )
-
-        reshape_and_cache2_flash(
+        reshape_and_cache_flash(
             key,
             value,
             kv_cache[0],
@@ -1523,7 +1346,7 @@ def unified_flash_attention(
                     make_attn_mask=False)  # type: ignore
             print("triton_attention prefill 1")
             # print(prefill_meta.seq_start_loc)
-            print(prefill_meta.max_prefill_seq_len)
+            # print(prefill_meta.max_prefill_seq_len)
             prefill_output, _ = triton_attention(
                 query,
                 key,
@@ -1538,23 +1361,6 @@ def unified_flash_attention(
                 attn_masks[0][None]
                 if attn_masks is not None else None,
             )
-            # prefill_output = triton_attention(
-            #     q=query,
-            #     k=key,
-            #     v=value,
-            #     o=None,
-            #     cu_seqlens_q=prefill_meta.seq_start_loc,
-            #     cu_seqlens_k=prefill_meta.seq_start_loc,
-            #     max_seqlen_q=prefill_meta.max_prefill_seq_len,
-            #     max_seqlen_k=prefill_meta.max_prefill_seq_len,
-            #     # softmax_scale=softmax_scale,
-            #     causal=True,
-            #     sm_scale=1.0,
-            #     bias=None,
-            #     # window_size=window_size,
-            #     # alibi_slopes=alibi_slopes,
-            #     # softcap=logits_soft_cap,
-            # )
             # prefill_output = flash_attn_varlen_func(
             #     q=query,
             #     k=key,
@@ -1623,7 +1429,6 @@ def unified_flash_attention(
                 True,
                 softmax_scale,
                 None,
-                # None,
             )
             # decode_output = flash_attn_varlen_func(
             #     q=decode_query,
@@ -1644,80 +1449,6 @@ def unified_flash_attention(
             # Use flash_attn_with_kvcache for normal decoding.
             from vllm.attention.ops.flash import triton_flag_attention
             print("triton_attention decode 2")
-            # print(decode_meta.query_start_loc)
-            # print(decode_meta.seq_lens_tensor)
-            # print(decode_meta.seq_lens)
-            # print(decode_meta.seq_start_loc)
-            # print(decode_meta.max_decode_query_len)
-            # print(decode_meta.max_decode_seq_len)
-            # print(decode_meta.max_decode_seq_len)
-            # print(decode_meta.max_query_len)
-            # print(decode_meta.max_prefill_seq_len)
-            # print(decode_meta.seq_lens)
-            # print(decode_meta.query_start_loc)
-            # print(prefill_meta.max_prefill_seq_len)
-            # decode_output, _ = triton_attention(
-            #     decode_query,
-            #     # key_cache,
-            #     # value_cache,
-            #     key,
-            #     value,
-            #     None,
-            #     # decode_meta.query_start_loc,
-            #     # decode_meta.seq_start_loc,
-            #     decode_meta.seq_lens_tensor,
-            #     decode_meta.seq_lens_tensor,
-            #     decode_meta.max_decode_seq_len,
-            #     decode_meta.max_decode_seq_len,
-            #     True,
-            #     softmax_scale,
-            #     None,
-            #     # None,
-            # )
-            # decode_output, _ = triton_flag_attention(
-            #     decode_query,
-            #     # key_cache,
-            #     # value_cache,
-            #     key,
-            #     value,
-            #     True,
-            #     softmax_scale,
-            #     0,
-            #     False,
-            #     False,
-            #     False,
-            #     # decode_meta.query_start_loc,
-            #     # decode_meta.seq_start_loc,
-            #     # decode_meta.seq_lens_tensor,
-            #     # decode_meta.seq_lens_tensor,
-            #     # decode_meta.max_decode_seq_len,
-            #     # decode_meta.max_decode_seq_len,
-            #     # True,
-            #     # softmax_scale,
-            #     # None,
-            #     # None,
-            # )
-
-            # sglang
-
-            # from vllm.attention.ops.decode_attention import decode_attention_fwd_normal
-            # decode_output = torch.empty_like(decode_query)
-            # decode_attention_fwd_normal(
-            #     decode_query.unsqueeze(1),
-            #     key_cache,
-            #     value_cache,
-            #     decode_output,
-            #     req_to_token,
-            #     b_req_idx,
-            #     b_start_loc,
-            #     b_seq_len,
-            #     attn_logits,
-            #     max_len_in_batch,
-            #     sm_scale,
-            #     logit_cap,
-            # )
-            
-            # example code for 11/14/2024 version, this may work fine with correct memory layout for reshape_and_cache_flash_kernel triton version.
             decode_output = triton_flash_flag_attention(
                 query=decode_query,
                 key_cache=key_cache,

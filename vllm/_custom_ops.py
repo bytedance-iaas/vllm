@@ -4,16 +4,14 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.library
-
-import vllm.envs as envs
-from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.scalar_type import ScalarType
-
 import triton
 import triton.language as tl
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.utils import libentry
+from vllm.platforms import current_platform
+from vllm.scalar_type import ScalarType
 
 
 logger = init_logger(__name__)
@@ -386,16 +384,16 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    print("rotary_embedding")
-    print(f"positions {positions.shape}")
-    print(positions)
-    print(f"query {query.shape}") # torch.Size([4, 4096])
+    print("Triton rotary_embedding")
+    # print(f"positions {positions.shape}")
+    # print(positions)
+    # print(f"query {query.shape}") # torch.Size([4, 4096])
     # print(query)
-    print(f"key {key.shape}") # torch.Size([4, 4096])
+    # print(f"key {key.shape}") # torch.Size([4, 4096])
     # print(key)
-    print(f"cos_sin_cache {cos_sin_cache.shape}")  # torch.Size([4096, 128])
+    # print(f"cos_sin_cache {cos_sin_cache.shape}")  # torch.Size([4096, 128])
     # print(cos_sin_cache)
-    print(head_size) # 128
+    # print(head_size) # 128
     # cos_cache, sin_cache = torch.split(cos_sin_cache, 64, dim=1)
     # transposed = cos_sin_cache.transpose(0, 1)
     # cos_cache, sin_cache = torch.chunk(cos_sin_cache, 2, dim=1)
@@ -406,8 +404,9 @@ def rotary_embedding(
     cos_cache, sin_cache = torch.chunk(cos_sin_cache, chunks=2, dim=-1)
     reshaped_query = query.reshape(-1, 32, 128)
     reshaped_key = key.reshape(-1, 32, 128)
-    print(f"reshaped_query {reshaped_query.shape}") # torch.Size([4, 4096])
-    print(f"reshaped_key {reshaped_key.shape}") # torch.Size([4, 4096])
+    # print(f"reshaped_query {reshaped_query.shape}") # torch.Size([4, 4096])
+    # print(f"reshaped_key {reshaped_key.shape}") # torch.Size([4, 4096])
+    
     # TODO(fix): The result is OK but sometimes wierd for llama2-7b using RoPE. Need fixing.
     # apply_rotary_pos_emb(reshaped_query, reshaped_key, cos_cache, sin_cache, positions, False)
     torch.ops._C.rotary_embedding(positions, query, key, head_size,

@@ -174,7 +174,7 @@ def unified_flash_attention(
     alibi_slopes: Optional[torch.Tensor] = None,
     logits_soft_cap: Optional[float] = None,
 ) -> torch.Tensor:
-    print("v1v1v1")
+    print("unified_flash_attention v1")
     current_metadata = get_forward_context()
     if current_metadata is None:
         # Profiling run.
@@ -193,7 +193,7 @@ def unified_flash_attention(
     # Reshape the input keys and values and store them in the cache.
     key_cache = kv_cache[0]
     value_cache = kv_cache[1]
-    print("flash_attn v1")
+    # print("flash_attn v1")
     torch.ops._C_cache_ops.reshape_and_cache_flash(
         key,
         value,

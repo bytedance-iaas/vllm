@@ -549,10 +549,10 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        print("Length ")
-        print(len(kv_caches))
-        if kv_caches[0] is not None:
-            print(kv_caches[0].shape)
+        # print("Length ")
+        # print(len(kv_caches))
+        # if kv_caches[0] is not None:
+        #     print(kv_caches[0].shape)
         model_output = self.model(input_ids, positions, kv_caches,
                                   attn_metadata, intermediate_tensors)
         return model_output

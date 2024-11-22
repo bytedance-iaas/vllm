@@ -157,7 +157,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        print("rotary embedding forward_cuda")
+        # print("rotary embedding forward_cuda")
         # print(offsets)
         from vllm import _custom_ops as ops
 
@@ -171,7 +171,7 @@ class RotaryEmbedding(CustomOp):
                                          self.is_neox_style, self.rotary_dim,
                                          offsets)
         else:
-            print("ops is None for RotaryEmbedding")
+            # print("ops is None for RotaryEmbedding")
             ops.rotary_embedding(positions, query, key, self.head_size,
                                  self.cos_sin_cache, self.is_neox_style)
         return query, key

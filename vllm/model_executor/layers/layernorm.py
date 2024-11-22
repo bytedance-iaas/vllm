@@ -194,9 +194,10 @@ class RMSNorm(CustomOp):
             return self.forward_native(x, residual)
 
         from vllm import _custom_ops as ops
-        print("rms norm forward_cuda")
+        # print("rms norm forward_cuda")
+        print("Triton rms_norm")
         if residual is not None:
-            print("fused_add_rms_norm")
+            print("Triton fused_add_rms_norm")
             fused_add_rms_norm(
                 x, 
                 residual,
@@ -212,7 +213,6 @@ class RMSNorm(CustomOp):
             # )
             return x, residual
         out = torch.empty_like(x)
-        print("rms_norm")
         out = rms_norm(x, [len(self.weight.data)], self.weight.data, self.variance_epsilon)
         # ops.rms_norm(
         #     out,

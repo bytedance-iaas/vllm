@@ -122,8 +122,9 @@ class SiluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         # print(x.shape)
         # print(x)
+        print("Triton SiluAndMul")
         silu_and_mul(out, x)
-        print("SiluAndMul forward_cuda")
+        # print("SiluAndMul forward_cuda")
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -166,10 +167,10 @@ class GeluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if self.approximate == "none":
             ops.gelu_and_mul(out, x)
-            print("GeluAndMul forward_cuda gelu_and_mul")
+            # print("GeluAndMul forward_cuda gelu_and_mul")
         elif self.approximate == "tanh":
             ops.gelu_tanh_and_mul(out, x)
-            print("GeluAndMul forward_cuda gelu_tanh_and_mul")
+            # print("GeluAndMul forward_cuda gelu_tanh_and_mul")
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
