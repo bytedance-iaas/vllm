@@ -1345,7 +1345,7 @@ def unified_flash_attention(
         # Reshape the input keys and values and store them in the cache.
         # If kv_cache is not provided, the new key and value tensors are
         # not cached. This happens during the initial memory profiling run.
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
+        torch.ops._C_cache_ops.reshape_and_cache_flash_transpose(
             key,
             value,
             kv_cache[0],
