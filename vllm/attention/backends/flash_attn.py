@@ -1284,6 +1284,113 @@ def reshape_and_cache_flash_torch(
     )
 
 
+@triton.jit
+def reshape_and_cache2_flash_kernel(
+    key_ptr,          # [num_tokens, num_heads, head_size]
+    value_ptr,        # [num_tokens, num_heads, head_size]
+    key_cache_ptr,    # [num_blocks, block_size, num_heads, head_size]
+    value_cache_ptr,  # [num_blocks, block_size, num_heads, head_size]
+    slot_mapping_ptr, # [num_tokens]
+    num_tokens: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_size: tl.constexpr,
+    block_size: tl.constexpr,
+    k_scale: tl.constexpr,
+    v_scale: tl.constexpr,
+    key_stride: tl.constexpr,
+    value_stride: tl.constexpr,
+    block_stride: tl.constexpr,
+    kv_dt: tl.constexpr,  # Fp8KVCacheDataType
+):
+    token_idx = tl.program_id(0)
+    if token_idx >= num_tokens:
+        return
+
+    # Load the slot mapping
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx < 0:
+        return  # Padded token
+
+    # Compute block and block offset
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    # Compute the global memory indices
+    n = num_heads * head_size
+    offsets = tl.arange(0, 32*64)
+    src_key_idx = token_idx * key_stride + offsets
+    src_value_idx = token_idx * value_stride + offsets
+
+    head_idx = offsets // head_size
+    head_offset = offsets % head_size
+    tgt_key_value_idx = (
+        block_idx * block_stride
+        + block_offset * n
+        + head_idx * head_size + head_offset
+        # + offsets
+    )
+
+    # Load key and value tensors
+    key = tl.load(key_ptr + src_key_idx, mask=offsets < n, other=0.0)
+    value = tl.load(value_ptr + src_value_idx, mask=offsets < n, other=0.0)
+
+    # # Perform optional scaling and conversion
+    # if kv_dt == "kAuto":
+    #     tgt_key = key
+    #     tgt_value = value
+    # else:
+    #     tgt_key = triton.language.fp8.scaled_convert(key, k_scale, kv_dt)
+    #     tgt_value = triton.language.fp8.scaled_convert(value, v_scale, kv_dt)
+    tgt_key = key
+    tgt_value = value
+    # 确保转换后的结果是 fp16 类型
+    # tgt_key = tl.cast(tgt_key, tl.float16)* k_scale
+    # tgt_value = tl.cast(tgt_value, tl.float16)* v_scale
+
+    # key_cache_ptr = tl.cast(key_cache_ptr, tl.pointer(tl.float16))
+    # value_cache_ptr = tl.cast(value_cache_ptr, tl.pointer(tl.float16))
+
+    # 将结果存储到缓存中
+    tl.store(key_cache_ptr + tgt_key_value_idx, tgt_key.to(tl.float16), mask=offsets < n)
+    tl.store(value_cache_ptr + tgt_key_value_idx, tgt_value.to(tl.float16), mask=offsets < n)
+    # tl.store(key_cache_ptr + tgt_key_value_idx, tgt_key, mask=offsets < n)
+    # tl.store(value_cache_ptr + tgt_key_value_idx, tgt_value, mask=offsets < n)
+
+
+def reshape_and_cache2_flash(
+    key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale, kv_dt
+):
+    num_tokens, num_heads, head_size = key.shape
+    _, block_size, _, _ = key_cache.shape
+    grid = (num_tokens,)
+
+    key_stride = key.stride(0)
+    value_stride = value.stride(0)
+    block_stride = key_cache.stride(0)
+    # print("key")
+    # print(key_stride)
+    # print(value_stride)
+    # print(block_stride)
+
+    # Launch Triton kernel
+    reshape_and_cache2_flash_kernel[grid](
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        head_size=head_size,
+        block_size=block_size,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        key_stride=key_stride,
+        value_stride=value_stride,
+        block_stride=block_stride,
+        kv_dt=kv_dt,
+    )
+
 
 @torch.library.custom_op("vllm::unified_flash_attention",
                          mutates_args=["kv_cache"])
@@ -1345,15 +1452,25 @@ def unified_flash_attention(
         # Reshape the input keys and values and store them in the cache.
         # If kv_cache is not provided, the new key and value tensors are
         # not cached. This happens during the initial memory profiling run.
-        torch.ops._C_cache_ops.reshape_and_cache_flash_transpose(
+        # torch.ops._C_cache_ops.reshape_and_cache_flash(
+        #     key,
+        #     value,
+        #     kv_cache[0],
+        #     kv_cache[1],
+        #     attn_metadata.slot_mapping.flatten(),
+        #     kv_cache_dtype,
+        #     k_scale,
+        #     v_scale,
+        # )
+        reshape_and_cache2_flash(
             key,
             value,
             kv_cache[0],
             kv_cache[1],
             attn_metadata.slot_mapping.flatten(),
-            kv_cache_dtype,
             k_scale,
             v_scale,
+            "kAuto",
         )
 
     num_prefill_tokens = attn_metadata.num_prefill_tokens
