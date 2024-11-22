@@ -27,8 +27,8 @@ def reshape_and_cache_flash_kernel(
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
 
-    #thread_idx = tl.arange(0, 1024)
-    thread_idx = tl.arange(0, n)
+    thread_idx = tl.arange(0, 16384)
+    #thread_idx = tl.arange(0, n)
 
     # Compute source indices
     src_key_idx = token_idx * key_stride + thread_idx
@@ -67,8 +67,7 @@ def reshape_and_cache_flash(
     num_tokens = int(key.size(0))
     num_heads = int(key.size(1))
     head_size = int(key.size(2))
-    #block_size = int(key_cache.size(1))
-    block_size = int(key_cache.size(2))
+    block_size = int(key_cache.size(1))
     block_stride = int(key_cache.stride(0))
     key_stride = int(key.stride(0))
     value_stride = int(value.stride(0))
@@ -92,3 +91,4 @@ def reshape_and_cache_flash(
         block_size=block_size, 
          k_scale=k_scale, v_scale=v_scale
     )
+    
