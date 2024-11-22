@@ -1323,11 +1323,18 @@ def reshape_and_cache2_flash_kernel(
 
     head_idx = offsets // head_size
     head_offset = offsets % head_size
+    # tgt_key_value_idx = (
+    #     block_idx * block_stride
+    #     + block_offset * n
+    #     + head_idx * head_size + head_offset
+    #     # + offsets
+    # )
+    # jack
     tgt_key_value_idx = (
-        block_idx * block_stride
-        + block_offset * n
-        + head_idx * head_size + head_offset
-        # + offsets
+    block_idx * block_stride
+    + head_idx * block_size * head_size
+    + block_offset * head_size
+    + head_offset
     )
 
     # Load key and value tensors
@@ -1361,7 +1368,8 @@ def reshape_and_cache2_flash(
     key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale, kv_dt
 ):
     num_tokens, num_heads, head_size = key.shape
-    _, block_size, _, _ = key_cache.shape
+    # _, block_size, _, _ = key_cache.shape
+    _, _, block_size, _ = key_cache.shape
     grid = (num_tokens,)
 
     key_stride = key.stride(0)
@@ -1449,6 +1457,10 @@ def unified_flash_attention(
         #     0,
         # )
 
+        #print(f'FlashAttentionImpl: unified_flash_attention(): OOO')
+        #print(f'kv_cache[0]:{kv_cache[0]}')
+        #print(f'kv_cache[0].shape:{kv_cache[0].shape}') # [num_blocks, block_size, num_heads, head_size]
+
         # Reshape the input keys and values and store them in the cache.
         # If kv_cache is not provided, the new key and value tensors are
         # not cached. This happens during the initial memory profiling run.
@@ -1462,6 +1474,7 @@ def unified_flash_attention(
         #     k_scale,
         #     v_scale,
         # )
+
         reshape_and_cache2_flash(
             key,
             value,
@@ -1705,16 +1718,16 @@ def unified_flash_attention(
             # )
             
             # example code for 11/14/2024 version, this may work fine with correct memory layout for reshape_and_cache_flash_kernel triton version.
-            # decode_output = triton_flash_flag_attention(
-            #     query=decode_query, 
-            #     key_cache=key_cache, 
-            #     value_cache=value_cache, 
-            #     context_lens=decode_meta.seq_lens_tensor, 
-            #     block_tables=decode_meta.block_tables, 
-            #     attn_scale=softmax_scale,
-            #     max_context_len=4096,
-            #     num_splits=0,
-            # )
+            decode_output = triton_flash_flag_attention(
+                query=decode_query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                context_lens=decode_meta.seq_lens_tensor,
+                block_tables=decode_meta.block_tables,
+                attn_scale=softmax_scale,
+                max_context_len=4096,
+                num_splits=0,
+            )
 
             # decode_output = triton_flag_attention_flash_attention(
             #     query=decode_query, 
@@ -1727,18 +1740,18 @@ def unified_flash_attention(
             #     num_splits=0,
             # )
 
-            decode_output = flash_attn_with_kvcache(
-                q=decode_query.unsqueeze(1),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                block_table=decode_meta.block_tables,
-                cache_seqlens=decode_meta.seq_lens_tensor,
-                softmax_scale=softmax_scale,
-                causal=True,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                softcap=logits_soft_cap,
-            ).squeeze(1)
+            # decode_output = flash_attn_with_kvcache(
+            #     q=decode_query.unsqueeze(1),
+            #     k_cache=key_cache,
+            #     v_cache=value_cache,
+            #     block_table=decode_meta.block_tables,
+            #     cache_seqlens=decode_meta.seq_lens_tensor,
+            #     softmax_scale=softmax_scale,
+            #     causal=True,
+            #     window_size=window_size,
+            #     alibi_slopes=alibi_slopes,
+            #     softcap=logits_soft_cap,
+            # ).squeeze(1)
 
     if prefill_output is None:
         assert decode_output is not None
