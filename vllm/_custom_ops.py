@@ -408,9 +408,9 @@ def rotary_embedding(
     # print(f"reshaped_key {reshaped_key.shape}") # torch.Size([4, 4096])
     
     # TODO(fix): The result is OK but sometimes wierd for llama2-7b using RoPE. Need fixing.
-    # apply_rotary_pos_emb(reshaped_query, reshaped_key, cos_cache, sin_cache, positions, False)
-    torch.ops._C.rotary_embedding(positions, query, key, head_size,
-                                  cos_sin_cache, is_neox)
+    apply_rotary_pos_emb(reshaped_query, reshaped_key, cos_cache, sin_cache, positions, False)
+    # torch.ops._C.rotary_embedding(positions, query, key, head_size,
+    #                               cos_sin_cache, is_neox)
 
 
 def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,

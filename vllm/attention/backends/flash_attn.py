@@ -1232,6 +1232,10 @@ def reshape_and_cache_flash(
     # print(key_stride)
     # print(value_stride)
     # print(block_stride)
+    hidden_size = num_heads*head_size
+    # fit for opt-125m
+    if hidden_size < 1024:
+        hidden_size = 1024
 
     # Launch Triton kernel
     reshape_and_cache_flash_kernel[grid](
@@ -1250,7 +1254,7 @@ def reshape_and_cache_flash(
         value_stride=value_stride,
         block_stride=block_stride,
         kv_dt=kv_dt,
-        hidden_size=num_heads*head_size,
+        hidden_size=hidden_size,
     )
 
 
