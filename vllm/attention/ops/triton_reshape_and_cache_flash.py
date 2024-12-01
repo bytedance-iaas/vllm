@@ -67,7 +67,7 @@ def reshape_and_cache_flash(
     num_tokens = int(key.size(0))
     num_heads = int(key.size(1))
     head_size = int(key.size(2))
-    block_size = int(key_cache.size(1))
+    block_size = int(key_cache.size(2))
     block_stride = int(key_cache.stride(0))
     key_stride = int(key.stride(0))
     value_stride = int(value.stride(0))
