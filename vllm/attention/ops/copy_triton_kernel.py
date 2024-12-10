@@ -11,8 +11,6 @@ def copy_blocks_kernel(
     src_tensor_ptr, dst_tensor_ptr,
     n_elements, BLOCK_SIZE: tl.constexpr
 ):
-    
-    
     # Get block and thread indices
     
     pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
@@ -49,13 +47,6 @@ def copy_blocks(key_caches, value_caches, block_mapping_tensor: torch.Tensor):
     
     cache_device = key_caches[0].device
     assert cache_device.type == 'cuda', "Caches must be on a CUDA device."
-    
-    # Create arrays of pointers to the key and value caches.
-    key_cache_ptrs = torch.tensor(
-        [key_cache.data_ptr() for key_cache in key_caches],
-        dtype=torch.int64,
-        device='cpu'  # Initial tensor on CPU.
-    )
     
     block_mapping = block_mapping_tensor.tolist()
     
