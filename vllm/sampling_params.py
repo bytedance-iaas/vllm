@@ -407,7 +407,7 @@ class SamplingParams(
             raise ValueError("best_of must equal n to use output_kind=DELTA")
 
         # use local imports to avoid circular imports
-        from vllm.distributed.kv_transfer.utils import (PDDisaggStage,
+        from vllm.distributed.kv_transfer_infinistore.utils import (PDDisaggStage,
                                                         get_pd_stage)
         if get_pd_stage() == PDDisaggStage.PREFILL:
             if self.max_tokens is None or self.max_tokens != 1:

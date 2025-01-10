@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
 
-from vllm.distributed.kv_transfer.infinite import InfiniStoreKVCacheTransporter
+from vllm.distributed.kv_transfer_infinistore.infinite import InfiniStoreKVCacheTransporter
 
 logger = init_logger(__name__)
 
@@ -66,7 +66,7 @@ class CacheEngine:
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
 
         # use local imports to avoid circular imports
-        from vllm.distributed.kv_transfer.utils import (PDDisaggStage,
+        from vllm.distributed.kv_transfer_infinistore.utils import (PDDisaggStage,
                                                         get_pd_stage)
         if get_pd_stage() != PDDisaggStage.NONE:
             self.set_kv_cache_transporter()

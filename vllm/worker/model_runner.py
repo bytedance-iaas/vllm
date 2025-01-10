@@ -56,8 +56,7 @@ from vllm.worker.model_runner_base import (
     _init_attn_metadata_from_tensor_dict,
     _init_sampling_metadata_from_tensor_dict, dump_input_when_exception)
 
-from vllm.distributed.kv_transfer.utils import (PDDisaggStage, get_pd_stage)
-from vllm.distributed.kv_transfer.utils import compute_token_page_hashes
+from vllm.distributed.kv_transfer_infinistore.utils import (PDDisaggStage, get_pd_stage, compute_token_page_hashes)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend

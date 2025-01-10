@@ -7,7 +7,7 @@ import array
 
 from vllm.attention import AttentionMetadata
 
-PAGE_SIZE = 16
+BLOCK_SIZE = 16
 
 
 class PDDisaggStage(Enum):
@@ -106,8 +106,8 @@ def finalize_kv_cache_transport(fp_type, kv_cache_transporter,
 def compute_token_page_hashes(prompt_ids: List[int],
                               prompt_seq_lengths: List[int]) -> List[str]:
 
-    global PAGE_SIZE
-    tokens_per_page = PAGE_SIZE
+    global BLOCK_SIZE
+    tokens_per_page = BLOCK_SIZE
 
     hashes = []
     seq_index = 0

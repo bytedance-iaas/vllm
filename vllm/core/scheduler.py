@@ -17,7 +17,7 @@ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
-from vllm.distributed.kv_transfer.utils import (PDDisaggStage, get_pd_stage)
+from vllm.distributed.kv_transfer_infinistore.utils import (PDDisaggStage, get_pd_stage)
 
 logger = init_logger(__name__)
 
