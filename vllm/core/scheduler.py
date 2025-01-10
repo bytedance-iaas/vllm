@@ -364,9 +364,6 @@ class Scheduler:
         # Sequence groups in the kv_cache_pending state.
         # requests that are waiting for the kv_cache to be filled.
         self.kv_cache_pending: Deque[SequenceGroup] = deque()
-        # Sequence groups in the preempeted_kv_cache_pending state.
-        # requests that are preempted and waiting for the kv_cache to be filled.
-        self.preempted_kv_cache_pending: Deque[SequenceGroup] = deque()
         # Sequence groups in the WAITING state.
         # Contain new prefill or preempted requests.
         self.waiting: Deque[SequenceGroup] = deque()
@@ -509,15 +506,14 @@ class Scheduler:
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0 or len(self.kv_cache_pending) != 0 or len(
-                self.preempted_kv_cache_pending) != 0
+            self.swapped) != 0 or len(self.kv_cache_pending) != 0
 
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped) + len(
-            self.kv_cache_pending) + len(self.preempted_kv_cache_pending)
+            self.kv_cache_pending)
 
     def get_and_reset_finished_requests_ids(self) -> List[str]:
         """Flushes the list of request ids of previously finished seq_groups."""
@@ -932,16 +928,6 @@ class Scheduler:
         seq_groups: List[ScheduledSequenceGroup] = []
 
         if get_pd_stage() == PDDisaggStage.DECODE:
-            if self.preempted_kv_cache_pending:
-                for seq_group in self.preempted_kv_cache_pending:
-                    seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-                    seq.data = SequenceData.from_seqs(
-                        seq.data.get_prompt_token_ids())
-                    # no need to checkout last hash, as it has been checked before being preempted
-                    self.waiting.append(seq_group)
-
-                self.preempted_kv_cache_pending.clear()
-
             kv_cache_pending = self.kv_cache_pending
             leftover_kv_cache_pending: Deque[SequenceGroup] = deque()
 
@@ -1140,12 +1126,7 @@ class Scheduler:
                 self.scheduler_config.max_num_batched_tokens)
         assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
 
-        # Update waiting requests.
-        if get_pd_stage() == PDDisaggStage.DECODE:
-            self.preempted_kv_cache_pending.extendleft(
-                running_scheduled.preempted)
-        else:
-            self.waiting.extendleft(running_scheduled.preempted)
+        self.waiting.extendleft(running_scheduled.preempted)
         # Update new running requests.
         if len(prefills.seq_groups) > 0:
             self.running.extend([s.seq_group for s in prefills.seq_groups])
@@ -1507,6 +1488,11 @@ class Scheduler:
             # This list will be used to update the Mamba cache in the
             # next step.
             self._finished_requests_ids.append(seq_group.request_id)
+
+            seqs = seq_group.get_seqs()
+            last_hash = seqs[0].last_prompt_hash
+            assert last_hash is not None and last_hash != ""
+            kv_cache_transporter.remove_hash_from_set(last_hash)
 
         # Free finished seqs
         self._free_finished_seqs(seq_group)

@@ -1,6 +1,6 @@
 import math
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 import torch
 import os
 import time
@@ -10,12 +10,18 @@ from vllm.distributed.kv_transfer_infinistore.base import KVCacheTransporterBase
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 
+from vllm.distributed.kv_transfer_infinistore.utils import PAGE_SIZE, get_pd_stage, PDDisaggStage
+
+from threading import Thread
+import zmq
+
 logger = logging.getLogger(__name__)
 
 Default_Infinite_Server = "127.0.0.1"
+Default_ZMQ_Server = "127.0.0.1"
+Default_ZMQ_PORT = "5555"
 interval = 0.01
 count = 0
-shared_signal_folder = "/tmp/infinistore"
 
 
 class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
@@ -36,9 +42,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         self.model = model.replace("/", "_")
         self.kv_cache_list = kv_cache_list
         self.tokens_per_page = tokens_per_page
-        
-        import vllm.distributed.kv_transfer_infinistore.utils as inf_utils
-        inf_utils.PAGE_SIZE = tokens_per_page
+        PAGE_SIZE = tokens_per_page
 
         self.page_size = kv_cache_list[0][0][0].numel()
         self.k_or_v_total_size = kv_cache_list[0][0].numel()
@@ -69,6 +73,18 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         # Assign the singleton connection to the instance attribute
         self.conn = InfiniStoreKVCacheTransporter._singleton_conn
 
+        if get_pd_stage() == PDDisaggStage.PREFILL:
+            zmq_server = os.environ.get("ZMQ_SERVER", Default_ZMQ_Server)
+            context = zmq.Context()
+            self.zmq_socket = context.socket(zmq.REQ)
+            self.zmq_socket.connect(f"tcp://{zmq_server}:{Default_ZMQ_PORT}")
+            logger.info("jxp--------zmq client")
+        # Set for sequence groups that the kv_cache is already filled
+        if get_pd_stage() == PDDisaggStage.DECODE:
+            self.completed_sqs: Set[str] = set()
+            Thread(target=self.receive_completed_sq).start()
+            logger.info("jxp--------zmq server")
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -79,6 +95,13 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             "Initialized InfiniStoreKVCacheTransporter, model: %s, layers: %d, tokens_per_page: %d, page_size: %.2f K elements, dtype: %s",
             self.model, len(self.kv_cache_list), self.tokens_per_page,
             self.page_size / 1024, self.kv_cache_list[0].dtype)
+
+    def receive_completed_sq(self):
+        context = zmq.Context()
+        socket = context.socket(zmq.REP)
+        socket.bind("tcp://127.0.0.1:5555")
+        while True:
+            self.completed_sqs.add(socket.recv())
 
     def get_hidden_states_cache_key(self, page_hash: str) -> str:
         return self.hs_key_initial + page_hash
@@ -138,14 +161,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         return block_offsets
 
     def _publish_write_completion(self, key: str) -> None:
-        file_path = os.path.join(shared_signal_folder, key)
-        directory = os.path.dirname(file_path)
-        try:
-            os.makedirs(directory, exist_ok=True)
-            open(file_path, mode="w").close()
-        except Exception as e:
-            logger.error("Failed to publish completion for %s: %s", key, e)
-            raise
+        self.zmq_socket.send(key)
 
     def publish_kv_cache_prefill_done(self, input_token_hashes: List[str],
                                       seq_lens: List[int],
@@ -162,8 +178,11 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
     def check_kv_cache_ready(self, hash: str) -> bool:
         _, v_cache_key = self.get_kv_cache_key(hash, 0)
+        return v_cache_key in self.completed_sqs
 
-        return os.path.exists(os.path.join(shared_signal_folder, v_cache_key))
+    def remove_hash_from_set(self, hash: str):
+        _, v_cache_key = self.get_kv_cache_key(hash, 0)
+        self.completed_sqs.remove(v_cache_key)
 
     def verify_kv_cache_prefill_done(self, input_token_hashes: List[str],
                                      seq_lens: List[int], layer_idx: int):
@@ -172,12 +191,11 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             covered_pages += math.ceil(seq_len / self.tokens_per_page)
             current_hash = input_token_hashes[covered_pages - 1]
             _, v_cache_key = self.get_kv_cache_key(current_hash, layer_idx)
-            if os.path.exists(os.path.join(shared_signal_folder, v_cache_key)):
+            if v_cache_key in self.completed_sqs:
                 continue
 
             wt = 0
-            while not os.path.exists(
-                    os.path.join(shared_signal_folder, v_cache_key)):
+            while v_cache_key not in self.completed_sqs:
                 time.sleep(interval)
                 wt += 1
                 if wt % 100 == 0:
