@@ -31,7 +31,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
-from vllm.distributed.kv_transfer.utils import (
+from vllm.distributed.kv_transfer_infinistore.utils import (
     PDDisaggStage,
     ForwardPassType,
     get_pd_stage,

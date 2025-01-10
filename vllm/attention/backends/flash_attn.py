@@ -241,7 +241,8 @@ class FlashAttentionMetadata(AttentionMetadata):
             encoder_seq_start_loc=self.encoder_seq_start_loc,
             max_encoder_seq_len=self.max_encoder_seq_len,
             cross_slot_mapping=self.cross_slot_mapping,
-            cross_block_tables=self.cross_block_tables)
+            cross_block_tables=self.cross_block_tables,
+            token_hashes=self.token_hashes)
         return self._cached_prefill_metadata
 
     @property
@@ -560,6 +561,7 @@ class FlashAttentionMetadataBuilder(
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
+            token_hashes=[],
         )
 
 

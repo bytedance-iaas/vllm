@@ -434,7 +434,7 @@ class Sequence:
         self.tokens: Optional[List[str]] = None
 
         # using local import to aoivd circular import
-        from vllm.distributed.kv_transfer.utils import (
+        from vllm.distributed.kv_transfer_infinistore.utils import (
             PDDisaggStage, get_pd_stage, compute_token_page_hashes)
 
         if get_pd_stage() != PDDisaggStage.NONE:
