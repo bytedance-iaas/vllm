@@ -9,6 +9,7 @@ import infinistore
 from vllm.distributed.kv_transfer_infinistore.base import KVCacheTransporterBase
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
+import vllm.distributed.kv_transfer_infinistore.utils as inf_utils
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         self.kv_cache_list = kv_cache_list
         self.tokens_per_page = tokens_per_page
         
-        import vllm.distributed.kv_transfer_infinistore.utils as inf_utils
-        inf_utils.PAGE_SIZE = tokens_per_page
+        inf_utils.BLOCK_SIZE = tokens_per_page
 
         self.page_size = kv_cache_list[0][0][0].numel()
         self.k_or_v_total_size = kv_cache_list[0][0].numel()
@@ -137,6 +137,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
         return block_offsets
 
+    # TODO： change to use zmq to notify
     def _publish_write_completion(self, key: str) -> None:
         file_path = os.path.join(shared_signal_folder, key)
         directory = os.path.dirname(file_path)
