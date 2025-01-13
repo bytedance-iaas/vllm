@@ -1492,6 +1492,8 @@ class Scheduler:
             seqs = seq_group.get_seqs()
             last_hash = seqs[0].last_prompt_hash
             assert last_hash is not None and last_hash != ""
+            kv_cache_transporter = self.cache_config.kv_cache_transporter
+            assert kv_cache_transporter is not None            
             kv_cache_transporter.remove_hash_from_set(last_hash)
 
         # Free finished seqs
