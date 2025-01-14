@@ -377,6 +377,7 @@ class LlamaModel(nn.Module):
             kv_cache_transporter.read_hidden_states(input_token_hashes,
                                                     attn_metadata.seq_lens,
                                                     hidden_states)
+            # TODO: validate if synchronization is necessary
             kv_cache_transporter.synchronize()
 
             return hidden_states
@@ -398,19 +399,9 @@ class LlamaModel(nn.Module):
                                             kv_caches[i - self.start_layer],
                                             attn_metadata, residual)
 
-            if i > 0 and fp_type == ForwardPassType.PREFILL:
-                kv_cache_transporter.synchronize()
-                kv_cache_transporter.publish_kv_cache_prefill_done(
-                    input_token_hashes, attn_metadata.seq_lens, i - 1)
-
             if fp_type == ForwardPassType.PREFILL:
                 kv_cache_transporter.save_kv_cache(input_token_hashes, offsets,
                                                    i, kv_caches[i])
-
-        if fp_type == ForwardPassType.PREFILL:
-            kv_cache_transporter.synchronize()
-            kv_cache_transporter.publish_kv_cache_prefill_done(
-                input_token_hashes, attn_metadata.seq_lens, self.end_layer - 1)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({

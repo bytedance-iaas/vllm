@@ -211,8 +211,9 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                                                                          int]],
                       layer_idx: int, kv_cache: torch.Tensor) -> None:
 
-        self.verify_kv_cache_prefill_done(prompt_token_page_hashes,
-                                          prompt_seq_lengths, layer_idx)
+        # We rely on the http request flow via proxy to guarantee the kv_cache is ready
+        # self.verify_kv_cache_prefill_done(prompt_token_page_hashes,
+        #                                   prompt_seq_lengths, layer_idx)
 
         block_offsets = self._compute_kv_cache_block_offsets(
             prompt_token_page_hashes, offsets, layer_idx)
