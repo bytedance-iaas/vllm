@@ -76,17 +76,11 @@ async def proxy_request(request: Request):
         StreamingResponse: The streamed response from the second vLLM service.
     """
     req_data = await request.json()
-
     try:
-        # Use asyncio.create_task to avoid waiting for the response
-        asyncio.create_task(send_request_to_vllm(app.state.vllm1_client, req_data))
-    except Exception as e:
-        print(f"Error sending request to vLLM-1: {e}")
-        raise
+        # Send request to prefill worker, ignore the response
+        await send_request_to_vllm(app.state.vllm1_client, req_data)
 
-    # Proceed to vLLM-2 immediately
-    try:
-
+        # Stream response from decode worker
         async def generate_stream():
             async for chunk in stream_vllm_response(app.state.vllm2_client, req_data):
                 yield chunk

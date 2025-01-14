@@ -98,6 +98,7 @@ def finalize_kv_cache_transport(fp_type, kv_cache_transporter,
                                                 attn_metadata.seq_lens,
                                                 hidden_states)
 
+        # TODO: verify whether the synchronization is necessary
         kv_cache_transporter.synchronize()
 
     return
