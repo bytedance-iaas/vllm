@@ -5,7 +5,7 @@ import torch
 import os
 import time
 import infinistore
-
+from vllm.config import ModelConfig
 from vllm.distributed.kv_transfer_infinistore.base import KVCacheTransporterBase
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
@@ -30,16 +30,17 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
     _singleton_rdma_conn = None
 
     def __init__(self,
-                 model: str,
+                 model_config: ModelConfig,
                  kv_cache_list: List[torch.Tensor],
                  tokens_per_page: int = 16) -> None:
-        if not model:
+        if not model_config.model:
             raise ValueError("model cannot be empty.")
         if tokens_per_page <= 0:
             raise ValueError("tokens_per_page must be greater than 0.")
 
         # escape the slash in the model name
-        self.model = model.replace("/", "_")
+        self.model = model_config.model.replace("/", "_")
+        self.model_config = model_config
         self.kv_cache_list = kv_cache_list
         self.tokens_per_page = tokens_per_page
         PAGE_SIZE = tokens_per_page
@@ -188,9 +189,10 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         return v_cache_key in self.completed_sqs
 
     def remove_hash_from_set(self, hash: str):
-        _, v_cache_key = self.get_kv_cache_key(hash, 0)
-        self.completed_sqs.remove(v_cache_key)
-        logger.debug(f"completed_sqs remove key: {v_cache_key}")
+        for layer_idx in range(self.model_config.hf_config.num_hidden_layers):
+            _, v_cache_key = self.get_kv_cache_key(hash, layer_idx)
+            self.completed_sqs.remove(v_cache_key)
+            logger.debug(f"completed_sqs remove key: {v_cache_key}")
 
     def verify_kv_cache_prefill_done(self, input_token_hashes: List[str],
                                      seq_lens: List[int], layer_idx: int):

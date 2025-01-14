@@ -72,7 +72,7 @@ class CacheEngine:
             self.set_kv_cache_transporter()
 
     def set_kv_cache_transporter(self):
-        kv_transporter = InfiniStoreKVCacheTransporter(self.model_config.model,
+        kv_transporter = InfiniStoreKVCacheTransporter(self.model_config,
                                                        self.gpu_cache,
                                                        self.block_size)
 
