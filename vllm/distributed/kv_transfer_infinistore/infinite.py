@@ -74,16 +74,18 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         self.conn = InfiniStoreKVCacheTransporter._singleton_conn
 
         if get_pd_stage() == PDDisaggStage.PREFILL:
+            # zmq as publisher
             zmq_server = os.environ.get("ZMQ_SERVER", Default_ZMQ_Server)
             context = zmq.Context()
-            self.zmq_socket = context.socket(zmq.REQ)
-            self.zmq_socket.connect(f"tcp://{zmq_server}:{Default_ZMQ_PORT}")
-            logger.info("jxp--------zmq client")
+            self.zmq_socket = context.socket(zmq.PUB)
+            self.zmq_socket.bind(f"tcp://{zmq_server}:{Default_ZMQ_PORT}")
+            logger.info("zmq publisher")
         # Set for sequence groups that the kv_cache is already filled
         if get_pd_stage() == PDDisaggStage.DECODE:
+            # zmq as subscriber
             self.completed_sqs: Set[str] = set()
             Thread(target=self.receive_completed_sq).start()
-            logger.info("jxp--------zmq server")
+            logger.info("zmq subscriber")
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -97,11 +99,15 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             self.page_size / 1024, self.kv_cache_list[0].dtype)
 
     def receive_completed_sq(self):
+        zmq_server = os.environ.get("ZMQ_SERVER", Default_ZMQ_Server)
         context = zmq.Context()
-        socket = context.socket(zmq.REP)
-        socket.bind("tcp://127.0.0.1:5555")
+        socket = context.socket(zmq.SUB)
+        socket.connect(f"tcp://{zmq_server}:{Default_ZMQ_PORT}")
+        socket.setsockopt_string(zmq.SUBSCRIBE, "")
         while True:
-            self.completed_sqs.add(socket.recv_string())
+            key = socket.recv_string()
+            logger.debug(f"zmq receive {key}")
+            self.completed_sqs.add(key)
 
     def get_hidden_states_cache_key(self, page_hash: str) -> str:
         return self.hs_key_initial + page_hash
@@ -161,6 +167,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         return block_offsets
 
     def _publish_write_completion(self, key: str) -> None:
+        logger.debug(f"zmq send: {key}")
         self.zmq_socket.send_string(key)
 
     def publish_kv_cache_prefill_done(self, input_token_hashes: List[str],
@@ -183,6 +190,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
     def remove_hash_from_set(self, hash: str):
         _, v_cache_key = self.get_kv_cache_key(hash, 0)
         self.completed_sqs.remove(v_cache_key)
+        logger.debug(f"completed_sqs remove key: {v_cache_key}")
 
     def verify_kv_cache_prefill_done(self, input_token_hashes: List[str],
                                      seq_lens: List[int], layer_idx: int):
