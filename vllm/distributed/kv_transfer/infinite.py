@@ -12,7 +12,7 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
 
 logger = logging.getLogger(__name__)
 
-Default_Infinite_Server = "127.0.0.1"
+Default_Infinite_Server = "127.0.0.1:22345"
 interval = 0.01
 count = 0
 shared_signal_folder = "/tmp/infinistore"
@@ -46,23 +46,33 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         # TODO: when server is local, use connection_type=infinistore.TYPE_LOCAL_GPU,
         # otherwise RDMA
         # TODO: grab the config values dynamically instead of hardcoding
-        infinite_server = os.environ.get("INFINITE_STORE_SERVER",
+        infinistore_server_addr = os.environ.get("INFINISTORE_SERVER_ADDR",
                                          Default_Infinite_Server)
-        infinite_server = infinite_server.strip('"')
+        infinistore_conn_type = os.environ.get("INFINISTORE_CONN_TYPE",
+                                               infinistore.TYPE_LOCAL_GPU)
+        infinistore_link_type = os.environ.get("INFINISTORE_LINK_TYPE",
+                                                  "Ethernet")
+        infinistore_dev_name = os.environ.get("INFINISTORE_DEV_NAME", "mlx5_0")
+
+        infinistore_server_addr = infinistore_server_addr.strip('"').split(":")
+        infinistore_server_ip = infinistore_server_addr[0]
+        infinistore_server_port = int(infinistore_server_addr[1])
+        infinistore_log_level = os.environ.get("INFINISTORE_LOG_LEVEL", "info")
+
         if InfiniStoreKVCacheTransporter._singleton_conn is None:
             infinte_config = infinistore.ClientConfig(
-                host_addr=infinite_server,
-                service_port=22345,
-                log_level="info",
-                connection_type=infinistore.TYPE_LOCAL_GPU,
+                host_addr=infinistore_server_ip,
+                service_port=infinistore_server_port,
+                log_level=infinistore_log_level,
+                connection_type=infinistore_conn_type,
                 ib_port=1,
-                link_type="Ethernet",
-                dev_name="mlx5_0",
+                link_type=infinistore_link_type,
+                dev_name=infinistore_dev_name,
             )
             InfiniStoreKVCacheTransporter._singleton_conn = infinistore.InfinityConnection(
                 infinte_config)
             logger.info("Connecting to infinite store server: %s",
-                        infinite_server)
+                        infinistore_server_addr)
 
             InfiniStoreKVCacheTransporter._singleton_conn.connect()
 
