@@ -402,14 +402,14 @@ def rotary_embedding(
     # apply_rotary_pos_emb(query, key, cos_cache.contiguous(), sin_cache.contiguous(), positions, False)
 
     cos_cache, sin_cache = torch.chunk(cos_sin_cache, chunks=2, dim=-1)
-    reshaped_query = query.reshape(-1, 32, 128)
-    reshaped_key = key.reshape(-1, 32, 128)
+    reshaped_query = query.reshape(-1, query.shape[1]//head_size, head_size)
+    reshaped_key = key.reshape(-1, key.shape[1]//head_size, head_size)
     # print(f"reshaped_query {reshaped_query.shape}") # torch.Size([4, 4096])
     # print(f"reshaped_key {reshaped_key.shape}") # torch.Size([4, 4096])
     
     reshaped_query, reshaped_key = apply_rotary_pos_emb(reshaped_query, reshaped_key, cos_cache, sin_cache, positions, False)
-    query.copy_(reshaped_query.reshape(-1, 4096))
-    key.copy_(reshaped_key.reshape(-1, 4096))
+    query.copy_(reshaped_query.reshape(-1, query.shape[1]))
+    key.copy_(reshaped_key.reshape(-1, key.shape[1]))
     # torch.ops._C.rotary_embedding(positions, query, key, head_size,
     #                               cos_sin_cache, is_neox)
 
