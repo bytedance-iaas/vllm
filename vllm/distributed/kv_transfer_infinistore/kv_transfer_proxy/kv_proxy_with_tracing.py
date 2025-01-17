@@ -42,12 +42,12 @@ FastAPIInstrumentor.instrument_app(app)
 tracer = trace.get_tracer(__name__)
 
 # Base URLs for the two vLLM processes (set to the root of the API)
-VLLM_1_BASE_URL = "http://localhost:8000/v1"
-VLLM_2_BASE_URL = "http://localhost:8001/v1"
+PREFILL_BASE_URL = "http://localhost:8000/v1"
+DECODE_BASE_URL = "http://localhost:8001/v1"
 
 # Initialize variables to hold the persistent clients
-app.state.vllm1_client = None
-app.state.vllm2_client = None
+app.state.prefill_client = None
+app.state.decode_client = None
 
 
 @app.on_event("startup")
@@ -56,10 +56,10 @@ async def startup_event():
     Initialize persistent HTTPX clients for vLLM services on startup.
     """
     HTTPXClientInstrumentor().instrument()
-    app.state.vllm2_client = httpx.AsyncClient(timeout=None,
-                                               base_url=VLLM_2_BASE_URL)
-    app.state.vllm1_client = httpx.AsyncClient(timeout=None,
-                                               base_url=VLLM_1_BASE_URL)
+    app.state.decode_client = httpx.AsyncClient(timeout=None,
+                                               base_url=DECODE_BASE_URL)
+    app.state.prefill_client = httpx.AsyncClient(timeout=None,
+                                               base_url=PREFILL_BASE_URL)
 
 
 @app.on_event("shutdown")
@@ -67,8 +67,8 @@ async def shutdown_event():
     """
     Close the persistent HTTPX clients on shutdown.
     """
-    await app.state.vllm1_client.aclose()
-    await app.state.vllm2_client.aclose()
+    await app.state.prefill_client.aclose()
+    await app.state.decode_client.aclose()
 
 
 async def send_request_to_vllm(client: httpx.AsyncClient, req_data: dict):
@@ -122,11 +122,10 @@ async def proxy_request(request: Request):
         with tracer.start_as_current_span(
                 "send-to-prefill-vllm") as send_vllm1_span:
             send_vllm1_span.set_attribute("vllm.url",
-                                          VLLM_1_BASE_URL + "/completions")
+                                          PREFILL_BASE_URL + "/completions")
             try:
                 # Use asyncio.create_task to avoid waiting for the response
-                asyncio.create_task(
-                    send_request_to_vllm(app.state.vllm1_client, req_data))
+                await send_request_to_vllm(app.state.prefill_client, req_data)
                 send_vllm1_span.set_status(Status(StatusCode.OK))
             except Exception as e:
                 send_vllm1_span.record_exception(e)
@@ -136,14 +135,14 @@ async def proxy_request(request: Request):
         with tracer.start_as_current_span(
                 "send-to-decode-vllm") as send_vllm2_span:
             send_vllm2_span.set_attribute("vllm.url",
-                                          VLLM_2_BASE_URL + "/completions")
+                                          DECODE_BASE_URL + "/completions")
             try:
 
                 async def generate_stream():
                     with tracer.start_as_current_span(
                             "stream-vllm2-response") as stream_span:
                         async for chunk in stream_vllm_response(
-                                app.state.vllm2_client, req_data):
+                                app.state.decode_client, req_data):
                             stream_span.add_event("Streaming chunk")
                             yield chunk
 
