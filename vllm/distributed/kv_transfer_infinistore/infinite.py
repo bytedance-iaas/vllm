@@ -79,6 +79,29 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         # Assign the singleton connection to the instance attribute
         self.conn = InfiniStoreKVCacheTransporter._singleton_conn
 
+        # read/save hidden_states needs rdma connection
+        if self.conn.rdma_connected:
+            self.rdma_conn = self.conn
+        else:
+            if InfiniStoreKVCacheTransporter._singleton_rdma_conn is None:
+                infinte_config = infinistore.ClientConfig(
+                    host_addr=infinistore_server_ip,
+                    service_port=infinistore_server_port,
+                    log_level=infinistore_log_level,
+                    connection_type=infinistore.TYPE_RDMA,
+                    ib_port=1,
+                    link_type=infinistore_link_type,
+                    dev_name=infinistore_dev_name,
+                )
+                InfiniStoreKVCacheTransporter._singleton_rdma_conn = infinistore.InfinityConnection(
+                    infinte_config)
+                logger.info("Connecting to infinite store server via rdma: %s",
+                        infinistore_server_addr)
+                InfiniStoreKVCacheTransporter._singleton_rdma_conn.connect()
+
+            self.rdma_conn = InfiniStoreKVCacheTransporter._singleton_rdma_conn
+
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
 
@@ -214,16 +237,12 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             logger.error("Failed to write kv_cache: %s", e)
             raise
 
-        logger.debug("Saved kv_cache for layer %s", layer_idx)
+        logger.debug(f"Saved kv_cache for layer {layer_idx}", )
 
     def read_kv_cache(self, prompt_token_page_hashes: List[str],
                       prompt_seq_lengths: List[int], offsets: List[Tuple[int,
                                                                          int]],
                       layer_idx: int, kv_cache: torch.Tensor) -> None:
-
-        # We rely on the http request flow via proxy to guarantee the kv_cache is ready
-        # self.verify_kv_cache_prefill_done(prompt_token_page_hashes,
-        #                                   prompt_seq_lengths, layer_idx)
 
         block_offsets = self._compute_kv_cache_block_offsets(
             prompt_token_page_hashes, offsets, layer_idx)
@@ -244,19 +263,21 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         if self.tp_rank != 0:
             return
 
-        if self.conn.rdma_connected:
-            self.conn.register_mr(hidden_states)
+        hidden_states = hidden_states.cpu()
+        logger.debug(f"save the hidden states: {hidden_states.view(-1)[:10]}, {hidden_states.view(-1)[-10:]}")
+
+
+        self.rdma_conn.register_mr(hidden_states)
         block_offsets = self._compute_hidden_states_block_offsets(
             prompt_token_page_hashes, prompt_seq_lengths, hidden_states)
 
         try:
             for cache_size, offsets in block_offsets.items():
-                if self.conn.rdma_connected:
-                    self.conn.rdma_write_cache(hidden_states, offsets,
-                                               cache_size)
-                else:
-                    self.conn.local_gpu_write_cache(hidden_states, offsets,
-                                                    cache_size)
+                keys, key_offsets = zip(*offsets)
+                remote_addrs = self.rdma_conn.allocate_rdma(keys, cache_size * hidden_states.element_size())
+                self.rdma_conn.rdma_write_cache(hidden_states, key_offsets, cache_size, remote_addrs)
+
+            self.rdma_conn.sync() # sync the RDMA connection for hidden states
         except Exception as e:
             logger.error("Failed to read hidden_states: %s", e)
             raise
@@ -267,19 +288,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                            prompt_seq_lengths: List[int],
                            hidden_states: torch.Tensor) -> None:
 
-        hs_cache_key = self.get_hidden_states_cache_key(
-            prompt_token_page_hashes[-1])
-        wt = 0
-        while not self.conn.check_exist(hs_cache_key):
-            time.sleep(interval)
-            wt += 1
-            if wt % 100 == 0:
-                logger.warning(
-                    f"Wait for hidden states cache key {hs_cache_key} for {wt} times"
-                )
-
-        if self.conn.rdma_connected:
-            self.conn.register_mr(hidden_states)
+        self.conn.register_mr(hidden_states)
         block_offsets = self._compute_hidden_states_block_offsets(
             prompt_token_page_hashes, prompt_seq_lengths, hidden_states)
 
@@ -290,7 +299,10 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             logger.error("Failed to read hidden_states: %s", e)
             raise
 
-        logger.debug("Loaded hidden_states")
+        self.synchronize()
+
+        logger.debug(f"read the hidden states: {hidden_states.view(-1)[:10]}, {hidden_states.view(-1)[-10:]}")
+
 
     def key_exists(self, key: str) -> bool:
         return self.conn.check_exist(key)
