@@ -299,7 +299,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             logger.error("Failed to read hidden_states: %s", e)
             raise
 
-        self.conn.synchronize()
+        self.synchronize()
 
         logger.debug(f"read the hidden states: {hidden_states.view(-1)[:10]}, {hidden_states.view(-1)[-10:]}")
 
