@@ -378,9 +378,6 @@ class LlamaModel(nn.Module):
             kv_cache_transporter.read_hidden_states(input_token_hashes,
                                                     attn_metadata.seq_lens,
                                                     hidden_states)
-            # TODO: validate if synchronization is necessary
-            kv_cache_transporter.synchronize()
-
             return hidden_states
 
         # with multiple sequences, it is possible some have cache and some don't

@@ -222,8 +222,6 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                       offsets: List[Tuple[int, int]], layer_idx: int,
                       kv_cache: torch.Tensor) -> None:
 
-        print(f"kv_caches layer {layer_idx}, {kv_cache}")
-
         block_offsets = self._compute_kv_cache_block_offsets(
             prompt_token_page_hashes, offsets, layer_idx)
 
@@ -239,16 +237,12 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             logger.error("Failed to write kv_cache: %s", e)
             raise
 
-        logger.debug("Saved kv_cache for layer %s", layer_idx)
+        logger.debug(f"Saved kv_cache for layer {layer_idx}", )
 
     def read_kv_cache(self, prompt_token_page_hashes: List[str],
                       prompt_seq_lengths: List[int], offsets: List[Tuple[int,
                                                                          int]],
                       layer_idx: int, kv_cache: torch.Tensor) -> None:
-
-        # We rely on the http request flow via proxy to guarantee the kv_cache is ready
-        # self.verify_kv_cache_prefill_done(prompt_token_page_hashes,
-        #                                   prompt_seq_lengths, layer_idx)
 
         block_offsets = self._compute_kv_cache_block_offsets(
             prompt_token_page_hashes, offsets, layer_idx)
@@ -259,7 +253,6 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             logger.error("Failed to read kv_cache: %s", e)
             raise
 
-        print(f"kv_caches layer {layer_idx}, {kv_cache}")
         logger.debug("Loaded kv_cache for layer %s", layer_idx)
 
     def save_hidden_states(self, prompt_token_page_hashes: List[str],
@@ -270,10 +263,8 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         if self.tp_rank != 0:
             return
 
-        print("~~~~~~~~~~ hideen states ", hidden_states)
-
         hidden_states = hidden_states.cpu()
-        logger.info(f"hidden states len: {len(hidden_states)}, hash: {hash(hidden_states)}")
+        logger.debug(f"save the hidden states: {hidden_states.view(-1)[:10]}, {hidden_states.view(-1)[-10:]}")
 
 
         self.rdma_conn.register_mr(hidden_states)
@@ -285,6 +276,8 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                 keys, key_offsets = zip(*offsets)
                 remote_addrs = self.rdma_conn.allocate_rdma(keys, cache_size * hidden_states.element_size())
                 self.rdma_conn.rdma_write_cache(hidden_states, key_offsets, cache_size, remote_addrs)
+
+            self.rdma_conn.sync() # sync the RDMA connection for hidden states
         except Exception as e:
             logger.error("Failed to read hidden_states: %s", e)
             raise
@@ -295,12 +288,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                            prompt_seq_lengths: List[int],
                            hidden_states: torch.Tensor) -> None:
 
-        hs_cache_key = self.get_hidden_states_cache_key(
-            prompt_token_page_hashes[-1])
-
-        print("~~~~~~~~~~ hideen states 1", hidden_states)
-
-        self.rdma_conn.register_mr(hidden_states)
+        self.conn.register_mr(hidden_states)
         block_offsets = self._compute_hidden_states_block_offsets(
             prompt_token_page_hashes, prompt_seq_lengths, hidden_states)
 
@@ -311,8 +299,10 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             logger.error("Failed to read hidden_states: %s", e)
             raise
 
-        print("~~~~~~~~~~ hideen states 2", hidden_states)
-        logger.debug("Loaded hidden_states")
+        self.conn.synchronize()
+
+        logger.debug(f"read the hidden states: {hidden_states.view(-1)[:10]}, {hidden_states.view(-1)[-10:]}")
+
 
     def key_exists(self, key: str) -> bool:
         return self.conn.check_exist(key)
