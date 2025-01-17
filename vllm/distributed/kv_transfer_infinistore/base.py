@@ -53,13 +53,3 @@ class KVCacheTransporterBase(ABC):
     def synchronize(self):
 
         raise NotImplementedError
-
-    @abstractmethod
-    def publish_kv_cache_prefill_done(self, input_token_hashes: List[str],
-                                      seq_lens: List[int],
-                                      layer_idx: int) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def check_kv_cache_ready(self, hash: str) -> bool:
-        raise NotImplementedError

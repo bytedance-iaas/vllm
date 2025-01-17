@@ -170,54 +170,6 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
         return block_offsets
 
-    # TODO： change to use zmq to notify
-    def _publish_write_completion(self, key: str) -> None:
-        file_path = os.path.join(shared_signal_folder, key)
-        directory = os.path.dirname(file_path)
-        try:
-            os.makedirs(directory, exist_ok=True)
-            open(file_path, mode="w").close()
-        except Exception as e:
-            logger.error("Failed to publish completion for %s: %s", key, e)
-            raise
-
-    def publish_kv_cache_prefill_done(self, input_token_hashes: List[str],
-                                      seq_lens: List[int],
-                                      layer_idx: int) -> None:
-
-        covered_pages = 0
-        for seq_len in seq_lens:
-            covered_pages += math.ceil(seq_len / self.tokens_per_page)
-            current_hash = input_token_hashes[covered_pages - 1]
-            _, v_cache_key = self.get_kv_cache_key(current_hash, layer_idx)
-
-            # only need to publish V cache key, as V cache is always written after K cache
-            self._publish_write_completion(v_cache_key)
-
-    def check_kv_cache_ready(self, hash: str) -> bool:
-        _, v_cache_key = self.get_kv_cache_key(hash, 0)
-
-        return os.path.exists(os.path.join(shared_signal_folder, v_cache_key))
-
-    def verify_kv_cache_prefill_done(self, input_token_hashes: List[str],
-                                     seq_lens: List[int], layer_idx: int):
-        covered_pages = 0
-        for seq_len in seq_lens:
-            covered_pages += math.ceil(seq_len / self.tokens_per_page)
-            current_hash = input_token_hashes[covered_pages - 1]
-            _, v_cache_key = self.get_kv_cache_key(current_hash, layer_idx)
-            if os.path.exists(os.path.join(shared_signal_folder, v_cache_key)):
-                continue
-
-            wt = 0
-            while not os.path.exists(
-                    os.path.join(shared_signal_folder, v_cache_key)):
-                time.sleep(interval)
-                wt += 1
-                if wt % 100 == 0:
-                    logger.warning(
-                        f"wait for kv cache key {v_cache_key} for {wt} times")
-
     def save_kv_cache(self, prompt_token_page_hashes: List[str],
                       offsets: List[Tuple[int, int]], layer_idx: int,
                       kv_cache: torch.Tensor) -> None:
