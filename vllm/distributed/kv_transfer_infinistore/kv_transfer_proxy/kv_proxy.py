@@ -7,13 +7,14 @@ import httpx
 app = FastAPI()
 
 # Base URLs for the two vLLM processes (set to the root of the API)
-PREFILL_BASE_URL = "http://localhost:8000/v1"
+PREFILL_BASE_URLS = ["http://localhost:9000/v1", "http://localhost:9000/v1"]
 DECODE_BASE_URL = "http://localhost:8001/v1"
 
 # Initialize variables to hold the persistent clients
 app.state.prefill_client = None
 app.state.decode_client = None
 
+counter = 0
 
 @app.on_event("startup")
 async def startup_event():
@@ -22,8 +23,8 @@ async def startup_event():
     """
     app.state.decode_client = httpx.AsyncClient(timeout=None,
                                                base_url=DECODE_BASE_URL)
-    app.state.prefill_client = httpx.AsyncClient(timeout=None,
-                                               base_url=PREFILL_BASE_URL)
+    app.state.prefill_clients = [httpx.AsyncClient(timeout=None,
+                                               base_url=url) for url in PREFILL_BASE_URLS]
 
 
 @app.on_event("shutdown")
@@ -31,7 +32,9 @@ async def shutdown_event():
     """
     Close the persistent HTTPX clients on shutdown.
     """
-    await app.state.prefill_client.aclose()
+    for prefill_client in app.state.prefill_clients:
+        await prefill_client.aclose()
+
     await app.state.decode_client.aclose()
 
 
@@ -66,6 +69,7 @@ async def stream_vllm_response(client: httpx.AsyncClient, req_data: dict):
 
 @app.post("/v1/completions")
 async def proxy_request(request: Request):
+    global counter
     """
     Proxy endpoint that forwards requests to two vLLM services.
 
@@ -75,10 +79,12 @@ async def proxy_request(request: Request):
     Returns:
         StreamingResponse: The streamed response from the second vLLM service.
     """
+    counter += 1
     req_data = await request.json()
     try:
+        prefill_client = app.state.prefill_clients[counter % len(app.state.prefill_clients)]
         # Send request to prefill worker, ignore the response
-        await send_request_to_vllm(app.state.prefill_client, req_data)
+        await send_request_to_vllm(prefill_client, req_data)
 
         # Stream response from decode worker
         async def generate_stream():
