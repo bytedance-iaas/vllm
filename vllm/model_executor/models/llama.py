@@ -384,13 +384,13 @@ class LlamaModel(nn.Module):
         # with multiple sequences, it is possible some have cache and some don't
         # TODO: might need to change scheduler so  sequences with/without cache
         # do not mix
-        if fp_type == ForwardPassType.PREFILL and attn_metadata.seq_lens == 1:
-            last_hs_key = kv_cache_transporter.get_hidden_states_cache_key(
-                input_token_hashes[-1])
+        #if fp_type == ForwardPassType.PREFILL and attn_metadata.seq_lens == 1:
+        #    last_hs_key = kv_cache_transporter.get_hidden_states_cache_key(
+        #        input_token_hashes[-1])
             # hidden states is the last piece to write to cache
             # if it exists, we assume the kv cache is saved
-            if kv_cache_transporter.key_exists(last_hs_key):
-                return hidden_states
+        #    if kv_cache_transporter.key_exists(last_hs_key):
+        #        return hidden_states
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
