@@ -374,7 +374,8 @@ class LlamaModel(nn.Module):
                 kv_cache_transporter.read_kv_cache(input_token_hashes,
                                                    attn_metadata.seq_lens,
                                                    offsets, i, kv_caches[i])
-                #kv_cache_transporter.synchronize()
+                kv_cache_transporter.synchronize()
+
             kv_cache_transporter.read_hidden_states(input_token_hashes,
                                                     attn_metadata.seq_lens,
                                                     hidden_states)
