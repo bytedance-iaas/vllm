@@ -228,7 +228,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                 keys, key_offsets = zip(*offsets)
                 remote_addrs = self.rdma_conn.allocate_rdma(keys, cache_size * hidden_states.element_size())
                 self.rdma_conn.rdma_write_cache(hidden_states, key_offsets, cache_size, remote_addrs)
-                self.rdma_conn.sync() # sync the RDMA connection for hidden states
+            self.rdma_conn.sync() # sync the RDMA connection for hidden states
         except Exception as e:
             logger.error("Failed to read hidden_states: %s", e)
             raise
@@ -246,12 +246,11 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         try:
             for cache_size, offsets in block_offsets.items():
                 self.conn.read_cache(hidden_states, offsets, cache_size)
-                self.synchronize()
         except Exception as e:
             logger.error("Failed to read hidden_states: %s", e)
             raise
 
-
+        self.synchronize()
 
         logger.debug(f"read the hidden states: {hidden_states.view(-1)[:10]}, {hidden_states.view(-1)[-10:]}")
 
