@@ -299,7 +299,8 @@ def seq_group_metadata_builder():
                                  is_prompt=False,
                                  seq_data={},
                                  sampling_params=None,
-                                 block_tables={})
+                                 block_tables={},
+                                 block_global_computed_tables={})
 
 
 def scheduler_running_outputs_builder():
@@ -1315,6 +1316,8 @@ class Scheduler:
             seq_data: Dict[int, SequenceData] = {}
             # seq_id -> physical block numbers
             block_tables: Dict[int, List[int]] = {}
+            block_hash_map: Dict[int, Dict[int, int]] = {}
+            block_global_computed_tables : Dict[int, List[int]] = {}            
 
             if seq_group.is_encoder_decoder():
                 # Encoder associated with SequenceGroup
@@ -1334,6 +1337,14 @@ class Scheduler:
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
+
+                if (self.cache_config.enable_prefix_caching and 
+                    self.cache_config.enable_global_prefix and 
+                    seq_group.is_prefill()):
+                    block_global_computed_tables[seq_id] = \
+                        self.block_manager.get_global_computed_list(seq)
+                    block_hash_map[seq_id] = \
+                        self.block_manager.get_block_hashes(seq)                
 
             if self.cache_config.enable_prefix_caching:
                 common_computed_block_nums = (
@@ -1369,6 +1380,8 @@ class Scheduler:
                     seq_data=seq_data,
                     sampling_params=seq_group.sampling_params,
                     block_tables=block_tables,
+                    block_global_computed_tables=block_global_computed_tables,
+                    block_hash_map=block_hash_map,                    
                     do_sample=do_sample,
                     pooling_params=seq_group.pooling_params,
                     token_chunk_size=token_chunk_size,

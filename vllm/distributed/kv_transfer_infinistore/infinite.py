@@ -26,6 +26,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
     def __init__(self,
                  model: str,
+                 num_attention_layers: int,
                  kv_cache_list: List[torch.Tensor],
                  tokens_per_page: int = 16) -> None:
         if not model:
@@ -35,6 +36,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
         # escape the slash in the model name
         self.model = model.replace("/", "_")
+        self.num_attention_layers = num_attention_layers
         self.kv_cache_list = kv_cache_list
         self.tokens_per_page = tokens_per_page
         
@@ -199,6 +201,9 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         block_offsets = self._compute_kv_cache_block_offsets(
             prompt_token_page_hashes, offsets, layer_idx)
 
+        if kv_cache is None:
+            kv_cache = self.kv_cache_list[layer_idx]
+            
         try:
             self.conn.read_cache(kv_cache, block_offsets, self.page_size)
         except Exception as e:
@@ -258,6 +263,12 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
     def key_exists(self, key: str) -> bool:
         return self.conn.check_exist(key)
 
+    def checkBlockHashExist(self, content_hash: int) -> bool:
+        for idx in range(self.num_attention_layers):
+            if not key_exists(get_kv_cache_key(content_hash, idx)):
+                return False
+        return True
+
     def get_match_last_index(self, keys: List[str]) -> int:
         return self.conn.get_match_last_index(keys)
 
@@ -267,3 +278,11 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
         except Exception as e:
             logger.error("Failed to synchronize: %s", e)
             raise
+
+kv_transporter: InfiniStoreKVCacheTransporter = None
+
+def set_kv_transporter(transporter: InfiniStoreKVCacheTransporter):
+    kv_transporter = transporter
+
+def get_kv_transporter():
+    return kv_transporter

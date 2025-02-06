@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
 
-from vllm.distributed.kv_transfer_infinistore.infinite import InfiniStoreKVCacheTransporter
+from vllm.distributed.kv_transfer_infinistore.infinite import InfiniStoreKVCacheTransporter, set_kv_transporter
 
 logger = init_logger(__name__)
 
@@ -73,6 +73,7 @@ class CacheEngine:
 
     def set_kv_cache_transporter(self):
         kv_transporter = InfiniStoreKVCacheTransporter(self.model_config.model,
+                                                       self.num_attention_layers,
                                                        self.gpu_cache,
                                                        self.block_size)
 
@@ -83,6 +84,8 @@ class CacheEngine:
                 kv_transporter.conn.register_mr(layer_kv_cache)
 
         self.cache_config.kv_cache_transporter = kv_transporter
+
+        set_kv_transporter(kv_transporter)
 
     def _allocate_kv_cache(
         self,
