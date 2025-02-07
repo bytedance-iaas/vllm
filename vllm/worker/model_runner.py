@@ -793,7 +793,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             is_prompt=is_prompt,
             block_tables=seq_group_metadata.block_tables,
             block_hash_map=seq_group_metadata.block_hash_map,
-            block_global_computed_tables=seq_group_metadata.block_global_computed_tables,            
+            block_global_computed_tables=seq_group_metadata.block_global_computed_tables,
+            block_global_computed_only=None,
             computed_block_nums=seq_group_metadata.computed_block_nums,
             reinit=True,
             reinit_use_defaults=True,
@@ -1091,6 +1092,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
     def transfer_global_computed_blocks(self, attn_metadata: AttentionMetadata):
         kv_transporter = get_kv_transporter()
+        if kv_transporter is None:
+            return
         block_size = kv_transporter.page_size
         k_or_v_total_size = kv_transporter.k_or_v_total_size
         block_hashes = []
