@@ -1338,8 +1338,7 @@ class Scheduler:
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
-                if (self.cache_config.enable_prefix_caching and 
-                    self.cache_config.enable_global_prefix and 
+                if (self.cache_config.enable_global_prefix and 
                     seq_group.is_prefill()):
                     block_global_computed_tables[seq_id] = \
                         self.block_manager.get_global_computed_list(seq)
@@ -1357,6 +1356,7 @@ class Scheduler:
             # is sent. Subsequent requests could be chunked prefill or decode.
             is_first_prefill = False
             if is_prompt:
+                logger.info(f"block_tables: {str(block_tables)}, block_global_computed_tables: {str(block_global_computed_tables)}, block_hash_map: {str(block_hash_map)}")
                 seqs = seq_group.get_seqs()
                 # Prefill has only 1 sequence.
                 assert len(seqs) == 1
@@ -1500,6 +1500,8 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
+        # from remote_pdb import set_trace
+        # set_trace()
         self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING

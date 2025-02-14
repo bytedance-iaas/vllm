@@ -210,6 +210,9 @@ class EngineArgs:
         if self.max_num_seqs is None:
             self.max_num_seqs = 256 if not envs.VLLM_USE_V1 else 1024
 
+        # APC is prerequisite of global prefix cache
+        self.enable_global_prefix &= self.enable_prefix_caching
+
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
@@ -438,9 +441,9 @@ class EngineArgs:
         )
         parser.add_argument(
             "--enable-global-prefix",
-            type=int,
+            action=argparse.BooleanOptionalAction,
             default=EngineArgs.enable_global_prefix,
-            help="number of global kv cache blocks, 0 for disable. ")        
+            help="Enables global prefix caching")        
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '

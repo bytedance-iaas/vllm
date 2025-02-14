@@ -57,7 +57,7 @@ from vllm.worker.model_runner_base import (
     _init_sampling_metadata_from_tensor_dict, dump_input_when_exception)
 
 # from vllm.global_cache import global_cache_instance
-from vllm.distributed.kv_transfer_infinistore.infinite import get_kv_transporter
+from vllm.distributed.kv_transfer_infinistore.infinite import get_kv_transporter, get_global_prefix_status
 from vllm.distributed.kv_transfer_infinistore.utils import (
     PDDisaggStage,
     ForwardPassType,
@@ -472,6 +472,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         self.model_input_cls = self.runner._model_input_cls
         self.attn_backend = self.runner.attn_backend
         self.scheduler_config = self.runner.scheduler_config
+        self.cache_config = self.runner.cache_config
         self.sliding_window = self.runner.sliding_window
         self.block_size = self.runner.block_size
         self.enable_lora = self.runner.lora_config is not None
@@ -586,6 +587,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 block for block in block_global_computed_tables 
                 if block not in computed_block_nums]
             inter_data.block_global_computed_only[seq_idx] = block_global_computed
+            logger.info(f"inter_data.block_global_computed_only: {inter_data.block_global_computed_only}")
             # for block_id in block_global_computed:
             #     content_hash = inter_data.block_hash_map[
             #         inter_data.seq_ids[seq_idx]][block_id]
@@ -974,6 +976,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         attn_metadata = self.attn_metadata_builder.build(
             seq_lens, query_lens, cuda_graph_pad_size, batch_size)
 
+        from remote_pdb import set_trace
+        set_trace()
         self.set_input_token_hashes_in_metadata(attn_metadata, input_tokens,
                                                 seq_lens)
         self.transfer_global_computed_blocks(attn_metadata)
@@ -1067,32 +1071,33 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 attn_metadata.token_hashes = []
             return
 
-        # attn_metadata.token_hashes = compute_token_page_hashes(
-        #     input_tokens, seq_lens)
-        token_hashes = []
-        seq_start_idx = 0
-        if (len(attn_metadata.block_hash_map) > 0 and 
-            attn_metadata.block_tables.numel() == 0):
-            for seq_idx, seq_length in enumerate(attn_metadata.seq_lens):
-                num_blocks = seq_length // self.cache_config.block_size
-                for idx in range(num_blocks):
-                    block_id = attn_metadata.slot_mapping[
-                        seq_start_idx + idx * self.cache_config.block_size
-                    ].item() // self.cache_config.block_size
-                    if (block_id in attn_metadata.block_hash_map[seq_idx] and 
-                        attn_metadata.block_hash_map[
-                            seq_idx][block_id] is not None):
-                        block_hash = attn_metadata.block_hash_map[
-                            seq_idx][block_id]
-                        token_hashes.append(block_hash)
+        attn_metadata.token_hashes = compute_token_page_hashes(
+            input_tokens, seq_lens, attn_metadata)
+        # token_hashes = []
+        # seq_start_idx = 0
+        # if (len(attn_metadata.block_hash_map) > 0 and 
+        #     attn_metadata.block_tables.numel() == 0):
+        #     for seq_idx, seq_length in enumerate(attn_metadata.seq_lens):
+        #         num_blocks = seq_length // self.cache_config.block_size
+        #         for idx in range(num_blocks):
+        #             block_id = attn_metadata.slot_mapping[
+        #                 seq_start_idx + idx * self.cache_config.block_size
+        #             ].item() // self.cache_config.block_size
+        #             if (block_id in attn_metadata.block_hash_map[seq_idx] and 
+        #                 attn_metadata.block_hash_map[
+        #                     seq_idx][block_id] is not None):
+        #                 block_hash = attn_metadata.block_hash_map[
+        #                     seq_idx][block_id]
+        #                 token_hashes.append(block_hash)
 
-                seq_start_idx += seq_length       
+        #         seq_start_idx += seq_length       
 
-        attn_metadata.token_hashes = token_hashes 
+        # logger.info(f"token_hashes: {token_hashes}")
+        # attn_metadata.token_hashes = token_hashes 
 
     def transfer_global_computed_blocks(self, attn_metadata: AttentionMetadata):
         kv_transporter = get_kv_transporter()
-        if kv_transporter is None:
+        if kv_transporter is None or not get_global_prefix_status():
             return
         block_size = kv_transporter.page_size
         k_or_v_total_size = kv_transporter.k_or_v_total_size
@@ -1106,7 +1111,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                     v_offset = k_offset + k_or_v_total_size
                     block_hashes.append(block_hash)
                     offsets.append((k_offset, v_offset))
-        # block_offsets: List[Tuple[str, int]] = []
+        logger.info("read global prefix cache, block_hashes: {block_hashes}, offsets: {offsets}")
         for layer_idx in range(kv_transporter.num_attention_layers):
             # for block_hash, offset in zip(block_hashes, offsets):
             #     k_cache_key, v_cache_key = kv_transporter.get_kv_cache_key(
@@ -1114,7 +1119,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             #     block_offsets.append((k_cache_key, offset[0]))
             #     block_offsets.append((v_cache_key, offset[1]))
             kv_transporter.read_kv_cache(block_hashes, attn_metadata.seq_lens, offsets, layer_idx)
-
+        kv_transporter.synchronize()
+        logger.info("read global prefix cache done")
 
 class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     """

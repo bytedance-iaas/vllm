@@ -1,11 +1,14 @@
 from enum import Enum
 import math
 import os
-from typing import List
+from typing import List, Dict
 import hashlib
 import array
 
 from vllm.attention import AttentionMetadata
+
+import logging
+logger = logging.getLogger(__name__)
 
 BLOCK_SIZE = 16
 
@@ -85,6 +88,7 @@ def prepare_kv_cache_transport(attn_metadata, cache_config):
             seq_start_index += seq_length
             page_start_index += num_pages
 
+        logger.info(f"offsets: {offsets}")
         assert len(offsets) == len(input_token_hashes)
 
     return fp_type, kv_cache_transporter, input_token_hashes, offsets
@@ -105,7 +109,8 @@ def finalize_kv_cache_transport(fp_type, kv_cache_transporter,
 
 
 def compute_token_page_hashes(prompt_ids: List[int],
-                              prompt_seq_lengths: List[int]) -> List[str]:
+                              prompt_seq_lengths: List[int],
+                              attn_metadata: AttentionMetadata):
 
     global BLOCK_SIZE
     tokens_per_page = BLOCK_SIZE
@@ -113,21 +118,39 @@ def compute_token_page_hashes(prompt_ids: List[int],
     hashes = []
     seq_index = 0
 
-    for seq_len in prompt_seq_lengths:
+    logger.info(f"in compute_token_page_hashes, attn_metadata: {attn_metadata}")
+
+    for seq_idx, seq_len in enumerate(prompt_seq_lengths):
         seq_tokens = prompt_ids[seq_index:seq_index + seq_len]
         num_pages = math.ceil(seq_len / tokens_per_page)
-        prev_hash = ""
+        prev_hash = None
 
         # Loop over each page within the current sequence
         for page_num in range(num_pages):
+            block_id = attn_metadata.slot_mapping[
+                seq_index + page_num * tokens_per_page
+            ].item() // tokens_per_page
+            if (attn_metadata.block_hash_map is not None
+                and len(attn_metadata.block_hash_map) > 0
+                and block_id in attn_metadata.block_hash_map[seq_idx] 
+                and attn_metadata.block_hash_map[
+                            seq_idx][block_id] is not None):
+                    current_hash = attn_metadata.block_hash_map[
+                            seq_idx][block_id]
+                    prev_hash = current_hash
+                    hashes.append(current_hash)
+                    continue
             start_token = page_num * tokens_per_page
             end_token = min((page_num + 1) * tokens_per_page, seq_len)
             tokens_in_page = seq_tokens[start_token:end_token]
 
             # Compute hash for the current page
-            tokens_bytes = array.array('l', tokens_in_page).tobytes()
-            hash_input = prev_hash.encode('utf-8') + tokens_bytes
-            current_hash = hashlib.sha256(hash_input).hexdigest()
+            # tokens_bytes = array.array('l', tokens_in_page).tobytes()
+            # hash_input = prev_hash.encode('utf-8') + tokens_bytes
+            # current_hash = hashlib.sha256(hash_input).hexdigest()
+
+            is_first_block = (prev_hash is None)
+            current_hash = hash((is_first_block, prev_hash, *tokens_in_page, None))
 
             prev_hash = current_hash
 

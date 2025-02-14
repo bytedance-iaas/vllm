@@ -133,7 +133,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
         for current_hash, offset in zip(prompt_token_page_hashes, offsets):
             k_cache_key, v_cache_key = self.get_kv_cache_key(
-                current_hash, layer_idx)
+                str(current_hash), layer_idx)
             block_offsets.append((k_cache_key, offset[0]))
             block_offsets.append((v_cache_key, offset[1]))
 
@@ -158,7 +158,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
                 current_hash = prompt_token_page_hashes[page_start_index +
                                                         page_num]
 
-                cache_key = self.get_hidden_states_cache_key(current_hash)
+                cache_key = self.get_hidden_states_cache_key(str(current_hash))
 
                 cache_size = hidden_size * (end_token_idx - start_token_idx)
                 offset = (seq_start_index + start_token_idx) * hidden_size
@@ -265,7 +265,7 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
 
     def checkBlockHashExist(self, content_hash: int) -> bool:
         for idx in range(self.num_attention_layers):
-            if not key_exists(get_kv_cache_key(content_hash, idx)):
+            if not key_exists(get_kv_cache_key(str(content_hash), idx)):
                 return False
         return True
 
@@ -280,9 +280,17 @@ class InfiniStoreKVCacheTransporter(KVCacheTransporterBase):
             raise
 
 kv_transporter: InfiniStoreKVCacheTransporter = None
+enable_global_prefix: bool = False
 
 def set_kv_transporter(transporter: InfiniStoreKVCacheTransporter):
     kv_transporter = transporter
 
 def get_kv_transporter():
     return kv_transporter
+
+def set_global_prefix_status(status: bool):
+    logger.info(f"Global Prefix Caching: {status}")
+    enable_global_prefix = status
+
+def get_global_prefix_status() -> bool:
+    return enable_global_prefix

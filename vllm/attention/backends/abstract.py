@@ -124,7 +124,7 @@ class AttentionMetadata:
     multi_modal_placeholder_index_maps: Optional[Dict[
         str, MultiModalPlaceholderMap.IndexMap]]
 
-    token_hashes: List[str]
+    token_hashes: List[int]
 
     @property
     @abstractmethod

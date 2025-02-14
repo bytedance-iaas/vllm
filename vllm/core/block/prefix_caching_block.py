@@ -15,7 +15,7 @@ from vllm.core.evictor import EvictionPolicy, Evictor, make_evictor
 from vllm.sequence import Sequence
 
 # from vllm.global_cache import global_cache_instance
-from vllm.distributed.kv_transfer_infinistore.infinite import get_kv_transporter
+from vllm.distributed.kv_transfer_infinistore.infinite import get_kv_transporter, get_global_prefix_status
 
 PrefixHash = int
 
@@ -183,7 +183,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         block = self.allocate_mutable_block(prev_block, extra_hash=extra_hash)
         block.append_token_ids(token_ids)
 
-        if get_kv_transporter().checkBlockHashExist(block.content_hash):
+        if get_global_prefix_status() and get_kv_transporter().checkBlockHashExist(block.content_hash):
             block.global_computed = True
             
         return block
