@@ -178,19 +178,36 @@ class SimpleConnector(KVConnectorBase):
 
             keys, values = [], []
 
-            for layer_id in range(start_layer, end_layer):
-                kv_cache = kv_caches[layer_id - start_layer]
+            # flash attn
+            # for layer_id in range(start_layer, end_layer):
+            #     kv_cache = kv_caches[layer_id - start_layer]
 
-                key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+            #     key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+            #     value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+
+            #     current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
+
+            #     keys.append(key_cache[current_slot_mapping].unsqueeze(0))
+            #     values.append(value_cache[current_slot_mapping].unsqueeze(0))
+
+            # keys = torch.cat(keys, dim=0)
+            # values = torch.cat(values, dim=0)
+            
+            # mla
+            for layer_id in range(start_layer, end_layer):
+                key_cache = kv_caches[layer_id - start_layer]
+
+                # key_cache = kv_cache.reshape(-1, num_heads, head_size)
+                # value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
 
                 current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
 
                 keys.append(key_cache[current_slot_mapping].unsqueeze(0))
-                values.append(value_cache[current_slot_mapping].unsqueeze(0))
+                # values.append(value_cache[current_slot_mapping].unsqueeze(0))
 
             keys = torch.cat(keys, dim=0)
-            values = torch.cat(values, dim=0)
+            # values = torch.cat(values, dim=0)
+            values = torch.zeros(1)
 
             self.insert(current_tokens,
                         torch.ones_like(current_tokens,
@@ -261,25 +278,38 @@ class SimpleConnector(KVConnectorBase):
             end_pos = start_pos + num_computed_tokens
 
             # put received KV caches into paged memory
+            # for i in range(model_executable.model.start_layer,
+            #                model_executable.model.end_layer):
+
+            #     kv_cache = kv_caches[i - model_executable.model.start_layer]
+            #     layer = model_executable.model.layers[i]
+
+            #     key_cache, value_cache = kv_cache[0], kv_cache[1]
+            #     ops.reshape_and_cache_flash(
+            #         keys[i - model_executable.model.start_layer].to(
+            #             key_cache.device),
+            #         values[i - model_executable.model.start_layer].to(
+            #             value_cache.device),
+            #         key_cache,
+            #         value_cache,
+            #         slot_mapping[start_pos:end_pos],
+            #         layer.self_attn.attn.kv_cache_dtype,
+            #         layer.self_attn.attn._k_scale,
+            #         layer.self_attn.attn._v_scale,
+            #     )
+
+            keys_list = []
+            for i in range(keys.shape[0]):
+                keys_list.append(keys[i])
+
+            current_slot_mapping = slot_mapping[start_pos:end_pos]
+
+            # put received KV caches into paged memory
             for i in range(model_executable.model.start_layer,
                            model_executable.model.end_layer):
 
                 kv_cache = kv_caches[i - model_executable.model.start_layer]
-                layer = model_executable.model.layers[i]
-
-                key_cache, value_cache = kv_cache[0], kv_cache[1]
-                ops.reshape_and_cache_flash(
-                    keys[i - model_executable.model.start_layer].to(
-                        key_cache.device),
-                    values[i - model_executable.model.start_layer].to(
-                        value_cache.device),
-                    key_cache,
-                    value_cache,
-                    slot_mapping[start_pos:end_pos],
-                    layer.self_attn.attn.kv_cache_dtype,
-                    layer.self_attn.attn._k_scale,
-                    layer.self_attn.attn._v_scale,
-                )
+                kv_cache[current_slot_mapping] = keys_list[i]
 
             hidden_or_intermediate_states_for_one_req.append(hidden)
 
