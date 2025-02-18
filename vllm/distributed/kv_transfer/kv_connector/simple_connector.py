@@ -131,21 +131,7 @@ class SimpleConnector(KVConnectorBase):
                 self.config.kv_buffer_size,
             )
 
-    def select(self, input_tokens: Optional[torch.Tensor],
-               roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:
 
-        assert self.consumer_buffer is not None, "Please initialize the "\
-            "consumer buffer before calling select."
-        return self.consumer_buffer.drop_select(input_tokens, roi)
-
-    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
-               key: torch.Tensor, value: torch.Tensor,
-               hidden: torch.Tensor) -> None:
-
-        assert self.producer_buffer is not None, "Please initialize the "\
-            "producer buffer before calling insert."
-
-        self.producer_buffer.insert(input_tokens, roi, key, value, hidden)
 
     def send_kv_caches_and_hidden_states(
         self,

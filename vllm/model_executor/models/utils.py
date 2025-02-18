@@ -553,11 +553,24 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(num_hidden_layers,
                                             get_pp_group().rank_in_group,
                                             get_pp_group().world_size)
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer() for _ in range(start_layer)] + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
-            for idx in range(start_layer, end_layer)
-        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+    
+    import os
+    original_end_layer_str = os.environ.get("ORIGINAL_END_LAYER", "")
+    original_end_layer_str = "61"
+    if original_end_layer_str:
+        original_end_layer = int(original_end_layer_str)
+
+        modules = torch.nn.ModuleList(
+            [
+                maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+                for idx in range(start_layer, end_layer)
+            ] + [PPMissingLayer() for _ in range(end_layer, original_end_layer)])
+    else:
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer() for _ in range(start_layer)] + [
+                maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
+                for idx in range(start_layer, end_layer)
+            ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
 
 
