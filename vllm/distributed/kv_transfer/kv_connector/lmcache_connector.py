@@ -61,14 +61,17 @@ class LMCacheConnector(KVConnectorBase):
                "ModelInputForGPUWithSamplingMetadata"]:
 
         # TODO(Jiayi): This shouldn't be none for disagg prefill
-        hidden_or_intermediate_states = None
+        # hidden_or_intermediate_states = None
 
         # TODO (Jiayi): Only normal prefill is supported for now
         retrieve_status = [self.retrieve_status.PREFILL]
 
-        model_input, bypass_model_exec = self.lmcache_retrieve_kv(
+        model_input, hidden_or_intermediate_states, bypass_model_exec = self.lmcache_retrieve_kv(
             model_executable, model_input, self.cache_config, kv_caches,
             retrieve_status)
+        
+        print("~~~~~~~~ retrieve hidden states ", hidden_or_intermediate_states)
+        # print("~~~~~~~~~ retrieve kv_caches [0]", kv_caches[0][0][0])
 
         return hidden_or_intermediate_states, bypass_model_exec, model_input
 
@@ -82,7 +85,10 @@ class LMCacheConnector(KVConnectorBase):
     ) -> None:
         num_reqs = 0
         seq_group_list = model_input.sampling_metadata.seq_groups
-        assert seq_group_list is not None
+        #assert seq_group_list is not None
+        if seq_group_list is None:
+            return
+
         for seq_group in seq_group_list:
             seq_ids = seq_group.seq_ids
             for seq_id in seq_ids:
@@ -99,7 +105,11 @@ class LMCacheConnector(KVConnectorBase):
             model_input,
             kv_caches,
             store_status,
+            hidden_or_intermediate_states,
         )
+        print("-----after store kv")
+        print("-----hidden states store", hidden_or_intermediate_states)
+        # print("~~~~~~~~~ save kv_caches [0]", kv_caches[0][0][0])
 
     def close(self):
         self.engine.close()
