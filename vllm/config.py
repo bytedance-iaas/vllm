@@ -28,6 +28,7 @@ from typing_extensions import deprecated
 import vllm.envs as envs
 from vllm import version
 from vllm.compilation.inductor_pass import CallableInductorPass, InductorPass
+from vllm.connector import create_remote_connector
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (QUANTIZATION_METHODS,
                                                      QuantizationMethods,
@@ -41,7 +42,9 @@ from vllm.transformers_utils.config import (
     get_sentence_transformer_tokenizer_config, is_encoder_decoder,
     try_get_generation_config, uses_mrope)
 from vllm.transformers_utils.s3_utils import S3Model
-from vllm.transformers_utils.utils import is_s3, maybe_model_redirect
+from vllm.transformers_utils.utils import (
+    is_s3, maybe_model_redirect,
+    is_remote_url, maybe_model_redirect)
 from vllm.utils import (DEFAULT_MAX_NUM_BATCHED_TOKENS,
                         MULTIMODAL_MODEL_MAX_NUM_BATCHED_TOKENS,
                         POOLING_MODEL_MAX_NUM_BATCHED_TOKENS, GiB_bytes,
@@ -624,6 +627,21 @@ class ModelConfig:
             tokenizer: Tokenizer name or path
         """
         if not (is_s3(model) or is_s3(tokenizer)):
+            if is_remote_url(model) or is_remote_url(tokenizer):
+                logger.info("Pulling model and tokenizer from remote...")
+                # BaseConnector implements __del__() to clean up the local dir.
+                # Since config files need to exist all the time, so we DO NOT use
+                # with statement to avoid closing the client.
+                client = create_remote_connector(model)
+                if is_remote_url(model):
+                    client.pull_files(allow_pattern=["*config.json"])
+                    self.model_weights = self.model
+                    self.model = client.get_local_dir()
+
+                if is_remote_url(tokenizer):
+                    client.pull_files(
+                        ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+                    self.tokenizer = client.get_local_dir()
             return
 
         if is_s3(model):
@@ -1574,6 +1592,7 @@ class TokenizerPoolConfig:
 
 class LoadFormat(str, enum.Enum):
     AUTO = "auto"
+    REMOTE = "remote"
     PT = "pt"
     SAFETENSORS = "safetensors"
     NPCACHE = "npcache"

@@ -35,7 +35,7 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.plugins import load_general_plugins
 from vllm.reasoning import ReasoningParserManager
 from vllm.test_utils import MODEL_WEIGHTS_S3_BUCKET, MODELS_ON_S3
-from vllm.transformers_utils.utils import check_gguf_file
+from vllm.transformers_utils.utils import check_gguf_file, is_remote_url
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (STR_DUAL_CHUNK_FLASH_ATTN_VAL, FlexibleArgumentParser,
                         GiB_bytes, is_in_doc_build, is_in_ray_actor)
@@ -917,6 +917,10 @@ class EngineArgs:
 
         if self.quantization == "bitsandbytes":
             self.load_format = "bitsandbytes"
+
+        if is_remote_url(self.model) and not self.load_format.startswith(
+                "runai_streamer"):
+            self.load_format = "remote"
 
         return LoadConfig(
             load_format=self.load_format,
