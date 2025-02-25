@@ -4,6 +4,7 @@ import enum
 
 from vllm.connector.base_connector import (BaseConnector, BaseFileConnector,
                                            BaseKVConnector)
+from vllm.connector.hpkv import HPKVConnector
 from vllm.connector.redis import RedisConnector
 from vllm.connector.s3 import S3Connector
 from vllm.logger import init_logger
@@ -23,6 +24,8 @@ def create_remote_connector(url, **kwargs) -> BaseConnector:
         return RedisConnector(url)
     elif connector_type == "s3":
         return S3Connector(url)
+    elif connector_type == "hpkv":
+        return HPKVConnector(url, **kwargs)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
