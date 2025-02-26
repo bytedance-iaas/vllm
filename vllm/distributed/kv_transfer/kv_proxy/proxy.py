@@ -8,11 +8,11 @@ app = FastAPI()
 
 # Base URLs for the two vLLM processes (set to the root of the API)
 PREFILL_BASE_URLS = ["http://localhost:8010/v1"]
-DECODE_BASE_URL = "http://localhost:8011/v1"
+DECODE_BASE_URLS = ["http://localhost:8011/v1"]
 
 # Initialize variables to hold the persistent clients
-app.state.prefill_client = None
-app.state.decode_client = None
+app.state.prefill_clients = None
+app.state.decode_clients = None
 
 counter = 0
 
@@ -21,8 +21,8 @@ async def startup_event():
     """
     Initialize persistent HTTPX clients for vLLM services on startup.
     """
-    app.state.decode_client = httpx.AsyncClient(timeout=None,
-                                               base_url=DECODE_BASE_URL)
+    app.state.decode_clients = [httpx.AsyncClient(timeout=None,
+                                               base_url=url) for url in DECODE_BASE_URLS]
     app.state.prefill_clients = [httpx.AsyncClient(timeout=None,
                                                base_url=url) for url in PREFILL_BASE_URLS]
 
@@ -34,13 +34,18 @@ async def shutdown_event():
     for prefill_client in app.state.prefill_clients:
         await prefill_client.aclose()
 
-    await app.state.decode_client.aclose()
+    for decode_client in app.state.decode_clients:
+        await decode_client.aclose()
 
 
 async def send_request_to_vllm(client: httpx.AsyncClient, req_data: dict):
     """
     Send a request to a vLLM process using a persistent client.
     """
+    req_data = req_data.copy()
+    # print(f"req_data: {req_data}")
+    req_data['max_tokens'] = 1
+    req_data['max_completion_tokens'] = 1
     response = await client.post("/chat/completions",
                                  json=req_data)  # Correct endpoint path
     response.raise_for_status()
@@ -85,9 +90,10 @@ async def proxy_request(request: Request):
         # Send request to prefill worker, ignore the response
         await send_request_to_vllm(prefill_client, req_data)
 
+        decode_client = app.state.decode_clients[counter % len(app.state.decode_clients)]
         # Stream response from decode worker
         async def generate_stream():
-            async for chunk in stream_vllm_response(app.state.decode_client, req_data):
+            async for chunk in stream_vllm_response(decode_client, req_data):
                 yield chunk
 
         return StreamingResponse(generate_stream(),
