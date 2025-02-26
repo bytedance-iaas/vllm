@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: Optional[str] = None
-
+    VLLM_USE_TRITON_NON_ATTN: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -585,6 +585,11 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH":
     lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
+
+    # Flag to control if vllm should use triton operators except for attention
+    "VLLM_USE_TRITON_NON_ATTN":
+    lambda: (os.environ.get("VLLM_USE_TRITON_NON_ATTN", "False").lower() in
+                ("true", "1")),
 }
 
 # end-env-vars-definition
