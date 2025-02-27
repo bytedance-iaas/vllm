@@ -17,6 +17,8 @@ except ImportError:
 
 import torch
 
+import vllm.hcdbg as hcdbg
+
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata,
@@ -705,6 +707,8 @@ class TritonMLAImpl(MLACommonImpl[TritonMLAMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 Triton MLA not yet supported")
+
+        hcdbg.jack_print(f'hcdbg: TritonMLAImpl._forward_decode: entered -> decode_attention_fwd(MQA)') # debug
 
         decode_meta = attn_metadata.decode_metadata
         assert decode_meta is not None

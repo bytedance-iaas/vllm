@@ -35,6 +35,9 @@ import triton
 import triton.language as tl
 from vllm.model_executor.utils import libentry
 
+import vllm.hcdbg as hcdbg
+
+
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., :x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
@@ -471,11 +474,21 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        #from vllm import _custom_ops as ops ###############
+        hcdbg.jack_print(f"hcdbg: 3rd forward_triton work - RotaryEmbedding at rotary_embedding.py") #########
+
+        # HCTODO: Evaluate ############
         self.cos_sin_cache = self.cos_sin_cache.to(query.device,
                                                    dtype=query.dtype)
         if offsets is not None:
+            # print(f'Not supported yet') ############
             raise Exception("Terminating the code as batched_rotary_embedding is not supported yet.")
+            #ops.batched_rotary_embedding(positions, query, key, self.head_size, ############
+            #                             self.cos_sin_cache, ############
+            #                             self.is_neox_style, self.rotary_dim, ############
+            #                             offsets) ############
         else:
+            hcdbg.jack_print(f"hcdbg: 3rd forward_triton - real function call entry") #########
             _rotary_embedding(positions, query, key, self.head_size,
                              self.cos_sin_cache, self.is_neox_style)
         return query, key

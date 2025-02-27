@@ -62,6 +62,8 @@ from vllm.worker.model_runner_base import (
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
+import vllm.hcdbg as hcdbg
+
 logger = init_logger(__name__)
 
 LORA_WARMUP_RANK = 8
@@ -1058,6 +1060,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         needs_attn_backend = (num_attn_heads != 0
                               or self.model_config.is_attention_free)
 
+        hcdbg.jack_print(f'hcdbg: model_runner.py - use_v1: {self.model_config.is_attention_free} use_mla: {self.model_config.use_mla}')
         self.attn_backend = get_attn_backend(
             self.model_config.get_head_size(),
             self.model_config.dtype,

@@ -9,6 +9,9 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 import vllm.envs as envs
 
+import vllm.hcdbg as hcdbg
+
+
 logger = init_logger(__name__)
 
 
@@ -66,6 +69,9 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def forward_triton(self, *args, **kwargs):
+        #
+        hcdbg.jack_print(f'hcdbg: not implemented') # entered at runtime
+        hcdbg.dump_stack(5) # debug
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
@@ -79,6 +85,11 @@ class CustomOp(nn.Module):
             compilation_config.disabled_custom_ops.update(
                 [self.__class__.name])
 
+        # Debugging # many but only warmup
+        hcdbg.jack_print(f'hcdbg: envs.VLLM_USE_TRITON_NON_ATTN {envs.VLLM_USE_TRITON_NON_ATTN}') # many but only warmup
+        #hcdbg.debug_print(f' {self.__class__.name}')
+        hcdbg.dump_stack(10)
+
         if not enabled:
             return self.forward_native
 
@@ -86,6 +97,7 @@ class CustomOp(nn.Module):
         # If any platform does not support them, we can add checks here to
         # print a warning and roll back to the original default operator path.
         if (envs.VLLM_USE_TRITON_NON_ATTN):
+            hcdbg.jack_print(f'hcdbg: return \'forward_triton\'')
             return self.forward_triton
 
         if current_platform.is_rocm():

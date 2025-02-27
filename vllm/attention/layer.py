@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
 
+import vllm.hcdbg as hcdbg
 
 class Attention(nn.Module):
     """Attention layer.
@@ -104,6 +105,7 @@ class Attention(nn.Module):
         # During model initialization, the default dtype is set as the model
         # weight and activation dtype.
         dtype = torch.get_default_dtype()
+        hcdbg.jack_print(f'hcdbg: layer.py - use_v1: {blocksparse_params is not None} use_mla: {use_mla}')
         attn_backend = get_attn_backend(head_size,
                                         dtype,
                                         kv_cache_dtype,
@@ -111,6 +113,10 @@ class Attention(nn.Module):
                                         is_attention_free,
                                         blocksparse_params is not None,
                                         use_mla=use_mla)
+
+        hcdbg.jack_print(f'\n\nhcdbg: layer.py Attention.__init__: attn_backend: {attn_backend}\n\n')
+        hcdbg.dump_stack(10)
+        print(f'\n\n')
         impl_cls = attn_backend.get_impl_cls()
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
                              alibi_slopes, sliding_window, kv_cache_dtype,
@@ -248,6 +254,7 @@ class MultiHeadAttention(nn.Module):
                                         block_size=16,
                                         is_attention_free=False)
         backend = backend_name_to_enum(attn_backend.get_name())
+        hcdbg.jack_print(f'hcdbg: MultiHeadAttention.__init__: attn_backend: {attn_backend} backend: {backend}')
         if backend in {_Backend.FLASH_ATTN, _Backend.FLASH_ATTN_VLLM_V1}:
             backend = _Backend.XFORMERS
 

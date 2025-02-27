@@ -31,6 +31,9 @@ import triton.language as tl
 from vllm import envs
 from vllm.model_executor.utils import libentry
 
+import vllm.hcdbg as hcdbg
+
+
 logger = init_logger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -517,8 +520,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             transposed = layer.weight
             transposed = transposed.transpose(0, 1)
             if bias is None:
+                hcdbg.jack_print(f'hcdbg: 4-1 mm') ######################################
                 return _mm(x, transposed)
             else:
+                hcdbg.jack_print(f'hcdbg: 4-2 addmm') ######################################
                 return _addmm(bias, x, transposed)
         else:
             return F.linear(x, layer.weight, bias)
