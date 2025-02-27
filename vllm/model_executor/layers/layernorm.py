@@ -13,6 +13,9 @@ import triton
 import triton.language as tl
 from vllm.model_executor.utils import libentry
 
+import vllm.hcdbg as hcdbg
+
+
 # From FlagGems
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
@@ -265,6 +268,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        hcdbg.jack_print(f"hcdbg: 1st forward_triton work - RMSNorm at layernorm.py {'_fused_add_rms_norm' if residual is not None else '_rms_norm'}") ############
+
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
@@ -281,6 +286,7 @@ class RMSNorm(CustomOp):
             return x, residual
 
         out = torch.empty_like(x)
+        # from flag_gems.ops.rms_norm import rms_norm # 用warpper ################
         out = _rms_norm(
                 x,
                 [len(self.weight.data)],

@@ -13,6 +13,8 @@ from vllm.logger import init_logger
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qualname
 
+import vllm.hcdbg as hcdbg
+
 logger = init_logger(__name__)
 
 
@@ -145,6 +147,7 @@ def _cached_get_attn_backend(
             selected_backend = backend_name_to_enum(backend_by_env_var)
 
     # get device-specific attn_backend
+    hcdbg.jack_print(f'selected_backend: {selected_backend} use_v1: {use_v1} use_mla: {use_mla}')
     attention_cls = current_platform.get_attn_backend_cls(
         selected_backend, head_size, dtype, kv_cache_dtype, block_size, use_v1,
         use_mla)

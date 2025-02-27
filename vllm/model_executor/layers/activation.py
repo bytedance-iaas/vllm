@@ -17,6 +17,9 @@ from vllm.utils import LazyDict
 import triton
 import triton.language as tl
 
+import vllm.hcdbg as hcdbg
+
+
 @triton.jit
 def silu_and_mul_kernel(out_ptr, x_ptr, d: tl.constexpr, d_padded: tl.constexpr):
     token_idx = tl.program_id(0)
@@ -132,6 +135,8 @@ class SiluAndMul(CustomOp):
         return result.view(*x.shape[:-1], d)
 
     def forward_triton(self, x: torch.Tensor) -> torch.Tensor:
+        hcdbg.jack_print(f"hcdbg: 2nd forward_triton work - SiluAndMul at activation.py") ################
+
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)

@@ -45,6 +45,8 @@ from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, deprecate_args, deprecate_kwargs, is_list_of
 
+import vllm.hcdbg as hcdbg
+
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
@@ -190,6 +192,8 @@ class LLM:
         Note: if enforce_eager is unset (enforce_eager is None)
         it defaults to False.
         '''
+
+        hcdbg.jack_print(f'\n\nhcdbg: QQQ llm start\n\n')
 
         if "disable_log_stats" not in kwargs:
             kwargs["disable_log_stats"] = True

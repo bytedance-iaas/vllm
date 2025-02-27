@@ -14,6 +14,9 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         align_to_256bytes, get_dtype_size,
                         is_pin_memory_available)
 
+import vllm.hcdbg as hcdbg
+
+
 logger = init_logger(__name__)
 
 
@@ -58,6 +61,7 @@ class CacheEngine:
             self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
         # Get attention backend.
+        hcdbg.jack_print(f'hcdbg: cache_engine.py - use_v1: {model_config.is_attention_free} use_mla: {model_config.use_mla}')
         self.attn_backend = get_attn_backend(self.head_size,
                                              model_config.dtype,
                                              cache_config.cache_dtype,

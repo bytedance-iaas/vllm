@@ -57,6 +57,8 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+import vllm.hcdbg as hcdbg
+
 
 class DeepseekV2MLP(nn.Module):
 
@@ -634,6 +636,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        hcdbg.jack_print(f'\n\n\n\n\nhcdbg: DeepseekV2ForCausalLM OOOOOOOOOOOOOOOOOOOOOOOOOOOO\n\n\n\n\n')
         self.model = DeepseekV2Model(vllm_config=vllm_config,
                                      prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:

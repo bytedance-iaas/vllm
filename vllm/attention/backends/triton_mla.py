@@ -4,10 +4,24 @@ from typing import Any, Dict, List, Optional, Type
 
 import torch
 
+<<<<<<< HEAD
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.backends.mla.common import (MLACommonBackend,
                                                 MLACommonImpl,
                                                 MLACommonMetadata)
+=======
+import vllm.hcdbg as hcdbg
+
+from vllm import _custom_ops as ops
+from vllm.attention.backends.abstract import (AttentionBackend,
+                                              AttentionMetadata,
+                                              AttentionMetadataBuilder,
+                                              AttentionState, AttentionType)
+from vllm.attention.backends.mla.utils import MLACommonImpl, MLACommonMetadata
+from vllm.attention.backends.utils import (PAD_SLOT_ID, compute_slot_mapping,
+                                           compute_slot_mapping_start_idx,
+                                           is_block_tables_empty)
+>>>>>>> 33adc3fb (print)
 from vllm.attention.ops.triton_decode_attention import decode_attention_fwd
 
 
@@ -68,6 +82,8 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 Triton MLA not yet supported")
+
+        hcdbg.jack_print(f'hcdbg: TritonMLAImpl._forward_decode: entered -> decode_attention_fwd(MQA)') # debug
 
         decode_meta = attn_metadata.decode_metadata
         assert decode_meta is not None
