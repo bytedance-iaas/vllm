@@ -1787,16 +1787,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
-        # in the producer side of pd disagg scenario, the next tokens are 
-        # not needed. So we skip it
-        if self.need_skip_sampling() and self._fake_sample_output is not None:
-            return [self._fake_sample_output] if self.is_driver_worker else []
-
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
 
         if not self.is_driver_worker:
             return []
+
+        # in the producer side of pd disagg scenario, the next tokens are
+        # not needed. So we skip it
+        if self.need_skip_sampling() and self._fake_sample_output is not None:
+            return [self._fake_sample_output]
 
         if model_input.async_callback is not None:
             model_input.async_callback()
