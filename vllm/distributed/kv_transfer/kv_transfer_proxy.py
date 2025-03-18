@@ -1,24 +1,26 @@
 import asyncio
 import uuid
+import json
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
+from multiprocessing import Manager
 
 # Initialize the FastAPI app
 app = FastAPI()
 
-# Single prefill vLLM worker
+# Prefill and Decode vLLM workers
 PREFILL_BASE_URL = "http://localhost:7080/v1"
-
-# Single decode vLLM worker
 DECODE_BASE_URL = "http://localhost:7090/v1"
 
 # Persistent HTTP clients
 app.state.prefill_client = None
 app.state.decode_client = None
 
-# Store request_id → (request_data, sender_info)
-app.state.request_store = {}
+# Shared request store using multiprocessing.Manager()
+manager = Manager()
+request_store = manager.dict()  # Stores request_id → request_data
+kv_cache_ready_flags = manager.dict()  # Stores request_id → readiness flag
 
 
 @app.on_event("startup")
@@ -30,7 +32,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Close the persistent HTTPX clients on shutdown."""
+    """Close the persistent HTTPX clients."""
     await app.state.prefill_client.aclose()
     await app.state.decode_client.aclose()
 
@@ -43,7 +45,7 @@ async def send_request_to_vllm(client: httpx.AsyncClient, req_data: dict):
 
 
 async def stream_vllm_response(client: httpx.AsyncClient, req_data: dict):
-    """Stream the response from a vLLM process using a persistent client."""
+    """Stream the response from the decode vLLM process."""
     async with client.stream("POST", "/chat/completions", json=req_data) as response:
         response.raise_for_status()
         async for chunk in response.aiter_bytes():
@@ -52,68 +54,81 @@ async def stream_vllm_response(client: httpx.AsyncClient, req_data: dict):
 
 @app.post("/v1/chat/completions")
 async def proxy_request(request: Request):
-    """Handle initial request and send it to the prefill vLLM worker."""
+    """Send the request to prefill worker but wait for KV cache readiness before sending to decode worker."""
     req_data = await request.json()
 
-    # Generate a unique conduit UUID
+    # Generate a unique request_id
     request_id = str(uuid.uuid4())
+    print(f"~~~genertated request id {request_id}" )
 
-    # Extract sender information (IP address, headers, etc.)
-    sender_info = {"ip": request.client.host, "headers": dict(request.headers)}
-
-    # Modify request to include request_id
-    req_data["request_id"] = request_id
+    # Store request in shared memory
+    request_store[request_id] = req_data
+    kv_cache_ready_flags[request_id] = False  # KV cache is initially not ready
 
     try:
-        # Send request to the prefill worker
+        # Send request to prefill worker
+        req_data["max_tokens"] = 1
+        req_data["request_id"] = request_id
         await send_request_to_vllm(app.state.prefill_client, req_data)
 
-        # Store request and sender info
-        app.state.request_store[request_id] = (req_data, sender_info)
+        # Wait for KV cache to be ready, but time out after 60 seconds
+        async def wait_for_kv_cache():
+            for _ in range(600):  # 600 iterations * 0.1s = 60 seconds max wait
+                if kv_cache_ready_flags.get(request_id, False):
+                    return True
+                await asyncio.sleep(0.1)
+            return False  # If it times out
 
-        # Acknowledge the request was received and being processed
-        return JSONResponse({"message": "Request sent to prefill worker", "request_id": request_id})
+        success = await asyncio.wait_for(wait_for_kv_cache(), timeout=60.0)
+
+        if not success:
+            raise HTTPException(status_code=504, detail="Timeout: KV cache not ready after 60 seconds")
+
+        # Retrieve the original request
+        req_data = request_store.pop(request_id, None)
+        kv_cache_ready_flags.pop(request_id, None)  # Cleanup
+
+        if req_data is None:
+            raise HTTPException(status_code=500, detail="Request lost in memory")
+
+        # Send request to decode worker and stream response
+        return StreamingResponse(stream_vllm_response(app.state.decode_client, req_data), media_type="application/json")
+
+    except asyncio.TimeoutError:
+        request_store.pop(request_id, None)
+        kv_cache_ready_flags.pop(request_id, None)
+        raise HTTPException(status_code=504, detail="Timeout: KV cache not ready after 60 seconds")
 
     except Exception as e:
-        print(f"Error sending request to prefill vLLM: {e}")
+        print(f"Error processing request: {e}")
+        request_store.pop(request_id, None)
+        kv_cache_ready_flags.pop(request_id, None)
         raise HTTPException(status_code=500, detail="Failed to process request")
 
 
 @app.post("/v1/kv_cache_ready")
 async def kv_cache_ready(request: Request):
-    """Handle notification that a vLLM has completed KV cache loading."""
+    """Handle notification that KV cache is ready and trigger decode request."""
     req_data = await request.json()
-
-    # Extract request_id from the incoming request
     request_id = req_data.get("request_id")
-    
+
     if not request_id:
         return JSONResponse(status_code=400, content={"error": "Missing request_id"})
+    
+    request_id = request_id.removeprefix("chatcmpl-")
+    print(f"--- received kv_cach_ready {request_id} ")
 
-    # Retrieve the original request and sender information
-    if request_id not in app.state.request_store:
-        return JSONResponse(status_code=404, content={"error": "Request not found for this request_id"})
+    # Print out the contents of both dictionaries
+    print("===== request_store Contents =====")
+    print(json.dumps(request_store, indent=4, default=str))  # Convert to JSON-like format
 
-    original_request, sender_info = app.state.request_store[request_id]  # Don't remove yet
+    print("===== kv_cache_ready_flags Contents =====")
+    print(json.dumps(kv_cache_ready_flags, indent=4, default=str))
 
-    try:
-        # Stream response from the decode worker
-        async def generate_stream():
-            try:
-                async for chunk in stream_vllm_response(app.state.decode_client, original_request):
-                    yield chunk
-            except Exception as e:
-                print(f"Error streaming decode response: {e}")
-                # Notify the original user of the internal error
-                yield b'{"error": "Internal Server Error"}'
-            finally:
-                # Once response is fully sent, remove entry from request_store
-                app.state.request_store.pop(request_id, None)
+    if request_id not in request_store:
+        return JSONResponse(status_code=404, content={"error": "Request not found"})
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+    # Mark KV cache as ready in shared memory
+    kv_cache_ready_flags[request_id] = True
 
-    except Exception as e:
-        print(f"Error processing decode response: {e}")
-        # Ensure the original user gets an Internal Server Error
-        app.state.request_store.pop(request_id, None)  # Cleanup request entry
-        return JSONResponse(status_code=500, content={"error": "Failed to process decode response"})
+    return JSONResponse({"message": "KV cache ready, starting decode", "request_id": request_id})
