@@ -1789,12 +1789,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         # in the producer side of pd disagg scenario, the next tokens are 
         # not needed. So we skip it
-        if self.need_skip_sampling():
-            if not self.is_driver_worker:
-                return []
-
-            if self._fake_sample_output is not None:
-                return [self._fake_sample_output]
+        if self.need_skip_sampling() and self._fake_sample_output is not None:
+            return [self._fake_sample_output] if self.is_driver_worker else []
 
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
