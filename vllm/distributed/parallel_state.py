@@ -771,8 +771,8 @@ _KV_TRANSFER: Optional[kv_transfer.KVTransferAgent] = None
 
 
 def get_kv_transfer_group() -> kv_transfer.KVTransferAgent:
-    assert _KV_TRANSFER is not None, (
-        "disaggregated KV cache transfer parallel group is not initialized")
+    #assert _KV_TRANSFER is not None, (
+    #    "disaggregated KV cache transfer parallel group is not initialized")
     return _KV_TRANSFER
 
 
@@ -979,15 +979,17 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
 
     if vllm_config.kv_transfer_config is None:
         return
-
+    print(f"vllm_config.kv_transfer_config.need_kv_parallel_group is {vllm_config.kv_transfer_config.need_kv_parallel_group}")
     if all([
             vllm_config.kv_transfer_config.is_kv_transfer_instance,
             _KV_TRANSFER is None
     ]):
+        print(f"xxxxxxxxxxxxxxxxxxxxx")
         _KV_TRANSFER = kv_transfer.KVTransferAgent(
             rank=get_world_group().rank,
             local_rank=get_world_group().local_rank,
-            config=vllm_config)
+            config=vllm_config,
+            world_group=get_world_group())
 
 
 def ensure_model_parallel_initialized(

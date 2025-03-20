@@ -1712,15 +1712,17 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # NOTE: The receive operation is blocking
         bypass_model_exec = False
         if self.need_recv_kv(model_input, kv_caches):
-            hidden_or_intermediate_states, bypass_model_exec, model_input = \
-                get_kv_transfer_group().recv_kv_caches_and_hidden_states(
-                    # model is used to know which layer the current worker
-                    # is working on, so that we can receive KV for only those
-                    # layers.
-                    model_executable,
-                    model_input,
-                    kv_caches=kv_caches
-                )
+            kv_transfer = get_kv_transfer_group()
+            if kv_transfer is not None:
+                hidden_or_intermediate_states, bypass_model_exec, model_input = \
+                    kv_transfer.recv_kv_caches_and_hidden_states(
+                        # model is used to know which layer the current worker
+                        # is working on, so that we can receive KV for only those
+                        # layers.
+                        model_executable,
+                        model_input,
+                        kv_caches=kv_caches
+                    )
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
@@ -1756,15 +1758,17 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # Sending KV cache in distributed KV cache transfer setting
         # NOTE: the send operation is non-blocking
         if self.need_send_kv(model_input, kv_caches):
-            get_kv_transfer_group().send_kv_caches_and_hidden_states(
-                # model_executable is used to know which layer the current
-                # worker is working on, so that we can send KV for only those
-                # layers.
-                model_executable,
-                model_input,
-                kv_caches,
-                hidden_or_intermediate_states,
-            )
+            kv_transfer = get_kv_transfer_group()
+            if kv_transfer is not None:
+                kv_transfer().send_kv_caches_and_hidden_states(
+                    # model_executable is used to know which layer the current
+                    # worker is working on, so that we can send KV for only those
+                    # layers.
+                    model_executable,
+                    model_input,
+                    kv_caches,
+                    hidden_or_intermediate_states,
+                )
 
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:
@@ -1847,6 +1851,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         if self.vllm_config.kv_transfer_config is None:
             return False
+        
+        if self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector":
+            return False
 
         prefill_meta = model_input.attn_metadata.prefill_metadata
 
@@ -1871,6 +1878,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         """
 
         if self.vllm_config.kv_transfer_config is None:
+            return False
+        
+        if self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector":
             return False
 
         prefill_meta = model_input.attn_metadata.prefill_metadata
