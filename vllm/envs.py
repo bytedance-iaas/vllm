@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_KV_NAMESPACE: Optional[str] = None
     VLLM_KV_COMPONENT: Optional[str] = None
     VLLM_WORKER_ID: Optional[int] = None
+    VLLM_SUPPORT_GDR: bool = True
 
 
 def get_default_cache_root():
@@ -645,6 +646,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_WORKER_ID":
     lambda: int(os.getenv("VLLM_WORKER_ID", "0"))
     if "VLLM_WORKER_ID" in os.environ else None,
+
+    "VLLM_SUPPORT_GDR":
+    lambda: bool(int(os.getenv("VLLM_SUPPORT_GDR", "1"))),
 }
 
 # end-env-vars-definition

@@ -1228,6 +1228,11 @@ class EngineArgs:
         else:
             self._set_default_args_v0(model_config)
 
+        if not envs.VLLM_SUPPORT_GDR:
+            logger.info(f"set preemption mode to 'recompute' when not support gdr.")
+            self.preemption_mode = "recompute"
+            self.swap_space = 0
+
         cache_config = CacheConfig(
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,

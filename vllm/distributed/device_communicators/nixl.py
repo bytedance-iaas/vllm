@@ -7,6 +7,7 @@ import time
 import uuid
 from collections import defaultdict
 from .kv_rearrange import rearrange_tensors
+from vllm.envs import VLLM_SUPPORT_GDR
 
 logger = init_logger(__name__)
 
@@ -97,7 +98,12 @@ class DynamoNixlConnector:
 
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
 
-        descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
+        if VLLM_SUPPORT_GDR is not None:
+            descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
+        else:
+            # Refer to https://github.com/ai-dynamo/nixl/blob/main/test/python/nixl_api_test.py
+            descs = self.nixl_wrapper.get_reg_descs(caches_data, "DRAM")
+
         logger.debug("Registering descs: %s", caches_data)
         self.nixl_wrapper.register_memory(descs)
         self._registered_descs.append(descs)

@@ -32,6 +32,7 @@ from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
 from vllm.distributed.device_communicators.nixl import DynamoNixlConnector
+from vllm.envs import VLLM_SUPPORT_GDR
 
 
 logger = init_logger(__name__)
@@ -316,7 +317,10 @@ class Worker(LocalOrDistributedWorkerBase):
 
         self.nixl_connector = DynamoNixlConnector(self.vllm_config, engine_id, self.local_rank) # TODO ptarasiewicz: rank or local_rank?
         assert len(self.cache_engine) == 1, "Only one cache engine is supported for now"
-        self.nixl_connector.register_kv_caches(self.cache_engine[0].gpu_cache)
+        if VLLM_SUPPORT_GDR:
+            self.nixl_connector.register_kv_caches(self.cache_engine[0].gpu_cache)
+        else:
+            self.nixl_connector.register_kv_caches(self.cache_engine[0].cpu_cache)
         return self.nixl_connector.agent_name
     
     def get_nixl_agent_metadata(self) -> bytes:
@@ -337,6 +341,16 @@ class Worker(LocalOrDistributedWorkerBase):
         return self.nixl_connector.kv_caches_base_addr[self.nixl_connector.engine_id]
         
     def _transfer_blocks(self, worker_input: WorkerInput) -> None:
+        # when not support gdr, need transfer kv_cache from gpu to cpu
+        if not VLLM_SUPPORT_GDR and worker_input.src_block_ids is not None:
+            virtual_engine = worker_input.virtual_engine
+            if len(worker_input.src_block_ids) > 0:
+                for src_block_id in worker_input.dst_block_ids:
+                    # generate gpu_cpu_block_mapping
+                    block_mapping = torch.tensor([[x, x] for x in src_block_id], device="cpu")
+
+                    # swap gpu kv_cache to cpu kv_cache
+                    self.cache_engine[virtual_engine].swap_out(block_mapping)
                 
         if not self.is_driver_worker:
             torch.cuda.synchronize() # to make sure that the blocks are ready, on driver worker we transfer after sampling, so there's no need to synchronize

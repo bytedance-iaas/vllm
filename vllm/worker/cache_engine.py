@@ -9,6 +9,7 @@ from vllm.config import CacheConfig, DeviceConfig, ModelConfig, ParallelConfig
 from vllm.logger import init_logger
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType,
                         get_dtype_size, is_pin_memory_available)
+from vllm.envs import VLLM_SUPPORT_GDR
 
 logger = init_logger(__name__)
 
@@ -63,7 +64,12 @@ class CacheEngine:
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
-        self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        
+        if VLLM_SUPPORT_GDR:
+            self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        else:
+            # when not support gdr, set cpu blocks = gpu blocks.
+            self.cpu_cache = self._allocate_kv_cache(self.num_gpu_blocks, "cpu")
 
     def _allocate_kv_cache(
         self,
