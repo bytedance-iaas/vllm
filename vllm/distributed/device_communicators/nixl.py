@@ -1,5 +1,5 @@
 import torch
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 import msgspec
@@ -25,7 +25,7 @@ class NixlMetadata(
         dict=True):
     engine_id: str
     agent_metadata: List[bytes]
-    kv_caches_base_addr: List[List[Tuple[int, int]]] # base address for each rank for each layer for keys and values
+    kv_caches_base_addr: List[List[List[int]]] # base address for each rank for each layer for keys and values
     num_blocks: int
 
 
@@ -56,6 +56,7 @@ class DynamoNixlConnector:
         self.src_xfer_side_handles = {}
         self.dst_xfer_side_handles = defaultdict(dict)
         self.dst_num_blocks = {}
+        self.use_mla = vllm_config.model_config.use_mla
 
         self._transfers = defaultdict(list)
 
@@ -68,20 +69,31 @@ class DynamoNixlConnector:
         return self.nixl_wrapper.name
 
     def register_kv_caches(self, kv_caches: List[torch.Tensor]):
-        _, num_blocks, block_size, num_heads, head_dim = kv_caches[0].shape
-        self.block_len = block_size * num_heads * head_dim * kv_caches[0].element_size()
+        if self.use_mla:
+            num_blocks, block_size, head_dim = kv_caches[0].shape
+            self.block_len = block_size * head_dim * kv_caches[0].element_size()            
+        else:
+            _, num_blocks, block_size, num_heads, head_dim = kv_caches[0].shape
+            self.block_len = block_size * num_heads * head_dim * kv_caches[0].element_size()
+            self.num_heads = num_heads
         logger.debug("Per layer kv cache size: %s", kv_caches[0].shape)
         self.num_layers = len(kv_caches)
         self.num_blocks = num_blocks
-        self.num_heads = num_heads
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
         caches_data = []
-        for key_cache, value_cache in kv_caches:
-            base_addr = key_cache.data_ptr()
-            region_len = 2 * num_blocks * self.block_len
-            caches_data.append((base_addr, region_len, self.rank, ""))
-            kv_caches_base_addr.append((key_cache.data_ptr(), value_cache.data_ptr()))
+        if self.use_mla:
+            for key_cache in kv_caches:
+                base_addr = key_cache.data_ptr()
+                region_len = num_blocks * self.block_len
+                caches_data.append((base_addr, region_len, self.rank, ""))
+                kv_caches_base_addr.append([key_cache.data_ptr()])
+        else:
+            for key_cache, value_cache in kv_caches:
+                base_addr = key_cache.data_ptr()
+                region_len = 2 * num_blocks * self.block_len
+                caches_data.append((base_addr, region_len, self.rank, ""))
+                kv_caches_base_addr.append([key_cache.data_ptr(), value_cache.data_ptr()])
 
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
 
@@ -128,14 +140,23 @@ class DynamoNixlConnector:
         blocks_data = []
         for layer_id in layer_ids:
             for range_idx, (range_start, range_end) in enumerate(ranges):
-                range_len = range_end - range_start + 1
-                key_base_addr, value_base_addr = kv_caches_base_addr[layer_id]
-                if staging_ranges is not None:
-                    start_offset = staging_ranges[range_idx][0] * self.block_len + i * block_len * (staging_ranges[range_idx][1] - staging_ranges[range_idx][0] + 1) + (range_start - staging_ranges[range_idx][0]) * block_len
-                else:
-                    start_offset = range_start * block_len
-                blocks_data.append((key_base_addr + start_offset, range_len * block_len, rank))
-                blocks_data.append((value_base_addr + start_offset, range_len * block_len, rank))
+                if self.use_mla:
+                    range_len = range_end - range_start + 1
+                    key_base_addr = kv_caches_base_addr[layer_id][0]
+                    if staging_ranges is not None:
+                        start_offset = staging_ranges[range_idx][0] * self.block_len + i * block_len * (staging_ranges[range_idx][1] - staging_ranges[range_idx][0] + 1) + (range_start - staging_ranges[range_idx][0]) * block_len
+                    else:
+                        start_offset = range_start * block_len
+                    blocks_data.append((key_base_addr + start_offset, range_len * block_len, rank))
+                else:    
+                    range_len = range_end - range_start + 1
+                    key_base_addr, value_base_addr = kv_caches_base_addr[layer_id]
+                    if staging_ranges is not None:
+                        start_offset = staging_ranges[range_idx][0] * self.block_len + i * block_len * (staging_ranges[range_idx][1] - staging_ranges[range_idx][0] + 1) + (range_start - staging_ranges[range_idx][0]) * block_len
+                    else:
+                        start_offset = range_start * block_len
+                    blocks_data.append((key_base_addr + start_offset, range_len * block_len, rank))
+                    blocks_data.append((value_base_addr + start_offset, range_len * block_len, rank))
         return self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
     
     def _get_ranges(self, block_ids):
@@ -260,8 +281,13 @@ class DynamoNixlConnector:
         for src_range, staging_range in zip(src_staging_overlapping_ranges, staging_src_overlapping_ranges):
             logger.debug("Rearranging tensors for cache: %s, src_range: %s, staging_range: %s", self.kv_caches[0].shape, src_range, staging_range)
             for kv_cache in self.kv_caches:
-                for cache in kv_cache:
-                    rearrange_tensors(cache[src_range[0]:src_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier)
+                if self.use_mla:
+                    cache_src = kv_cache[src_range[0]:src_range[1] + 1].unsqueeze(0)
+                    cache_staging = kv_cache[staging_range[0]:staging_range[1] + 1].unsqueeze(0)
+                    rearrange_tensors(cache_src, cache_staging, tp_multiplier)
+                else:    
+                    for cache in kv_cache:
+                        rearrange_tensors(cache[src_range[0]:src_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier)
 
         logger.debug("Time to rearrange tensors: %s ms", (time.perf_counter() - start_time) * 1000)
 
@@ -306,8 +332,13 @@ class DynamoNixlConnector:
         for src_range, staging_range in zip(src_staging_overlapping_ranges, staging_src_overlapping_ranges):
             logger.debug("Rearranging tensors for cache: %s, src_range: %s, staging_range: %s", self.kv_caches[0].shape, src_range, staging_range)
             for kv_cache in self.kv_caches:
-                for cache in kv_cache:
-                    rearrange_tensors(cache[src_range[0]:src_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier)
+                if self.use_mla:
+                    cache_src = kv_cache[src_range[0]:src_range[1] + 1].unsqueeze(0)
+                    cache_staging = kv_cache[staging_range[0]:staging_range[1] + 1].unsqueeze(0)
+                    rearrange_tensors(cache_src, cache_staging, tp_multiplier)
+                else:    
+                    for cache in kv_cache:
+                        rearrange_tensors(cache[src_range[0]:src_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier)
 
         staging_overlapping_ranges, dst_overlapping_ranges, original_src_ranges = self._get_same_length_ranges(staging_src_overlapping_ranges, dst_ranges, return_original_src_ranges=True)
         assert len(staging_overlapping_ranges) == len(dst_overlapping_ranges)
