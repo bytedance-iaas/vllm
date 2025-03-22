@@ -66,7 +66,6 @@ async def proxy_request(request: Request):
 
     # Generate a unique request_id
     request_id = str(uuid.uuid4())
-    print(f"~~~ Generated request ID: {request_id}")
     kv_cache_counter[request_id] = 0
 
     original_max_tokens = req_data["max_tokens"] if "max_tokens" in req_data else None
@@ -89,14 +88,10 @@ async def proxy_request(request: Request):
         return StreamingResponse(stream_vllm_response(app.state.decode_client, req_data), media_type="application/json")
 
     except asyncio.TimeoutError:
-        # request_store.pop(request_id, None)
-        # kv_cache_counter.pop(request_id, None)
         raise HTTPException(status_code=504, detail="Timeout: KV cache not ready after 60 seconds")
 
     except Exception as e:
         print(f"Error processing request: {e}")
-        # request_store.pop(request_id, None)
-        # kv_cache_counter.pop(request_id, None)
         raise HTTPException(status_code=500, detail="Failed to process request")
 
 
@@ -114,9 +109,6 @@ async def kv_cache_ready(request: Request):
     
     request_id = request_id.removeprefix("chatcmpl-")
     print(f"--- Received KV cache ready for request ID: {request_id}")
-
-    print("===== kv_cache_counter Contents =====")
-    print(json.dumps(kv_cache_counter, indent=4, default=str))
 
     # Decrement the KV cache counter instead of setting to True
     async with cond:
