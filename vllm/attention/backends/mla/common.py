@@ -1331,6 +1331,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         q_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: T,
+        scale: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -1416,6 +1417,6 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
 
         if has_decode:
             output[num_prefill_tokens:] = self._forward_decode(
-                decode_ql_nope, decode_q_pe, kv_cache, attn_metadata)
+                decode_ql_nope, decode_q_pe, kv_cache, attn_metadata, layer._k_scale)
 
         return output
