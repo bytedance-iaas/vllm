@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
 
-from vllm.attention.backends.abstract import (AttentionType,
+from vllm.attention.backends.abstract import (AttentionType,AttentionLayer,
                                               is_quantized_kv_cache)
 from vllm.attention.backends.mla.common import (MLACommonBackend,
                                                 MLACommonImpl,
                                                 MLACommonMetadata,
                                                 MLACommonMetadataBuilder,
                                                 MLACommonState)
+
 from vllm.attention.ops.flashmla import (flash_mla_with_kvcache,
                                          get_mla_metadata,
                                          is_flashmla_supported)
@@ -208,12 +209,9 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                                       "are not implemented for "
                                       "FlashMLAImpl")
 
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError(
-                "FlashMLA with FP8 KV cache not yet supported")
-
     def _forward_decode(
         self,
+        layer: AttentionLayer,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
@@ -227,6 +225,25 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         q = torch.cat([q_nope, q_pe], dim=-1)\
             .unsqueeze(1) # Add seqlen dim of 1 (decode)
 
+        descale_q = None
+        descale_k = None
+        
+        fp8_attention = False
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            fp8_attention = True
+            from vllm import _custom_ops as ops
+            
+            # Reshape q to 2D for scaled_fp8_quant
+            original_shape = q.shape
+            # Get FP8 quantized tensor
+            q_2d, descale_q = ops.scaled_fp8_quant(q.reshape(-1, q.shape[-1]), scale=None)
+            
+            # Reshape back to original shape
+            q = q_2d.reshape(original_shape)
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(dtype=torch.float8_e4m3fn)
+            
+            # For descale_k, we'll need to obtain the scaling factor
+            # This is typically stored in the KV cache metadata
         o, _ = flash_mla_with_kvcache(
             q=q,
             k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
@@ -237,6 +254,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             num_splits=decode_meta.decode_num_splits,
             softmax_scale=self.scale,
             causal=True,
+            **({"descale_q": layer._q_scale.unsqueeze(0),
+                "descale_k": layer._k_scale.unsqueeze(0)} if fp8_attention else {})
         )
 
         return self._v_up_proj_and_o_proj(o)
