@@ -35,15 +35,45 @@ message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 # sm90a
 cuda_archs_loose_intersection(FLASH_MLA_ARCHS "9.0a" "${CUDA_ARCHS}")
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.3 AND FLASH_MLA_ARCHS)
+    # Check environment variables for disabling FP16/FP8
+    if(DEFINED ENV{FLASH_MLA_DISABLE_FP16})
+        set(FLASH_MLA_DISABLE_FP16 $ENV{FLASH_MLA_DISABLE_FP16})
+    else()
+        set(FLASH_MLA_DISABLE_FP16 "FALSE")
+    endif()
+
+    if(DEFINED ENV{FLASH_MLA_DISABLE_FP8})
+        set(FLASH_MLA_DISABLE_FP8 $ENV{FLASH_MLA_DISABLE_FP8})
+    else()
+        set(FLASH_MLA_DISABLE_FP8 "FALSE")
+    endif()
+
     set(FlashMLA_SOURCES
         ${flashmla_SOURCE_DIR}/csrc/flash_api.cpp
         ${flashmla_SOURCE_DIR}/csrc/flash_fwd_mla_bf16_sm90.cu
-        ${flashmla_SOURCE_DIR}/csrc/flash_fwd_mla_fp16_sm90.cu
         ${flashmla_SOURCE_DIR}/csrc/flash_fwd_mla_metadata.cu)
+
+    # Conditionally add FP16 and FP8 sources
+    if(NOT ${FLASH_MLA_DISABLE_FP16} STREQUAL "TRUE")
+        list(APPEND FlashMLA_SOURCES ${flashmla_SOURCE_DIR}/csrc/flash_fwd_mla_fp16_sm90.cu)
+    endif()
+
+    if(NOT ${FLASH_MLA_DISABLE_FP8} STREQUAL "TRUE")
+        list(APPEND FlashMLA_SOURCES ${flashmla_SOURCE_DIR}/csrc/flash_fwd_mla_fp8_sm90.cu)
+    endif()
 
     set(FlashMLA_INCLUDES
         ${flashmla_SOURCE_DIR}/csrc/cutlass/include
         ${flashmla_SOURCE_DIR}/csrc/include)
+
+    # Set up compile flags based on disabled features
+    set(FlashMLA_COMPILE_FLAGS ${VLLM_GPU_FLAGS})
+    if(${FLASH_MLA_DISABLE_FP16} STREQUAL "TRUE")
+        list(APPEND FlashMLA_COMPILE_FLAGS "-DFLASH_MLA_DISABLE_FP16")
+    endif()
+    if(${FLASH_MLA_DISABLE_FP8} STREQUAL "TRUE")
+        list(APPEND FlashMLA_COMPILE_FLAGS "-DFLASH_MLA_DISABLE_FP8")
+    endif()
 
     set_gencode_flags_for_srcs(
         SRCS "${FlashMLA_SOURCES}"
@@ -54,7 +84,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.3 AND FLASH_MLA_ARCHS)
         DESTINATION vllm
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES ${FlashMLA_SOURCES}
-        COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+        COMPILE_FLAGS ${FlashMLA_COMPILE_FLAGS}
         ARCHITECTURES ${VLLM_GPU_ARCHES}
         INCLUDE_DIRECTORIES ${FlashMLA_INCLUDES}
         USE_SABI 3
