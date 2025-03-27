@@ -190,9 +190,10 @@ def fused_moe_kernel_gptq_awq(
                     (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                     other=0.0)
         b = tl.load(
-            b_ptrs,
-            cache_modifier=".cg",
-            eviction_policy="evict_last",
+            b_ptrs
+            # b_ptrs,
+            # cache_modifier=".cg",
+            # eviction_policy="evict_last",
         )
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
