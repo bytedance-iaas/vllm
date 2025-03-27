@@ -3339,6 +3339,7 @@ class VllmConfig:
     # tree config registration.
     additional_config: SupportsHash = field(default=None,
                                             init=True)  # type: ignore
+    use_te: bool = field(default=False, init=True)  # type: ignore
     instance_id: str = ""
 
     def compute_hash(self) -> str:

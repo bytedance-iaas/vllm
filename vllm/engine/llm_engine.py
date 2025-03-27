@@ -511,7 +511,6 @@ class LLMEngine:
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
         vllm_config = engine_args.create_engine_config(usage_context)
-
         engine_cls = cls
         if envs.VLLM_USE_V1:
             from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine

@@ -426,7 +426,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.config = config
         self.lora_config = lora_config
-
         self.quant_config = quant_config
         self.model = Qwen2Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
@@ -445,9 +444,9 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
-
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

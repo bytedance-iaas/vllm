@@ -223,6 +223,7 @@ class EngineArgs:
     enable_reasoning: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     use_tqdm_on_load: bool = True
+    use_te: bool = False
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -1126,7 +1127,6 @@ class EngineArgs:
             "could be useful for preventing potential numerical issues. "
             "Note that even if this is set to False, cascade attention will be "
             "only used when the heuristic tells that it's beneficial.")
-            
         parser.add_argument(
             "--use-te",
             action="store_true",
@@ -1154,7 +1154,6 @@ class EngineArgs:
                 and self.load_format == LoadFormat.AUTO):  # noqa: E501
             self.model = f"{MODEL_WEIGHTS_S3_BUCKET}/{self.model}"
             self.load_format = LoadFormat.RUNAI_STREAMER
-
         return ModelConfig(
             model=self.model,
             hf_config_path=self.hf_config_path,
@@ -1311,7 +1310,6 @@ class EngineArgs:
 
         device_config = DeviceConfig(device=self.device)
         model_config = self.create_model_config()
-
         # * If VLLM_USE_V1 is unset, we enable V1 for "supported features"
         #   and fall back to V0 for experimental or unsupported features.
         # * If VLLM_USE_V1=1, we enable V1 for supported + experimental
@@ -1500,6 +1498,7 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             additional_config=self.additional_config,
+            use_te=self.use_te
         )
 
         return config
