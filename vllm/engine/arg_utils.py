@@ -1126,7 +1126,13 @@ class EngineArgs:
             "could be useful for preventing potential numerical issues. "
             "Note that even if this is set to False, cascade attention will be "
             "only used when the heuristic tells that it's beneficial.")
-
+            
+        parser.add_argument(
+            "--use-te",
+            action="store_true",
+            default=False,
+            help="Whether to use TransformerEngine for better performance."
+        )
         return parser
 
     @classmethod
