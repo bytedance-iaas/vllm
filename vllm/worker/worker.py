@@ -2,7 +2,7 @@
 """A GPU worker class."""
 import gc
 import os
-from typing import Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Dict, List, Optional, Set, Tuple, Type, Union, TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -31,6 +31,8 @@ from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
 from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
+from vllm.distributed.device_communicators.nixl import DynamoNixlConnector
+
 
 logger = init_logger(__name__)
 
@@ -307,6 +309,46 @@ class Worker(LocalOrDistributedWorkerBase):
             self._init_cache_engine()
         self._warm_up_model()
 
+    def initialize_nixl(self, engine_id: str) -> List[bytes]:
+
+        # TODO ptarasiewicz nixl can also support DRAM
+        assert self.device_config.device_type == "cuda", "Currently only CUDA is supported for Nixl connector"
+
+        self.nixl_connector = DynamoNixlConnector(self.vllm_config, engine_id, self.local_rank) # TODO ptarasiewicz: rank or local_rank?
+        assert len(self.cache_engine) == 1, "Only one cache engine is supported for now"
+        self.nixl_connector.register_kv_caches(self.cache_engine[0].gpu_cache)
+        return self.nixl_connector.agent_name
+    
+    def get_nixl_agent_metadata(self) -> bytes:
+        assert self.nixl_connector is not None, "Nixl connector is not initialized"
+        return self.nixl_connector.get_agent_metadata()
+
+    def add_remote_nixl_metadata(self, engine_id: str, agents_metadata: List[bytes], kv_caches_base_addr: List[List[Tuple[int, int]]], num_blocks: int) -> str:
+        assert self.nixl_connector is not None, "Nixl connector is not initialized"
+        agent_name = self.nixl_connector.add_remote_agent(engine_id, agents_metadata, len(agents_metadata), kv_caches_base_addr, num_blocks) # TODO ptarasiewicz: rank or local_rank?
+        return agent_name
+    
+    def transfer_nixl_memory(self, src_descs: List[bytes], dst_descs: List[bytes], remote_agent_name: List[str], notify_msg: str) -> None:
+        assert self.nixl_connector is not None, "Nixl connector is not initialized"
+        self.nixl_connector.transfer_mem(src_descs[self.local_rank], dst_descs[self.local_rank], remote_agent_name, notify_msg) # TODO ptarasiewicz: rank or local_rank?
+
+    def get_nixl_kv_caches_base_addr(self) -> List[bytes]:
+        assert self.nixl_connector is not None, "Nixl connector is not initialized"
+        return self.nixl_connector.kv_caches_base_addr[self.nixl_connector.engine_id]
+        
+    def _transfer_blocks(self, worker_input: WorkerInput) -> None:
+                
+        if not self.is_driver_worker:
+            torch.cuda.synchronize() # to make sure that the blocks are ready, on driver worker we transfer after sampling, so there's no need to synchronize
+
+        if worker_input.src_block_ids is not None:
+            for src_block_ids, staging_block_ids, dst_block_ids, dst_engine_id, notify_msg in zip(worker_input.src_block_ids, worker_input.staging_block_ids, worker_input.dst_block_ids, worker_input.dst_engine_id, worker_input.notify_msg):
+                self.nixl_connector.transfer_mem(src_block_ids, staging_block_ids, dst_block_ids, dst_engine_id, notify_msg)
+
+    def shutdown_nixl(self) -> None:
+        assert self.nixl_connector is not None, "Nixl connector is not initialized"
+        self.nixl_connector.shutdown()
+
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
@@ -368,6 +410,8 @@ class Worker(LocalOrDistributedWorkerBase):
         blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
                                       device=self.device,
                                       dtype=torch.int64).view(-1, 2)
+        
+        mem_transfer_reqs = execute_model_req.memory_transfer_requests or []
 
         return WorkerInput(
             num_seq_groups=num_seq_groups,
@@ -376,6 +420,11 @@ class Worker(LocalOrDistributedWorkerBase):
             blocks_to_copy=blocks_to_copy,
             virtual_engine=virtual_engine,
             num_steps=num_steps,
+            src_block_ids=[r.src_block_ids for r in mem_transfer_reqs],
+            staging_block_ids=[r.staging_block_ids for r in mem_transfer_reqs],
+            dst_block_ids=[r.dst_block_ids for r in mem_transfer_reqs],
+            dst_engine_id=[r.dst_engine_id for r in mem_transfer_reqs],
+            notify_msg=[r.notify_msg for r in mem_transfer_reqs],
         )
 
     @torch.inference_mode()
