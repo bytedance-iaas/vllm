@@ -80,6 +80,9 @@ class BatchExpansionTop1Scorer(SpeculativeScorer):
         target_sampler_output = self._scorer_worker.execute_model(
             execute_model_req=execute_model_req.clone(
                 seq_group_metadata_list=target_seq_group_metadata_list))
+        if isinstance(target_sampler_output, tuple) \
+            and len(target_sampler_output) == 3:
+            target_sampler_output = target_sampler_output[0]
         assert len(target_sampler_output) == 1, "expected single-step output"
         target_sampler_output = target_sampler_output[0]
 

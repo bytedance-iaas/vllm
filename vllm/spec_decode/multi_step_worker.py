@@ -99,8 +99,10 @@ class MultiStepWorker(ProposerWorkerBase, DelegateWorkerBase):
             if expanded_request.previous_hidden_states is not None:
                 self.worker.model_runner.return_hidden_states = True
             for _ in range(sample_len):
-                model_output: List[SamplerOutput] = self.worker.execute_model(
+                model_output = self.worker.execute_model(
                     execute_model_req=expanded_request)
+                if isinstance(model_output, tuple) and len(model_output) == 3:
+                    model_output = model_output[0]
                 assert (len(model_output) == 1
                         ), "composing multistep workers not supported"
                 model_output = model_output[0]

@@ -391,6 +391,19 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
     def load_model(self, *args, **kwargs):
         pass
 
+    def initialize_nixl(self, engine_id: str) -> List[bytes]:
+        return self.scorer_worker.initialize_nixl(engine_id)
+
+    def get_nixl_agent_metadata(self) -> bytes:
+        return self.scorer_worker.get_nixl_agent_metadata()
+
+    def add_remote_nixl_metadata(self, engine_id: str, agents_metadata: List[bytes], kv_caches_base_addr: List[List[Tuple[int
+, int]]], num_blocks: int) -> str:
+        return self.scorer_worker.add_remote_nixl_metadata(engine_id, agents_metadata, kv_caches_base_addr, num_blocks)
+
+    def get_nixl_kv_caches_base_addr(self) -> List[bytes]:
+        return self.scorer_worker.get_nixl_kv_caches_base_addr()
+
     def _configure_model_sampler_for_spec_decode(self):
         """Configure model sampler to emit GPU tensors. This allows spec decode
         to keep data on device without transferring to CPU and serializing,
@@ -669,8 +682,12 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         not called, meaning that the kv-cache in proposer for requests is not
         updated, so they cannot enable spec decode in the rest decoding.
         """
-
+        request_notif_counter = {}
+        request_done_counter = {}
         sampler_output = self.scorer_worker.execute_model(execute_model_req)
+        if isinstance(sampler_output, tuple) and len(sampler_output) == 3:
+           sampler_output, request_notif_counter, request_done_counter = sampler_output
+
         assert len(sampler_output) == 1
         sampler_output = sampler_output[0]
 
@@ -717,7 +734,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         sampler_output.sampled_token_probs = None
         sampler_output.sampled_token_ids = None
         sampler_output.logprobs = None
-        return sampler_output_to_return
+        return sampler_output_to_return, request_notif_counter, request_done_counter
 
     def _run_non_driver_rank(self) -> bool:
         """Run proposer and verifier model in non-driver workers. This is used
