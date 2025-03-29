@@ -806,9 +806,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                "workers generate no tokens")
 
         execute_model_req.previous_hidden_states = None
+        request_notif_counter = {}
+        request_done_counter = {}
 
         with Timer() as scoring_timer:
-            proposal_scores = self.scorer.score_proposals(
+            proposal_scores, request_notif_counter, request_done_counter = self.scorer.score_proposals(
                 execute_model_req,
                 proposals,
             )
@@ -848,7 +850,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             prompt_logprobs=proposal_scores.prompt_logprobs
             if not self._disable_logprobs else None,
             k=execute_model_req.num_lookahead_slots,
-            stage_times=stage_times)
+            stage_times=stage_times), request_notif_counter, request_done_counter
 
     @nvtx_range("spec_decode_worker._verify_tokens")
     def _verify_tokens(
