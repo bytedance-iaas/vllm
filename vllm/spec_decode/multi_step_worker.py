@@ -90,6 +90,8 @@ class MultiStepWorker(ProposerWorkerBase, DelegateWorkerBase):
                 indices_of_seq_with_bonus_tokens)
             model_outputs = self.execute_model(
                 execute_model_req=expanded_request)
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 3:
+                model_outputs = model_outputs[0]
         else:
             # Here we run multi-step directly, with every step prepared
             # on the CPU.

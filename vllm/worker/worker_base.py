@@ -241,6 +241,8 @@ class WorkerInput:
         Pop fields from the given tensor_dict and populate a new instance of
         WorkerInput.
         """
+        print(f"-----------------------{tensor_dict}")
+
         return cls(
             num_seq_groups=tensor_dict.pop("num_seq_groups"),
             blocks_to_swap_in=tensor_dict.pop("blocks_to_swap_in"),
@@ -371,6 +373,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         if self.do_metadata_broadcast:
             broadcast_data = worker_input.as_broadcastable_tensor_dict()
+            print("--------------rank 0 broadcast_data", broadcast_data)
             broadcast_data.update(model_input.as_broadcastable_tensor_dict())
             broadcast_data.update(kwargs)
             broadcast_tensor_dict(broadcast_data, src=0)

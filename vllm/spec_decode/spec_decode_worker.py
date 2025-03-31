@@ -550,10 +550,16 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             disable_all_speculation, execute_model_req.seq_group_metadata_list)
 
         if no_spec:
-            return self._run_no_spec(execute_model_req,
+            output, request_notif_counter, request_done_counter = \
+                self._run_no_spec(execute_model_req,
                                      skip_proposer=disable_all_speculation)
-        return self._run_speculative_decoding_step(execute_model_req,
+
+            return output, request_notif_counter, request_done_counter
+
+        result = self._run_speculative_decoding_step(execute_model_req,
                                                    num_lookahead_slots)
+        print(f"------------------spec decoding: {result}")
+        return result
 
     @torch.inference_mode()
     def start_worker_execution_loop(self) -> None:
@@ -688,6 +694,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         if isinstance(sampler_output, tuple) and len(sampler_output) == 3:
            sampler_output, request_notif_counter, request_done_counter = sampler_output
 
+        if len(sampler_output) == 0:
+            return sampler_output, request_notif_counter, request_done_counter
+
         assert len(sampler_output) == 1
         sampler_output = sampler_output[0]
 
@@ -746,6 +755,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         assert self.rank != self._driver_rank
 
         data = broadcast_tensor_dict(src=self._driver_rank)
+        print(f"-------------non driver rank {self.rank} recv {data}")
         if not data:
             return False
         num_lookahead_slots = data["num_lookahead_slots"]
