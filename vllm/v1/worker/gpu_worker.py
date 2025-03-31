@@ -269,6 +269,9 @@ class Worker(WorkerBase):
         # worker will always be healthy as long as it's running.
         return
 
+    def swap_blocks(self, d2h_map: dict[int, int], h2d_map: dict[int, int]):
+        self.model_runner.swap_blocks(d2h_map, h2d_map)
+
 
 def init_worker_distributed_environment(
     parallel_config: ParallelConfig,

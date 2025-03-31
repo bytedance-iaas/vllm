@@ -122,3 +122,8 @@ class SchedulerOutput:
     structured_output_request_ids: dict[str, int]
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
+    # Block swap maps for the current scheduling step.
+    # GPU block ID -> CPU block ID
+    d2h_swap_map: dict[int, int]
+    # CPU block ID -> GPU block ID
+    h2d_swap_map: dict[int, int]

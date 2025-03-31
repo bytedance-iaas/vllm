@@ -88,6 +88,9 @@ class Executor(ExecutorBase):
     def profile(self, is_start: bool = True):
         self.collective_rpc("profile", args=(is_start, ))
 
+    def swap_blocks(self, d2h_map: dict[int, int], h2d_map: dict[int, int]):
+        self.collective_rpc("swap_blocks", args=(d2h_map, h2d_map))
+
 
 class UniProcExecutor(UniProcExecutorV0, Executor):
     pass

@@ -809,8 +809,9 @@ class TPUModelRunner:
 
         bind_kv_cache(
             kv_caches,
+            self.kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+        )
 
 
 class ModelWrapperV1(nn.Module):
