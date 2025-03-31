@@ -64,7 +64,12 @@ class FlashAttentionBackend(AttentionBackend):
     @staticmethod
     def use_cascade_attention(*args, **kwargs) -> bool:
         return use_cascade_attention(*args, **kwargs)
+    
+    def swap_in(connector, req_id, block_mapping):
+        connector.swap_in_mha(req_id, block_mapping)
 
+    def swap_out(connector, block_mapping):
+        connector.swap_out_mha(block_mapping)
 
 @dataclass
 class FlashAttentionMetadata:

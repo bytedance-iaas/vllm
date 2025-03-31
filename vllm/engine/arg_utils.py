@@ -118,6 +118,7 @@ class EngineArgs:
     enable_expert_parallel: bool = False
     max_parallel_loading_workers: Optional[int] = None
     block_size: Optional[int] = None
+    kv_cache_swapper: Optional[str] = None
     enable_prefix_caching: Optional[bool] = None
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
@@ -1095,6 +1096,13 @@ class EngineArgs:
             "Select the reasoning parser depending on the model that you're "
             "using. This is used to parse the reasoning content into OpenAI "
             "API format. Required for ``--enable-reasoning``.")
+        
+        parser.add_argument(
+            "--kv-cache-swapper",
+            type=str,
+            default=EngineArgs.kv_cache_swapper,
+            help=
+            "Select the swapper for kv cache offloading.")
 
         return parser
 
@@ -1239,6 +1247,7 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,
+            kv_cache_swapper=self.kv_cache_swapper,
         )
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,

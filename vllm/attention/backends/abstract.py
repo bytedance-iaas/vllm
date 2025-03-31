@@ -98,6 +98,16 @@ class AttentionBackend(ABC):
                      sampled_token_ids: Optional[torch.Tensor],
                      block_size: int, num_seqs: int, num_queries: int) -> None:
         raise NotImplementedError
+    
+    @staticmethod
+    @abstractmethod
+    def swap_in(connector, req_id, block_mapping):
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    def swap_out(connector, swap_out_mapping):
+        raise NotImplementedError
 
 
 @dataclass

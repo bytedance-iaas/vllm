@@ -122,3 +122,9 @@ class SchedulerOutput:
     structured_output_request_ids: dict[str, int]
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
+
+    # During swap-in, the swap operation should be performed on
+    # a per-req basis. When all blocks of a req have been successfully
+    # swapped in, then the request is ready to be scheduled.
+    swap_in_blocks: dict[str, dict[int, int]] = None
+    swap_out_blocks: dict[int, int] = None

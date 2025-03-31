@@ -81,6 +81,20 @@ class Executor(ExecutorBase):
                                      args=(scheduler_output, ))
         return output[0]
 
+    def swap_in(self, block_mapping):
+        return self.collective_rpc("swap_in",
+                                     args=(block_mapping, ))
+
+    def swap_out(self, block_mapping):
+        return self.collective_rpc("swap_out",
+                                     args=(block_mapping, ))
+    
+    def get_kv_cache_loaded_reqs(self):
+        return self.collective_rpc("get_kv_cache_loaded_reqs")
+
+    def get_kv_cache_saved_blocks(self):
+        return self.collective_rpc("get_kv_cache_saved_blocks")
+
     @property
     def max_concurrent_batches(self) -> int:
         return 1

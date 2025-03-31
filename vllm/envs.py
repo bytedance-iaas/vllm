@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_V0_USE_OUTLINES_CACHE: bool = False
+    VLLM_GPU_RDMA_MAP: Optional[dict[int, str]] = None
 
 
 def get_default_cache_root():
@@ -115,6 +116,13 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
         return None
     return int(value)
 
+
+def get_gpu_rama_map() ->Optional[dict[int, str]]:
+    user_info_str = os.environ.get("VLLM_GPU_RDMA_MAP")
+    if user_info_str:
+        pairs = user_info_str.split(';')
+        return {int(pair.split(':')[0]): pair.split(':')[1] for pair in pairs}
+    return None
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -618,6 +626,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # an environment with potentially malicious users.
     "VLLM_V0_USE_OUTLINES_CACHE":
     lambda: os.environ.get("VLLM_V0_USE_OUTLINES_CACHE", "0") == "1",
+
+    "VLLM_GPU_RDMA_MAP": get_gpu_rama_map,
 }
 
 # end-env-vars-definition

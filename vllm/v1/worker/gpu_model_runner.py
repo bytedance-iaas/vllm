@@ -41,6 +41,7 @@ from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.core.swapper.base_swapper import get_swapper_class
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -58,6 +59,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self,
         vllm_config: VllmConfig,
         device: torch.device,
+        local_rank: Optional[int] = None,
     ):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -69,6 +71,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+
+        self.local_rank = local_rank
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -260,6 +264,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+
+        self.swapper = None
+        if vllm_config.cache_config.kv_cache_swapper is not None:
+            self.swapper = get_swapper_class(vllm_config.cache_config.kv_cache_swapper, self.local_rank)
+
+    def swap_in(self, swap_in_mapping: dict[str, dict[int, int]]):
+        if len(swap_in_mapping) == 0 or self.swapper is None:
+            return
+
+        for req_id, block_mapping in swap_in_mapping.items():
+                self.attn_backend.swap_in(self.swapper, req_id, block_mapping)
+
+    def swap_out(self, swap_out_mapping: dict[int, int]):
+        if len(swap_out_mapping) == 0 or self.swapper is None:
+            return
+
+        self.attn_backend.swap_out(self.swapper, swap_out_mapping)
+
+    # get loaded req
+    def get_kv_cache_loaded_reqs(self):
+        if self.swapper is None:
+            return []
+
+        return self.swapper.get_loaded_reqs()
+
+    # get saved blocks
+    def get_kv_cache_saved_blocks(self):
+        if self.swapper is None:
+            return []
+
+        return self.swapper.get_saved_blocks()
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -1532,6 +1567,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
+        
+        # register memory
+        if self.swapper is not None:
+            self.swapper.reg_mr(self.kv_caches)
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         """

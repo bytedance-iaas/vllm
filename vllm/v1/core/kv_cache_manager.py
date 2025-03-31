@@ -89,7 +89,7 @@ class KVCacheManager:
         return stats
 
     def get_computed_blocks(
-            self, request: Request) -> tuple[list[KVCacheBlock], int]:
+            self, request: Request) -> tuple[list[KVCacheBlock], list[BlockHashType], int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -103,7 +103,7 @@ class KVCacheManager:
         """
         if not self.enable_caching:
             # Prefix caching is disabled.
-            return [], 0
+            return [], [], 0
 
         # The block hashes for the request may already be computed
         # if the scheduler has tried to schedule the request before.
@@ -133,16 +133,18 @@ class KVCacheManager:
             # sharing, `num_computed_tokens` is always a multiple of
             # `block_size`.
             num_computed_tokens = len(computed_blocks) * self.block_size
-            return computed_blocks, num_computed_tokens
+            return computed_blocks, [], num_computed_tokens
         else:
             # Skip cache hits for prompt logprobs
-            return [], 0
+            return [], [],  0
 
     def allocate_slots(
         self,
         request: Request,
         num_tokens: int,
-        new_computed_blocks: Optional[list[KVCacheBlock]] = None
+        new_computed_blocks: Optional[list[KVCacheBlock]] = None,
+        new_computed_extended_blocks: Optional[list[BlockHashType]] = None,
+        saved_blocks: Optional[set[int]] = None,
     ) -> Optional[list[KVCacheBlock]]:
         """Add slots for a request with new tokens to append.
 

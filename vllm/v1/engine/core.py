@@ -33,6 +33,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
+import time
 
 logger = init_logger(__name__)
 
@@ -109,6 +110,21 @@ class EngineCore:
                         self.batch_queue_size)
             self.batch_queue = queue.Queue(self.batch_queue_size)
 
+        self.tp = vllm_config.parallel_config.tensor_parallel_size
+        self.is_async_kv_cache_swapper = vllm_config.cache_config.kv_cache_swapper is not None
+
+        if self.is_async_kv_cache_swapper:
+            # Used to record whether multiple tp have completed
+            # KV cache transmission.
+            # block_id/req_id : tp_count
+            self.kv_cache_loading_req: dict[str, int] = {}
+            self.kv_cache_saving_block: dict[str, int] = {}
+
+            # Used to record the requests and blocks that have
+            # completed KV cache transmission.
+            self.kv_cache_loaded_reqs: set = set()
+            self.kv_cache_saved_blocks: set = set()
+
     def _initialize_kv_caches(self,
                               vllm_config: VllmConfig) -> tuple[int, int]:
         start = time.time()
@@ -167,6 +183,68 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids,
                                        RequestStatus.FINISHED_ABORTED)
+
+    # TODO(luchangqi) Optimize performance
+    def _get_kv_cache_loaded_reqs(self):
+        loaded_reqs = self.model_executor.get_kv_cache_loaded_reqs()
+        for req_ids in loaded_reqs:
+            for req_id in req_ids:
+                if req_id in self.kv_cache_loading_req:
+                    self.kv_cache_loading_req[req_id] += 1
+                else:
+                    self.kv_cache_loading_req[req_id] = 1
+
+                if self.kv_cache_loading_req[req_id] == self.tp:
+                    self.kv_cache_loaded_reqs.add(req_id)
+                    del self.kv_cache_loading_req[req_id]
+    
+    def _get_kv_cache_saved_blocks(self):
+        loaded_blocks = self.model_executor.get_kv_cache_saved_blocks()
+        for block_ids in loaded_blocks:
+            for block_id in block_ids:
+                if block_id in self.kv_cache_saving_block:
+                    self.kv_cache_saving_block[block_id] += 1
+                else:
+                    self.kv_cache_saving_block[block_id] = 1
+
+                if self.kv_cache_saving_block[block_id] == self.tp:
+                    self.kv_cache_saved_blocks.add(block_id)
+                    del self.kv_cache_saving_block[block_id]
+
+    def async_kv_cache_step(self) -> EngineCoreOutputs:
+        if not self.scheduler.has_requests():
+            return EngineCoreOutputs(
+                outputs=[],
+                scheduler_stats=self.scheduler.make_stats(),
+            )
+        
+        # During each scheduling, retrieve the information about
+        # requests and blocks that have completed swapping from
+        # the model_runner.
+        self._get_kv_cache_loaded_reqs()
+        self._get_kv_cache_saved_blocks()
+        
+        scheduler_output = self.scheduler.schedule(self.kv_cache_loaded_reqs, self.kv_cache_saved_blocks)
+
+        self.kv_cache_loaded_reqs.clear()
+        self.kv_cache_saved_blocks.clear()
+
+        # swap in according scheduler_out
+        self.model_executor.swap_in(scheduler_output.swap_in_blocks)
+
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            return EngineCoreOutputs(
+                outputs=[],
+                scheduler_stats=self.scheduler.make_stats(),
+            )
+
+        output = self.model_executor.execute_model(scheduler_output)
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, output)  # type: ignore
+
+        # swap out according scheduler_out when finishing req.
+        self.model_executor.swap_out(scheduler_output.swap_out_blocks)
+        return engine_core_outputs
 
     def step(self) -> EngineCoreOutputs:
         """Schedule, execute, and make output."""
@@ -347,8 +425,12 @@ class EngineCoreProc(EngineCore):
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
-        step_fn = (self.step
-                   if self.batch_queue is None else self.step_with_batch_queue)
+        if self.batch_queue is not None:
+            step_fn = self.step_with_batch_queue
+        elif self.is_async_kv_cache_swapper:
+            step_fn = self.async_kv_cache_step
+        else:
+            step_fn = self.step
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
