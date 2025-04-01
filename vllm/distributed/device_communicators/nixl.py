@@ -276,7 +276,8 @@ class DynamoNixlConnector:
         staging_ranges = self._get_ranges(staging_block_ids)
 
         src_staging_overlapping_ranges, staging_src_overlapping_ranges = self._get_same_length_ranges(src_ranges, staging_ranges)
-        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id] 
+        
         
         for src_range, staging_range in zip(src_staging_overlapping_ranges, staging_src_overlapping_ranges):
             logger.debug("Rearranging tensors for cache: %s, src_range: %s, staging_range: %s", self.kv_caches[0].shape, src_range, staging_range)
@@ -284,7 +285,7 @@ class DynamoNixlConnector:
                 if self.use_mla:
                     cache_src = kv_cache[src_range[0]:src_range[1] + 1].unsqueeze(0)
                     cache_staging = kv_cache[staging_range[0]:staging_range[1] + 1].unsqueeze(0)
-                    rearrange_tensors(cache_src, cache_staging, tp_multiplier)
+                    rearrange_tensors(cache_src, cache_staging, 1)
                 else:    
                     for cache in kv_cache:
                         rearrange_tensors(cache[src_range[0]:src_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier)
@@ -296,7 +297,8 @@ class DynamoNixlConnector:
         src_xfer_side_handle = self.src_xfer_side_handles[tp_multiplier]
         
         for i in range(tp_multiplier):
-            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=i, tp_multiplier=tp_multiplier, staging_ranges=staging_src_overlapping_ranges)
+            tp,index=(tp_multiplier, i) if not self.use_mla else(1, 0)
+            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=index, tp_multiplier=tp, staging_ranges=staging_src_overlapping_ranges)
             assert len(staging_block_descs_ids) == len(dst_block_descs_ids)
             dst_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
 
@@ -335,7 +337,7 @@ class DynamoNixlConnector:
                 if self.use_mla:
                     cache_src = kv_cache[src_range[0]:src_range[1] + 1].unsqueeze(0)
                     cache_staging = kv_cache[staging_range[0]:staging_range[1] + 1].unsqueeze(0)
-                    rearrange_tensors(cache_src, cache_staging, tp_multiplier)
+                    rearrange_tensors(cache_src, cache_staging, 1)
                 else:    
                     for cache in kv_cache:
                         rearrange_tensors(cache[src_range[0]:src_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier)
@@ -346,9 +348,9 @@ class DynamoNixlConnector:
         logger.debug("Time to get same length ranges: %s ms", (time.perf_counter() - start_time) * 1000)
 
         for i in range(tp_multiplier):
-
-            src_descs = self._get_range_descs(staging_overlapping_ranges, "all", self.kv_caches_base_addr[self.engine_id], tp_multiplier, i=i, staging_ranges=original_src_ranges)
-            dst_descs = self._get_range_descs(dst_overlapping_ranges, "all", self.kv_caches_base_addr[dst_engine_id][self.rank * tp_multiplier + i], tp_multiplier, rank=self.rank * tp_multiplier + i)
+            tp,index=(tp_multiplier, i) if not self.use_mla else(1, 0)
+            src_descs = self._get_range_descs(staging_overlapping_ranges, "all", self.kv_caches_base_addr[self.engine_id], tp_multiplier=tp, i=index, staging_ranges=original_src_ranges)
+            dst_descs = self._get_range_descs(dst_overlapping_ranges, "all", self.kv_caches_base_addr[dst_engine_id][self.rank * tp_multiplier + i], tp_multiplier=tp, rank=self.rank * tp_multiplier + i)
             logger.debug("Time to get descs: %s ms", (time.perf_counter() - start_time) * 1000)
             
             logger.debug("Transfering to agent %s", self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i])
@@ -377,7 +379,7 @@ class DynamoNixlConnector:
         self._remote_agents[engine_id] = agent_names
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
 
-        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
+        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id] if not self.use_mla else 1
         assert tp_multiplier > 0, f"Decode TP cannot be smaller than prefill TP, got {self._tp_size[engine_id]} and {self._tp_size[self.engine_id]}"
 
         logger.debug("Creating src xfer side handles for engine %s, tp_multiplier: %s", engine_id, tp_multiplier)
@@ -390,7 +392,7 @@ class DynamoNixlConnector:
                     for block_id in range(self.num_blocks):
                             block_offset = block_id * self.block_len
                             for i in range(tp_multiplier):
-                                tp_multiplier_offset = i * dst_block_len
+                                tp_multiplier_offset = i * dst_block_len if not self.use_mla else 0
                                 blocks_data.append((base_addr + block_offset + tp_multiplier_offset, dst_block_len, self.rank))
             logger.debug("Created %s blocks for src engine %s and rank %s", len(blocks_data), self.engine_id, self.rank * tp_multiplier + i)
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
