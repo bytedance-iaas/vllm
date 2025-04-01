@@ -1377,6 +1377,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
 
     def _forward_prefill(
         self,
+        layer: AttentionLayer,
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
@@ -1401,7 +1402,30 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         # v with 0s to match the qk head dim
         v_padded = torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]],
                                            value=0)
-
+        fp8_attention = self.kv_cache_dtype.startswith("fp8")
+        
+        # Apply fp8 quantization if needed
+        if fp8_attention:
+            num_tokens, num_heads, head_size = q.shape
+            q, _ = ops.scaled_fp8_quant(
+                q.reshape((num_tokens, num_heads * head_size)).contiguous(),
+                layer._q_scale)
+            q = q.reshape((num_tokens, num_heads, head_size))
+            
+            num_kv_tokens, num_kv_heads, head_size = k.shape
+            k, _ = ops.scaled_fp8_quant(
+                k.reshape((num_kv_tokens, num_kv_heads * head_size)).contiguous(),
+                layer._k_scale)
+            k = k.reshape((num_kv_tokens, num_kv_heads, head_size))
+            
+            v_padded, _ = ops.scaled_fp8_quant(
+                v_padded.reshape((num_kv_tokens, num_kv_heads * head_size)).contiguous(),
+                layer._v_scale)
+            v_padded = v_padded.reshape((num_kv_tokens, num_kv_heads, head_size))
+            
+        # Set up descale shape for fp8
+        descale_shape = (prefill_metadata.query_start_loc.shape[0] - 1, k.shape[1])
+            
         if is_hip and envs.VLLM_USE_TRITON_FLASH_ATTN and not has_context:
             output = self.triton_fa_func(
                 q,
@@ -1431,6 +1455,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 softmax_scale=self.scale,
                 causal=True,
                 return_softmax_lse=has_context,
+                **({"q_descale": layer._q_scale.expand(descale_shape),
+                   "k_descale": layer._k_scale.expand(descale_shape),
+                   "v_descale": layer._v_scale.expand(descale_shape)} if fp8_attention else {})
             )
         else:
             output = self.flash_attn_varlen_func(
@@ -1444,6 +1471,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 softmax_scale=self.scale,
                 causal=True,
                 return_attn_probs=has_context,
+                **({"q_descale": layer._q_scale.expand(descale_shape),
+                   "k_descale": layer._k_scale.expand(descale_shape),
+                   "v_descale": layer._v_scale.expand(descale_shape)} if fp8_attention else {})
             )
 
         if has_context:
@@ -1471,7 +1501,8 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
     @abstractmethod
     def _forward_decode(
         self,
-        q_nope: torch.Tensor,
+        layer: AttentionLayer,
+        ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: T,
@@ -1556,11 +1587,11 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                              dtype=hidden_states_or_q_c.dtype)
         if has_prefill:
             output[:num_prefill_tokens] = self._forward_prefill(
-                prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
+                layer, prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
                 attn_metadata)
 
         if has_decode:
             output[num_prefill_tokens:] = self._forward_decode(
-                decode_q_nope, decode_q_pe, kv_cache, attn_metadata)
+                layer, decode_ql_nope, decode_q_pe, kv_cache, attn_metadata)
 
         return output
