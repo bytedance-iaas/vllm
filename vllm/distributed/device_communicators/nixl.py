@@ -379,7 +379,7 @@ class DynamoNixlConnector:
         self._remote_agents[engine_id] = agent_names
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
 
-        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id] if self.use_mla else 1
+        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id] if not self.use_mla else 1
         assert tp_multiplier > 0, f"Decode TP cannot be smaller than prefill TP, got {self._tp_size[engine_id]} and {self._tp_size[self.engine_id]}"
 
         logger.debug("Creating src xfer side handles for engine %s, tp_multiplier: %s", engine_id, tp_multiplier)
