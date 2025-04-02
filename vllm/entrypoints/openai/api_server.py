@@ -230,6 +230,7 @@ async def build_async_engine_client_from_engine_args(
         # not actually result in an exitcode being reported. As a result
         # we use a shared variable to communicate the information.
         engine_alive = multiprocessing.Value('b', True, lock=False)
+        print("2~~~~~~~~~~~~ build async engine start run_mp_engine")
         engine_process = context.Process(
             target=run_mp_engine,
             args=(vllm_config, UsageContext.OPENAI_API_SERVER, ipc_path,

@@ -611,6 +611,8 @@ class MQLLMEngineClient(EngineClient):
             prompt = inputs
         assert (prompt is not None and sampling_params is not None
                 and request_id is not None)
+        
+        print("^^^^^^^^^^^^^ MQLLMEngineClient.generate ^^^^^^^^^^^^^")
 
         return self._process_request(prompt, sampling_params, request_id,
                                      lora_request, trace_headers,
@@ -763,7 +765,8 @@ class MQLLMEngineClient(EngineClient):
                     remote_prefill_params=remote_prefill_params,
                 ))
 
-            # 3) Send the RPCGenerateRequest to the MQLLMEngine.
+            # 3) Send the RPCGenera
+            # teRequest to the MQLLMEngine.
             parts = (request_bytes, lp_bytes) if lp_bytes else (request_bytes,)
             await self.input_socket.send_multipart(parts, copy=False)
 

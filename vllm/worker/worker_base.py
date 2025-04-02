@@ -91,6 +91,7 @@ class WorkerBase:
         You can stop the loop by executing a driver worker with an empty output.
         See `stop_remote_worker_execution_loop` for more details.
         """
+        print("0000000000-2 worker base start_worker_execution_loop")
         with self.current_platform.inference_mode():
             while True:
                 output = self.execute_model(execute_model_req=None)
@@ -173,6 +174,14 @@ class DelegateWorkerBase(WorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> Optional[List[SamplerOutput]]:
+        print(f"%%%%%%%%%%%%%%% inside worrker base execute_model, self.worker: {type(self.worker)}")
+        import inspect
+
+        method = self.worker.execute_model
+        source_file = inspect.getfile(method)
+        source_lines, starting_line_no = inspect.getsourcelines(method)
+        print(f"%%%%%%%%%%%%%%%%%% 8.3 execute_model of self.worker in: {source_file}, line {starting_line_no}")
+
         return self.worker.execute_model(execute_model_req)
 
     def get_cache_block_size_bytes(self) -> int:
@@ -241,7 +250,7 @@ class WorkerInput:
         Pop fields from the given tensor_dict and populate a new instance of
         WorkerInput.
         """
-        print(f"-----------------------{tensor_dict}")
+        # print(f"-----------------------{tensor_dict}")
 
         return cls(
             num_seq_groups=tensor_dict.pop("num_seq_groups"),
@@ -343,16 +352,23 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         if not broadcast_data:
             return None
 
+        # print("+++++++++ calls stack from Worker Base +++++++++")
+        # import traceback
+        # traceback.print_stack()
+        # print("+++++++++ calls stack from Worker Base +++++++++")
+
         worker_input = WorkerInput.from_broadcasted_tensor_dict(broadcast_data)
+        print("~~~~~~~~~~~~ 1  worker base receive data")
         if worker_input.num_seq_groups > 0:
             model_input = (
                 self.model_runner.make_model_input_from_broadcasted_tensor_dict(
                     broadcast_data))
 
             kwargs = extract_previous_hidden_states(broadcast_data)
-
+            print("~~~~~~~~~~~~ 2 worker base receive data return")
             return model_input, worker_input, kwargs
         else:
+            print("~~~~~~~~~~~~ 3 worker base receive data return")
             return None, worker_input, {}
 
     def _get_driver_input_and_broadcast(
@@ -373,7 +389,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         if self.do_metadata_broadcast:
             broadcast_data = worker_input.as_broadcastable_tensor_dict()
-            print("--------------rank 0 broadcast_data", broadcast_data)
+            print("-------------- Worker Base broadcast tensor dict --------------")
             broadcast_data.update(model_input.as_broadcastable_tensor_dict())
             broadcast_data.update(kwargs)
             broadcast_tensor_dict(broadcast_data, src=0)
@@ -402,6 +418,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                     # driver broadcasts an empty input. Send an empty input to
                     # notify all other workers to stop their execution loop.
                     broadcast_tensor_dict({}, src=0)
+                    print("-------------- Worker Base broadcast empty--------------")
                 return None
             return self._get_driver_input_and_broadcast(execute_model_req)
         else:

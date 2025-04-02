@@ -236,6 +236,7 @@ class MultiprocessingDistributedExecutor(DistributedExecutorBase):
         return results[-1]
 
     async def _start_worker_execution_loop(self):
+        print("************ 2 MP Distributed executor _start_worker_execution_loop ")
         coros = [
             worker.execute_method_async("start_worker_execution_loop")
             for worker in self.non_driver_workers

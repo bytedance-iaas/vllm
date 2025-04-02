@@ -481,6 +481,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             # Send an empty input to notify all other workers to stop their
             # execution loop.
             broadcast_tensor_dict({}, src=0)
+            print("~~~~~~ spec decoder worker broadcast empty")
             return []
 
         self._track_finished_requests(execute_model_req)
@@ -543,6 +544,13 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         )
         broadcast_tensor_dict(broadcast_dict, src=self._driver_rank)
 
+        print(f"~~~~~~~~ spec decoder worker broadcast num_lookahead_slots, request: {execute_model_req}, broadcast_tensor_dict: {broadcast_dict}")
+
+        import traceback
+        print("======================================")
+        traceback.print_stack()
+        print("======================================")
+
         assert execute_model_req.seq_group_metadata_list is not None, (
             "speculative decoding requires non-None seq_group_metadata_list")
 
@@ -558,15 +566,30 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
         result = self._run_speculative_decoding_step(execute_model_req,
                                                    num_lookahead_slots)
-        print(f"------------------spec decoding: {result}")
+        # print(f"------------------spec decoding: {result}")
         return result
 
     @torch.inference_mode()
     def start_worker_execution_loop(self) -> None:
         """Execute model loop to perform speculative decoding
         in parallel worker."""
-        while self._run_non_driver_rank():
-            pass
+        print("0000000000-1 spec decoder worker start_worker_execution_loop")
+        # while self._run_non_driver_rank():
+        #     print("2222222222 spec decoder worker execute model")
+        #     pass
+
+        while True:
+            result = self._run_non_driver_rank()
+
+            print(">>>>>>>>>>>>>>>>>>>>>>>> _run_non_driver_rank returns ")
+            
+            if result == True:
+                print("2222222222 _run_non_driver_rank return True")
+                pass
+            else: 
+                print("3333333333 _run_non_driver_rank return False")
+                break
+
 
     def _should_disable_all_speculation(
             self, execute_model_req: ExecuteModelRequest) -> bool:
@@ -752,33 +775,63 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
 
         Returns True if there are remaining sequences to process.
         """
+        print(" %%%%%%%%%%%%%%%%%% - 1 inside _run_non_driver_rank")
+
         assert self.rank != self._driver_rank
 
         data = broadcast_tensor_dict(src=self._driver_rank)
-        print(f"-------------non driver rank {self.rank} recv {data}")
+        print(" %%%%%%%%%%%%%%%%%% - 2 inside _run_non_driver_rank")
+        # print(f"-------------non driver rank {self.rank} recv {data}")
+        # print("------ calls stack from Spec Decoder Worker--------")
+        # import traceback
+        # traceback.print_stack()
+        # print("------ calls stack from Spec Decoder Worker--------")
         if not data:
+            print(" %%%%%%%%%%%%%%%%%% - 3 inside _run_non_driver_rank")
             return False
         num_lookahead_slots = data["num_lookahead_slots"]
+
+        print(" %%%%%%%%%%%%%%%%%% - 4 inside _run_non_driver_rank")
 
         # In case of prefill, scorer_worker has to be run before proposer so
         # that the hidden states can be propagated to proposer when needed.
         if data["no_spec"]:
+            print(" %%%%%%%%%%%%%%%%%% - 5 inside _run_non_driver_rank")
             self.scorer_worker.execute_model()
 
+        print(" %%%%%%%%%%%%%%%%%% - 6 inside _run_non_driver_rank")
         if not data["disable_all_speculation"]:
             # Even if num_lookahead_slots is zero, we want to run the
             # proposer model as it may have KV.
             #
             # We run the proposer once per lookahead slot. In the future we
             # should delegate how many times it runs to the proposer.
+            print(" %%%%%%%%%%%%%%%%%% - 7 inside _run_non_driver_rank")
             for _ in range(max(num_lookahead_slots, 1)):
+                print(" %%%%%%%%%%%%%%%%%% - 8 inside _run_non_driver_rank")
+                print(f" %%%%%%%%%%%%%%%%%% - 8.1 {type(self.proposer_worker)}  {self.proposer_worker}")
+
+                import inspect
+                try:
+                    method = self.proposer_worker.execute_model
+                    source_file = inspect.getfile(method)
+                    source_lines, starting_line_no = inspect.getsourcelines(method)
+                    print(f"%%%%%%%%%%%%%%%%%% 8.2execute_model of proposer_workerdefined in: {source_file}, line {starting_line_no}")
+                except Exception as e:
+                    print(f"Could not retrieve source: {e}")
+
                 self.proposer_worker.execute_model()
 
         if not data["no_spec"]:
+            print(" %%%%%%%%%%%%%%%%%% - 9 inside _run_non_driver_rank")
             self.scorer_worker.execute_model()
+            print(" %%%%%%%%%%%%%%%%%% - 10 inside _run_non_driver_rank")
             if data["run_spec_proposer_for_prefill"]:
+                print(" %%%%%%%%%%%%%%%%%% - 11 inside _run_non_driver_rank")
                 self.proposer_worker.execute_model()
+                print(" %%%%%%%%%%%%%%%%%% - 12 inside _run_non_driver_rank")
 
+        print(" %%%%%%%%%%%%%%%%%% - 13 inside _run_non_driver_rank")
         return True
 
     @nvtx_range("spec_decode_worker._run_speculative_decoding_step")

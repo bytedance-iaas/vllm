@@ -276,6 +276,7 @@ class DistributedExecutorBase(ExecutorBase):
     ) -> List[SamplerOutput]:
         # TODO: unify into collective_rpc
         if self.parallel_worker_tasks is None:
+            print("************ 1 Distributed base executor _run_workers ")
             self.parallel_worker_tasks = self._run_workers(
                 "start_worker_execution_loop",
                 async_run_tensor_parallel_workers_only=True)
