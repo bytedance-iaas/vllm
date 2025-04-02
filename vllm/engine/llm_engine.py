@@ -1549,7 +1549,7 @@ class LLMEngine:
             execute_model_req.memory_transfer_requests = memory_transfer_reqs
             
             try:
-                outputs, request_notif_counter, request_done_counter = self.model_executor.execute_model(
+                outputs, output_metadata = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False
             except InputProcessingError as e:
@@ -1582,16 +1582,16 @@ class LLMEngine:
                 blocks_to_swap_out=[],
                 blocks_to_copy=[])
 
-            outputs, request_notif_counter, request_done_counter = self.model_executor.execute_model(
+            outputs, output_metadata = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
             
-        for req_id, notif_count in request_notif_counter.items():
+        for req_id, notif_count in output_metadata.get("request_notify_counter", {}).items():
             self._request_notif_counter[req_id] += notif_count
             if self._request_notif_counter[req_id] > -1:
                 self._finished_prefills.add(req_id)
                 del self._request_notif_counter[req_id]
 
-        for req_id, done_count in request_done_counter.items():
+        for req_id, done_count in output_metadata.get("request_done_counter", {}).items():
             self._request_done_counter[req_id] += done_count
             if self._request_done_counter[req_id] > -1:
                 self._finished_transfers.add(req_id)

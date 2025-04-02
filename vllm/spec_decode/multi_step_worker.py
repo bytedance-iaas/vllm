@@ -90,7 +90,7 @@ class MultiStepWorker(ProposerWorkerBase, DelegateWorkerBase):
                 indices_of_seq_with_bonus_tokens)
             model_outputs = self.execute_model(
                 execute_model_req=expanded_request)
-            if isinstance(model_outputs, tuple) and len(model_outputs) == 3:
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 2:
                 model_outputs = model_outputs[0]
         else:
             # Here we run multi-step directly, with every step prepared
@@ -103,7 +103,7 @@ class MultiStepWorker(ProposerWorkerBase, DelegateWorkerBase):
             for _ in range(sample_len):
                 model_output = self.worker.execute_model(
                     execute_model_req=expanded_request)
-                if isinstance(model_output, tuple) and len(model_output) == 3:
+                if isinstance(model_output, tuple) and len(model_output) == 2:
                     model_output = model_output[0]
                 assert (len(model_output) == 1
                         ), "composing multistep workers not supported"

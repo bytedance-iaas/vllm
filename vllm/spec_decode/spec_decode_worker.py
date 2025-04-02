@@ -404,6 +404,9 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
     def get_nixl_kv_caches_base_addr(self) -> List[bytes]:
         return self.scorer_worker.get_nixl_kv_caches_base_addr()
 
+    def shutdown_nixl(self) -> None:
+        return self.scorer_worker.shutdown_nixl()
+
     def _configure_model_sampler_for_spec_decode(self):
         """Configure model sampler to emit GPU tensors. This allows spec decode
         to keep data on device without transferring to CPU and serializing,
@@ -550,15 +553,15 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             disable_all_speculation, execute_model_req.seq_group_metadata_list)
 
         if no_spec:
-            output, request_notif_counter, request_done_counter = \
+            output, output_metadata = \
                 self._run_no_spec(execute_model_req,
                                      skip_proposer=disable_all_speculation)
 
-            return output, request_notif_counter, request_done_counter
+            return output, output_metadata
 
         result = self._run_speculative_decoding_step(execute_model_req,
                                                    num_lookahead_slots)
-        print(f"------------------spec decoding: {result}")
+
         return result
 
     @torch.inference_mode()
@@ -688,14 +691,12 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         not called, meaning that the kv-cache in proposer for requests is not
         updated, so they cannot enable spec decode in the rest decoding.
         """
-        request_notif_counter = {}
-        request_done_counter = {}
+        output_metadata = {}
         sampler_output = self.scorer_worker.execute_model(execute_model_req)
-        if isinstance(sampler_output, tuple) and len(sampler_output) == 3:
-           sampler_output, request_notif_counter, request_done_counter = sampler_output
-
-        if len(sampler_output) == 0:
-            return sampler_output, request_notif_counter, request_done_counter
+        if isinstance(sampler_output, tuple) and len(sampler_output) == 2:
+            sampler_output, output_metadata = sampler_output
+            if output_metadata.get("is_kv_cache_download", False):
+                return sampler_output, output_metadata
 
         assert len(sampler_output) == 1
         sampler_output = sampler_output[0]
@@ -743,7 +744,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         sampler_output.sampled_token_probs = None
         sampler_output.sampled_token_ids = None
         sampler_output.logprobs = None
-        return sampler_output_to_return, request_notif_counter, request_done_counter
+        return sampler_output_to_return, output_metadata
 
     def _run_non_driver_rank(self) -> bool:
         """Run proposer and verifier model in non-driver workers. This is used
@@ -755,7 +756,6 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         assert self.rank != self._driver_rank
 
         data = broadcast_tensor_dict(src=self._driver_rank)
-        print(f"-------------non driver rank {self.rank} recv {data}")
         if not data:
             return False
         num_lookahead_slots = data["num_lookahead_slots"]
@@ -763,7 +763,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
         # In case of prefill, scorer_worker has to be run before proposer so
         # that the hidden states can be propagated to proposer when needed.
         if data["no_spec"]:
-            self.scorer_worker.execute_model()
+            sampler_output = self.scorer_worker.execute_model()
+            if isinstance(sampler_output, tuple) and len(sampler_output) == 2:
+                sampler_output, output_metadata = sampler_output
+                if output_metadata.get("is_kv_cache_download", False):
+                    return True
 
         if not data["disable_all_speculation"]:
             # Even if num_lookahead_slots is zero, we want to run the
@@ -816,11 +820,10 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
                                "workers generate no tokens")
 
         execute_model_req.previous_hidden_states = None
-        request_notif_counter = {}
-        request_done_counter = {}
+        output_metadata = {}
 
         with Timer() as scoring_timer:
-            proposal_scores, request_notif_counter, request_done_counter = self.scorer.score_proposals(
+            proposal_scores, output_metadata = self.scorer.score_proposals(
                 execute_model_req,
                 proposals,
             )
@@ -860,7 +863,7 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             prompt_logprobs=proposal_scores.prompt_logprobs
             if not self._disable_logprobs else None,
             k=execute_model_req.num_lookahead_slots,
-            stage_times=stage_times), request_notif_counter, request_done_counter
+            stage_times=stage_times), output_metadata
 
     @nvtx_range("spec_decode_worker._verify_tokens")
     def _verify_tokens(

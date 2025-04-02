@@ -63,15 +63,14 @@ class MQAScorer(SpeculativeScorer):
             )
             target_seq_group_metadata_list.append(new_seq_group_metadata)
 
-        request_notif_counter = {}
-        request_done_counter = {}
+        output_metadata = {}
 
         target_sampler_output = self._scorer_worker.execute_model(
             execute_model_req=execute_model_req.clone(
                 seq_group_metadata_list=target_seq_group_metadata_list))
 
-        if isinstance(target_sampler_output, tuple) and len(target_sampler_output) == 3:
-            target_sampler_output, request_notif_counter, request_done_counter = target_sampler_output
+        if isinstance(target_sampler_output, tuple) and len(target_sampler_output) == 2:
+            target_sampler_output, output_metadata = target_sampler_output
 
         target_sampler_output = target_sampler_output[0]
 
@@ -162,4 +161,4 @@ class MQAScorer(SpeculativeScorer):
                                  token_ids=all_tokens,
                                  logprobs=all_logprobs,
                                  hidden_states=hidden_states,
-                                 prompt_logprobs=prompt_logprobs), request_notif_counter, request_done_counter
+                                 prompt_logprobs=prompt_logprobs), output_metadata

@@ -241,7 +241,6 @@ class WorkerInput:
         Pop fields from the given tensor_dict and populate a new instance of
         WorkerInput.
         """
-        print(f"-----------------------{tensor_dict}")
 
         return cls(
             num_seq_groups=tensor_dict.pop("num_seq_groups"),
@@ -373,7 +372,6 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         if self.do_metadata_broadcast:
             broadcast_data = worker_input.as_broadcastable_tensor_dict()
-            print("--------------rank 0 broadcast_data", broadcast_data)
             broadcast_data.update(model_input.as_broadcastable_tensor_dict())
             broadcast_data.update(kwargs)
             broadcast_tensor_dict(broadcast_data, src=0)
@@ -428,10 +426,11 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             kwargs["spec_step_idx"] = execute_model_req.spec_step_idx
 
         self.execute_worker(worker_input)
+        output_metadata = {}
 
         # If there is no input, we don't need to execute the model.
         if worker_input.num_seq_groups > 0:
-
+            output_metadata['is_kv_cache_download'] = False
             intermediate_tensors = None
             orig_model_execute_time = 0.0
             if not get_pp_group().is_first_rank:
@@ -473,6 +472,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
             self._transfer_blocks(worker_input)
 
         else:
+            output_metadata['is_kv_cache_download'] = True
             output = []
 
         # collect kv transfer notifications from non driver workers
@@ -506,8 +506,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         else:
             request_notif_counter = {}
             request_done_counter = {}
+        output_metadata['request_notify_counter'] = request_notif_counter
+        output_metadata['request_done_counter'] = request_done_counter
         # output is List[SamplerOutput]
-        return output, request_notif_counter, request_done_counter
+        return output, output_metadata
     
     def _transfer_blocks(self, worker_input: WorkerInput) -> None:
         pass
