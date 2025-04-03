@@ -348,14 +348,18 @@ class DynamoNixlConnector:
         logger.debug("Time to get same length ranges: %s ms", (time.perf_counter() - start_time) * 1000)
 
         for i in range(tp_multiplier):
-            tp,index=(tp_multiplier, i) if not self.use_mla else(1, 0)
+            tp,index,rank_transfer=(tp_multiplier, i,1) if not self.use_mla else(1,0,0)
             src_descs = self._get_range_descs(staging_overlapping_ranges, "all", self.kv_caches_base_addr[self.engine_id], tp_multiplier=tp, i=index, staging_ranges=original_src_ranges)
-            dst_descs = self._get_range_descs(dst_overlapping_ranges, "all", self.kv_caches_base_addr[dst_engine_id][self.rank * tp_multiplier + i], tp_multiplier=tp, rank=self.rank * tp_multiplier + i)
+            dst_descs = self._get_range_descs(dst_overlapping_ranges, "all", self.kv_caches_base_addr[dst_engine_id][(self.rank * tp_multiplier + i)*rank_transfer], tp_multiplier=tp, rank=(self.rank * tp_multiplier + i)*rank_transfer)
+            # logger.info(f"src_descs:{src_descs.descCount()}+++++++++++ dst_descs: {dst_descs.descCount()}")
+
             logger.debug("Time to get descs: %s ms", (time.perf_counter() - start_time) * 1000)
             
-            logger.debug("Transfering to agent %s", self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i])
+            logger.debug("Transfering to agent %s", self._remote_agents[dst_engine_id][self.rank * tp_multiplier + index])
+            #         self._remote_agents[engine_id] = agent_names
+            logger.debug(f" self._remote_agents[dst_engine_id] { self._remote_agents[dst_engine_id]}")
             handle = self.nixl_wrapper.initialize_xfer("WRITE", src_descs, dst_descs,
-                                                        self._remote_agents[dst_engine_id][self.rank * tp_multiplier + i], 
+                                                        self._remote_agents[dst_engine_id][(self.rank * tp_multiplier + i)*rank_transfer], 
                                                         notify_msg)
             self._transfers[notify_msg].append(handle)
             logger.debug("Time to initialize xfer: %s ms", (time.perf_counter() - start_time) * 1000)
@@ -371,7 +375,10 @@ class DynamoNixlConnector:
         return self.nixl_wrapper.get_new_notifs()
 
     def add_remote_agent(self, engine_id, agent_metadata, agent_tp, kv_caches_base_addr, num_blocks):
+        logger.info(f" before self._tp_size {self._tp_size}")
         self._tp_size[engine_id] = agent_tp
+        logger.info(f"after self._tp_size {self._tp_size}")
+        logger.info(f"agent_tp {agent_tp}")
         agent_names = []
         for agent_meta in agent_metadata:
             agent_name = self.nixl_wrapper.add_remote_agent(agent_meta)
@@ -407,9 +414,11 @@ class DynamoNixlConnector:
                     for block_id in range(num_blocks):
                         block_offset = block_id * dst_block_len
                         blocks_data.append((base_addr + block_offset, dst_block_len, self.rank * tp_multiplier + i))
-            logger.debug("Created %s blocks for dst engine %s and rank %s", len(blocks_data), engine_id, self.rank * tp_multiplier + i)
+            logger.info("Created %s blocks for dst engine %s and rank %s", len(blocks_data), engine_id, self.rank * tp_multiplier + i)
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
             self.dst_xfer_side_handles[engine_id][i] = self.nixl_wrapper.prep_xfer_dlist(self._remote_agents[engine_id][self.rank * tp_multiplier + i], descs)
+            logger.info(f"self._remote_agents[engine_id] {self._remote_agents[engine_id]} self.rank * tp_multiplier + i {self.rank * tp_multiplier + i}")
+            logger.info(f"self._remote_agents[engine_id][self.rank * transfer_times + i] {self._remote_agents[engine_id][self.rank * tp_multiplier + i]}")
 
         return agent_names
 
