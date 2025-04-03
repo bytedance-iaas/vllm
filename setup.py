@@ -201,6 +201,9 @@ class cmake_build_ext(build_ext):
         else:
             # Default build tool to whatever cmake picks.
             build_tool = []
+
+        cmake_args += ['-DCMAKE_CUDA_FLAGS="-gencode=arch=compute_90a,code=sm_90a"']
+
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda():
             cmake_args += [f'-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc']
