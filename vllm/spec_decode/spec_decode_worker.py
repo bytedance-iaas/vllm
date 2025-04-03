@@ -727,9 +727,11 @@ class SpecDecodeWorker(LoRANotSupportedWorkerBase):
             # We prepare the prefill hidden states here so that there no
             # additional complexity in worker for spec_decode vs non_spec_decode
             # flow and execute_model doesn't need additional modifications.
+            previous_hidden_states = hidden_states \
+                if sampler_output.prefill_hidden_states is None \
+                    else sampler_output.prefill_hidden_states
             execute_model_req.previous_hidden_states = \
-                prepare_prefill_hidden_states(
-                    sampler_output.prefill_hidden_states)
+                prepare_prefill_hidden_states(previous_hidden_states)
             for i in range(self._num_spec_prefill_steps):
                 execute_model_req.spec_step_idx = i
                 self.proposer_worker.execute_model(execute_model_req)
