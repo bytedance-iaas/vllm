@@ -97,6 +97,11 @@ if TYPE_CHECKING:
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_V0_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_DISABLE_TOPK_TOPP_OPTIMIZATION: bool = False
+    VLLM_KV_CAPI_PATH: Optional[str] = None
+    VLLM_KV_NAMESPACE: Optional[str] = None
+    VLLM_KV_COMPONENT: Optional[str] = None
+    VLLM_WORKER_ID: Optional[int] = None
+ 
 
 
 def get_default_cache_root():
@@ -627,6 +632,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DISABLE_TOPK_TOPP_OPTIMIZATION":
     lambda: bool(int(os.environ["VLLM_TPU_DISABLE_TOPK_TOPP_OPTIMIZATION"]))
     if "VLLM_TPU_DISABLE_TOPK_TOPP_OPTIMIZATION" in os.environ else None,
+
+    # Path to the C API Library
+    "VLLM_KV_CAPI_PATH":
+    lambda: os.environ.get("VLLM_KV_CAPI_PATH", None),
+
+    # Identifiers to publish KV related information
+    "VLLM_KV_NAMESPACE":
+    lambda: os.environ.get("VLLM_KV_NAMESPACE", None),
+    "VLLM_KV_COMPONENT":
+    lambda: os.environ.get("VLLM_KV_COMPONENT", None),
+
+    # Worker ID used for identifying workers in distributed settings
+    "VLLM_WORKER_ID":
+    lambda: int(os.getenv("VLLM_WORKER_ID", "0"))
+    if "VLLM_WORKER_ID" in os.environ else None,
 }
 
 # end-env-vars-definition
