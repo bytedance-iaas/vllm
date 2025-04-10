@@ -486,6 +486,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor! output_scale, Tensor input_scale) -> ()");
   ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
 
+  // fp8 * int4 GEMM from Cutlass
+  ops.def(
+      "int4_fp8_gemm(Tensor A, Tensor B,"
+      "              Tensor scales, int group_size) -> Tensor");
+  ops.impl("int4_fp8_gemm", torch::kCUDA, &int4_fp8_gemm);
+
   // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
   // of the given capability
   ops.def("cutlass_scaled_mm_supports_fp4(int cuda_device_capability) -> bool");
