@@ -1007,6 +1007,57 @@ def int4_fp8_gemm(
 
     return torch.ops._C.int4_fp8_gemm(A, B, scales, group_size)
 
+# int4_fp8 grouped gemm
+def int4_fp8_grouped_gemm(
+    group_size: int,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    scales: torch.Tensor,
+    C: torch.Tensor,
+    chunk_size :int,
+    alpha: float,
+    beta: float) -> torch.Tensor:
+    """
+    Perform grouped matrix multiplication between int4 weights and fp8 activations.
+    
+    This function executes multiple GEMM operations in parallel, which is useful for
+    scenarios like Mixture of Experts (MoE) where different inputs go through different
+    experts. The implementation leverages NVIDIA Hopper architecture features for
+    optimal performance with quantized weights.
+    
+    Args:
+        num_groups: Number of GEMM operations to perform in parallel
+        a_tensors: List of activation matrices in FP8 (float_e4m3_t) format
+            Each tensor should be of shape [M, K] in row-major layout
+        b_tensors: List of weight matrices in packed int4 format
+            Each tensor should be of shape [N, K/2] in row-major layout
+            where each byte contains two 4-bit integers
+        scale_tensors: List of scale factors for the quantized weights
+            Each tensor should be of shape [N, K/chunk_size]
+        c_tensors: List of output accumulator matrices
+            Each tensor should be of shape [M, N] and typically initialized to zeros
+        chunk_size: Number of elements each scale value applies to (K/num_chunks)
+        alpha: Scalar multiplier for the product of matrices A and B (default: 1.0)
+        beta: Scalar multiplier for matrix C (default: 0.0)
+            
+    Returns:
+        list[torch.Tensor]: List of output matrices of shape [M, N]
+        
+    Requirements:
+        - All tensors must be on a CUDA device
+        - Requires an NVIDIA Hopper GPU (H100)
+        - A tensors must be in float8_e4m3fn format
+        - B tensors must contain packed int4 values (stored as int8)
+        - All lists must have the same length, equal to num_groups
+        
+    Note:
+        The function computes: D = alpha * (A × (B * scales)) + beta * C
+        for each group of tensors in parallel
+    """
+    
+    return torch.ops._C.int4_fp8_grouped_gemm(
+        group_size, A, B, scales, C, chunk_size, alpha, beta)
+
 # fp8
 def scaled_fp8_quant(
     input: torch.Tensor,
