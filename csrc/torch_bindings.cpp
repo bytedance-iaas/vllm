@@ -477,11 +477,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // fp8 * int4 Grouped GEMM from Cutlass
   ops.def(
-      "int4_fp8_grouped_gemm(int group_size, 
-                             Tensor A, Tensor B,
-                             Tensor scales, Tensor C,
-                             int chunk_size,
-                             float alpha, beta) -> Tensor");
+      "int4_fp8_grouped_gemm(Tensor a, Tensor b, Tensor scales, Tensor c,"
+      "                      Tensor a_strides, Tensor b_strides,"
+      "                      Tensor c_strides, Tensor problem_sizes,"
+      "                      int chunk_size, float alpha,"
+      "                      float beta) -> Tensor",
+      {stride_tag});
   ops.impl("int4_fp8_grouped_gemm", torch::kCUDA, &int4_fp8_grouped_gemm);
 
   // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
