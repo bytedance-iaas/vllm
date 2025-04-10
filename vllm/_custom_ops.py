@@ -1014,14 +1014,18 @@ def int4_fp8_gemm(
 
 # int4_fp8 grouped gemm
 def int4_fp8_grouped_gemm(
-    group_size: int,
-    A: torch.Tensor,
-    B: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
     scales: torch.Tensor,
-    C: torch.Tensor,
-    chunk_size :int,
-    alpha: float,
-    beta: float) -> torch.Tensor:
+    c: torch.Tensor,
+    a_strides: Optional[torch.tensor] = None,
+    b_strides: Optional[torch.tensor] = None,
+    c_strides: Optional[torch.tensor] = None,
+    problem_sizes: Optional[torch.tensor] = None,
+    chunk_size: int = 0,
+    alpha: float = 1.0,
+    beta: float = 0.0
+) -> list[torch.Tensor]:
     """
     Perform grouped matrix multiplication between int4 weights and fp8 activations.
     
@@ -1031,7 +1035,6 @@ def int4_fp8_grouped_gemm(
     optimal performance with quantized weights.
     
     Args:
-        num_groups: Number of GEMM operations to perform in parallel
         a_tensors: List of activation matrices in FP8 (float_e4m3_t) format
             Each tensor should be of shape [M, K] in row-major layout
         b_tensors: List of weight matrices in packed int4 format
@@ -1041,27 +1044,32 @@ def int4_fp8_grouped_gemm(
             Each tensor should be of shape [N, K/chunk_size]
         c_tensors: List of output accumulator matrices
             Each tensor should be of shape [M, N] and typically initialized to zeros
+        a_strides: Optional custom strides for A matrices (None for default)
+        b_strides: Optional custom strides for B matrices (None for default)
+        c_strides: Optional custom strides for C matrices (None for default)
+        problem_sizes: Optional custom problem sizes (None for auto-detection)
         chunk_size: Number of elements each scale value applies to (K/num_chunks)
+            If 0, will be auto-detected from the first tensors
         alpha: Scalar multiplier for the product of matrices A and B (default: 1.0)
         beta: Scalar multiplier for matrix C (default: 0.0)
             
     Returns:
-        list[torch.Tensor]: List of output matrices of shape [M, N]
+        torch.Tensor: List of output matrices of shape [M, N]
         
     Requirements:
         - All tensors must be on a CUDA device
         - Requires an NVIDIA Hopper GPU (H100)
         - A tensors must be in float8_e4m3fn format
         - B tensors must contain packed int4 values (stored as int8)
-        - All lists must have the same length, equal to num_groups
+        - All lists must have the same length
         
     Note:
-        The function computes: D = alpha * (A × (B * scales)) + beta * C
+        The function computes: D = alpha * (A * (B * scales)) + beta * C
         for each group of tensors in parallel
     """
-    
+
     return torch.ops._C.int4_fp8_grouped_gemm(
-        group_size, A, B, scales, C, chunk_size, alpha, beta)
+        a, b, scales, c, a_strides, b_strides, c_strides, problem_sizes, chunk_size, alpha, beta)
 
 # fp8
 def scaled_fp8_quant(
