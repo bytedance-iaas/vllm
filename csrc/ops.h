@@ -236,6 +236,15 @@ torch::Tensor int4_fp8_gemm(torch::Tensor const& A,      // fp8
                             torch::Tensor const& B,      // int4 packed
                             torch::Tensor const& scales, // fp8 packed scales
                             int64_t group_size);
+
+torch::Tensor int4_fp8_grouped_gemm(int64_t group_size,
+                                    torch::Tensor const& A, // fp8,
+                                    torch::Tensor const& B, // int4 packed
+                                    torch::Tensor const& scales,
+                                    torch::Tensor const& C,
+                                    int64_t chunk_size,
+                                    double alpha,
+                                    double beta);
 #endif
 
 void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
