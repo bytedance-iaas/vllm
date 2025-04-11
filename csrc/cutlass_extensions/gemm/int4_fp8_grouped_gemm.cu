@@ -353,28 +353,28 @@ std::vector<torch::Tensor> preprocessScaleTensors(const std::vector<torch::Tenso
  * @param scale_tensor Tensor containing all scale factors with shape [total_n, K/chunk_size]
  * @param c_tensor Tensor containing all C matrices (input) with shape [total_m, total_n]
  * @param expert_offsets Tensor containing expert offsets for determining group boundaries
- * @param a_strides Optional custom strides for A matrices (nullptr for default)
- * @param b_strides Optional custom strides for B matrices (nullptr for default)
- * @param c_strides Optional custom strides for C matrices (nullptr for default)
- * @param problem_sizes Optional problem sizes (nullptr for auto-detection)
- * @param chunk_size Size of each chunk for scales (K / number of scale chunks); if 0, will be auto-detected
+ * @param problem_sizes Tensor containing problem sizes with shape [num_groups, 3] (M, N, K for each group)
+ * @param a_strides Tensor containing strides for A matrices with shape [num_groups, 3]
+ * @param b_strides Tensor containing strides for B matrices with shape [num_groups, 3]
+ * @param c_strides Tensor containing strides for C matrices with shape [num_groups, 3]
+ * @param chunk_size Size of each chunk for scales (K / number of scale chunks)
  * @param alpha Optional scalar multiplier for the product of A and B matrices
  * @param beta Optional scalar multiplier for matrix C
  * @return torch::Tensor Output tensor D with shape [total_m, total_n]
  */
-torch::Tensor int4Fp8GroupedGemm(
-    const torch::Tensor& a_tensor,
-    const torch::Tensor& b_tensor,
-    const torch::Tensor& scale_tensor,
-    const torch::Tensor& c_tensor,
-    const torch::Tensor& expert_offsets,
-    const StrideA* a_strides = nullptr,
-    const StrideB* b_strides = nullptr,
-    const StrideC* c_strides = nullptr,
-    typename ProblemShape::UnderlyingProblemShape* problem_sizes = nullptr,
-    int chunk_size = 0,
-    float alpha = 1.0f,
-    float beta = 0.0f)
+torch::Tensor int4_fp8_grouped_gemm(
+    torch::Tensor const& a_tensor,
+    torch::Tensor const& b_tensor,
+    torch::Tensor const& scale_tensor,
+    torch::Tensor const& c_tensor,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides,
+    torch::Tensor const& c_strides,
+    int64_t chunk_size,
+    double alpha,
+    double beta)
 {
     // Check inputs
     TORCH_CHECK(a_tensor.dim() == 2, "A tensor must be 2D");
@@ -382,9 +382,23 @@ torch::Tensor int4Fp8GroupedGemm(
     TORCH_CHECK(scale_tensor.dim() == 2, "Scale tensor must be 2D");
     TORCH_CHECK(c_tensor.dim() == 2, "C tensor must be 2D");
     TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
+    TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
+    TORCH_CHECK(a_strides.dim() == 2, "a_strides must be 2D tensor");
+    TORCH_CHECK(b_strides.dim() == 2, "b_strides must be 2D tensor");
+    TORCH_CHECK(c_strides.dim() == 2, "c_strides must be 2D tensor");
 
     // Get number of groups from expert_offsets
     int num_groups = static_cast<int>(expert_offsets.size(0));
+
+    // Check tensor shapes
+    TORCH_CHECK(problem_sizes.size(0) == num_groups, "problem_sizes must have num_groups rows");
+    TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (M, N, K)");
+    TORCH_CHECK(a_strides.size(0) == num_groups, "a_strides must have num_groups rows");
+    TORCH_CHECK(a_strides.size(1) == 3, "a_strides must have 3 columns");
+    TORCH_CHECK(b_strides.size(0) == num_groups, "b_strides must have num_groups rows");
+    TORCH_CHECK(b_strides.size(1) == 3, "b_strides must have 3 columns");
+    TORCH_CHECK(c_strides.size(0) == num_groups, "c_strides must have num_groups rows");
+    TORCH_CHECK(c_strides.size(1) == 3, "c_strides must have 3 columns");
 
     // Check tensor types
     TORCH_CHECK(a_tensor.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
@@ -420,90 +434,103 @@ torch::Tensor int4Fp8GroupedGemm(
     // Preprocess scale tensors
     std::vector<torch::Tensor> packed_scale_tensors = preprocessScaleTensors(scale_tensors);
 
-    // Track if we allocate problem_sizes ourselves
-    bool allocated_problem_sizes = false;
-    typename ProblemShape::UnderlyingProblemShape* device_problem_sizes = problem_sizes;
+    // Convert problem sizes to device memory
+    typename ProblemShape::UnderlyingProblemShape* device_problem_sizes;
+    cudaMalloc(&device_problem_sizes, num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape));
 
-    // Collect problem dimensions if not provided
-    if (!problem_sizes) {
-        std::vector<int> m_values(num_groups), n_values(num_groups), k_values(num_groups);
-        std::vector<typename ProblemShape::UnderlyingProblemShape> host_problem_sizes;
+    std::vector<typename ProblemShape::UnderlyingProblemShape> host_problem_sizes(num_groups);
+    auto problem_sizes_cpu = problem_sizes.cpu();
+    auto problem_sizes_ptr = problem_sizes_cpu.data_ptr<int>();
 
-        for (int i = 0; i < num_groups; ++i) {
-            const auto& a = a_tensors[i];
-            const auto& b = b_tensors[i];
-
-            int64_t M = a.size(0);
-            int64_t K = a.size(1);
-            int64_t N = b.size(0);
-
-            // Verify that K is consistent with packed int4 format in B
-            TORCH_CHECK(b.size(1) * 2 == K,
-                "B tensor has inconsistent dimensions for int4 format. "
-                "B.size(1) should be A.size(1)/2 because each byte stores two int4 values.");
-
-            m_values[i] = static_cast<int>(M);
-            n_values[i] = static_cast<int>(N);
-            k_values[i] = static_cast<int>(K);
-        }
-
-        // Create problem sizes
-        host_problem_sizes = createProblemSizes(m_values, n_values, k_values);
-
-        // Allocate device memory for problem sizes and copy
-        cudaMalloc(&device_problem_sizes, num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape));
-        cudaMemcpy(
-            device_problem_sizes,
-            host_problem_sizes.data(),
-            num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape),
-            cudaMemcpyHostToDevice
+    for (int i = 0; i < num_groups; ++i) {
+        host_problem_sizes[i] = make_tuple(
+            problem_sizes_ptr[i * 3 + 0],  // M
+            problem_sizes_ptr[i * 3 + 1],  // N
+            problem_sizes_ptr[i * 3 + 2]   // K
         );
-        allocated_problem_sizes = true;
-    } else {
-        // We're using provided problem_sizes
-        device_problem_sizes = problem_sizes;
     }
 
-    // Create strides for tensors if not provided
-    std::vector<StrideA> local_stride_a;
-    std::vector<StrideB> local_stride_b;
-    std::vector<StrideC> local_stride_c;
-    std::vector<StrideD> local_stride_d;
-    std::vector<StrideS> local_stride_s;
+    cudaMemcpy(
+        device_problem_sizes,
+        host_problem_sizes.data(),
+        num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape),
+        cudaMemcpyHostToDevice
+    );
 
-    StrideA* stride_a_ptr = (StrideA*) a_strides;
-    StrideB* stride_b_ptr = (StrideB*) b_strides;
-    StrideC* stride_c_ptr = (StrideC*) c_strides;
+    // Convert strides to device memory
+    StrideA* stride_a_ptr;
+    StrideB* stride_b_ptr;
+    StrideC* stride_c_ptr;
 
-    if (!a_strides) {
-        local_stride_a = createStrides<StrideA>(a_tensors);
-        stride_a_ptr = local_stride_a.data();
+    cudaMalloc(&stride_a_ptr, num_groups * sizeof(StrideA));
+    cudaMalloc(&stride_b_ptr, num_groups * sizeof(StrideB));
+    cudaMalloc(&stride_c_ptr, num_groups * sizeof(StrideC));
+
+    // Convert A strides
+    std::vector<StrideA> host_strides_a(num_groups);
+    auto a_strides_cpu = a_strides.cpu();
+    auto a_strides_ptr = a_strides_cpu.data_ptr<int>();
+
+    for (int i = 0; i < num_groups; ++i) {
+        host_strides_a[i] = cutlass::make_cute_packed_stride(StrideA{}, {
+            a_strides_ptr[i * 3 + 0],
+            a_strides_ptr[i * 3 + 1],
+            a_strides_ptr[i * 3 + 2]
+        });
     }
 
-    if (!b_strides) {
-        local_stride_b = createStrides<StrideB>(processed_b_tensors);
-        stride_b_ptr = local_stride_b.data();
+    cudaMemcpy(
+        stride_a_ptr,
+        host_strides_a.data(),
+        num_groups * sizeof(StrideA),
+        cudaMemcpyHostToDevice
+    );
+
+    // Convert B strides
+    std::vector<StrideB> host_strides_b(num_groups);
+    auto b_strides_cpu = b_strides.cpu();
+    auto b_strides_ptr = b_strides_cpu.data_ptr<int>();
+
+    for (int i = 0; i < num_groups; ++i) {
+        host_strides_b[i] = cutlass::make_cute_packed_stride(StrideB{}, {
+            b_strides_ptr[i * 3 + 0],
+            b_strides_ptr[i * 3 + 1],
+            b_strides_ptr[i * 3 + 2]
+        });
     }
 
-    if (!c_strides) {
-        local_stride_c = createStrides<StrideC>(c_tensors);
-        stride_c_ptr = local_stride_c.data();
+    cudaMemcpy(
+        stride_b_ptr,
+        host_strides_b.data(),
+        num_groups * sizeof(StrideB),
+        cudaMemcpyHostToDevice
+    );
+
+    // Convert C strides
+    std::vector<StrideC> host_strides_c(num_groups);
+    auto c_strides_cpu = c_strides.cpu();
+    auto c_strides_ptr = c_strides_cpu.data_ptr<int>();
+
+    for (int i = 0; i < num_groups; ++i) {
+        host_strides_c[i] = cutlass::make_cute_packed_stride(StrideC{}, {
+            c_strides_ptr[i * 3 + 0],
+            c_strides_ptr[i * 3 + 1],
+            c_strides_ptr[i * 3 + 2]
+        });
     }
 
-    // Always create D strides
-    local_stride_d = createStrides<StrideD>(d_tensors);
+    cudaMemcpy(
+        stride_c_ptr,
+        host_strides_c.data(),
+        num_groups * sizeof(StrideC),
+        cudaMemcpyHostToDevice
+    );
+
+    // Create D strides
+    std::vector<StrideD> local_stride_d = createStrides<StrideD>(d_tensors);
 
     // Create scale strides
-    local_stride_s = createStrides<StrideS>(packed_scale_tensors);
-
-    // Determine chunk_size if not provided
-    if (chunk_size <= 0) {
-        // Default to K / number of scales in the scale tensor
-        int64_t K = a_tensor.size(1);
-        int64_t scale_cols = scale_tensor.size(1);
-        chunk_size = static_cast<int>(K / scale_cols);
-        TORCH_CHECK(chunk_size > 0, "Cannot determine chunk size. Please provide it explicitly.");
-    }
+    std::vector<StrideS> local_stride_s = createStrides<StrideS>(packed_scale_tensors);
 
     // Get device pointers
     auto a_ptrs = getDevicePtrs<MmaType>(a_tensors);
@@ -546,11 +573,10 @@ torch::Tensor int4Fp8GroupedGemm(
     // Free allocated resources
     if (alpha_ptr) cudaFree(alpha_ptr);
     if (beta_ptr) cudaFree(beta_ptr);
-
-    // Free problem sizes if we allocated them
-    if (allocated_problem_sizes && device_problem_sizes) {
-        cudaFree(device_problem_sizes);
-    }
+    cudaFree(device_problem_sizes);
+    cudaFree(stride_a_ptr);
+    cudaFree(stride_b_ptr);
+    cudaFree(stride_c_ptr);
 
     if (status != cudaSuccess) {
         TORCH_CHECK(false, "int4_fp8_grouped_gemm failed with error: ", cudaGetErrorString(status));

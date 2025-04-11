@@ -1013,10 +1013,11 @@ def int4_fp8_grouped_gemm(
     b: torch.Tensor,
     scales: torch.Tensor,
     c: torch.Tensor,
-    a_strides: Optional[torch.tensor] = None,
-    b_strides: Optional[torch.tensor] = None,
-    c_strides: Optional[torch.tensor] = None,
-    problem_sizes: Optional[torch.tensor] = None,
+    experts_offsets: torch.tensor,
+    problem_sizes: torch.tensor,
+    a_strides: torch.tensor,
+    b_strides: torch.tensor,
+    c_strides: torch.tensor,
     chunk_size: int = 0,
     alpha: float = 1.0,
     beta: float = 0.0
@@ -1033,16 +1034,17 @@ def int4_fp8_grouped_gemm(
         a_tensors: List of activation matrices in FP8 (float_e4m3_t) format
             Each tensor should be of shape [M, K] in row-major layout
         b_tensors: List of weight matrices in packed int4 format
-            Each tensor should be of shape [N, K/2] in row-major layout
+            Each tensor should be of shape [N, K/2] in column-major layout
             where each byte contains two 4-bit integers
         scale_tensors: List of scale factors for the quantized weights
             Each tensor should be of shape [N, K/chunk_size]
         c_tensors: List of output accumulator matrices
             Each tensor should be of shape [M, N] and typically initialized to zeros
+        experts_offsets: Tensor containing expert offsets for determining group boundaries
+        problem_sizes: Optional custom problem sizes (None for auto-detection)
         a_strides: Optional custom strides for A matrices (None for default)
         b_strides: Optional custom strides for B matrices (None for default)
         c_strides: Optional custom strides for C matrices (None for default)
-        problem_sizes: Optional custom problem sizes (None for auto-detection)
         chunk_size: Number of elements each scale value applies to (K/num_chunks)
             If 0, will be auto-detected from the first tensors
         alpha: Scalar multiplier for the product of matrices A and B (default: 1.0)
@@ -1064,7 +1066,9 @@ def int4_fp8_grouped_gemm(
     """
 
     return torch.ops._C.int4_fp8_grouped_gemm(
-        a, b, scales, c, a_strides, b_strides, c_strides, problem_sizes, chunk_size, alpha, beta)
+        a, b, scales, c, experts_offsets, problem_sizes,
+        a_strides, b_strides, c_strides,
+        chunk_size, alpha, beta)
 
 # fp8
 def scaled_fp8_quant(
