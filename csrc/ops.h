@@ -214,10 +214,10 @@ void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
                       torch::Tensor& output_scale,
                       torch::Tensor const& input_scale);
 
-torch::Tensor int4_fp8_gemm(torch::Tensor const& A,      // fp8
-                            torch::Tensor const& B,      // int4 packed
-                            torch::Tensor const& scales, // fp8 packed scales
-                            int64_t group_size);
+// torch::Tensor int4_fp8_gemm(torch::Tensor const& A,      // fp8
+//                             torch::Tensor const& B,      // int4 packed
+//                             torch::Tensor const& scales, // fp8 packed scales
+//                             int64_t group_size);
 
 torch::Tensor int4_fp8_grouped_gemm(torch::Tensor const& a, // fp8,
                                     torch::Tensor const& b, // int4 packed
