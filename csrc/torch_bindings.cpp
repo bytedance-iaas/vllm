@@ -495,8 +495,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // fp8 * int4 Grouped GEMM from Cutlass
   ops.def(
       "int4_fp8_grouped_gemm(Tensor a, Tensor b, Tensor scales, Tensor c,"
+      "                      Tensor experts_offsets, Tensor problem_sizes,"
       "                      Tensor a_strides, Tensor b_strides,"
-      "                      Tensor c_strides, Tensor problem_sizes,"
+      "                      Tensor c_strides,"
       "                      int chunk_size, float alpha,"
       "                      float beta) -> Tensor",
       {stride_tag});
