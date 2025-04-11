@@ -6,6 +6,7 @@ import torch
 
 from vllm import _custom_ops as ops
 
+
 def cutlass_w4a8_moe(
     a: torch.Tensor,
     w1_q: torch.Tensor,
@@ -38,7 +39,7 @@ def cutlass_w4a8_moe(
         Shape: [num_experts, N, K // 2]
         (the weights are passed transposed and int4-packed)
     - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-        Shape: [num_experts] or 
+        Shape: [num_experts] or
             [num_experts, 2N // 2, K // chunk_size (default: 128)]
     - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
         Shape: [num_experts] or
@@ -61,11 +62,14 @@ def cutlass_w4a8_moe(
     - torch.Tensor: The fp8 output tensor after applying the MoE layer.
     """
 
+    print(
+        f"a.shape: {a.shape}, w1_q.shape: {w1_q.shape}, w2_q.shape: {w2_q.shape}, w1_scale.shape: {w1_scale.shape}, w2_scale.shape: {w2_scale.shape}, topk_weights.shape: {topk_weights.shape}, topk_ids.shape: {topk_ids.shape}, ab_strides1.shape: {ab_strides1.shape}, c_strides1.shape: {c_strides1.shape}, ab_strides2.shape: {ab_strides2.shape}, c_strides2.shape: {c_strides2.shape}"
+    )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
     assert w2_q.dtype == torch.int8
     assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
-    assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
+    assert w1_q.shape[1] == w2_q.shape[2] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
     assert a1_scale is None or a1_scale.dim(
     ) == 0 or a1_scale.shape[0] == 1 or a1_scale.shape[0] == a.shape[

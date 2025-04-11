@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -14,15 +14,19 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
                                                   FusedMoeWeightScaleSupported)
+from vllm.model_executor.layers.fused_moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+
+
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     apply_fp8_marlin_linear, prepare_fp8_layer_for_marlin)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped)
+
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp, all_close_1d, convert_to_channelwise,
     cutlass_block_fp8_supported, cutlass_fp8_supported,
@@ -161,7 +165,7 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Union["Fp8Config", "Fp8MoEInt4Config"]):
         self.quant_config = quant_config
         self.cutlass_block_fp8_supported = cutlass_block_fp8_supported()
         self.out_dtype = torch.get_default_dtype()
@@ -419,6 +423,77 @@ class Fp8LinearMethod(LinearMethodBase):
                                      out_dtype=self.out_dtype,
                                      input_scale=layer.input_scale,
                                      bias=bias)
+
+class Fp8MoEInt4Config(QuantizationConfig):
+    """Config class for ModelOpt W4A8."""
+
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        is_moe_w4a8_serialized: bool = False,
+        activation_scheme: str = "static",
+        ignored_layers: Optional[List[str]] = None,
+        weight_block_size: Optional[List[int]] = None,
+        group_size: int = 128,
+    ) -> None:
+        super().__init__()
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.is_moe_w4a8_serialized = is_moe_w4a8_serialized
+        if is_moe_w4a8_serialized:
+            logger.warning(
+                "Detected fp8 moe int4 checkpoint. Please note that"
+                " the format is experimental and could change."
+            )
+        self.activation_scheme = activation_scheme
+        self.ignored_layers = ignored_layers or []
+        self.weight_block_size = weight_block_size
+        self.group_size = group_size
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "fp8_moe_int4"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 90
+
+    @classmethod
+    def get_config_filenames(cls) -> List[str]:
+        # return ["hf_quant_config.json"]
+        return []
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "Fp8MoEInt4Config":
+        quant_method = cls.get_from_keys(config, ["quant_method"])
+        is_checkpoint_fp8_serialized = "fp8" in quant_method
+        is_moe_w4a8_serialized = "moe_int4" in quant_method
+        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        return cls(
+            is_checkpoint_fp8_serialized,
+            is_moe_w4a8_serialized,
+            activation_scheme,
+            ignored_layers,
+            weight_block_size,
+        )
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional["QuantizeMethodBase"]:
+        from vllm.attention.layer import Attention  # Avoid circular import
+
+        if isinstance(layer, LinearBase):
+            return Fp8LinearMethod(self)
+        elif isinstance(layer, Attention):
+            return Fp8KVCacheMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return Fp8MoEInt4MoEMethod(self)
+        return None
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -819,10 +894,164 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
 
+class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
+    def __init__(self, quant_config: Fp8MoEInt4Config):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        assert "weight_loader" in extra_weight_attrs
+
+        # Fused gate_up_proj (column parallel)
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                hidden_size,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        # down_proj (row parallel)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // 2,
+                intermediate_size_per_partition,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.quant_config.group_size,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.quant_config.group_size,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        w13_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("w3_w1_scale", w13_input_scale)
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
+        set_weight_attrs(w13_input_scale, extra_weight_attrs)
+
+        w2_input_scale = torch.nn.Parameter(
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+        )
+        layer.register_parameter("w2_scale", w2_input_scale)
+        set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+        return
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+        # return ops.group_gemm_xx()
+        num_experts = layer.w2_weight.shape[0]
+        ab_strides1 = torch.full(
+            (num_experts,), x.stride(0), device="cuda", dtype=torch.int64
+        )
+        c_strides1 = torch.full(
+            (num_experts,),
+            layer.w2_weight.stride(0),
+            device="cuda",
+            dtype=torch.int64,
+        )
+        ab_strides2 = torch.full(
+            (num_experts,),
+            layer.w2_weight.stride(0),
+            device="cuda",
+            dtype=torch.int64,
+        )
+        c_strides2 = torch.full(
+            (num_experts,), x.stride(0), device="cuda", dtype=torch.int64
+        )
+        return cutlass_w4a8_moe(
+            x,
+            layer.w13_weight.permute(0, 2, 1),
+            layer.w2_weight.permute(0, 2, 1),
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            ab_strides1,
+            c_strides1,
+            ab_strides2,
+            c_strides2,
+            # layer.w3_w1_scale,
+            # layer.w2_scale,
+            # True,
+        )
+        # return x
+
+
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """
     Supports loading kv-cache scaling factors from FP8 checkpoints.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Union[Fp8Config, Fp8MoEInt4Config]):
         super().__init__(quant_config)

@@ -11,6 +11,7 @@ QUANTIZATION_METHODS: List[str] = [
     "deepspeedfp",
     "tpu_int8",
     "fp8",
+    "fp8_moe_int4",
     "ptpc_fp8",
     "fbgemm_fp8",
     "modelopt",
@@ -91,7 +92,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     from .deepspeedfp import DeepSpeedFPConfig
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
-    from .fp8 import Fp8Config
+    from .fp8 import (Fp8Config, Fp8MoEInt4Config)
     from .gguf import GGUFConfig
     from .gptq import GPTQConfig
     from .gptq_marlin import GPTQMarlinConfig
@@ -113,6 +114,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         "deepspeedfp": DeepSpeedFPConfig,
         "tpu_int8": Int8TpuConfig,
         "fp8": Fp8Config,
+        "fp8_moe_int4": Fp8MoEInt4Config,
         "fbgemm_fp8": FBGEMMFp8Config,
         "modelopt": ModelOptFp8Config,
         "nvfp4": ModelOptNvFp4Config,
