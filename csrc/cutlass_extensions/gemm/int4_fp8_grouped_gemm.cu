@@ -378,27 +378,27 @@ torch::Tensor int4_fp8_grouped_gemm(
 {
     // Check inputs
     TORCH_CHECK(a_tensor.dim() == 2, "A tensor must be 2D");
-    TORCH_CHECK(b_tensor.dim() == 2, "B tensor must be 2D");
-    TORCH_CHECK(scale_tensor.dim() == 2, "Scale tensor must be 2D");
-    TORCH_CHECK(c_tensor.dim() == 2, "C tensor must be 2D");
+    TORCH_CHECK(b_tensor.dim() == 3, "B tensor must be 3D");
+    TORCH_CHECK(scale_tensor.dim() == 3, "Scale tensor must be 3D");
+    // TORCH_CHECK(c_tensor.dim() == 2, "C tensor must be 2D");
     TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
     TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
-    TORCH_CHECK(a_strides.dim() == 2, "a_strides must be 2D tensor");
-    TORCH_CHECK(b_strides.dim() == 2, "b_strides must be 2D tensor");
-    TORCH_CHECK(c_strides.dim() == 2, "c_strides must be 2D tensor");
+    // TORCH_CHECK(a_strides.dim() == 2, "a_strides must be 2D tensor");
+    // TORCH_CHECK(b_strides.dim() == 2, "b_strides must be 2D tensor");
+    // TORCH_CHECK(c_strides.dim() == 2, "c_strides must be 2D tensor");
 
     // Get number of groups from expert_offsets
     int num_groups = static_cast<int>(expert_offsets.size(0));
 
     // Check tensor shapes
-    TORCH_CHECK(problem_sizes.size(0) == num_groups, "problem_sizes must have num_groups rows");
-    TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (M, N, K)");
-    TORCH_CHECK(a_strides.size(0) == num_groups, "a_strides must have num_groups rows");
-    TORCH_CHECK(a_strides.size(1) == 3, "a_strides must have 3 columns");
-    TORCH_CHECK(b_strides.size(0) == num_groups, "b_strides must have num_groups rows");
-    TORCH_CHECK(b_strides.size(1) == 3, "b_strides must have 3 columns");
-    TORCH_CHECK(c_strides.size(0) == num_groups, "c_strides must have num_groups rows");
-    TORCH_CHECK(c_strides.size(1) == 3, "c_strides must have 3 columns");
+    // TORCH_CHECK(problem_sizes.size(0) == num_groups, "problem_sizes must have num_groups rows");
+    // TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (M, N, K)");
+    // TORCH_CHECK(a_strides.size(0) == num_groups, "a_strides must have num_groups rows");
+    // TORCH_CHECK(a_strides.size(1) == 3, "a_strides must have 3 columns");
+    // TORCH_CHECK(b_strides.size(0) == num_groups, "b_strides must have num_groups rows");
+    // TORCH_CHECK(b_strides.size(1) == 3, "b_strides must have 3 columns");
+    // TORCH_CHECK(c_strides.size(0) == num_groups, "c_strides must have num_groups rows");
+    // TORCH_CHECK(c_strides.size(1) == 3, "c_strides must have 3 columns");
 
     // Check tensor types
     TORCH_CHECK(a_tensor.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");

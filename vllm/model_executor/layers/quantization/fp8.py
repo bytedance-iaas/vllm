@@ -994,6 +994,7 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -1029,6 +1030,10 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         c_strides2 = torch.full(
             (num_experts,), x.stride(0), device="cuda", dtype=torch.int64
         )
+        print(
+            f"w3_w1_scale shape, dtype: {layer.w3_w1_scale.shape, layer.w3_w1_scale.dtype}"
+        )
+        print(f"w2_scale shape, dtype: {layer.w2_scale.shape, layer.w2_scale.dtype}")
         return cutlass_w4a8_moe(
             x,
             layer.w13_weight.permute(0, 2, 1),
@@ -1043,10 +1048,11 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             c_strides2,
             # layer.w3_w1_scale,
             # layer.w2_scale,
-            # True,
+            None,
+            None,
+            apply_router_weight_on_input,
         )
         # return x
-
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """

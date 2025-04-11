@@ -63,7 +63,7 @@ def cutlass_w4a8_moe(
     """
 
     print(
-        f"a.shape: {a.shape}, w1_q.shape: {w1_q.shape}, w2_q.shape: {w2_q.shape}, w1_scale.shape: {w1_scale.shape}, w2_scale.shape: {w2_scale.shape}, topk_weights.shape: {topk_weights.shape}, topk_ids.shape: {topk_ids.shape}, ab_strides1.shape: {ab_strides1.shape}, c_strides1.shape: {c_strides1.shape}, ab_strides2.shape: {ab_strides2.shape}, c_strides2.shape: {c_strides2.shape}"
+        f"a.shape, dtype: {a.shape, a.dtype}, w1_q.shape, dtype: {w1_q.shape, w1_q.dtype}, w2_q.shape, dtype: {w2_q.shape, w2_q.dtype}, w1_scale.shape, dtype: {w1_scale.shape, w1_scale.dtype}, w2_scale.shape, dtype: {w2_scale.shape, w2_scale.dtype}, topk_weights.shape: {topk_weights.shape}, topk_ids.shape: {topk_ids.shape}, ab_strides1.shape: {ab_strides1.shape}, c_strides1.shape: {c_strides1.shape}, ab_strides2.shape: {ab_strides2.shape}, c_strides2.shape: {c_strides2.shape}"
     )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.int8
@@ -112,15 +112,9 @@ def cutlass_w4a8_moe(
         a, a1_scale, use_per_token_if_dynamic=per_act_token)
     device = a_q.device
 
-    expert_offsets = torch.empty((num_experts + 1),
-                                 dtype=torch.int32,
-                                 device=device)
-    problem_sizes1 = torch.empty((num_experts, 3),
-                                 dtype=torch.int32,
-                                 device=device)
-    problem_sizes2 = torch.empty((num_experts, 3),
-                                 dtype=torch.int32,
-                                 device=device)
+    expert_offsets = torch.empty((num_experts + 1), dtype=torch.int64, device=device)
+    problem_sizes1 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
 
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
@@ -133,10 +127,20 @@ def cutlass_w4a8_moe(
     rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
     rep_a1_scales = a1_scale[a_map] if per_act_token else a1_scale
 
+    print(f"m {m}, n {n}, k {k}, topk {topk}")
+    # m 32768, n 256, k 7168, topk 8
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.half)
 
-    c1 = ops.int4_fp8_grouped_gemm(rep_a_q, w1_q, w1_scale, None,
+    print(
+        f"rep_a_q.shape {rep_a_q.shape}, w1_q.shape {w1_q.shape}, w1_scale.shape {w1_scale.shape}"
+    )
+    print(
+        f"expert_offsets.shape {expert_offsets.shape}, problem_sizes1.shape {problem_sizes1.shape}, ab_strides1.shape {ab_strides1.shape}, c_strides1.shape {c_strides1.shape}"
+    )
+    # rep_a_q.shape torch.Size([262144, 7168]), w1_q.shape torch.Size([256, 7168, 256]), w1_scale.shape torch.Size([256, 512, 56])
+    # expert_offsets.shape torch.Size([257]), problem_sizes1.shape torch.Size([256, 3]), ab_strides1.shape torch.Size([256]), c_strides1.shape torch.Size([256])
+    c1 = ops.int4_fp8_grouped_gemm(rep_a_q, w1_q, w1_scale, c1,
                                    expert_offsets[:-1], problem_sizes1,
                                    ab_strides1, ab_strides1, c_strides1, 128)
 
@@ -146,7 +150,7 @@ def cutlass_w4a8_moe(
     intemediate_q, a2_scale = ops.scaled_fp8_quant(
         intermediate, a2_scale, use_per_token_if_dynamic=per_act_token)
 
-    c2 = ops.int4_fp8_grouped_gemm(intemediate_q, w2_q, w2_scale, None,
+    c2 = ops.int4_fp8_grouped_gemm(intemediate_q, w2_q, w2_scale, c2,
                                    expert_offsets[:-1], problem_sizes2,
                                    ab_strides2, ab_strides2, c_strides2, 128)
     # Gather tokens
