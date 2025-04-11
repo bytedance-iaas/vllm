@@ -1649,3 +1649,12 @@ class TranscriptionResponseVerbose(OpenAIBaseModel):
 
     words: Optional[list[TranscriptionWord]] = None
     """Extracted words and their corresponding timestamps."""
+
+class NixlMetadataResponse(BaseModel):
+    metadata: str
+
+class NixlMetadataRequest(BaseModel):
+    metadata: str
+
+class RemotePrefillGenerateRequest(BaseModel):
+    content: str
