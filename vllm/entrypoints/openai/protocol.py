@@ -1658,3 +1658,6 @@ class NixlMetadataRequest(BaseModel):
 
 class RemotePrefillGenerateRequest(BaseModel):
     content: str
+
+class RemotePrefillEpRequest(BaseModel):
+    endpoints: list[str]
