@@ -14,10 +14,10 @@ def cutlass_w4a8_moe(
     w2_scale: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    ab_strides1: torch.Tensor,
-    c_strides1: torch.Tensor,
-    ab_strides2: torch.Tensor,
-    c_strides2: torch.Tensor,
+    # ab_strides1: torch.Tensor,
+    # c_strides1: torch.Tensor,
+    # ab_strides2: torch.Tensor,
+    # c_strides2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
@@ -44,12 +44,14 @@ def cutlass_w4a8_moe(
         Shape: [num_experts] or
             [num_experts, K // 2, N // chunk_size (default: 128)]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
-    - ab_strides1 (torch.Tensor): The input and weights strides of the first
-        grouped gemm.
-    - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
-    - ab_strides2 (torch.Tensor): The input and weights strides of the second
-        grouped gemm.
-    - c_strides2 (torch.Tensor): The output strides of the second grouped gemm.
+    # - ab_strides1 (torch.Tensor): The input and weights strides of the first
+    #     grouped gemm. Shape: [num_experts]
+    # - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
+    #     Shape: [num_experts]
+    # - ab_strides2 (torch.Tensor): The input and weights strides of the second
+    #     grouped gemm. Shape: [num_experts]
+    # - c_strides2 (torch.Tensor): The output strides of the second grouped gemm.
+    #     Shape: [num_experts]
     - a1_scale (Optional[torch.Tensor]): The optional fp32 scale to quantize a.
         Shape: scalar or [M]
     - a2_scale (Optional[torch.Tensor]): The optional fp32 scale to
@@ -80,14 +82,14 @@ def cutlass_w4a8_moe(
     assert w1_q.shape[0] == w2_scale.shape[
         0], "w2 scales expert number mismatch"
     assert a2_scale is None or a1_scale is None or a2_scale.shape == a1_scale.shape, "Intermediate scale shape mismatch"  # noqa: E501
-    assert ab_strides1.shape[0] == w1_q.shape[
-        0], "AB Strides 1 expert number mismatch"
-    assert c_strides1.shape[0] == w1_q.shape[
-        0], "C Strides 1 expert number mismatch"
-    assert ab_strides2.shape[0] == w2_q.shape[
-        0], "AB Strides 2 expert number  mismatch"
-    assert c_strides2.shape[0] == w2_q.shape[
-        0], "C Strides 2 expert number mismatch"
+    # assert ab_strides1.shape[0] == w1_q.shape[
+    #     0], "AB Strides 1 expert number mismatch"
+    # assert c_strides1.shape[0] == w1_q.shape[
+    #     0], "C Strides 1 expert number mismatch"
+    # assert ab_strides2.shape[0] == w2_q.shape[
+    #     0], "AB Strides 2 expert number  mismatch"
+    # assert c_strides2.shape[0] == w2_q.shape[
+    #     0], "C Strides 2 expert number mismatch"
 
     num_experts = w1_q.size(0)
     m = a.size(0)
@@ -132,9 +134,8 @@ def cutlass_w4a8_moe(
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.half)
 
-    c1 = ops.int4_fp8_grouped_gemm(rep_a_q, w1_q, w1_scale, None,
-                                   expert_offsets[:-1], problem_sizes1,
-                                   ab_strides1, ab_strides1, c_strides1, 128)
+    c1 = ops.int4_fp8_grouped_gemm(rep_a_q, w1_q, w1_scale,
+                                   expert_offsets[:-1], problem_sizes1, 128)
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     torch.ops._C.silu_and_mul(intermediate, c1)
@@ -143,8 +144,7 @@ def cutlass_w4a8_moe(
         intermediate, a2_scale, use_per_token_if_dynamic=per_act_token)
 
     c2 = ops.int4_fp8_grouped_gemm(intemediate_q, w2_q, w2_scale, None,
-                                   expert_offsets[:-1], problem_sizes2,
-                                   ab_strides2, ab_strides2, c_strides2, 128)
+                                   expert_offsets[:-1], problem_sizes2, 128)
     # Gather tokens
     c2 = c2[c_map].view(m, topk, k)
     if not apply_router_weight_on_input:
