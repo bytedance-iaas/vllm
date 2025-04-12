@@ -1017,15 +1017,9 @@ def int4_fp8_grouped_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     scales: torch.Tensor,
-    c: torch.Tensor,
     experts_offsets: torch.tensor,
     problem_sizes: torch.tensor,
-    a_strides: torch.tensor,
-    b_strides: torch.tensor,
-    c_strides: torch.tensor,
     chunk_size: int = 0,
-    alpha: float = 1.0,
-    beta: float = 0.0
 ) -> list[torch.Tensor]:
     """
     Perform grouped matrix multiplication between int4 weights and fp8 activations.
@@ -1043,17 +1037,10 @@ def int4_fp8_grouped_gemm(
             where each byte contains two 4-bit integers
         scale_tensors: List of scale factors for the quantized weights
             Each tensor should be of shape [N, K/chunk_size]
-        c_tensors: List of output accumulator matrices
-            Each tensor should be of shape [M, N] and typically initialized to zeros
         experts_offsets: Tensor containing expert offsets for determining group boundaries
-        problem_sizes: Optional custom problem sizes (None for auto-detection)
-        a_strides: Optional custom strides for A matrices (None for default)
-        b_strides: Optional custom strides for B matrices (None for default)
-        c_strides: Optional custom strides for C matrices (None for default)
+        problem_sizes: problem sizes
         chunk_size: Number of elements each scale value applies to (K/num_chunks)
             If 0, will be auto-detected from the first tensors
-        alpha: Scalar multiplier for the product of matrices A and B (default: 1.0)
-        beta: Scalar multiplier for matrix C (default: 0.0)
             
     Returns:
         torch.Tensor: List of output matrices of shape [M, N]
@@ -1066,14 +1053,12 @@ def int4_fp8_grouped_gemm(
         - All lists must have the same length
         
     Note:
-        The function computes: D = alpha * (A * (B * scales)) + beta * C
+        The function computes: D = (A * (B * scales))
         for each group of tensors in parallel
     """
 
     return torch.ops._C.int4_fp8_grouped_gemm(
-        a, b, scales, c, experts_offsets, problem_sizes,
-        a_strides, b_strides, c_strides,
-        chunk_size, alpha, beta)
+        a, b, scales, experts_offsets, problem_sizes, chunk_size)
 
 # fp8
 def scaled_fp8_quant(
