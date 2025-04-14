@@ -36,6 +36,7 @@ class DynamoNixlConnector:
             logger.error("NIXL is not available")
             raise RuntimeError("NIXL is not available")
         logger.info("Initializing NIXL wrapper")
+        logger.info(f"DynamoNixlConnector rank {rank}")
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), None)
 
         self.use_prepped_xfer = vllm_config.kv_transfer_config.use_prepped_xfer
@@ -238,7 +239,7 @@ class DynamoNixlConnector:
 
         local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges, staging_ranges)
 
-        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id] if not self.use_mla else 1
         remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
         local_xfer_side_handle = self.src_xfer_side_handles[tp_multiplier]
         handles = []
@@ -247,7 +248,8 @@ class DynamoNixlConnector:
         create_xfer_start_time = time.perf_counter()
 
         for i in range(tp_multiplier):
-            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=i, tp_multiplier=tp_multiplier, staging_ranges=staging_rearranging_ranges)
+            tp,index=(tp_multiplier,i)if not self.use_mla else (1,0)
+            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=index, tp_multiplier=tp, staging_ranges=staging_rearranging_ranges)
             assert len(staging_block_descs_ids) == len(remote_block_descs_ids)
             remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
             handle = self.nixl_wrapper.make_prepped_xfer("READ", local_xfer_side_handle, staging_block_descs_ids, 
@@ -296,7 +298,7 @@ class DynamoNixlConnector:
         remote_block_ids = remote_block_ids[:len(local_block_ids)]
 
         assert len(staging_block_ids) == len(local_block_ids)
-        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
+        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id] if not self.use_mla else 1
 
         if len(local_block_ids) == 0:
             logger.debug("No blocks to write")
@@ -329,9 +331,10 @@ class DynamoNixlConnector:
         # getting block descs ids
         remote_block_descs_ids = self._get_block_descs_ids(dst_engine_id, "all", remote_block_ids)
         local_xfer_side_handle = self.src_xfer_side_handles[tp_multiplier]
-
+        tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
         for i in range(tp_multiplier):
-            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=i, tp_multiplier=tp_multiplier, staging_ranges=staging_rearranging_ranges)
+            tp,index=(tp_multiplier,i)if not self.use_mla else (1,0)
+            staging_block_descs_ids = self._get_block_descs_ids(self.engine_id, "all", staging_block_ids, i=index, tp_multiplier=tp, staging_ranges=staging_rearranging_ranges)
             assert len(staging_block_descs_ids) == len(remote_block_descs_ids)
             remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][i]
             handle = self.nixl_wrapper.make_prepped_xfer("WRITE", local_xfer_side_handle, staging_block_descs_ids,
@@ -360,11 +363,12 @@ class DynamoNixlConnector:
         self._remote_agents[engine_id] = agent_names
         self.kv_caches_base_addr[engine_id] = kv_caches_base_addr
 
-        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id]
+        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id] if not self.use_mla else 1
         assert tp_multiplier > 0, f"Decode TP cannot be smaller than prefill TP, got {self._tp_size[engine_id]} and {self._tp_size[self.engine_id]}"
 
         logger.debug("Creating src xfer side handles for engine %s, tp_multiplier: %s", engine_id, tp_multiplier)
-        dst_block_len = self.block_len // tp_multiplier
+        # dst_block_len = self.block_len // tp_multiplier if not self.use_mla else self.block_len
+        dst_block_len = self.block_len // tp_multiplier 
         if tp_multiplier not in self.src_xfer_side_handles:
             # create descs and xfer side handles
             blocks_data = []
@@ -373,7 +377,8 @@ class DynamoNixlConnector:
                     for block_id in range(self.num_blocks):
                             block_offset = block_id * self.block_len
                             for i in range(tp_multiplier):
-                                tp_multiplier_offset = i * dst_block_len
+                                tp_multiplier_offset = i * dst_block_len if not self.use_mla else 0
+                                # tp_multiplier_offset = i * dst_block_len 
                                 blocks_data.append((base_addr + block_offset + tp_multiplier_offset, dst_block_len, self.rank))
             logger.debug("Created %s blocks for src engine %s and rank %s", len(blocks_data), self.engine_id, self.rank * tp_multiplier + i)
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
@@ -381,16 +386,18 @@ class DynamoNixlConnector:
 
         # create dst xfer side handles
         self.dst_num_blocks[engine_id] = num_blocks
+        tp_multiplier = self._tp_size[engine_id] // self._tp_size[self.engine_id] 
         for i in range(tp_multiplier):
             blocks_data = []
             for layer_id in range(self.num_layers):
-                for base_addr in self.kv_caches_base_addr[engine_id][self.rank * tp_multiplier + i][layer_id]:
+                for base_addr in self.kv_caches_base_addr[engine_id][ self.rank * tp_multiplier + i ][layer_id]:
                     for block_id in range(num_blocks):
                         block_offset = block_id * dst_block_len
-                        blocks_data.append((base_addr + block_offset, dst_block_len, self.rank * tp_multiplier + i))
-            logger.debug("Created %s blocks for dst engine %s and rank %s", len(blocks_data), engine_id, self.rank * tp_multiplier + i)
+                        blocks_data.append((base_addr + block_offset, dst_block_len,  self.rank * tp_multiplier + i))
+            logger.debug("Created %s blocks for dst engine %s and rank %s", len(blocks_data), engine_id, self.rank )
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
-            self.dst_xfer_side_handles[engine_id][i] = self.nixl_wrapper.prep_xfer_dlist(self._remote_agents[engine_id][self.rank * tp_multiplier + i], descs)
+            logger.info(f"self.rank * tp_multiplier + i {self.rank * tp_multiplier + i}")
+            self.dst_xfer_side_handles[engine_id][i] = self.nixl_wrapper.prep_xfer_dlist(self._remote_agents[engine_id][ self.rank * tp_multiplier + i], descs)
 
         return agent_names
 

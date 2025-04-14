@@ -314,8 +314,10 @@ class Worker(LocalOrDistributedWorkerBase):
 
         # TODO ptarasiewicz nixl can also support DRAM
         assert self.device_config.device_type == "cuda", "Currently only CUDA is supported for Nixl connector"
+        logger.debug(f"node 1 self.rank+{self.rank}  self.local_rank +{self.local_rank}")
 
-        self.nixl_connector = DynamoNixlConnector(self.vllm_config, engine_id, self.local_rank) # TODO ptarasiewicz: rank or local_rank?
+        self.nixl_connector = DynamoNixlConnector(self.vllm_config, engine_id, self.rank) # TODO ptarasiewicz: rank or local_rank?
+
         assert len(self.cache_engine) == 1, "Only one cache engine is supported for now"
         self.nixl_connector.register_kv_caches(self.cache_engine[0].gpu_cache)
         return self.nixl_connector.agent_name
@@ -327,6 +329,7 @@ class Worker(LocalOrDistributedWorkerBase):
     def add_remote_nixl_metadata(self, engine_id: str, agents_metadata: List[bytes], kv_caches_base_addr: List[List[Tuple[int, int]]], num_blocks: int) -> str:
         assert self.nixl_connector is not None, "Nixl connector is not initialized"
         agent_name = self.nixl_connector.add_remote_agent(engine_id, agents_metadata, len(agents_metadata), kv_caches_base_addr, num_blocks) # TODO ptarasiewicz: rank or local_rank?
+        logger.info(f"agent_name _{agent_name}")
         return agent_name
 
     def get_nixl_kv_caches_base_addr(self) -> List[bytes]:
