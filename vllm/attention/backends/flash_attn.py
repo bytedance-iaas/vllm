@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
                                           ModelInputForGPUWithSamplingMetadata)
 
+import vllm.attention.backends.sparse_prefill as sparse_prefill
+import vllm.envs
+
 logger = init_logger(__name__)
 
 
@@ -779,6 +782,15 @@ class FlashAttentionImpl(AttentionImpl):
             # Prompt run.
             if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
                     or prefill_meta.block_tables.numel() == 0):
+
+                if vllm.envs.VLLM_USE_SP_PREFILL:
+                    out = sparse_prefill.sparse_prefill_attention(
+                        query.unsqueeze(0), key.unsqueeze(0),
+                        value.unsqueeze(0)).squeeze(0)
+                    assert output[:attn_metadata.
+                                  num_prefill_tokens].shape == out.shape
+                    output[:attn_metadata.num_prefill_tokens] = out
+                    return output
                 # normal attention
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.
