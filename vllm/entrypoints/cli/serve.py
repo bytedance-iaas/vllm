@@ -4,6 +4,7 @@ import argparse
 
 import uvloop
 
+import vllm
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
@@ -23,6 +24,10 @@ class ServeSubcommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, 'model_tag') and args.model_tag is not None:
             args.model = args.model_tag
+
+        if vllm.envs.VLLM_USE_SP_PREFILL:
+            args.enable_chunked_prefill = False
+            args.max_num_seqs = 1
 
         uvloop.run(run_server(args))
 

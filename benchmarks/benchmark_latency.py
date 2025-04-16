@@ -14,6 +14,7 @@ import torch
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from tqdm import tqdm
 
+import vllm
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
@@ -37,7 +38,9 @@ def main(args: argparse.Namespace):
     print(args)
 
     engine_args = EngineArgs.from_cli_args(args)
-
+    if vllm.envs.VLLM_USE_SP_PREFILL:
+        engine_args.enable_chunked_prefill = False
+        engine_args.max_num_seqs = 1
     # NOTE(woosuk): If the request cannot be processed in a single batch,
     # the engine will automatically process the request in multiple batches.
     llm = LLM(**dataclasses.asdict(engine_args))
