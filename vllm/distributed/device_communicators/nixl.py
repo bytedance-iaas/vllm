@@ -307,20 +307,24 @@ class DynamoNixlConnector:
         start_time = time.perf_counter()
 
         local_ranges = self._get_ranges(local_block_ids)
-        staging_ranges = self._get_ranges(staging_block_ids)
+        if tp_multiplier > 1:
+            staging_ranges = self._get_ranges(staging_block_ids)
 
-        local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges, staging_ranges)
+            local_rearranging_ranges, staging_rearranging_ranges = self._get_same_length_ranges(local_ranges, staging_ranges)
 
-        for local_range, staging_range in zip(local_rearranging_ranges, staging_rearranging_ranges):
-            logger.debug("Rearranging tensors for cache: %s, local_range: %s, staging_range: %s", self.kv_caches[0].shape, local_range, staging_range)
-            for kv_cache in self.kv_caches:
-                if self.use_mla:
-                    cache_src = kv_cache[local_range[0]:local_range[1] + 1].unsqueeze(0)
-                    cache_staging = kv_cache[staging_range[0]:staging_range[1] + 1].unsqueeze(0)
-                    rearrange_tensors(cache_src, cache_staging, 1, "write") # for mla, the head size is not the same as flash attention, split not required here
-                else:
-                    for cache in kv_cache:
-                        rearrange_tensors(cache[local_range[0]:local_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier, "write")
+            for local_range, staging_range in zip(local_rearranging_ranges, staging_rearranging_ranges):
+                logger.debug("Rearranging tensors for cache: %s, local_range: %s, staging_range: %s", self.kv_caches[0].shape, local_range, staging_range)
+                for kv_cache in self.kv_caches:
+                    if self.use_mla:
+                        cache_src = kv_cache[local_range[0]:local_range[1] + 1].unsqueeze(0)
+                        cache_staging = kv_cache[staging_range[0]:staging_range[1] + 1].unsqueeze(0)
+                        rearrange_tensors(cache_src, cache_staging, 1, "write") # for mla, the head size is not the same as flash attention, split not required here
+                    else:
+                        for cache in kv_cache:
+                            rearrange_tensors(cache[local_range[0]:local_range[1] + 1], cache[staging_range[0]:staging_range[1] + 1], tp_multiplier, "write")
+        else:
+            staging_block_ids = local_block_ids
+            staging_rearranging_ranges = local_ranges
 
         logger.debug("Time to rearrange tensors: %s ms", (time.perf_counter() - start_time) * 1000)
 
