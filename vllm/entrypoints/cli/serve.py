@@ -36,6 +36,10 @@ class ServeSubcommand(CLISubcommand):
         if hasattr(args, 'model_tag') and args.model_tag is not None:
             args.model = args.model_tag
 
+        if envs.VLLM_USE_SP_PREFILL:
+            args.enable_chunked_prefill = False
+            args.max_num_seqs = 1
+
         if args.headless:
             run_headless(args)
         else:
