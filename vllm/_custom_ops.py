@@ -1031,19 +1031,19 @@ def int4_fp8_grouped_gemm(
     
     Args:
         a_tensors: List of activation matrices in FP8 (float_e4m3_t) format
-            Each tensor should be of shape [M, K] in row-major layout
+            Each tensor should be of shape [total_m, K] in row-major layout
         b_tensors: List of weight matrices in packed int4 format
-            Each tensor should be of shape [N, K/2] in column-major layout
+            Each tensor should be of shape [E, N, K/2] in column-major layout
             where each byte contains two 4-bit integers
         scale_tensors: List of scale factors for the quantized weights
-            Each tensor should be of shape [N, K/chunk_size]
+            Each tensor should be of shape [E, K//512, N*4]
         experts_offsets: Tensor containing expert offsets for determining group boundaries
         problem_sizes: problem sizes
         chunk_size: Number of elements each scale value applies to (K/num_chunks)
             If 0, will be auto-detected from the first tensors
             
     Returns:
-        torch.Tensor: List of output matrices of shape [M, N]
+        torch.Tensor: List of output matrices of shape [total_m, total_n]
         
     Requirements:
         - All tensors must be on a CUDA device
