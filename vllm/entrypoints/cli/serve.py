@@ -11,6 +11,7 @@ import zmq
 
 import vllm.envs as envs
 from vllm import AsyncEngineArgs
+import vllm
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.api_server import (run_server, run_server_worker,
                                                 setup_server)
@@ -56,6 +57,11 @@ class ServeSubcommand(CLISubcommand):
         else:
             # Single API server (this process).
             uvloop.run(run_server(args))
+        if vllm.envs.VLLM_USE_SP_PREFILL:
+            args.enable_chunked_prefill = False
+            args.max_num_seqs = 1
+
+        uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)
