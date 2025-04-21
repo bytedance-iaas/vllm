@@ -783,14 +783,13 @@ class FlashAttentionImpl(AttentionImpl):
             # Prompt run.
             if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
                     or prefill_meta.block_tables.numel() == 0):
-                    
+
                 if vllm.envs.VLLM_USE_SP_PREFILL:
                     out = sparse_prefill.sparse_prefill_attention(
-                        query.unsqueeze(0),
-                        key.unsqueeze(0),
-                        value.unsqueeze(0)
-                    ).squeeze(0)
-                    assert output[:attn_metadata.num_prefill_tokens].shape == out.shape
+                        query.unsqueeze(0), key.unsqueeze(0),
+                        value.unsqueeze(0)).squeeze(0)
+                    assert output[:attn_metadata.
+                        num_prefill_tokens].shape == out.shape
                     output[:attn_metadata.num_prefill_tokens] = out
                     return output
                 # normal attention

@@ -735,7 +735,6 @@ def sparse_prefill_attention(
     assert q.shape[1] == k.shape[1]
     assert head_dim in {16, 32, 64, 128}
     assert block_size in {16, 32, 64, 128}
-    num_blocks = math.ceil(q_len / block_size)
     min_budget = 1 if min_budget is None else min_budget
     max_budget = 2147483647 if max_budget is None else max_budget
     if q_len <= max(2 * block_size, math.ceil(min_budget / block_size) * block_size):
