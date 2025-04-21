@@ -638,22 +638,18 @@ def get_active_blocks(
     qk[..., -block_size:].masked_fill_(
         ~causal_mask[..., :block_size, :block_size], float("-inf")
     )
-    # softmax
     qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
     qk = rearrange(qk, "b h g i j -> b (h g) i j")
     slash = sum_all_diagonal_matrix(qk) / qk.shape[-2]
     vertical = qk.mean(-2)
-    # get vertical slash size to make sure attention score >= gamma. shape: [batch_size, num_heads]
     num_vertical_blocks = score_cover_topk(vertical, gamma) // 128 + 1
     num_slash_blocks = score_cover_topk(slash, gamma) // 128 + 1
     num_vertical_blocks[num_vertical_blocks < min_budget] = min_budget
     num_vertical_blocks[num_vertical_blocks > max_budget] = max_budget
     num_slash_blocks[num_slash_blocks < min_budget] = min_budget
     num_slash_blocks[num_slash_blocks > max_budget] = max_budget
-    # block avg pool
     vertical = torch_bhn_sumpool(vertical, block_size)
     slash = torch_bhn_sumpool(slash, block_size)
-    # get block sparse mask
     if not gqa_interleave:
         avg_k = triton_bnhd_pool(k, block_size).repeat_interleave(num_share_q_heads, 2)
     else:
@@ -666,10 +662,8 @@ def get_active_blocks(
     block_sparse_mask = kl_div < tau
     num_vertical_blocks[block_sparse_mask] = min_budget
     num_slash_blocks[block_sparse_mask] = min_budget
-    # keep first vertical and slash block
     vertical[..., :1] = torch.inf
     slash[..., -1:] = torch.inf
-    # get slash topk
     num_slash_blocks = num_slash_blocks.view(batch_size * num_heads)
     slash = slash.view(batch_size * num_heads, -1)
     slash_topk = (num_blocks - 1) - slash.topk(
@@ -729,7 +723,7 @@ def sparse_prefill_attention(
     softmax_scale: Optional[float] = 1.0,
     block_size: int = 128,
     return_computational_ratio: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, float]]:
+) -> torch.Tensor:
 
     batch_size, q_len, num_q_heads, head_dim = q.shape
     batch_size, k_len, num_kv_heads, head_dim = k.shape
@@ -737,10 +731,7 @@ def sparse_prefill_attention(
 
     if q_len == 1:
         attn_out = flash_attn_func(q, k, v, softmax_scale=softmax_scale)
-        if return_computational_ratio:
-            return attn_out, 1
-        else:
-            return attn_out
+        return attn_out
     assert q.shape[1] == k.shape[1]
     assert head_dim in {16, 32, 64, 128}
     assert block_size in {16, 32, 64, 128}
@@ -751,10 +742,7 @@ def sparse_prefill_attention(
         attn_out = flash_attn_func(
             q, k, v, softmax_scale=softmax_scale, causal=True
         )
-        if return_computational_ratio:
-            return attn_out, 1
-        else:
-            return attn_out
+        return attn_out
     # get vertical slash index
     block_idx = get_active_blocks(
         q,
@@ -767,16 +755,6 @@ def sparse_prefill_attention(
         tau,
         gqa_interleave,
     )
-    if return_computational_ratio:
-        activated_block_num = sum(
-            [
-                block_idx[b][h].shape[-1]
-                for b in range(len(block_idx))
-                for h in range(len(block_idx[0]))
-            ]
-        )
-        total_block_num = num_blocks * num_blocks * len(block_idx) * len(block_idx[0])
-        computational_ratio = activated_block_num / total_block_num
     attn_out = triton_block_wise_attention(
         q,
         k,
@@ -786,7 +764,4 @@ def sparse_prefill_attention(
         softmax_scale=softmax_scale,
         gqa_interleave=gqa_interleave,
     )
-    if return_computational_ratio:
-        return attn_out, computational_ratio
-    else:
-        return attn_out
+    return attn_out
