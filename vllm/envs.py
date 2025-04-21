@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     VLLM_PORT: Optional[int] = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
+    VLLM_USE_SP_PREFILL: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: Optional[str] = None
     LD_LIBRARY_PATH: Optional[str] = None
@@ -223,6 +224,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # note that the value is true or false, not numbers
     "VLLM_USE_MODELSCOPE":
     lambda: os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true",
+    "VLLM_USE_SP_PREFILL":
+    lambda: os.environ.get("VLLM_USE_SP_PREFILL", "False").lower() == "true",
 
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL":
