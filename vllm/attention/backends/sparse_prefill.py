@@ -4,6 +4,13 @@ import triton.language as tl
 from typing import List, Optional, Tuple, Union
 import math
 from einops import rearrange
+from vllm.logger import init_logger
+
+try:
+    from flash_attn import flash_attn_func
+except ImportError as e:
+    logger.warning('Import error %s, please install flash-attn correctly', e.msg)
+
 causal_mask = None
 
 def gpu_info():
@@ -228,7 +235,6 @@ def count_kernel(
 ):
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
-    # load x
     x_ptr = x_ptr + pid_b * stride_xb + pid_h * stride_xh
     off_k = tl.arange(0, BLOCK_SIZE_K)
     x_ptrs = x_ptr + off_k * stride_xk
@@ -237,14 +243,9 @@ def count_kernel(
         x = tl.load(x_ptrs, off_k < k - i, -1)
         x = x // r
         x = tl.where(off_k < k - i, x, -1)
-        # count
-        # maybe triton bug: when BLOCK_SIZE_R == r, the count of values ​​in bin [r-1, r) will be wrong
         y += tl.histogram(x, BLOCK_SIZE_R)
-        # move ptr
         x_ptrs = x_ptrs + BLOCK_SIZE_K * stride_xk
-    # cumsum
     y = tl.cumsum(y, axis=0)
-    # store result
     y_ptr = y_ptr + pid_b * stride_yb + pid_h * stride_yh + stride_yr
     off_r = tl.arange(0, BLOCK_SIZE_R)
     tl.store(y_ptr + off_r * stride_yr, y, off_r < r)
@@ -253,12 +254,7 @@ def triton_column_count_cumsum(x: torch.Tensor, num_columns: int) -> torch.Tenso
     x = x.to(torch.int32)
     b, h, k = x.shape
     r = num_columns
-    # torch implementation:
-    # y = torch.zeros(b,h,r*r,dtype=x.dtype,device=x.device)
-    # y[torch.arange(b,device=x.device)[:,None,None],torch.arange(h,device=x.device)[None,:,None],torch.where(x<r*r,x,0)]=1
-    # y = torch.nn.functional.pad(torch.cumsum(y.view(b,h,r,r).sum(-1),-1),(1,0),value=0).to(torch.int32)
     block_size_k = min(triton.next_power_of_2(k), 4096)
-    # plus r by 1 to avoid tl.histogram bug
     block_size_r = triton.next_power_of_2(r + 2)
     y = torch.zeros(b, h, r + 1, device=x.device, dtype=torch.int32)
     count_kernel[(b, h)](
@@ -538,7 +534,7 @@ def triton_bnhd_pool(x: torch.Tensor, kernel_size: int, pool_type: str = "avg"):
                 (x[:, kernel_size - 1 :: kernel_size, ...], x[:, -1:, ...]), dim=1
             )
 
-    block_size_h = triton.next_power_of_2(h)
+    block_size_h = int(triton.next_power_of_2(h))
     while kernel_size * block_size_h * d > 128 * 128 * 128:
         block_size_h = int(block_size_h // 2)
 
@@ -727,10 +723,10 @@ def sparse_prefill_attention(
     v: torch.Tensor,
     gamma: float,
     tau: float = 0,
-    min_budget: int = None,
-    max_budget: int = None,
+    min_budget: int = 0,
+    max_budget: int = 0,
     gqa_interleave: bool = False,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: Optional[float] = 1.0,
     block_size: int = 128,
     return_computational_ratio: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, float]]:
