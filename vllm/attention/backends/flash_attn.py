@@ -34,9 +34,8 @@ if TYPE_CHECKING:
     from vllm.worker.model_runner import (ModelInputForGPUBuilder,
                                           ModelInputForGPUWithSamplingMetadata)
 
-import vllm.envs
 import vllm.attention.backends.sparse_prefill as sparse_prefill
-
+import vllm.envs
 
 logger = init_logger(__name__)
 
@@ -789,7 +788,7 @@ class FlashAttentionImpl(AttentionImpl):
                         query.unsqueeze(0), key.unsqueeze(0),
                         value.unsqueeze(0)).squeeze(0)
                     assert output[:attn_metadata.
-                        num_prefill_tokens].shape == out.shape
+                                  num_prefill_tokens].shape == out.shape
                     output[:attn_metadata.num_prefill_tokens] = out
                     return output
                 # normal attention

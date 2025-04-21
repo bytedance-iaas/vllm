@@ -4,12 +4,13 @@ import argparse
 
 import uvloop
 
+import vllm
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import (make_arg_parser,
                                               validate_parsed_serve_args)
 from vllm.utils import FlexibleArgumentParser
-import vllm
+
 
 class ServeSubcommand(CLISubcommand):
     """The `serve` subcommand for the vLLM CLI. """
@@ -27,7 +28,7 @@ class ServeSubcommand(CLISubcommand):
         if vllm.envs.VLLM_USE_SP_PREFILL:
             args.enable_chunked_prefill = False
             args.max_num_seqs = 1
-            
+
         uvloop.run(run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:

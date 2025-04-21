@@ -224,10 +224,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # note that the value is true or false, not numbers
     "VLLM_USE_MODELSCOPE":
     lambda: os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true",
-
     "VLLM_USE_SP_PREFILL":
     lambda: os.environ.get("VLLM_USE_SP_PREFILL", "False").lower() == "true",
-    
+
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL":
     lambda: int(os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")),
