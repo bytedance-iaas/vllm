@@ -539,7 +539,7 @@ def triton_bnhd_pool(x: torch.Tensor,
 
     block_size_d = int(triton.next_power_of_2(d))
     pool_str_to_type = {"avg": 0, "max": 1, "min": 2, "maxabs": 3, "sum": 4}
-    pool_type = pool_str_to_type[pool_type]
+    pool_type = int(pool_str_to_type[pool_type])
 
     grid = lambda META: (
         b,
