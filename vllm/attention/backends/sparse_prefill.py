@@ -540,7 +540,7 @@ def triton_bnhd_pool(x: torch.Tensor, kernel_size: int, pool_type: str = "avg"):
 
     block_size_h = triton.next_power_of_2(h)
     while kernel_size * block_size_h * d > 128 * 128 * 128:
-        block_size_h = block_size_h // 2
+        block_size_h = int(block_size_h // 2)
 
     block_size_d = triton.next_power_of_2(d)
     pool_str_to_type = {"avg": 0, "max": 1, "min": 2, "maxabs": 3, "sum": 4}
