@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple, Union
 import math
 from einops import rearrange
 from vllm.logger import init_logger
-
+logger = init_logger(__name__)
 try:
     from flash_attn import flash_attn_func
 except ImportError as e:
