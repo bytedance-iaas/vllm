@@ -277,86 +277,6 @@ def triton_column_count_cumsum(x: torch.Tensor, num_columns: int) -> torch.Tenso
     )
     return y
 
-def triton_block_wise_decode_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_idx: torch.Tensor,
-    block_size: int,
-    softmax_scale: Optional[float] = None,
-    gqa_interleave: bool = False,
-) -> torch.Tensor:
-
-    batch_size, q_len, num_q_heads, head_dim = q.shape
-    assert q_len == 1
-    batch_size, k_len, num_kv_heads, head_dim = k.shape
-    batch_size, num_q_heads, num_blocks = block_idx.shape
-    assert q.dtype == torch.bfloat16
-    assert head_dim in {16, 32, 64, 128}, "only support head_dim in {16, 32, 64, 128}"
-    assert block_size in {
-        16,
-        32,
-        64,
-        128,
-    }, "only support block size in {16, 32, 64, 128}"
-    assert num_blocks <= triton.cdiv(k_len, block_size)
-    # gqa
-    assert num_q_heads % num_kv_heads == 0
-    num_share_q_heads = num_q_heads // num_kv_heads
-    # softmax_scale
-    if softmax_scale is None:
-        softmax_scale = 1 / math.sqrt(head_dim) * math.log2(math.e)
-    else:
-        softmax_scale = softmax_scale * math.log2(math.e)
-    # sort idx and get block index bins
-    block_idx = block_idx.sort(-1).values
-    # launch attention kernel
-    o = torch.empty_like(q)
-    num_warps = 8
-    BLOCK_SIZE_Q = 16
-    BLOCK_SIZE_K = block_size
-    block_wise_decode_attention_kernel[(batch_size, num_q_heads)](
-        q,
-        k,
-        v,
-        o,
-        block_idx,
-        batch_size,
-        num_q_heads,
-        num_q_heads,
-        num_kv_heads,
-        num_share_q_heads,
-        k_len,
-        head_dim,
-        num_blocks,
-        softmax_scale,
-        gqa_interleave,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
-        block_idx.stride(0),
-        block_idx.stride(1),
-        block_idx.stride(2),
-        BLOCK_SIZE_Q=BLOCK_SIZE_Q,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        num_warps=num_warps,
-        num_stages=3,
-    )
-    return o
-
 def triton_block_wise_prefill_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -486,39 +406,13 @@ def triton_block_wise_attention(
             softmax_scale,
             gqa_interleave,
         )
-    else:
-        return triton_block_wise_decode_attention(
-            q, k, v, block_idx, block_size, softmax_scale, gqa_interleave
-        )
+
 
 def score_cover_idx(x: torch.Tensor, score: float, padding_value=0):
     x, idx = torch.sort(x, dim=-1, descending=True)
     cumsum_x = torch.cumsum(x, dim=-1)
     idx[cumsum_x > score] = padding_value
     return idx
-
-def transform_veritcal_slash_idx(v_idx, s_idx, num_blocks):
-    batch_size, num_heads, _ = v_idx.shape
-    range_blocks = torch.arange(num_blocks, device=s_idx.device)[None, None, :, None]
-    # vertical
-    v_idx = (
-        torch.arange(0, num_blocks, device=v_idx.device)[None, None, :, None]
-        * num_blocks
-        + v_idx[:, :, None, :]
-    ).view(batch_size, num_heads, -1)
-    v_idx[v_idx // num_blocks < v_idx % num_blocks] = 0
-    # slash
-    s_idx = (
-        range_blocks * num_blocks + range_blocks + s_idx[:, :, None, :] * num_blocks
-    ).view(batch_size, num_heads, -1)
-    s_idx[s_idx >= num_blocks * num_blocks] = 0
-    # union
-    vs_idx = torch.cat((s_idx, v_idx), dim=-1)
-    block_idx = [
-        [torch.unique(vs_idx[b, h]) for h in range(num_heads)]
-        for b in range(batch_size)
-    ]
-    return block_idx
 
 def transform_veritcal_slash_idx(v_idx, s_idx, num_blocks):
     batch_size, num_heads, _ = v_idx.shape
@@ -899,162 +793,6 @@ def triton_flash_prefill(
     )
     return o
 
-
-def triton_flash_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    gqa_interleave: bool = False,
-):
-    batch_size, q_len, num_q_heads, head_dim = q.shape
-    batch_size, k_len, num_kv_heads, head_dim = k.shape
-    assert q_len == 1
-    assert v.shape == k.shape
-    assert q.dtype == torch.bfloat16, "only support dtype bfloat16"
-    assert head_dim in {16, 32, 64, 128}, "only support head_dim in {16, 32, 64, 128}"
-    # softmax_scale needs to be multiplied by math.log2(math.e)
-    if softmax_scale is None:
-        softmax_scale = 1 / math.sqrt(head_dim) * math.log2(math.e)
-    else:
-        softmax_scale = softmax_scale * math.log2(math.e)
-    # gqa
-    assert num_q_heads % num_kv_heads == 0
-    num_share_q_heads = num_q_heads // num_kv_heads
-    # grid
-    grid = lambda META: (
-        batch_size * num_q_heads,  # batch & head
-        triton.cdiv(k_len, META["CHUNK_SIZE_K"]),  # k chunks
-    )
-    # set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
-    BLOCK_SIZE_K = 128
-    CHUNK_SIZE_K = 4096
-    num_warps, num_stages = get_num_warps_stages(head_dim, BLOCK_SIZE_K, GPU_NAME)
-    # chunk output and chunk lse and chunk
-    num_chunks = triton.cdiv(k_len, CHUNK_SIZE_K)
-    lse = torch.empty(
-        batch_size, num_chunks, num_q_heads, dtype=torch.float32, device=q.device
-    )
-    mi = torch.empty(
-        batch_size, num_chunks, num_q_heads, dtype=torch.float32, device=q.device
-    )
-    acc_o = torch.empty(
-        batch_size,
-        num_chunks,
-        num_q_heads,
-        head_dim,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    # launch kernel
-    decode_kernel[grid](
-        q,
-        k,
-        v,
-        acc_o,
-        lse,
-        mi,
-        batch_size,
-        num_q_heads,
-        num_kv_heads,
-        num_share_q_heads,
-        k_len,
-        num_chunks,
-        head_dim,
-        softmax_scale,
-        gqa_interleave,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        acc_o.stride(0),
-        acc_o.stride(1),
-        acc_o.stride(2),
-        acc_o.stride(3),
-        lse.stride(0),
-        lse.stride(1),
-        lse.stride(2),
-        mi.stride(0),
-        mi.stride(1),
-        mi.stride(2),
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        CHUNK_SIZE_K=CHUNK_SIZE_K,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    # rescale
-    o = torch.empty(
-        batch_size,
-        1,
-        num_q_heads,
-        head_dim,
-        dtype=q.dtype,
-        device=q.device,
-    )
-    # grid
-    grid = lambda META: (batch_size * num_q_heads,)  # batch & head
-    # set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
-    BLOCK_SIZE_C = triton.next_power_of_2(num_chunks)
-    BLOCK_SIZE_D = min(head_dim, 128 * 128 // BLOCK_SIZE_C)
-    num_warps, num_stages = get_num_warps_stages(head_dim, BLOCK_SIZE_K, GPU_NAME)
-    # launch kernel
-    rescale_kernel[grid](
-        acc_o,
-        o,
-        lse,
-        mi,
-        batch_size,
-        num_q_heads,
-        num_chunks,
-        head_dim,
-        acc_o.stride(0),
-        acc_o.stride(1),
-        acc_o.stride(2),
-        acc_o.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
-        lse.stride(0),
-        lse.stride(1),
-        lse.stride(2),
-        mi.stride(0),
-        mi.stride(1),
-        mi.stride(2),
-        BLOCK_SIZE_D=BLOCK_SIZE_D,
-        BLOCK_SIZE_C=BLOCK_SIZE_C,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    return o
-
-def triton_flash_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool = True,
-    softmax_scale: Optional[float] = None,
-    gqa_interleave: bool = False,
-):
-    batch_size, q_len, num_heads, head_dim = q.shape
-    batch_size, k_len, num_heads, head_dim = k.shape
-    assert v.shape == k.shape
-    assert q.dtype == torch.bfloat16, "only support dtype bfloat16"
-    assert head_dim in {16, 32, 64, 128}, "only support head_dim in {16, 32, 64, 128}"
-    if q_len > 1:
-        return triton_flash_prefill(q, k, v, causal, softmax_scale, gqa_interleave)
-    else:
-        return triton_flash_decode(q, k, v, softmax_scale, gqa_interleave)
-
-
 def sparse_prefill_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1074,12 +812,7 @@ def sparse_prefill_attention(
     assert batch_size == 1, "currently only support batch_size == 1"
 
     if q_len == 1:
-        if gqa_interleave:
-            attn_out = triton_flash_attention(
-                q, k, v, softmax_scale=softmax_scale, gqa_interleave=True
-            )
-        else:
-            attn_out = flash_attn_func(q, k, v, softmax_scale=softmax_scale)
+        attn_out = flash_attn_func(q, k, v, softmax_scale=softmax_scale)
         if return_computational_ratio:
             return attn_out, 1
         else:
@@ -1091,14 +824,9 @@ def sparse_prefill_attention(
     min_budget = 1 if min_budget is None else min_budget
     max_budget = 2147483647 if max_budget is None else max_budget
     if q_len <= max(2 * block_size, math.ceil(min_budget / block_size) * block_size):
-        if gqa_interleave:
-            attn_out = triton_flash_attention(
-                q, k, v, softmax_scale=softmax_scale, causal=True, gqa_interleave=True
-            )
-        else:
-            attn_out = flash_attn_func(
-                q, k, v, softmax_scale=softmax_scale, causal=True
-            )
+        attn_out = flash_attn_func(
+            q, k, v, softmax_scale=softmax_scale, causal=True
+        )
         if return_computational_ratio:
             return attn_out, 1
         else:
