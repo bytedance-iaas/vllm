@@ -538,7 +538,7 @@ def triton_bnhd_pool(x: torch.Tensor, kernel_size: int, pool_type: str = "avg"):
     while kernel_size * block_size_h * d > 128 * 128 * 128:
         block_size_h = int(block_size_h // 2)
 
-    block_size_d = triton.next_power_of_2(d)
+    block_size_d = int(triton.next_power_of_2(d))
     pool_str_to_type = {"avg": 0, "max": 1, "min": 2, "maxabs": 3, "sum": 4}
     pool_type = pool_str_to_type[pool_type]
 
@@ -721,10 +721,10 @@ def sparse_prefill_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    gamma: float,
-    tau: float = 0,
-    min_budget: int = 0,
-    max_budget: int = 0,
+    gamma: float = 0.9,
+    tau: float = 0.1,
+    min_budget: int = 512,
+    max_budget: int = 32768,
     gqa_interleave: bool = False,
     softmax_scale: Optional[float] = 1.0,
     block_size: int = 128,
