@@ -1007,6 +1007,29 @@ def initialize_model_parallel(
         _DP.rank_in_group, _PP.rank_in_group, _TP.rank_in_group)
 
 
+def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
+    """
+    Initialize KV cache transfer parallel group.
+    """
+
+    global _KV_TRANSFER
+
+    if vllm_config.kv_transfer_config is None:
+        return
+
+    if all([
+            vllm_config.kv_transfer_config.is_kv_transfer_instance,
+            _KV_TRANSFER is None
+    ]):
+        from vllm.distributed.kv_transfer import kv_transfer
+
+        _KV_TRANSFER = kv_transfer.KVTransferAgent(
+            rank=get_world_group().rank,
+            local_rank=get_world_group().local_rank,
+            config=vllm_config,
+            world_group=get_world_group())
+
+
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
