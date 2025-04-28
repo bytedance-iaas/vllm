@@ -119,6 +119,11 @@ if TYPE_CHECKING:
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5557
     VLLM_ALL2ALL_BACKEND: str = "naive"
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
+    VLLM_KV_CAPI_PATH: Optional[str] = None
+    VLLM_KV_NAMESPACE: Optional[str] = None
+    VLLM_KV_COMPONENT: Optional[str] = None
+    VLLM_WORKER_ID: Optional[int] = None
+ 
 
 
 def get_default_cache_root():
@@ -825,6 +830,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This is used to prevent the kernel from running out of memory.
     "VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE":
     lambda: int(os.getenv("VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE", "163840")),
+
+    # Path to the C API Library
+    "VLLM_KV_CAPI_PATH":
+    lambda: os.environ.get("VLLM_KV_CAPI_PATH", None),
+
+    # Identifiers to publish KV related information
+    "VLLM_KV_NAMESPACE":
+    lambda: os.environ.get("VLLM_KV_NAMESPACE", None),
+    "VLLM_KV_COMPONENT":
+    lambda: os.environ.get("VLLM_KV_COMPONENT", None),
+
+    # Worker ID used for identifying workers in distributed settings
+    "VLLM_WORKER_ID":
+    lambda: int(os.getenv("VLLM_WORKER_ID", "0"))
+    if "VLLM_WORKER_ID" in os.environ else None,
 }
 
 # --8<-- [end:env-vars-definition]

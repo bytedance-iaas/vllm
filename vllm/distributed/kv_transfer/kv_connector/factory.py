@@ -35,7 +35,7 @@ class KVConnectorFactory:
 
     @classmethod
     def create_connector_v0(cls, rank: int, local_rank: int,
-                            config: "VllmConfig") -> KVConnectorBase:
+                            config: "VllmConfig", world_group) -> KVConnectorBase:
         if envs.VLLM_USE_V1:
             raise ValueError("Attempting to initialize a V0 Connector, "
                              f"but found {envs.VLLM_USE_V1=}")
@@ -46,7 +46,7 @@ class KVConnectorFactory:
 
         connector_cls = cls._registry[connector_name]()
         assert issubclass(connector_cls, KVConnectorBase)
-        return connector_cls(rank, local_rank, config)
+        return connector_cls(rank, local_rank, config, world_group)
 
     @classmethod
     def create_connector_v1(
