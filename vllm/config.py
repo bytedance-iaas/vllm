@@ -3235,6 +3235,9 @@ class KVTransferConfig(BaseModel):
     # The KV connector for vLLM to transmit KV caches between vLLM instances.
     kv_connector: Optional[str] = None
 
+    # Whether to use NIXL prepped xfer for KV cache transfer.
+    use_prepped_xfer: bool = False
+
     # The device used by kv connector to buffer the KV cache.
     # Currently only support 'cuda'.
     kv_buffer_device: Optional[str] = "cuda"
@@ -3244,7 +3247,7 @@ class KVTransferConfig(BaseModel):
     kv_buffer_size: float = 1e9
 
     # Whether this vLLM instance produces, consumes KV cache, or both. Choices
-    # are 'kv_producer', 'kv_consumer', and 'both'.
+    # are 'kv_producer', 'kv_consumer', and 'kv_both'.
     kv_role: Optional[str] = None
 
     # The rank of this vLLM instance in the KV cache transfer. Typical value:
@@ -3299,10 +3302,15 @@ class KVTransferConfig(BaseModel):
                 f"Supported roles are `kv_producer`, `kv_consumer`, "
                 f"and `kv_both`")
 
-        if self.kv_connector is not None and self.kv_role is None:
+        if self.kv_connector is not None and self.kv_connector != "DynamoNixlConnector" and self.kv_role is None:
             raise ValueError("Please specify kv_disagg_role when kv_connector "
                              "is set, supported roles are `kv_producer`, "
                              "`kv_consumer`, and `kv_both`")
+
+        if self.use_prepped_xfer is False:
+            logger.warning("`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer.")
+            self.use_prepped_xfer = True
+
 
     @property
     def is_kv_transfer_instance(self) -> bool:
