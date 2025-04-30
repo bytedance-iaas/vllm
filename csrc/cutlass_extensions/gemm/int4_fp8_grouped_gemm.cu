@@ -1,586 +1,481 @@
-#include <vector>
-#include <torch/all.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/mixed_dtype_utils.hpp"
+/**
+ * @file int4_fp8_grouped_gemm.cu
+ * @brief Implementation of grouped GEMM operation with int4 and fp8 mixed precision
+ * 
+ * This file implements a grouped GEMM operation that multiplies FP8 matrices (A) with
+ * quantized INT4 matrices (B), applying per-channel scaling factors. The implementation
+ * is optimized for NVIDIA Hopper GPUs, leveraging Tensor Cores for mixed precision arithmetic.
+ * 
+ * Key features:
+ * - Supports grouped GEMM operations with multiple experts
+ * - Uses FP8 (e4m3) for matrix A
+ * - Uses INT4 quantization for matrix B with per-channel scaling
+ * - Implements preprocessing for INT4 encoding and scale packing
+ * - Optimized for Hopper architecture with Tensor Core operations
+ */
 
-using namespace cute;
+ #include <vector>
+ #include <torch/all.h>
+ #include <cuda_runtime.h>
+ #include <cuda_fp8.h>
+ #include "cutlass/cutlass.h"
+ #include "cutlass/gemm/dispatch_policy.hpp"
+ #include "cutlass/gemm/group_array_problem_shape.hpp"
+ #include "cutlass/gemm/collective/collective_builder.hpp"
+ #include "cutlass/epilogue/collective/collective_builder.hpp"
+ #include "cutlass/gemm/device/gemm_universal_adapter.h"
+ #include "cutlass/gemm/kernel/gemm_universal.hpp"
+ #include "cutlass/util/packed_stride.hpp"
+ #include "cutlass/util/mixed_dtype_utils.hpp"
+ #include <ATen/cuda/CUDAContext.h>
+ #include "int4_fp8_get_group_starts.cuh"
+ 
+ using namespace cute;
+ 
+ // Type definitions
+ using MmaType = cutlass::float_e4m3_t;      // FP8 e4m3 type
+ using QuantType = cutlass::int4b_t;         // 4-bit integer type
+ using ElementAccumulator = float;           // Accumulator type
+ using ElementScale = cutlass::half_t;       // Scale type
+ using ElementScalePacked = cutlass::Array<ElementScale, 4>;
+ using ElementC = cutlass::half_t;           // Default output type (FP16)
+ using ElementD = ElementC;                  // Default output type (FP16)
+ using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+ 
+ // Architecture-specific configurations
+ using ArchTag = cutlass::arch::Sm90;
+ using OperatorClass = cutlass::arch::OpClassTensorOp;
+ constexpr int TileShapeK = 512;
+ using TileShape = Shape<_128, _16, cute::Int<TileShapeK>>;
+ using ClusterShape = Shape<_2, _1, _1>;
+ 
+ // Layout configurations
+ using LayoutA = cutlass::layout::RowMajor;
+ using LayoutB = cutlass::layout::ColumnMajor;
+ using LayoutC = cutlass::layout::RowMajor;
+ using LayoutD = LayoutC;
+ 
+ // Transposed layouts
+ using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+ using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+ using LayoutC_Transpose = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
+ using LayoutD_Transpose = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
+ 
+ // Alignments
+ constexpr int AlignmentA = 128 / cutlass::sizeof_bits<MmaType>::value;
+ constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
+ constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+ constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+ 
+ // Kernel schedule and epilogue definitions
+ using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+ using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+ 
+ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+     ArchTag, OperatorClass,
+     TileShape, ClusterShape,
+     cutlass::epilogue::collective::EpilogueTileAuto,
+     ElementAccumulator, ElementAccumulator,
+     ElementC, LayoutC_Transpose *, AlignmentC,
+     ElementD, LayoutD_Transpose *, AlignmentD,
+     EpilogueSchedule
+ >::CollectiveOp;
+ 
+ using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
+     ArchTag, OperatorClass,
+     cute::tuple<QuantType, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
+     MmaType, LayoutA_Transpose *, AlignmentA,
+     ElementAccumulator,
+     TileShape, ClusterShape,
+     cutlass::gemm::collective::StageCountAutoCarveout<
+       static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+     KernelSchedule
+ >::CollectiveOp;
+ 
+ // Define the final kernel and GEMM operation types
+ using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
+     ProblemShape,
+     CollectiveMainloopScaleOnly,
+     CollectiveEpilogue
+ >;
+ 
+ using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
+ 
+ using StrideA = cute::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutA*>>;
+ using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
+ using StrideC = typename GemmKernelScaleOnly::InternalStrideC;
+ using StrideD = typename GemmKernelScaleOnly::InternalStrideD;
+ using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
+ 
+ /**
+  * @brief Main function to run int4 * fp8 grouped GEMM from PyTorch
+  *
+  * This function performs multiple GEMM operations in parallel where each operation multiplies
+  * an FP8 matrix (A) with a quantized INT4 matrix (B), applying per-channel scaling factors.
+  * It's designed for efficient execution on NVIDIA Hopper GPUs, leveraging Tensor Cores for
+  * optimal performance with mixed precision arithmetic.
+  *
+  * The function includes preprocessing steps for both INT4 tensors and scale factors to ensure
+  * optimal performance and correct operation.
+  *
+  * @param d_tensors Output tensor D with shape [total_m, total_n]
+  * @param a_tensors Tensor containing all A matrices (fp8_e4m3) with shape [total_m, K]
+  * @param b_tensors Tensor containing all B matrices (int4 packed as int8) with shape [E, N, K/2]
+  * @param a_scales Tensor containing A matrix scale factors
+  * @param b_scales Tensor containing B matrix scale factors with shape [E, K//512, N*8]
+  * @param expert_offsets Tensor containing expert offsets for determining group boundaries (int32)
+  * @param problem_sizes Tensor containing problem sizes with shape [num_experts, 3] (M, N, K for each group) (int32)
+  * @param a_strides Stride information for A tensors
+  * @param b_strides Stride information for B tensors
+  * @param d_strides Stride information for D tensors
+  * @param s_strides Stride information for scale tensors
+  * @param chunk_size Size of each chunk for scales (K / number of scale chunks)
+  */
+ void int4_fp8_grouped_gemm(
+     torch::Tensor& d_tensors,
+     torch::Tensor const& a_tensors,
+     torch::Tensor const& b_tensors,
+     torch::Tensor const& a_scales,
+     torch::Tensor const& b_scales,
+     torch::Tensor const& expert_offsets,
+     torch::Tensor const& problem_sizes,
+     torch::Tensor const& a_strides,
+     torch::Tensor const& b_strides,
+     torch::Tensor const& d_strides,
+     torch::Tensor const& s_strides,
+     int64_t chunk_size)
+ {
+     // Check inputs
+     // TORCH_CHECK(a_tensor.dim() == 2, "A tensor must be 2D");
+     // TORCH_CHECK(b_tensor.dim() == 3, "B tensor must be 3D [E, N, K/2]");
+     // TORCH_CHECK(scale_tensor.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
+     // TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
+     // TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
+ 
+     // Get number of groups from expert_offsets
+     int num_experts = static_cast<int>(expert_offsets.size(0));
+    //  int k_size = a_tensors.size(1);
+    //  int n_size = b_tensors.size(1);
+    //  int scale_k = k_size / TileShapeK;
+     bool per_act_token = a_scales.numel() != 1;
+     bool per_out_ch = b_scales.numel() != num_experts;
+ 
+    //  int debug_node = 0;
+     int current_device = a_tensors.device().index();
+    //  if (current_device == debug_node) {
+    //      printf("=== Debug Info ===\n");
+    //      printf("Debug node: %d\n", debug_node);
+ 
+    //      printf("\n=== Input Tensor Information (Device %d) ===\n", current_device); // 添加设备 ID 到标题
+    //      printf("a_tensors shape: [%ld, %ld], device: %s\n", a_tensors.size(0), a_tensors.size(1), a_tensors.device().str().c_str()); // 添加设备信息
+    //      printf("b_tensors shape: [%ld, %ld, %ld], device: %s\n", b_tensors.size(0), b_tensors.size(1), b_tensors.size(2), b_tensors.device().str().c_str()); // 添加设备信息
+    //      printf("a_scales shape: [%ld], device: %s\n", a_scales.size(0), a_scales.device().str().c_str()); // 添加设备信息
+    //      printf("b_scales shape: [%ld, %ld, %ld], device: %s\n", b_scales.size(0), b_scales.size(1), b_scales.size(2), b_scales.device().str().c_str()); // 添加设备信息
+    //      printf("expert_offsets shape: [%ld], device: %s\n", expert_offsets.size(0), expert_offsets.device().str().c_str()); // 添加设备信息
+    //      printf("chunk_size: %ld\n", chunk_size);
+ 
+    //      printf("\n=== Derived Parameters ===\n");
+    //      printf("num_experts: %d\n", num_experts);
+    //      printf("k_size: %d\n", k_size);
+    //      printf("n_size: %d\n", n_size);
+    //      printf("per_act_token: %d\n", per_act_token);
+    //      printf("per_out_ch: %d\n", per_out_ch);
+    //  }
+ 
+     auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
+   
+     auto options_int =
+         torch::TensorOptions().dtype(torch::kInt64).device(a_tensors.device());
+ 
+     torch::Tensor a_ptrs = torch::empty(num_experts, options_int); 
+     torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
+     torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
+     torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
+     torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
+ 
+    //  cudaDeviceSynchronize();
+ 
+     // // Check tensor shapes
+     // TORCH_CHECK(problem_sizes.size(0) == num_experts, "problem_sizes must have num_experts rows");
+     // TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (M, N, K)");
+     // TORCH_CHECK(b_tensor.size(0) == num_experts, "B tensor first dimension must match number of groups");
+     // TORCH_CHECK(scale_tensor.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
+     // TORCH_CHECK(b_tensor.size(2) * 2 == a_tensor.size(1), "B tensor K/2 dimension must match A tensor K dimension");
+     // TORCH_CHECK(scale_tensor.size(1) == a_tensor.size(1) / 512, "Scale tensor second dimension must be K//512");
+     // TORCH_CHECK(scale_tensor.size(2) == 4 * b_tensor.size(1), "Scale tensor last dimension must be 4*N");
+ 
+     // // Check tensor types
+     // TORCH_CHECK(a_tensor.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
+     // TORCH_CHECK(b_tensor.scalar_type() == torch::kInt8, "B tensor must contain packed int4 values (stored as int8)");
+     // TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32, "Expert offsets must be int32 type");
+     // TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32, "Problem sizes must be int32 type");
+ 
+     cutlass::KernelHardwareInfo hw_info;
+     hw_info.device_id = a_tensors.device().index();
+     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+ 
+     // Set up fusion arguments
+     using Args = typename GemmScaleOnly::Arguments;
+     Args arguments;
+     decltype(arguments.epilogue.thread) fusion_args;
+     fusion_args.alpha = 1.0f;
+     fusion_args.beta = 0.0f;
+     fusion_args.alpha_ptr = nullptr;
+     fusion_args.beta_ptr = nullptr;
+     fusion_args.alpha_ptr_array = nullptr;
+     fusion_args.beta_ptr_array = nullptr;
+     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+     fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+ 
+    //  printf("POINTER 3: %p\n", a_ptrs.data_ptr());
+ 
+     ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes =
+         static_cast<ProblemShape::UnderlyingProblemShape*>(problem_sizes.data_ptr());
+ 
+     auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
+     auto* problem_sizes_cpu_ptr = problem_sizes_cpu.data_ptr<int32_t>();
+    //  if (current_device == debug_node) {
+    //      printf("\n=== Problem Sizes ===\n");
+    //      for (int i = 0; i < num_experts; ++i) {
+    //          printf("Expert %d: N=%d, M=%d, K=%d\n", 
+    //              i, 
+    //              problem_sizes_cpu_ptr[i * 3],     // N
+    //              problem_sizes_cpu_ptr[i * 3 + 1], // M
+    //              problem_sizes_cpu_ptr[i * 3 + 2]  // K
+    //          );
+    //      }
+    //  }
+ 
+    //  printf("POINTER 4: %p\n", a_ptrs.data_ptr());
+ 
+    //  cudaDeviceSynchronize();
+ 
+    //  if (current_device == debug_node) {
+    //     //  printf("POINTER 5: %p\n", a_ptrs.data_ptr());
+    //      printf("\n=== Pointer Arrays (Before get_group_gemm_starts) ===\n");
+    //      // Copy pointer arrays to CPU
+    //      auto a_ptrs_cpu = a_ptrs.to(torch::kCPU);
+    //      auto b_ptrs_cpu = b_ptrs.to(torch::kCPU);
+    //      auto out_ptrs_cpu = out_ptrs.to(torch::kCPU);
+    //      auto a_scales_ptrs_cpu = a_scales_ptrs.to(torch::kCPU);
+    //      auto b_scales_ptrs_cpu = b_scales_ptrs.to(torch::kCPU);
+ 
+    //      auto* a_ptrs_cpu_ptr = a_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* b_ptrs_cpu_ptr = b_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* out_ptrs_cpu_ptr = out_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* a_scales_ptrs_cpu_ptr = a_scales_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* b_scales_ptrs_cpu_ptr = b_scales_ptrs_cpu.data_ptr<int64_t>();
+    //     //  printf("POINTER 6: %p\n", a_ptrs.data_ptr());
+ 
+    //      for (int i = 0; i < std::min(32, num_experts); ++i) {
+    //          printf("Expert %d:\n", i);
+    //          printf("  a_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(a_ptrs_cpu_ptr[i]));
+    //          printf("  b_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(b_ptrs_cpu_ptr[i]));
+    //          printf("  out_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(out_ptrs_cpu_ptr[i]));
+    //          printf("  a_scales_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(a_scales_ptrs_cpu_ptr[i]));
+    //          printf("  b_scales_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(b_scales_ptrs_cpu_ptr[i]));
+    //      }
+ 
+    //      printf("Expert Offsets:\n");
+    //      auto expert_offsets_cpu = expert_offsets.to(torch::kCPU);
+    //      auto* expert_offsets_cpu_ptr = expert_offsets_cpu.data_ptr<int32_t>();
+    //      for (int i = 0; i < std::min(32, num_experts); ++i) {
+    //          printf("  expert_offsets[%d]: %d\n", i, expert_offsets_cpu_ptr[i]);
+    //      }
+    //  }
+ 
+    //  cudaDeviceSynchronize();
+    //  if (current_device == debug_node) {
+    //      printf("\n=== run_int4_fp8_get_group_gemm_starts start ===\n");
+    //  }
+ 
+     run_int4_fp8_get_group_gemm_starts(expert_offsets, a_ptrs, b_ptrs, out_ptrs,
+         a_scales_ptrs, b_scales_ptrs, a_tensors, b_tensors,
+         d_tensors, a_scales, b_scales);
+ 
+    //  cudaDeviceSynchronize();
+    //  if (current_device == debug_node) {
+    //      printf("\n=== run_int4_fp8_get_group_gemm_starts done ===\n");
+    //  }
 
-// Type definitions
-using MmaType = cutlass::float_e4m3_t;      // FP8 e4m3 type
-using QuantType = cutlass::int4b_t;         // 4-bit integer type
-using ElementAccumulator = float;           // Accumulator type
-using ElementScale = float;                 // Scale type
-using ElementC = cutlass::half_t;           // Default output type (FP16)
-using ElementD = ElementC;                  // Default output type (FP16)
-using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+    //  if (current_device == debug_node) {
+    //      printf("\n=== Strides ===\n");
+    //  }
+ 
+    //  // Create problem sizes and strides
+    //  std::vector<StrideA> local_strides_a_host(num_experts);
+    //  std::vector<StrideB> local_strides_b_host(num_experts);
+    //  std::vector<StrideD> local_strides_d_host(num_experts);
+    //  std::vector<StrideS> local_strides_s_host(num_experts);
 
-// Architecture-specific configurations
-using ArchTag = cutlass::arch::Sm90;
-using OperatorClass = cutlass::arch::OpClassTensorOp;
-constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
-using TileShape = Shape<_128, _16, cute::Int<TileShapeK>>;
-using ClusterShape = Shape<_1, _1, _1>;
-
-// Layout configurations
-using LayoutA = cutlass::layout::RowMajor;
-using LayoutB = cutlass::layout::ColumnMajor;
-using LayoutC = cutlass::layout::RowMajor;
-using LayoutD = LayoutC;
-using LayoutScale = cutlass::layout::RowMajor;
-
-// Alignments
-constexpr int AlignmentA = 128 / cutlass::sizeof_bits<MmaType>::value;
-constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
-constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
-constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-
-using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
-using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
-
-// Element packing for scales
-using ElementScalePacked = cutlass::Array<ElementScale, 1>;
-
-// Kernel schedule and epilogue definitions
-using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
-using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-
-using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    TileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type *, AlignmentC,
-    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type *, AlignmentD,
-    EpilogueSchedule
->::CollectiveOp;
-
-using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<QuantType, ElementScalePacked>, LayoutB_Transpose *, AlignmentB,
-    MmaType, LayoutA_Transpose *, AlignmentA,
-    ElementAccumulator,
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    KernelSchedule
->::CollectiveOp;
-
-// Define the final kernel and GEMM operation types
-using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
-    ProblemShape,
-    CollectiveMainloopScaleOnly,
-    CollectiveEpilogue
->;
-
-using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
-
-// Stride definitions
-using StrideA = cute::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutA*>>;
-using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
-using StrideC = typename GemmKernelScaleOnly::InternalStrideC;
-using StrideD = typename GemmKernelScaleOnly::InternalStrideD;
-using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
-
-struct Int4Fp8GemmParams {
-    // Problem size parameters
-    int num_groups;
-    typename ProblemShape::UnderlyingProblemShape* problem_sizes; // Sizes of GEMM problems
-
-    // Tensors
-    const MmaType **a_ptrs;        // Array of pointers to A matrices
-    const QuantType **b_ptrs;      // Array of pointers to B matrices
-    const ElementScalePacked **scale_ptrs; // Array of pointers to scale factors
-    const ElementC **c_ptrs;       // Array of pointers to C matrices (input)
-    ElementD **d_ptrs;             // Array of pointers to D matrices (output)
-
-    // Strides for each tensor
-    StrideA *stride_a;        // Strides for A matrices
-    StrideB *stride_b;        // Strides for B matrices
-    StrideC *stride_c;        // Strides for C matrices
-    StrideD *stride_d;        // Strides for D matrices
-    const StrideS *stride_s;  // Strides for scales
-
-    // Alpha and beta scaling factors
-    ElementAccumulator *alpha;     // Array of alpha values for each problem
-    ElementAccumulator *beta;      // Array of beta values for each problem
-
-    // Scale chunk size
-    int chunk_size;                // Size of each chunk for scales (typically K/chunks)
-
-    // Workspace memory
-    void *workspace;               // Workspace memory
-    size_t workspace_size;         // Size of the workspace
-};
-
-cudaError_t runInt4Fp8GroupedGemm(Int4Fp8GemmParams& params) {
-    // Prepare device pointers for alpha and beta if they're not nullptr
-    ElementAccumulator** d_alpha_ptr_array = nullptr;
-    ElementAccumulator** d_beta_ptr_array = nullptr;
-
-    if (params.alpha && params.beta) {
-        cudaMalloc(&d_alpha_ptr_array, params.num_groups * sizeof(ElementAccumulator*));
-        cudaMalloc(&d_beta_ptr_array, params.num_groups * sizeof(ElementAccumulator*));
-
-        // Copy alpha and beta arrays to device
-        cudaMemcpy(d_alpha_ptr_array, params.alpha, params.num_groups * sizeof(ElementAccumulator*), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_beta_ptr_array, params.beta, params.num_groups * sizeof(ElementAccumulator*), cudaMemcpyHostToDevice);
-    }
-
-    // Set up GemmUniversalMode and fusion arguments
-    using Args = typename GemmScaleOnly::Arguments;
-    Args arguments;
-    decltype(arguments.epilogue.thread) fusion_args;
-
-    if (params.alpha && params.beta) {
-        // Use per-group alpha/beta values
-        fusion_args.alpha = 0;
-        fusion_args.beta = 0;
-        fusion_args.alpha_ptr = nullptr;
-        fusion_args.beta_ptr = nullptr;
-        fusion_args.alpha_ptr_array = d_alpha_ptr_array;
-        fusion_args.beta_ptr_array = d_beta_ptr_array;
-        fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
-        fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
-    } else {
-        // Use default alpha=1, beta=0
-        fusion_args.alpha = 1.0f;
-        fusion_args.beta = 0.0f;
-        fusion_args.alpha_ptr = nullptr;
-        fusion_args.beta_ptr = nullptr;
-        fusion_args.alpha_ptr_array = nullptr;
-        fusion_args.beta_ptr_array = nullptr;
-        fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-        fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
-    }
-
-    // Create hardware info for the current device
-    cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = 0;
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
-    // Create gemm arguments
+    //  for (int i = 0; i < num_experts; ++i) {
+    //      int64_t M = problem_sizes_cpu_ptr[i * 3 + 1];
+    //      int64_t N = b_tensors[i].size(0);
+    //      int64_t K = a_tensors.size(1);
+ 
+    //      local_strides_a_host[i] = cutlass::make_cute_packed_stride(StrideA{},
+    //          {static_cast<int>(M), static_cast<int>(K), 1});
+    //      local_strides_b_host[i] = cutlass::make_cute_packed_stride(StrideB{},
+    //          {static_cast<int>(N), static_cast<int>(K / 2), 1});
+    //      local_strides_d_host[i] = cutlass::make_cute_packed_stride(StrideD{},
+    //          {static_cast<int>(N), static_cast<int>(M), 1});
+    //      local_strides_s_host[i] = cutlass::make_cute_packed_stride(StrideS{},
+    //          {static_cast<int>(N), static_cast<int>(scale_k), 1});
+ 
+    //      if (current_device == debug_node) {
+    //          printf("Group %d:\n", i);
+    //          printf("  Problem size: M=%ld, N=%ld, K=%ld\n", M, N, K);
+    //          printf("  Stride A: [%d, %d, %d]\n",
+    //              static_cast<int>(get<0>(local_strides_a_host[i])),
+    //              static_cast<int>(get<1>(local_strides_a_host[i])),
+    //              static_cast<int>(get<2>(local_strides_a_host[i])));
+    //          printf("  Stride B: [%d, %d, %d]\n",
+    //              static_cast<int>(get<0>(local_strides_b_host[i])),
+    //              static_cast<int>(get<1>(local_strides_b_host[i])),
+    //              static_cast<int>(get<2>(local_strides_b_host[i])));
+    //          printf("  Stride D: [%d, %d, %d]\n",
+    //              static_cast<int>(get<0>(local_strides_d_host[i])),
+    //              static_cast<int>(get<1>(local_strides_d_host[i])),
+    //              static_cast<int>(get<2>(local_strides_d_host[i])));
+    //          printf("  Stride S: [%d, %d, %d]\n",
+    //              static_cast<int>(get<0>(local_strides_s_host[i])),
+    //              static_cast<int>(get<1>(local_strides_s_host[i])),
+    //              static_cast<int>(get<2>(local_strides_s_host[i])));
+    //      }
+    //  }
+ 
+    //  // Device allocations
+    //  cutlass::DeviceAllocation<StrideA> local_strides_a;
+    //  cutlass::DeviceAllocation<StrideB> local_strides_b;
+    //  cutlass::DeviceAllocation<StrideD> local_strides_d;
+    //  cutlass::DeviceAllocation<StrideS> local_strides_s;
+ 
+    //  // Reset and copy from host
+    //  local_strides_a.reset(num_experts);
+    //  local_strides_a.copy_from_host(local_strides_a_host.data());
+ 
+    //  local_strides_b.reset(num_experts);
+    //  local_strides_b.copy_from_host(local_strides_b_host.data());
+ 
+    //  local_strides_d.reset(num_experts);
+    //  local_strides_d.copy_from_host(local_strides_d_host.data());
+ 
+    //  local_strides_s.reset(num_experts);
+    //  local_strides_s.copy_from_host(local_strides_s_host.data());
+     
+    //  if (current_device == debug_node) {
+    //      printf("\n=== Pointer Arrays (Before GEMM) ===\n");
+    //      // Copy pointer arrays to CPU
+    //      auto a_ptrs_cpu = a_ptrs.to(torch::kCPU);
+    //      auto b_ptrs_cpu = b_ptrs.to(torch::kCPU);
+    //      auto out_ptrs_cpu = out_ptrs.to(torch::kCPU);
+    //      auto a_scales_ptrs_cpu = a_scales_ptrs.to(torch::kCPU);
+    //      auto b_scales_ptrs_cpu = b_scales_ptrs.to(torch::kCPU);
+ 
+    //      auto* a_ptrs_cpu_ptr = a_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* b_ptrs_cpu_ptr = b_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* out_ptrs_cpu_ptr = out_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* a_scales_ptrs_cpu_ptr = a_scales_ptrs_cpu.data_ptr<int64_t>();
+    //      auto* b_scales_ptrs_cpu_ptr = b_scales_ptrs_cpu.data_ptr<int64_t>();
+ 
+    //      for (int i = 0; i < std::min(32, num_experts); ++i) {
+    //          printf("Expert %d:\n", i);
+    //          printf("  a_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(a_ptrs_cpu_ptr[i]));
+    //          printf("  b_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(b_ptrs_cpu_ptr[i]));
+    //          printf("  out_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(out_ptrs_cpu_ptr[i]));
+    //          printf("  a_scales_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(a_scales_ptrs_cpu_ptr[i]));
+    //          printf("  b_scales_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(b_scales_ptrs_cpu_ptr[i]));
+    //      }
+ 
+         // // Print strides
+         // printf("\n=== Stride Information ===\n");
+         // auto a_strides_cpu = a_strides.to(torch::kCPU);
+         // auto b_strides_cpu = b_strides.to(torch::kCPU);
+         // auto d_strides_cpu = d_strides.to(torch::kCPU);
+         // auto s_strides_cpu = s_strides.to(torch::kCPU);
+ 
+         // auto* a_strides_cpu_ptr = a_strides_cpu.data_ptr<int64_t>();
+         // auto* b_strides_cpu_ptr = b_strides_cpu.data_ptr<int64_t>();
+         // auto* d_strides_cpu_ptr = d_strides_cpu.data_ptr<int64_t>();
+         // auto* s_strides_cpu_ptr = s_strides_cpu.data_ptr<int64_t>();
+ 
+         // for (int i = 0; i < std::min(32, num_experts); ++i) {
+         //     printf("Expert %d:\n", i);
+         //     printf("  a_strides[%d]: %ld\n", i, a_strides_cpu_ptr[i]);
+         //     printf("  b_strides[%d]: %ld\n", i, b_strides_cpu_ptr[i]);
+         //     printf("  d_strides[%d]: %ld\n", i, d_strides_cpu_ptr[i]);
+         //     printf("  s_strides[%d]: %ld\n", i, s_strides_cpu_ptr[i]);
+         // }
+ 
+     // Modify the arguments setup to use processed tensors
+    //  arguments = Args {
+    //      cutlass::gemm::GemmUniversalMode::kGrouped,
+    //      {num_experts, problem_sizes_as_shapes, nullptr},
+    //      {static_cast<const QuantType **>(b_ptrs.data_ptr()), static_cast<StrideB*>(local_strides_b.get()),
+    //       static_cast<const MmaType **>(a_ptrs.data_ptr()), static_cast<StrideA*>(local_strides_a.get()),
+    //       static_cast<const ElementScalePacked **>(b_scales_ptrs.data_ptr()),
+    //       static_cast<StrideS*>(local_strides_s.get()),
+    //       static_cast<int>(chunk_size)},
+    //      {fusion_args, nullptr, nullptr, static_cast<ElementD **>(out_ptrs.data_ptr()),
+    //       static_cast<StrideD*>(local_strides_d.get())},
+    //      hw_info
+    //  };
     arguments = Args {
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {params.num_groups, params.problem_sizes, nullptr},
-        {params.b_ptrs, params.stride_b, params.a_ptrs, params.stride_a, params.scale_ptrs, params.stride_s, params.chunk_size},
-        {fusion_args, params.c_ptrs, params.stride_c, params.d_ptrs, params.stride_d},
+        {num_experts, problem_sizes_as_shapes, nullptr},
+        {static_cast<const QuantType **>(b_ptrs.data_ptr()), static_cast<StrideB*>(b_strides.data_ptr()),
+         static_cast<const MmaType **>(a_ptrs.data_ptr()), static_cast<StrideA*>(a_strides.data_ptr()),
+         static_cast<const ElementScalePacked **>(b_scales_ptrs.data_ptr()),
+         static_cast<StrideS*>(s_strides.data_ptr()),
+         static_cast<int>(chunk_size)},
+        {fusion_args, nullptr, nullptr, static_cast<ElementD **>(out_ptrs.data_ptr()),
+         static_cast<StrideD*>(d_strides.data_ptr())},
         hw_info
     };
-
-    // Instantiate GEMM
-    GemmScaleOnly gemm;
-
-    // Get workspace size
-    params.workspace_size = GemmScaleOnly::get_workspace_size(arguments);
-
-    // Allocate workspace if not provided
-    void* workspace_ptr = params.workspace;
-    bool allocated_workspace = false;
-
-    if (!workspace_ptr && params.workspace_size > 0) {
-        cudaMalloc(&workspace_ptr, params.workspace_size);
-        allocated_workspace = true;
-    }
-
-    // Check if the problem is supported
-    cutlass::Status status = gemm.can_implement(arguments);
-    if (status != cutlass::Status::kSuccess) {
-        if (allocated_workspace) {
-            cudaFree(workspace_ptr);
-        }
-        if (d_alpha_ptr_array) cudaFree(d_alpha_ptr_array);
-        if (d_beta_ptr_array) cudaFree(d_beta_ptr_array);
-        return cudaErrorInvalidValue;
-    }
-
-    // Initialize the GEMM with arguments and workspace
-    status = gemm.initialize(arguments, workspace_ptr);
-    if (status != cutlass::Status::kSuccess) {
-        if (allocated_workspace) {
-            cudaFree(workspace_ptr);
-        }
-        if (d_alpha_ptr_array) cudaFree(d_alpha_ptr_array);
-        if (d_beta_ptr_array) cudaFree(d_beta_ptr_array);
-        return cudaErrorInvalidValue;
-    }
-
-    // Run the GEMM
-    status = gemm.run();
-
-    // Free allocated resources
-    if (allocated_workspace) {
-        cudaFree(workspace_ptr);
-    }
-    if (d_alpha_ptr_array) cudaFree(d_alpha_ptr_array);
-    if (d_beta_ptr_array) cudaFree(d_beta_ptr_array);
-
-    // Wait for kernel to finish
-    cudaDeviceSynchronize();
-
-    // Return status
-    return status == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorUnknown;
-}
-
-template <typename StrideType>
-std::vector<StrideType> createStrides(const std::vector<torch::Tensor>& tensors, bool is_transposed = false) {
-    std::vector<StrideType> strides;
-    strides.reserve(tensors.size());
-
-    for (const auto& tensor : tensors) {
-        int64_t M = tensor.size(0);
-        int64_t N = tensor.size(1);
-        if (is_transposed) {
-            // For transposed layout
-            strides.push_back(cutlass::make_cute_packed_stride(StrideType{}, {static_cast<int>(N), static_cast<int>(M), 1}));
-        } else {
-            // For standard layout
-            strides.push_back(cutlass::make_cute_packed_stride(StrideType{}, {static_cast<int>(M), static_cast<int>(N), 1}));
-        }
-    }
-
-    return strides;
-}
-
-template <typename T>
-std::vector<const T*> getDevicePtrs(const std::vector<torch::Tensor>& tensors) {
-    std::vector<const T*> ptrs;
-    ptrs.reserve(tensors.size());
-
-    for (const auto& tensor : tensors) {
-        ptrs.push_back(reinterpret_cast<const T*>(tensor.data_ptr()));
-    }
-
-    return ptrs;
-}
-
-template <typename T>
-std::vector<T*> getMutableDevicePtrs(const std::vector<torch::Tensor>& tensors) {
-    std::vector<T*> ptrs;
-    ptrs.reserve(tensors.size());
-
-    for (auto& tensor : tensors) {
-        // Remove const for output tensors
-        ptrs.push_back(reinterpret_cast<T*>(tensor.data_ptr()));
-    }
-
-    return ptrs;
-}
-
-std::vector<typename ProblemShape::UnderlyingProblemShape> createProblemSizes(
-    const std::vector<int>& m_values,
-    const std::vector<int>& n_values,
-    const std::vector<int>& k_values)
-{
-    int num_groups = m_values.size();
-    std::vector<typename ProblemShape::UnderlyingProblemShape> problem_sizes(num_groups);
-
-    for (int i = 0; i < num_groups; i++) {
-        // Note: We swap M and N because of the transpose
-        problem_sizes[i] = make_tuple(n_values[i], m_values[i], k_values[i]);
-    }
-
-    return problem_sizes;
-}
-
-// Helper function to preprocess int4 tensors
-std::vector<torch::Tensor> preprocessInt4Tensors(const std::vector<torch::Tensor>& raw_tensors) {
-    std::vector<torch::Tensor> processed_tensors;
-    processed_tensors.reserve(raw_tensors.size());
-
-    for (const auto& tensor : raw_tensors) {
-        // Create a new tensor with the same size to hold the processed values
-        auto processed = torch::empty_like(tensor);
-
-        // Call the CUTLASS encoding function
-        cutlass::unified_encode_int4b(
-            reinterpret_cast<const cutlass::int4b_t*>(tensor.data_ptr()),
-            reinterpret_cast<cutlass::int4b_t*>(processed.data_ptr()),
-            tensor.numel()
-        );
-
-        processed_tensors.push_back(processed);
-    }
-
-    return processed_tensors;
-}
-
-// Helper function to preprocess scale tensors
-std::vector<torch::Tensor> preprocessScaleTensors(const std::vector<torch::Tensor>& scale_tensors) {
-    std::vector<torch::Tensor> packed_tensors;
-    packed_tensors.reserve(scale_tensors.size());
-
-    for (const auto& tensor : scale_tensors) {
-        // Create a tensor for packed scales
-        auto packed = torch::empty_like(tensor);
-
-        // Pack the scales using our template function
-        cutlass::pack_scale_fp32<ElementScale, ElementScalePacked>(
-            reinterpret_cast<const float*>(tensor.data_ptr()),
-            reinterpret_cast<ElementScalePacked*>(packed.data_ptr()),
-            tensor.numel(),
-            ElementScalePacked::kElements
-        );
-
-        packed_tensors.push_back(packed);
-    }
-
-    return packed_tensors;
-}
-
-/**
- * @brief Main function to run int4 * fp8 grouped GEMM from PyTorch
- *
- * This function performs multiple GEMM operations in parallel where each operation multiplies
- * an FP8 matrix (A) with a quantized INT4 matrix (B), applying per-channel scaling factors.
- * It's designed for efficient execution on NVIDIA Hopper GPUs, leveraging Tensor Cores for
- * optimal performance with mixed precision arithmetic.
- *
- * Rather than taking vectors of tensors, this function uses expert_offsets to manage
- * multiple GEMM operations within the unified tensors.
- *
- * @param a_tensor Tensor containing all A matrices (fp8_e4m3) with shape [total_m, K]
- * @param b_tensor Tensor containing all B matrices (int4 packed as int8) with shape [total_n, K/2]
- * @param scale_tensor Tensor containing all scale factors with shape [total_n, K/chunk_size]
- * @param c_tensor Tensor containing all C matrices (input) with shape [total_m, total_n]
- * @param expert_offsets Tensor containing expert offsets for determining group boundaries
- * @param problem_sizes Tensor containing problem sizes with shape [num_groups, 3] (M, N, K for each group)
- * @param a_strides Tensor containing strides for A matrices with shape [num_groups, 3]
- * @param b_strides Tensor containing strides for B matrices with shape [num_groups, 3]
- * @param c_strides Tensor containing strides for C matrices with shape [num_groups, 3]
- * @param chunk_size Size of each chunk for scales (K / number of scale chunks)
- * @param alpha Optional scalar multiplier for the product of A and B matrices
- * @param beta Optional scalar multiplier for matrix C
- * @return torch::Tensor Output tensor D with shape [total_m, total_n]
- */
-torch::Tensor int4_fp8_grouped_gemm(
-    torch::Tensor const& a_tensor,
-    torch::Tensor const& b_tensor,
-    torch::Tensor const& scale_tensor,
-    torch::Tensor const& c_tensor,
-    torch::Tensor const& expert_offsets,
-    torch::Tensor const& problem_sizes,
-    torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides,
-    torch::Tensor const& c_strides,
-    int64_t chunk_size,
-    double alpha,
-    double beta)
-{
-    // Check inputs
-    TORCH_CHECK(a_tensor.dim() == 2, "A tensor must be 2D");
-    TORCH_CHECK(b_tensor.dim() == 3, "B tensor must be 3D");
-    TORCH_CHECK(scale_tensor.dim() == 3, "Scale tensor must be 3D");
-    // TORCH_CHECK(c_tensor.dim() == 2, "C tensor must be 2D");
-    TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
-    TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
-    // TORCH_CHECK(a_strides.dim() == 2, "a_strides must be 2D tensor");
-    // TORCH_CHECK(b_strides.dim() == 2, "b_strides must be 2D tensor");
-    // TORCH_CHECK(c_strides.dim() == 2, "c_strides must be 2D tensor");
-
-    // Get number of groups from expert_offsets
-    int num_groups = static_cast<int>(expert_offsets.size(0));
-
-    // Check tensor shapes
-    // TORCH_CHECK(problem_sizes.size(0) == num_groups, "problem_sizes must have num_groups rows");
-    // TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (M, N, K)");
-    // TORCH_CHECK(a_strides.size(0) == num_groups, "a_strides must have num_groups rows");
-    // TORCH_CHECK(a_strides.size(1) == 3, "a_strides must have 3 columns");
-    // TORCH_CHECK(b_strides.size(0) == num_groups, "b_strides must have num_groups rows");
-    // TORCH_CHECK(b_strides.size(1) == 3, "b_strides must have 3 columns");
-    // TORCH_CHECK(c_strides.size(0) == num_groups, "c_strides must have num_groups rows");
-    // TORCH_CHECK(c_strides.size(1) == 3, "c_strides must have 3 columns");
-
-    // Check tensor types
-    TORCH_CHECK(a_tensor.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
-    TORCH_CHECK(b_tensor.scalar_type() == torch::kInt8, "B tensor must contain packed int4 values (stored as int8)");
-
-    // Set CUDA device based on the input tensor
-    const at::cuda::CUDAGuard device_guard(a_tensor.device());
-
-    // Create output tensor
-    auto d_tensor = torch::empty_like(c_tensor);
-
-    // Split tensors into groups based on expert_offsets
-    std::vector<torch::Tensor> a_tensors, b_tensors, scale_tensors, c_tensors, d_tensors;
-
-    auto offsets = expert_offsets.cpu().data_ptr<int64_t>();
-    int64_t K = a_tensor.size(1);
-
-    for (int i = 0; i < num_groups; i++) {
-        // Extract the appropriate slices for each group
-        int64_t M_offset = offsets[i];
-        int64_t M = (i < num_groups - 1) ? (offsets[i+1] - offsets[i]) : (a_tensor.size(0) - offsets[i]);
-
-        a_tensors.push_back(a_tensor.slice(0, M_offset, M_offset + M));
-        b_tensors.push_back(b_tensor);  // Each group uses the whole B tensor
-        scale_tensors.push_back(scale_tensor);  // Each group uses the whole scale tensor
-        c_tensors.push_back(c_tensor.slice(0, M_offset, M_offset + M));
-        d_tensors.push_back(d_tensor.slice(0, M_offset, M_offset + M));
-    }
-
-    // Preprocess int4 tensors
-    std::vector<torch::Tensor> processed_b_tensors = preprocessInt4Tensors(b_tensors);
-
-    // Preprocess scale tensors
-    std::vector<torch::Tensor> packed_scale_tensors = preprocessScaleTensors(scale_tensors);
-
-    // Convert problem sizes to device memory
-    typename ProblemShape::UnderlyingProblemShape* device_problem_sizes;
-    cudaMalloc(&device_problem_sizes, num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape));
-
-    std::vector<typename ProblemShape::UnderlyingProblemShape> host_problem_sizes(num_groups);
-    auto problem_sizes_cpu = problem_sizes.cpu();
-    auto problem_sizes_ptr = problem_sizes_cpu.data_ptr<int>();
-
-    for (int i = 0; i < num_groups; ++i) {
-        host_problem_sizes[i] = make_tuple(
-            problem_sizes_ptr[i * 3 + 0],  // M
-            problem_sizes_ptr[i * 3 + 1],  // N
-            problem_sizes_ptr[i * 3 + 2]   // K
-        );
-    }
-
-    cudaMemcpy(
-        device_problem_sizes,
-        host_problem_sizes.data(),
-        num_groups * sizeof(typename ProblemShape::UnderlyingProblemShape),
-        cudaMemcpyHostToDevice
-    );
-
-    // Convert strides to device memory
-    StrideA* stride_a_ptr;
-    StrideB* stride_b_ptr;
-    StrideC* stride_c_ptr;
-
-    cudaMalloc(&stride_a_ptr, num_groups * sizeof(StrideA));
-    cudaMalloc(&stride_b_ptr, num_groups * sizeof(StrideB));
-    cudaMalloc(&stride_c_ptr, num_groups * sizeof(StrideC));
-
-    // Convert A strides
-    std::vector<StrideA> host_strides_a(num_groups);
-    auto a_strides_cpu = a_strides.cpu();
-    auto a_strides_ptr = a_strides_cpu.data_ptr<int>();
-
-    for (int i = 0; i < num_groups; ++i) {
-        host_strides_a[i] = cutlass::make_cute_packed_stride(StrideA{}, {
-            a_strides_ptr[i * 3 + 0],
-            a_strides_ptr[i * 3 + 1],
-            a_strides_ptr[i * 3 + 2]
-        });
-    }
-
-    cudaMemcpy(
-        stride_a_ptr,
-        host_strides_a.data(),
-        num_groups * sizeof(StrideA),
-        cudaMemcpyHostToDevice
-    );
-
-    // Convert B strides
-    std::vector<StrideB> host_strides_b(num_groups);
-    auto b_strides_cpu = b_strides.cpu();
-    auto b_strides_ptr = b_strides_cpu.data_ptr<int>();
-
-    for (int i = 0; i < num_groups; ++i) {
-        host_strides_b[i] = cutlass::make_cute_packed_stride(StrideB{}, {
-            b_strides_ptr[i * 3 + 0],
-            b_strides_ptr[i * 3 + 1],
-            b_strides_ptr[i * 3 + 2]
-        });
-    }
-
-    cudaMemcpy(
-        stride_b_ptr,
-        host_strides_b.data(),
-        num_groups * sizeof(StrideB),
-        cudaMemcpyHostToDevice
-    );
-
-    // Convert C strides
-    std::vector<StrideC> host_strides_c(num_groups);
-    auto c_strides_cpu = c_strides.cpu();
-    auto c_strides_ptr = c_strides_cpu.data_ptr<int>();
-
-    for (int i = 0; i < num_groups; ++i) {
-        host_strides_c[i] = cutlass::make_cute_packed_stride(StrideC{}, {
-            c_strides_ptr[i * 3 + 0],
-            c_strides_ptr[i * 3 + 1],
-            c_strides_ptr[i * 3 + 2]
-        });
-    }
-
-    cudaMemcpy(
-        stride_c_ptr,
-        host_strides_c.data(),
-        num_groups * sizeof(StrideC),
-        cudaMemcpyHostToDevice
-    );
-
-    // Create D strides
-    std::vector<StrideD> local_stride_d = createStrides<StrideD>(d_tensors);
-
-    // Create scale strides
-    std::vector<StrideS> local_stride_s = createStrides<StrideS>(packed_scale_tensors);
-
-    // Get device pointers
-    auto a_ptrs = getDevicePtrs<MmaType>(a_tensors);
-    auto b_ptrs = getDevicePtrs<QuantType>(processed_b_tensors);
-    auto scale_ptrs = getDevicePtrs<ElementScalePacked>(packed_scale_tensors);
-    auto c_ptrs = getDevicePtrs<ElementC>(c_tensors);
-    auto d_ptrs = getMutableDevicePtrs<ElementD>(d_tensors);
-
-    // Create parameters structure
-    Int4Fp8GemmParams params;
-    params.num_groups = num_groups;
-    params.problem_sizes = device_problem_sizes;
-    params.a_ptrs = a_ptrs.data();
-    params.b_ptrs = b_ptrs.data();
-    params.scale_ptrs = scale_ptrs.data();
-    params.c_ptrs = c_ptrs.data();
-    params.d_ptrs = d_ptrs.data();
-    params.stride_a = stride_a_ptr;
-    params.stride_b = stride_b_ptr;
-    params.stride_c = stride_c_ptr;
-    params.stride_d = local_stride_d.data();
-    params.stride_s = local_stride_s.data();
-
-    // Allocate and set alpha and beta values
-    ElementAccumulator* alpha_ptr = nullptr;
-    ElementAccumulator* beta_ptr = nullptr;
-    cudaMalloc(&alpha_ptr, sizeof(ElementAccumulator));
-    cudaMalloc(&beta_ptr, sizeof(ElementAccumulator));
-    cudaMemcpy(alpha_ptr, &alpha, sizeof(ElementAccumulator), cudaMemcpyHostToDevice);
-    cudaMemcpy(beta_ptr, &beta, sizeof(ElementAccumulator), cudaMemcpyHostToDevice);
-
-    params.alpha = alpha_ptr;
-    params.beta = beta_ptr;
-    params.chunk_size = chunk_size;
-    params.workspace = nullptr;  // Allocated inside runInt4Fp8GroupedGemm
-
-    // Run the GEMM
-    cudaError_t status = runInt4Fp8GroupedGemm(params);
-
-    // Free allocated resources
-    if (alpha_ptr) cudaFree(alpha_ptr);
-    if (beta_ptr) cudaFree(beta_ptr);
-    cudaFree(device_problem_sizes);
-    cudaFree(stride_a_ptr);
-    cudaFree(stride_b_ptr);
-    cudaFree(stride_c_ptr);
-
-    if (status != cudaSuccess) {
-        TORCH_CHECK(false, "int4_fp8_grouped_gemm failed with error: ", cudaGetErrorString(status));
-    }
-
-    return d_tensor;
-}
+ 
+    //  if (current_device == debug_node) {
+    //      printf("\n=== GEMM Arguments ===\n");
+    //      printf("mode: %d\n", static_cast<int>(arguments.mode));
+    //      printf("num_experts: %d\n", num_experts);
+    //      printf("chunk_size: %d\n", static_cast<int>(chunk_size));
+    //  }
+ 
+     // Instantiate and run GEMM
+     GemmScaleOnly gemm;
+     size_t workspace_size = GemmScaleOnly::get_workspace_size(arguments);
+     auto const workspace_options =
+         torch::TensorOptions().dtype(torch::kUInt8).device(a_tensors.device());
+     auto workspace = torch::empty(workspace_size, workspace_options);
+ 
+     cutlass::Status status = gemm.can_implement(arguments);
+     if (status != cutlass::Status::kSuccess) {
+         TORCH_CHECK(false, "GEMM implementation not supported");
+     }
+ 
+     status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+     if (status != cutlass::Status::kSuccess) {
+         TORCH_CHECK(false, "GEMM initialization failed");
+     }
+ 
+    //  if (current_device == debug_node) {
+    //      printf("\n=== Run GEMM ===\n");
+    //  }
+    //  cudaDeviceSynchronize(); // Jack: just in case
+     status = gemm.run(stream);
+     if (status != cutlass::Status::kSuccess) {
+        //  if (current_device == debug_node) {
+        //      printf("%d GEMM execution failed. Status: %d\n", current_device, static_cast<int>(status));
+        //  }
+         TORCH_CHECK(false, "GEMM execution failed");
+     }
+ 
+    //  if (current_device == debug_node) {
+    //      printf("\n=== Done GEMM ===\n");
+    //  }
+ 
+    // //  cudaDeviceSynchronize();
+    //  cudaError_t err = cudaGetLastError();
+    //  if (err != cudaSuccess) {
+    //      printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+    //  }
+ }

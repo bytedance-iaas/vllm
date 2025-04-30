@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
+from ast import Try
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -557,6 +558,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            # print(f"hidden_states shape{hidden_states.shape}, dtype {hidden_states.dtype}")
+            # print(f"residual shape{residual.shape}, dtype {residual.dtype}")
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
         hidden_states = self.self_attn(
@@ -577,6 +580,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        # print(f"layer idx, {self.layer_idx}")
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp,
@@ -745,6 +749,16 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        # ('experts.w13_', 'experts.17.gate_proj.', 17, 'w1')
+        # ('experts.w2_', 'experts.17.down_proj.', 17, 'w2')
+        # ('experts.w13_', 'experts.17.up_proj.', 17, 'w3')
+        # ('experts.w13_', 'experts.18.gate_proj.', 18, 'w1')
+        # ('experts.w2_', 'experts.18.down_proj.', 18, 'w2')
+        # ('experts.w13_', 'experts.18.up_proj.', 18, 'w3')
+        # Add scale:
+        # ('experts.w13_input_scale', 'experts.w3_w1_scale', expert_id, 'w1')
+        # ('experts.w2_input_scale', 'experts.w2_scale', expert_id, 'w2')
+        # ('experts.w13_input_scale', 'experts.w3_w1_scale', expert_id, 'w3')
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -815,8 +829,13 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
 
                     if is_pp_missing_parameter(name, self):
                         continue
-
+                    # if "w2_scale" in name and name not in params_dict:
+                    #     print("Keys containing 'w2_scale':", 
+                    #           [k for k in params_dict.keys() if "w2_scale" in k])
                     param = params_dict[name]
+                    # print(f"param name {name}")
+                    # model.layers.10.mlp.experts.w2_scale
+                    # print(f"expert_params_mapping {expert_params_mapping}")
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)

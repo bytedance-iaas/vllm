@@ -1010,25 +1010,27 @@ def scaled_fp4_quant(
 
 # int4_fp8 grouped gemm
 def int4_fp8_grouped_gemm(
+    d: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    scales: torch.Tensor,
-    c: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
     experts_offsets: torch.tensor,
     problem_sizes: torch.tensor,
     a_strides: torch.tensor,
     b_strides: torch.tensor,
-    c_strides: torch.tensor,
+    d_strides: torch.tensor,
+    s_strides: torch.tensor,
     chunk_size: int = 0,
-    alpha: float = 1.0,
-    beta: float = 0.0,
-) -> list[torch.Tensor]:
+):
     """
     Perform grouped matrix multiplication between int4 weights and fp8 activations.
+    
     This function executes multiple GEMM operations in parallel, which is useful for
     scenarios like Mixture of Experts (MoE) where different inputs go through different
     experts. The implementation leverages NVIDIA Hopper architecture features for
     optimal performance with quantized weights.
+    
     Args:
         a_tensors: List of activation matrices in FP8 (float_e4m3_t) format
             Each tensor should be of shape [M, K] in row-major layout
@@ -1037,34 +1039,29 @@ def int4_fp8_grouped_gemm(
             where each byte contains two 4-bit integers
         scale_tensors: List of scale factors for the quantized weights
             Each tensor should be of shape [N, K/chunk_size]
-        c_tensors: List of output accumulator matrices
-            Each tensor should be of shape [M, N] and typically initialized to zeros
         experts_offsets: Tensor containing expert offsets for determining group boundaries
-        problem_sizes: Optional custom problem sizes (None for auto-detection)
-        a_strides: Optional custom strides for A matrices (None for default)
-        b_strides: Optional custom strides for B matrices (None for default)
-        c_strides: Optional custom strides for C matrices (None for default)
+        problem_sizes: problem sizes
         chunk_size: Number of elements each scale value applies to (K/num_chunks)
             If 0, will be auto-detected from the first tensors
-        alpha: Scalar multiplier for the product of matrices A and B (default: 1.0)
-        beta: Scalar multiplier for matrix C (default: 0.0)
+            
     Returns:
         torch.Tensor: List of output matrices of shape [M, N]
+        
     Requirements:
         - All tensors must be on a CUDA device
         - Requires an NVIDIA Hopper GPU (H100)
         - A tensors must be in float8_e4m3fn format
         - B tensors must contain packed int4 values (stored as int8)
         - All lists must have the same length
+        
     Note:
-        The function computes: D = alpha * (A * (B * scales)) + beta * C
+        The function computes: D = (A * (B * scales))
         for each group of tensors in parallel
     """
 
-    return torch.ops._C.int4_fp8_grouped_gemm(
-        a, b, scales, c, experts_offsets, problem_sizes,
-        a_strides, b_strides, c_strides,
-        chunk_size, alpha, beta)
+    torch.ops._C.int4_fp8_grouped_gemm(
+        d, a, b, a_scales, b_scales, experts_offsets, problem_sizes, 
+        a_strides, b_strides, d_strides, s_strides, chunk_size)
 
 # fp8
 def scaled_fp8_quant(

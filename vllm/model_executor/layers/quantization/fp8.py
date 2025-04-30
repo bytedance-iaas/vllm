@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import importlib.util
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -895,6 +896,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
 
 class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
+
     def __init__(self, quant_config: Fp8MoEInt4Config):
         self.quant_config = quant_config
 
@@ -913,8 +915,8 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size_per_partition,
-                hidden_size,
+                intermediate_size_per_partition * 2,
+                hidden_size // 2,
                 dtype=torch.int8,
             ),
             requires_grad=False,
@@ -926,8 +928,8 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         w2_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                hidden_size // 2,
-                intermediate_size_per_partition,
+                hidden_size,
+                intermediate_size_per_partition // 2,
                 dtype=torch.int8,
             ),
             requires_grad=False,
@@ -944,40 +946,108 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
         extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-        )
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value})
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition // self.quant_config.group_size,
+                intermediate_size_per_partition //
+                self.quant_config.group_size,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-        w13_input_scale = torch.nn.Parameter(
-            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-        )
-        layer.register_parameter("w3_w1_scale", w13_input_scale)
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+        w13_input_scale = torch.nn.Parameter(torch.ones(num_experts,
+                                                        dtype=torch.float32),
+                                             requires_grad=False)
+        layer.register_parameter("w13_input_scale", w13_input_scale)
+        # extra_weight_attrs.update(
+        #     {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        # )
+        # set_weight_attrs(w13_input_scale, {"scale_type": "input_scale"})
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
-        w2_input_scale = torch.nn.Parameter(
-            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-        )
-        layer.register_parameter("w2_scale", w2_input_scale)
+        w2_input_scale = torch.nn.Parameter(torch.ones(num_experts,
+                                                       dtype=torch.float32),
+                                            requires_grad=False)
+        # set_weight_attrs(w2_input_scale, {"scale_type": "input_scale"})
+        layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
         return
+
+    def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
+        """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+        s_shape = scales.shape
+        # Reshape to separate groups of 4
+        scales_interleaved = scales.reshape(s_shape[0], s_shape[1],
+                                            (s_shape[2] // 4), 4)
+        # Permute dimensions to interleave
+        scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
+        # Reshape back to original dimensions but with interleaved values
+        scales_interleaved = scales_interleaved.reshape(
+            s_shape[0], s_shape[2] // 4, s_shape[1] * 4)
+        return scales_interleaved.contiguous()
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        hidden_size = layer.w2_weight.shape[1]
+        intermediate_size_per_partition = layer.w2_weight.shape[2] * 2
+
+        # Interleave w13_weight_scale (gate_up_proj)
+        # print(f"w13_weight_scale_inv shape {layer.w13_weight_scale_inv.shape}")
+        w13_weight_scale = layer.w13_weight_scale_inv.to(torch.bfloat16)
+        w13_weight_scale = self._interleave_scales(w13_weight_scale)
+        # print(f"w13_weight_scale_inv shape after post process {w13_weight_scale.shape}")
+        # layer.w13_weight_scale_inv = Parameter(w13_weight_scale.view(
+        #     torch.quint4x2),
+        #                                        requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_weight_scale,
+                                               requires_grad=False)
+
+        # Interleave w2_weight_scale (down_proj)
+        # print(f"w2_weight_scale_inv shape {layer.w2_weight_scale_inv.shape}")
+        w2_weight_scale = layer.w2_weight_scale_inv.to(torch.bfloat16)
+        w2_weight_scale = self._interleave_scales(w2_weight_scale)
+        # print(f"w2_weight_scale_inv shape after post process {w2_weight_scale.shape}")
+        # layer.w2_weight_scale_inv = Parameter(w2_weight_scale.view(
+        #     torch.quint4x2),
+        #                                       requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(w2_weight_scale,
+                                              requires_grad=False)
+
+        # Process input scales
+        # print(f"w13_input_scale shape {layer.w13_input_scale.shape}")
+        w13_input_scale_scalar = layer.w13_input_scale.max().item()
+        w13_input_scale = Parameter(torch.ones(
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=layer.w13_input_scale.device),
+                                    requires_grad=False)
+        # layer.w13_input_scale = Parameter(w13_input_scale, requires_grad=False)
+        layer.w13_input_scale = Parameter(w13_input_scale /
+                                          w13_input_scale_scalar,
+                                          requires_grad=False)
+        # print(f"w13_input_scale shape after post process {w13_input_scale.shape}")
+
+        # print(f"w2_input_scale shape {layer.w2_input_scale.shape}")
+        w2_input_scale_scalar = layer.w2_input_scale.max().item()
+        w2_input_scale = Parameter(torch.ones(
+            intermediate_size_per_partition,
+            dtype=torch.bfloat16,
+            device=layer.w2_input_scale.device),
+                                   requires_grad=False)
+        # layer.w2_input_scale = Parameter(w2_input_scale, requires_grad=False)
+        layer.w2_input_scale = Parameter(w2_input_scale /
+                                         w2_input_scale_scalar,
+                                         requires_grad=False)
+        # print(f"w2_input_scale shape after post process {w2_input_scale.shape}")
 
     def apply(
         self,
@@ -1010,46 +1080,173 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
+        m = x.shape[0]
+        k = x.shape[1]
+        n = layer.w13_weight.shape[1] / 2
+        device = layer.w13_weight.device
+
         # return ops.group_gemm_xx()
         num_experts = layer.w2_weight.shape[0]
-        ab_strides1 = torch.full(
-            (num_experts,), x.stride(0), device="cuda", dtype=torch.int64
-        )
-        c_strides1 = torch.full(
-            (num_experts,),
-            layer.w2_weight.stride(0),
-            device="cuda",
-            dtype=torch.int64,
-        )
-        ab_strides2 = torch.full(
-            (num_experts,),
-            layer.w2_weight.stride(0),
-            device="cuda",
-            dtype=torch.int64,
-        )
-        c_strides2 = torch.full(
-            (num_experts,), x.stride(0), device="cuda", dtype=torch.int64
-        )
-        print(
-            f"w3_w1_scale shape, dtype: {layer.w3_w1_scale.shape, layer.w3_w1_scale.dtype}"
-        )
-        print(f"w2_scale shape, dtype: {layer.w2_scale.shape, layer.w2_scale.dtype}")
+        # a_strides1 = torch.full(
+        #     (num_experts,), k, device=device, dtype=torch.int64
+        # )
+        a_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        a_strides1[:, 0] = k
+        a_strides1[:, 1] = 1
+        a_strides1[:, 2] = 0
+        # print(f"a_strides1 shape {a_strides1.shape}")
+        # b_strides1 = torch.full((num_experts, ),
+        #                         k / 2,
+        #                         device=device,
+        #                         dtype=torch.int64)
+        b_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        b_strides1[:, 0] = k // 2
+        b_strides1[:, 1] = 1
+        b_strides1[:, 2] = 0
+        # print(f"b_strides1 shape {b_strides1.shape}")
+        # c_strides1 = torch.full(
+        #     (num_experts, ),
+        #     2 * n,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        c_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        c_strides1[:, 0] = 1
+        c_strides1[:, 1] = 2 * n
+        c_strides1[:, 2] = 0
+        # print(f"c_strides1 shape {c_strides1.shape}")
+        # a_strides2 = torch.full(
+        #     (num_experts, ),
+        #     n,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        a_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        a_strides2[:, 0] = n
+        a_strides2[:, 1] = 1
+        a_strides2[:, 2] = 0
+        # print(f"a_strides2 shape {a_strides2.shape}")
+        # b_strides2 = torch.full(
+        #     (num_experts, ),
+        #     n / 2,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        b_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        b_strides2[:, 0] = n // 2 # Use integer division
+        b_strides2[:, 1] = 1
+        b_strides2[:, 2] = 0
+        # print(f"b_strides2 shape {b_strides2.shape}")
+        # c_strides2 = torch.full((num_experts, ),
+        #                         k,
+        #                         device=device,
+        #                         dtype=torch.int64)
+        c_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        c_strides2[:, 0] = 1
+        c_strides2[:, 1] = k
+        c_strides2[:, 2] = 0
+        # print(f"c_strides2 shape {c_strides2.shape}")
+        # s_strides13 = torch.full(
+        #     (num_experts, ),
+        #     n * 2,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        s_strides13 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        s_strides13[:, 0] = 1
+        s_strides13[:, 1] = 2 * n
+        s_strides13[:, 2] = 0
+        # print(f"s_strides13 shape {s_strides13.shape}")
+        # s_strides2 = torch.full(
+        #     (num_experts, ),
+        #     k,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        s_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        s_strides2[:, 0] = 1
+        s_strides2[:, 1] = k
+        s_strides2[:, 2] = 0
+        # print(f"s_strides2 shape {s_strides2.shape}")
+        # print(
+        #     f"w13_weight shape, dtype: {layer.w13_weight.shape, layer.w13_weight.dtype}"
+        # )
+        # print(
+        #     f"w2_weight shape, dtype: {layer.w2_weight.shape, layer.w2_weight.dtype}"
+        # )
+        # print(
+        #     f"w13_weight_scale_inv shape, dtype: {layer.w13_weight_scale_inv.shape, layer.w13_weight_scale_inv.dtype}"
+        # )
+        # print(
+        #     f"w2_weight_scale_inv shape, dtype: {layer.w2_weight_scale_inv.shape, layer.w2_weight_scale_inv.dtype}"
+        # )
+        # print(
+        #     f"w13_input_scale shape, dtype: {layer.w13_input_scale.shape, layer.w13_input_scale.dtype}"
+        # )
+        # print(
+        #     f"w2_input_scale shape, dtype: {layer.w2_input_scale.shape, layer.w2_input_scale.dtype}"
+        # )
+
+        # 获取当前设备ID
+        device_id = device.index
+        # 创建保存目录
+        save_dir = f"/nvme0n1/w4a8_debug_tensors/device_{device_id}"
+
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+            # 定义要保存的张量列表
+            tensors = {
+                "x": x,
+                "w13_weight": layer.w13_weight,
+                "w2_weight": layer.w2_weight,
+                "w13_weight_scale_inv": layer.w13_weight_scale_inv,
+                "w2_weight_scale_inv": layer.w2_weight_scale_inv,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                "w13_input_scale": layer.w13_input_scale,
+                "w2_input_scale": layer.w2_input_scale,
+                "a_strides1": a_strides1,
+                "b_strides1": b_strides1,
+                "c_strides1": c_strides1,
+                "a_strides2": a_strides2,
+                "b_strides2": b_strides2,
+                "c_strides2": c_strides2,
+                "s_strides13": s_strides13,
+                "s_strides2": s_strides2,
+            }
+
+            # 保存形状信息到单独文件
+            with open(f"{save_dir}/shapes_and_dtypes.txt", "w") as f:
+                for name, tensor in tensors.items():
+                    f.write(
+                        f"{name}: {tensor.shape}, {tensor.dtype}, {tensor.device}\n"
+                    )
+                f.write(
+                    f"apply_router_weight_on_input: {apply_router_weight_on_input}\n"
+                )
+
+            # 保存每个张量的数据到单独文件
+            for name, tensor in tensors.items():
+                torch.save(tensor, f"{save_dir}/{name}.pt")
+
         return cutlass_w4a8_moe(
             x,
-            layer.w13_weight.permute(0, 2, 1),
-            layer.w2_weight.permute(0, 2, 1),
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            layer.w13_weight,  # Alreay transpose
+            layer.w2_weight,  # Alreay transpose
+            layer.w13_weight_scale_inv,  # Already interleaved
+            layer.w2_weight_scale_inv,  # Already interleaved
             topk_weights,
             topk_ids,
-            ab_strides1,
+            a_strides1,
+            b_strides1,
             c_strides1,
-            ab_strides2,
+            a_strides2,
+            b_strides2,
             c_strides2,
-            # layer.w3_w1_scale,
-            # layer.w2_scale,
-            None,
-            None,
+            s_strides13,
+            s_strides2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
             apply_router_weight_on_input,
         )
         # return x
