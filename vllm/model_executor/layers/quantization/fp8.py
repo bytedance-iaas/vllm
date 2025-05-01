@@ -577,6 +577,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def fp8_bf16_fp8(self, fp8_tensor, fp8_scale):
+        # Before - w13_weight shape: torch.Size([256, 512, 7168])
+        # Before - w13_weight_scale_inv shape: torch.Size([256, 4, 56])
+        # Before - w2_weight shape: torch.Size([256, 7168, 256])
+        # Before - w2_weight_scale_inv shape: torch.Size([256, 56, 2])
+        # Q1: why  w13 and w2不同
+        # w13_weight [256, 512 // 128, 128, 7168 // 128, 128]
+        blocked_tensor = fp8_tensor.view(
+                                        fp8_tensor.shape[0],
+                                        fp8_tensor.shape[1] // 128, 128,
+                                        fp8_tensor.shape[2] // 128,
+                                        128).to(torch.float32)
+        # dequant_tensor = (blocked_tensor *
+        #                 fp8_scale.unsqueeze(1).unsqueeze(3)).view(
+        #                     fp8_tensor.shape).to(torch.bfloat16).to(torch.float32)
+        # 原本是 .unsqueeze(1).unsqueeze(3)，那是對應 blocked_tensor 是 4 維的 case
+        # 現在 blocked_tensor 是 5 維，所以 reshape 成 [B, M//128, 1, N//128, 1]
+        dequant_tensor = (blocked_tensor *
+                  fp8_scale.unsqueeze(2).unsqueeze(4)).view(
+                      fp8_tensor.shape).to(torch.bfloat16).to(torch.float32)
+
+        scale_tensor = torch.abs(dequant_tensor).max() / 448
+        quant_tensor = dequant_tensor / scale_tensor
+
+        return quant_tensor, scale_tensor
+
     def process_weights_after_loading(self, layer: Module) -> None:
         # Lazy import to avoid importing triton too early.
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
@@ -600,6 +626,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight = layer.w2_weight
                 w2_weight_scale_inv = layer.w2_weight_scale_inv
 
+            del layer._parameters['w13_weight']
+            del layer._parameters['w13_weight_scale_inv']
+            del layer._parameters['w2_weight']
+            del layer._parameters['w2_weight_scale_inv']
+            torch.cuda.empty_cache()
+            print("Before - w13_weight shape:", w13_weight.shape)
+            print("Before - w13_weight_scale_inv shape:", w13_weight_scale_inv.shape)
+            print("Before - w2_weight shape:", w2_weight.shape)
+            print("Before - w2_weight_scale_inv shape:", w2_weight_scale_inv.shape)
+            print("Before - w13_weight_scale_inv.dim():", w13_weight_scale_inv.dim())
+            w13_weight, w13_weight_scale_inv = \
+                    self.fp8_bf16_fp8(w13_weight, w13_weight_scale_inv)
+            w2_weight, w2_weight_scale_inv = \
+                    self.fp8_bf16_fp8(w2_weight, w2_weight_scale_inv)
+            print("After - w13_weight shape:", w13_weight.shape)
+            print("After - w13_weight_scale_inv shape:", w13_weight_scale_inv.shape, w13_weight_scale_inv)
+            print("After - w2_weight shape:", w2_weight.shape)
+            print("After - w2_weight_scale_inv shape:", w2_weight_scale_inv.shape, w2_weight_scale_inv)
+            print("After - w13_weight_scale_inv.dim():", w13_weight_scale_inv.dim())
+            # w13_weight_scale_inv = w13_weight_scale_inv.repeat(256)
+            print("HACK - w13_weight_scale_inv shape:", w13_weight_scale_inv.shape, w13_weight_scale_inv)
+            print("HACK - w13_weight_scale_inv.dim():", w13_weight_scale_inv.dim())
+            
+
             # torch.compile() cannot use Parameter subclasses.
             layer.w13_weight = Parameter(w13_weight, requires_grad=False)
             layer.w13_weight_scale_inv = Parameter(w13_weight_scale_inv,
@@ -607,6 +657,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale_inv = Parameter(w2_weight_scale_inv,
                                                   requires_grad=False)
+
             if is_rocm_aiter_moe_enabled():
                 # reshaping weights is required for aiter moe kernel.
                 shuffled_w13, shuffled_w2 = shuffle_weights(
@@ -800,6 +851,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
+        print(f"global_num_experts shape {global_num_experts}")
+        """
         return fused_experts(
             x,
             layer.w13_weight,
@@ -821,6 +874,168 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.quant_config.weight_block_size,
             allow_deep_gemm=self.allow_deep_gemm,
         )
+        
+        """
+        """
+        === Input Tensor Information ===
+        a_tensors shape: [262144, 7168]
+        b_tensors shape: [32, 3584, 4096]
+        a_scales shape: [262144]
+        b_scales shape: [32, 14, 16384]
+        expert_offsets shape: [32]
+        chunk_size: 128
+
+        w13_weight[E, N, K]
+        w2_weight[E, K, N]
+        After - new_w2_weight shape: torch.Size([256, 7168, 256])
+        After - new_w2_weight_scale_inv shape: torch.Size([]) tensor(0.0042, device='cuda:2', dtype=torch.float32)
+
+        N=256
+        # Before - w13_weight shape: torch.Size([256, 512, 7168])
+        # Before - w13_weight_scale_inv shape: torch.Size([256, 4, 56])
+        """
+        m = x.shape[0]      # m = x.shape[0] same
+        k = x.shape[1]      # k = x.shape[1] same
+        n = layer.w13_weight.shape[1] # / 2 # 不用除二
+        device = layer.w13_weight.device
+
+        # return ops.group_gemm_xx()
+        num_experts = layer.w2_weight.shape[0]
+        print(f"num_experts shape {num_experts}")
+    
+        self.ab_strides1 = torch.full((num_experts, ),
+                                      k, # k
+                                      device=device,
+                                      dtype=torch.int64)
+        self.c_strides1 = torch.full((num_experts, ),
+                                     2 * n, #n
+                                     device=device,
+                                     dtype=torch.int64)
+        self.ab_strides2 = torch.full((num_experts, ),
+                                      n,
+                                      device=device,
+                                      dtype=torch.int64)
+        self.c_strides2 = torch.full((num_experts, ),
+                                     k,
+                                     device=device,
+                                     dtype=torch.int64)
+
+        """
+        # a_strides1 = torch.full(
+        #     (num_experts,), k, device=device, dtype=torch.int64
+        # )
+        a_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        a_strides1[:, 0] = k
+        a_strides1[:, 1] = 1
+        a_strides1[:, 2] = 0
+        # print(f"a_strides1 shape {a_strides1.shape}")
+        # b_strides1 = torch.full((num_experts, ),
+        #                         k / 2,
+        #                         device=device,
+        #                         dtype=torch.int64)
+        b_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        b_strides1[:, 0] = k # // 2
+        b_strides1[:, 1] = 1
+        b_strides1[:, 2] = 0
+        # print(f"b_strides1 shape {b_strides1.shape}")
+        # c_strides1 = torch.full(
+        #     (num_experts, ),
+        #     2 * n,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        c_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        c_strides1[:, 0] = 1
+        c_strides1[:, 1] = 2 * n
+        c_strides1[:, 2] = 0
+        # print(f"c_strides1 shape {c_strides1.shape}")
+        # a_strides2 = torch.full(
+        #     (num_experts, ),
+        #     n,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        a_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        a_strides2[:, 0] = n
+        a_strides2[:, 1] = 1
+        a_strides2[:, 2] = 0
+        # print(f"a_strides2 shape {a_strides2.shape}")
+        # b_strides2 = torch.full(
+        #     (num_experts, ),
+        #     n / 2,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        b_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        b_strides2[:, 0] = n // 2 # Use integer division
+        b_strides2[:, 1] = 1
+        b_strides2[:, 2] = 0
+        # print(f"b_strides2 shape {b_strides2.shape}")
+        # c_strides2 = torch.full((num_experts, ),
+        #                         k,
+        #                         device=device,
+        #                         dtype=torch.int64)
+        c_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        c_strides2[:, 0] = 1
+        c_strides2[:, 1] = k
+        c_strides2[:, 2] = 0
+        # print(f"c_strides2 shape {c_strides2.shape}")
+        # s_strides13 = torch.full(
+        #     (num_experts, ),
+        #     n * 2,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        """
+        """
+        s_strides13 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        s_strides13[:, 0] = 1
+        s_strides13[:, 1] = 2 * n
+        s_strides13[:, 2] = 0
+        # print(f"s_strides13 shape {s_strides13.shape}")
+        # s_strides2 = torch.full(
+        #     (num_experts, ),
+        #     k,
+        #     device=device,
+        #     dtype=torch.int64,
+        # )
+        s_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
+        s_strides2[:, 0] = 1
+        s_strides2[:, 1] = k
+        s_strides2[:, 2] = 0
+        # print(f"s_strides2 shape {s_strides2.shape}")
+        # print(f"w13_weight shape, dtype: {layer.w13_weight.shape, layer.w13_weight.dtype}")
+        # print(f"w2_weight shape, dtype: {layer.w2_weight.shape, layer.w2_weight.dtype}")
+        # print(f"w13_weight_scale_inv shape, dtype: {layer.w13_weight_scale_inv.shape, layer.w13_weight_scale_inv.dtype}"ssssssssss)
+        # print(f"w2_weight_scale_inv shape, dtype: {layer.w2_weight_scale_inv.shape, layer.w2_weight_scale_inv.dtype}")
+        # print(f"w13_input_scale shape, dtype: {layer.w13_input_scale.shape, layer.w13_input_scale.dtype}")
+        # print(f"w2_input_scale shape, dtype: {layer.w2_input_scale.shape, layer.w2_input_scale.dtype}")
+        """
+        from vllm.model_executor.layers.fused_moe import cutlass_moe_fp8
+
+        print(f"Jack type {type(layer)}")
+        print(f"Jack dir(layer) {dir(layer)}")
+        print(f"Jack final check layer.w13_weight_scale_inv.dim(): {layer.w13_weight_scale_inv.dim()}")
+
+        return cutlass_moe_fp8(
+            x,
+            layer.w13_weight.transpose(1, 2),   # per-block = scale_inv
+            layer.w2_weight.transpose(1, 2),
+            layer.w13_weight_scale_inv,         # per-block = scale_inv
+            layer.w2_weight_scale_inv,
+            topk_weights,
+            topk_ids,
+            self.ab_strides1,                 # missing
+            self.c_strides1,                  # missing
+            self.ab_strides2,                 # missing
+            self.c_strides2,                  # missing
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            out_dtype=x.dtype,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):

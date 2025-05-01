@@ -434,11 +434,11 @@ class CompressedTensorsW8A8Fp8MoECutlassMethod(CompressedTensorsMoEMethod):
         device = w13_weight.device
         # TODO strides can be shared across multiple layers
         self.ab_strides1 = torch.full((num_experts, ),
-                                      hidden_size,
+                                      hidden_size, # k
                                       device=device,
                                       dtype=torch.int64)
         self.c_strides1 = torch.full((num_experts, ),
-                                     2 * intermediate_size_per_partition,
+                                     2 * intermediate_size_per_partition, #n
                                      device=device,
                                      dtype=torch.int64)
         self.ab_strides2 = torch.full((num_experts, ),
