@@ -504,7 +504,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Completions API")
 
-    generator = await handler.create_completion(request, raw_request)
+    remote_prefill_handler = remote_prefill(raw_request)
+    remote_prefill_params = remote_prefill_handler.get_remote_prefill_params(raw_request)
+
+    generator = await handler.create_completion(request, raw_request, remote_prefill_params)
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.code)
