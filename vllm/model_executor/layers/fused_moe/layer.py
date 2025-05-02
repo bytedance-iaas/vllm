@@ -7,6 +7,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
+import tensorrt_llm
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
@@ -491,6 +492,7 @@ class FusedMoE(torch.nn.Module):
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
+        self.quant_config = quant_config
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
                 UnquantizedFusedMoEMethod())
@@ -576,16 +578,29 @@ class FusedMoE(torch.nn.Module):
                            expert_data=expert_data,
                            tp_rank=tp_rank)
 
+    @staticmethod
+    def postprocess(w):
+            packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+            return packer(unpacker(w.cpu().T.contiguous()).T.contiguous())
+
     def _load_w13(self, expert_data: torch.Tensor, shard_dim: int,
                   shard_id: str, loaded_weight: torch.Tensor, tp_rank: int):
 
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
-        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank,
-                                             shard_size)
-        # Narrow parameter and load.
-        # w1, gate_proj: Load into first logical weight of w13.
+        weight_shard_size = shard_size
+        if self.quant_config is not None and \
+            self.quant_config.get_name() == "fp8_moe_int4" and \
+            expert_data.dtype == torch.int8:
+            weight_shard_size = weight_shard_size // 2
+        loaded_weight = loaded_weight.narrow(shard_dim, weight_shard_size * tp_rank,
+                                             weight_shard_size)
+        # int4 weight postprocess
+        if self.quant_config is not None and self.quant_config.get_name() == "fp8_moe_int4" and expert_data.dtype == torch.int8:
+            loaded_weight = self.postprocess(loaded_weight)
+
         if shard_id == "w1":
             expert_data = expert_data.narrow(shard_dim, 0, shard_size)
         # w3, up_proj: Load into second logical weight of w13.
@@ -605,11 +620,20 @@ class FusedMoE(torch.nn.Module):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
+        if self.quant_config is not None and \
+            self.quant_config.get_name() == "fp8_moe_int4" and \
+            expert_data.dtype == torch.int8:
+            shard_size = shard_size * 2
         if not load_full:
             loaded_weight = loaded_weight.narrow(shard_dim,
                                                  shard_size * tp_rank,
                                                  shard_size)
         # w2, down_proj: Load into only logical weight of w2.
+        # int4 weight postprocess
+        if self.quant_config is not None and \
+            self.quant_config.get_name() == "fp8_moe_int4" and \
+            expert_data.dtype == torch.int8:
+            loaded_weight = self.postprocess(loaded_weight)
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(self, param: torch.nn.Parameter,
@@ -894,7 +918,7 @@ class FusedMoE(torch.nn.Module):
             ckpt_up_proj_name: str,
             num_experts: int) -> List[Tuple[str, str, int, str]]:
 
-        return [
+        weights_and_weight_sacles_mapping = [
             # (param_name, weight_name, expert_id, shard_id)
             ("experts.w13_" if weight_name
              in [ckpt_gate_proj_name, ckpt_up_proj_name] else "experts.w2_",
@@ -905,6 +929,16 @@ class FusedMoE(torch.nn.Module):
                 ("w3", ckpt_up_proj_name),
             ]
         ]
+        input_scales_mapping = [
+            (param_name, scale_name, expert_id, shard_id)
+            for expert_id in range(num_experts)
+            for (param_name, scale_name, shard_id) in [
+                ("experts.w13_input_scale", "experts.w3_w1_scale", "w1"),
+                ("experts.w2_input_scale", "experts.w2_scale", "w2"),
+                ("experts.w13_input_scale", "experts.w3_w1_scale", "w3"),
+            ]
+        ]
+        return weights_and_weight_sacles_mapping + input_scales_mapping
 
     def extra_repr(self) -> str:
 

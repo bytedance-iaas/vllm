@@ -936,91 +936,97 @@ def scaled_fp4_quant(
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
 
-# int4_fp8
-def int4_fp8_gemm(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    scales: torch.Tensor,
-    group_size: int
-) -> torch.Tensor:
-    """
-    Perform INT4-FP8 GEMM operation using CUTLASS 3.0 for NVIDIA Hopper architecture.
+# # int4_fp8
+# def int4_fp8_gemm(
+#     A: torch.Tensor,
+#     B: torch.Tensor,
+#     scales: torch.Tensor,
+#     group_size: int
+# ) -> torch.Tensor:
+#     """
+#     Perform INT4-FP8 GEMM operation using CUTLASS 3.0 for NVIDIA Hopper architecture.
 
-    This function implements an efficient matrix multiplication between an FP8 matrix A
-    and an INT4 matrix B, with group-wise scaling. The implementation uses CUTLASS 3.0's
-    modern APIs and optimizations for NVIDIA Hopper GPUs.
+#     This function implements an efficient matrix multiplication between an FP8 matrix A
+#     and an INT4 matrix B, with group-wise scaling. The implementation uses CUTLASS 3.0's
+#     modern APIs and optimizations for NVIDIA Hopper GPUs.
 
-    Args:
-        A: The input matrix in FP8 format (float8_e4m3fn)
-            Shape: (m, k)
-            Layout: Row-major
-            Must be contiguous
-        B: The INT4 weight matrix
-            Shape: (k, n)
-            Layout: Column-major
-            Must be contiguous
-            N dimension must be divisible by 8
-        scales: The scaling factors for INT4 dequantization in FP8 format
-            Shape: (k // group_size, N)
-            Layout: Row-major
-            Must be contiguous
-        group_size: The size of each group for group-wise quantization
-            Must be a positive integer
-            Typically 128 or 256 for optimal performance
+#     Args:
+#         A: The input matrix in FP8 format (float8_e4m3fn)
+#             Shape: (m, k)
+#             Layout: Row-major
+#             Must be contiguous
+#         B: The INT4 weight matrix
+#             Shape: (k, n)
+#             Layout: Column-major
+#             Must be contiguous
+#             N dimension must be divisible by 8
+#         scales: The scaling factors for INT4 dequantization in FP8 format
+#             Shape: (k // group_size, N)
+#             Layout: Row-major
+#             Must be contiguous
+#         group_size: The size of each group for group-wise quantization
+#             Must be a positive integer
+#             Typically 128 or 256 for optimal performance
 
-    Returns:
-        torch.Tensor: The output matrix in FP16 format
-            Shape: (m, n)
-            Layout: Row-major
+#     Returns:
+#         torch.Tensor: The output matrix in FP16 format
+#             Shape: (m, n)
+#             Layout: Row-major
 
-    Requirements:
-        - CUDA 12.0 or later
-        - NVIDIA GPU with Hopper architecture (H100)
-        - CUTLASS 3.0 or later
-        - PyTorch 2.0 or later
-    """
-    # Check data types
-    assert A.dtype == torch.float8_e4m3fn, f"Input A must be float8_e4m3fn, got {A.dtype}"
-    # assert B.dtype == torch.int4, f"Input B must be int4, got {B.dtype}"
-    assert scales.dtype == torch.float8_e4m3fn, f"Scales must be float8_e4m3fn, got {scales.dtype}"
+#     Requirements:
+#         - CUDA 12.0 or later
+#         - NVIDIA GPU with Hopper architecture (H100)
+#         - CUTLASS 3.0 or later
+#         - PyTorch 2.0 or later
+#     """
+#     # Check data types
+#     assert A.dtype == torch.float8_e4m3fn, f"Input A must be float8_e4m3fn, got {A.dtype}"
+#     assert B.dtype == torch.int8, f"Input B must be packed int4 (int8), got {B.dtype}"
+#     assert scales.dtype == torch.float8_e4m3fn, f"Scales must be float8_e4m3fn, got {scales.dtype}"
     
-    # Check tensor dimensions
-    assert A.dim() == 2, f"Input A must be 2D, got {A.dim()}D"
-    assert B.dim() == 2, f"Input B must be 2D, got {B.dim()}D"
-    assert scales.dim() == 2, f"Scales must be 2D, got {scales.dim()}D"
+#     # Check tensor dimensions
+#     assert A.dim() == 2, f"Input A must be 2D, got {A.dim()}D"
+#     assert B.dim() == 2, f"Input B must be 2D, got {B.dim()}D"
+#     assert scales.dim() == 2, f"Scales must be 2D, got {scales.dim()}D"
     
-    # Check matrix dimensions
-    m, k = A.shape
-    k_b, n = B.shape
-    # assert k == k_b, f"Matrix dimensions mismatch: A.shape[1]={k}, B.shape[0]={k_b}"
-    assert n % 8 == 0, f"B matrix N dimension must be divisible by 8, got {n}"
+#     # Check matrix dimensions
+#     m, k = A.shape
+#     k_b, n = B.shape
+#     assert k == k_b * 2, f"Matrix dimensions mismatch: A.shape[1]={k}, B.shape[0]={k_b}"
+#     assert n % 8 == 0, f"B matrix N dimension must be divisible by 8, got {n}"
     
-    # Check scales dimensions
-    expected_scales_k = (k + group_size - 1) // group_size
-    scales_n, scales_k  = scales.shape
-    assert scales_k == expected_scales_k, f"Scales K dimension mismatch: expected {expected_scales_k}, got {scales_k}"
-    assert scales_n == n, f"Scales N dimension mismatch: expected {n}, got {scales_n}"
+#     # Check scales dimensions
+#     expected_scales_k = (k + group_size - 1) // group_size
+#     scales_n, scales_k  = scales.shape
+#     assert scales_k == expected_scales_k, f"Scales K dimension mismatch: expected {expected_scales_k}, got {scales_k}"
+#     assert scales_n == n, f"Scales N dimension mismatch: expected {n}, got {scales_n}"
     
-    # Check group size
-    assert group_size > 0, f"Group size must be positive, got {group_size}"
-    assert k % group_size == 0, f"K dimension ({k}) must be divisible by group_size ({group_size})"
+#     # Check group size
+#     assert group_size > 0, f"Group size must be positive, got {group_size}"
+#     assert k % group_size == 0, f"K dimension ({k}) must be divisible by group_size ({group_size})"
     
-    # Check memory layout
-    assert A.is_contiguous(), "Input A must be contiguous"
-    assert B.is_contiguous(), "Input B must be contiguous"
-    assert scales.is_contiguous(), "Scales must be contiguous"
+#     # Check memory layout
+#     assert A.is_contiguous(), "Input A must be contiguous"
+#     assert B.is_contiguous(), "Input B must be contiguous"
+#     assert scales.is_contiguous(), "Scales must be contiguous"
 
-    return torch.ops._C.int4_fp8_gemm(A, B, scales, group_size)
+#     return torch.ops._C.int4_fp8_gemm(A, B, scales, group_size)
 
 # int4_fp8 grouped gemm
 def int4_fp8_grouped_gemm(
+    d: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    scales: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
     experts_offsets: torch.tensor,
     problem_sizes: torch.tensor,
+    a_strides: torch.tensor,
+    b_strides: torch.tensor,
+    d_strides: torch.tensor,
+    s_strides: torch.tensor,
     chunk_size: int = 0,
-) -> list[torch.Tensor]:
+):
     """
     Perform grouped matrix multiplication between int4 weights and fp8 activations.
     
@@ -1030,35 +1036,37 @@ def int4_fp8_grouped_gemm(
     optimal performance with quantized weights.
     
     Args:
-        a_tensors: List of activation matrices in FP8 (float_e4m3_t) format
-            Each tensor should be of shape [total_m, K] in row-major layout
-        b_tensors: List of weight matrices in packed int4 format
-            Each tensor should be of shape [E, N, K/2] in column-major layout
-            where each byte contains two 4-bit integers
-        scale_tensors: List of scale factors for the quantized weights
-            Each tensor should be of shape [E, K//512, N*4]
+        d: Output matrices of shape [total_m, total_n]
+        a: Activation matrices in FP8 (float_e4m3_t) format
+           Each tensor should be of shape [total_m, K] in row-major layout
+        b: Weight matrices in packed int4 format
+           Each tensor should be of shape [E, N, K//2] in column-major layout
+           where each byte contains two 4-bit integers
+        a_scales: NOT USED
+        b_scales: Scale factors for the quantized weights
+           Each tensor should be of shape [E, K//512, N*8]
         experts_offsets: Tensor containing expert offsets for determining group boundaries
-        problem_sizes: problem sizes
-        chunk_size: Number of elements each scale value applies to (K/num_chunks)
-            If 0, will be auto-detected from the first tensors
-            
-    Returns:
-        torch.Tensor: List of output matrices of shape [total_m, total_n]
+        problem_sizes: with shape [num_experts, 3] (M, N, K for each group) (int32)
+        a_strides: Strides information for A matrices
+        b_strides: Strides information for B matrices
+        d_strides: Strides information for D matrices
+        s_strides: Strides information for b_scales matrices
+        chunk_size: Number of elements each scale value applies to (K//512), default to 128
         
     Requirements:
         - All tensors must be on a CUDA device
         - Requires an NVIDIA Hopper GPU (H100)
         - A tensors must be in float8_e4m3fn format
         - B tensors must contain packed int4 values (stored as int8)
-        - All lists must have the same length
         
     Note:
         The function computes: D = (A * (B * scales))
         for each group of tensors in parallel
     """
 
-    return torch.ops._C.int4_fp8_grouped_gemm(
-        a, b, scales, experts_offsets, problem_sizes, chunk_size)
+    torch.ops._C.int4_fp8_grouped_gemm(
+        d, a, b, a_scales, b_scales, experts_offsets, problem_sizes, 
+        a_strides, b_strides, d_strides, s_strides, chunk_size)
 
 # fp8
 def scaled_fp8_quant(

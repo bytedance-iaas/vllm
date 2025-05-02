@@ -7,7 +7,7 @@
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
 
-__global__ void compute_problem_sizes(const int* __restrict__ topk_ids,
+__global__ void compute_problem_sizes(const int32_t* __restrict__ topk_ids,
                                       int32_t* problem_sizes1,
                                       int32_t* problem_sizes2,
                                       int32_t* atomic_buffer,
@@ -24,11 +24,11 @@ __global__ void compute_problem_sizes(const int* __restrict__ topk_ids,
 
   if (threadIdx.x == 0) {
     int final_occurrences = atomic_buffer[expert_id];
-    problem_sizes1[expert_id * 3] = final_occurrences;
-    problem_sizes1[expert_id * 3 + 1] = 2 * n;
+    problem_sizes1[expert_id * 3] = 2 * n;
+    problem_sizes1[expert_id * 3 + 1] = final_occurrences;
     problem_sizes1[expert_id * 3 + 2] = k;
-    problem_sizes2[expert_id * 3] = final_occurrences;
-    problem_sizes2[expert_id * 3 + 1] = k;
+    problem_sizes2[expert_id * 3] = k;
+    problem_sizes2[expert_id * 3 + 1] = final_occurrences;
     problem_sizes2[expert_id * 3 + 2] = n;
   }
 }
@@ -40,12 +40,12 @@ __global__ void compute_expert_offsets(
   expert_offsets[0] = 0;
   for (int i = 0; i < num_experts; ++i) {
     atomic_buffer[i] = tot_offset;
-    tot_offset += problem_sizes1[i * 3];
+    tot_offset += problem_sizes1[i * 3 + 1];
     expert_offsets[i + 1] = tot_offset;
   }
 }
 
-__global__ void compute_arg_sorts(const int* __restrict__ topk_ids,
+__global__ void compute_arg_sorts(const int32_t* __restrict__ topk_ids,
                                   const int32_t* __restrict__ expert_offsets,
                                   int32_t* input_permutation,
                                   int32_t* output_permutation,

@@ -487,16 +487,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
 
   // fp8 * int4 GEMM from Cutlass
-  ops.def(
-      "int4_fp8_gemm(Tensor A, Tensor B,"
-      "              Tensor scales, int group_size) -> Tensor");
-  ops.impl("int4_fp8_gemm", torch::kCUDA, &int4_fp8_gemm);
+  //   ops.def(
+  //       "int4_fp8_gemm(Tensor A, Tensor B,"
+  //       "              Tensor scales, int group_size) -> Tensor");
+  //   ops.impl("int4_fp8_gemm", torch::kCUDA, &int4_fp8_gemm);
 
   // fp8 * int4 Grouped GEMM from Cutlass
   ops.def(
-      "int4_fp8_grouped_gemm(Tensor a, Tensor b, Tensor scales,"
+      "int4_fp8_grouped_gemm(Tensor! d, Tensor a, Tensor b,"
+      "                      Tensor a_scales, Tensor b_scales,"
       "                      Tensor experts_offsets, Tensor problem_sizes,"
-      "                      int chunk_size) -> Tensor",
+      "                      Tensor a_strides, Tensor b_strides,"
+      "                      Tensor d_strides, Tensor s_strides,"
+      "                      int chunk_size) -> ()",
       {stride_tag});
   ops.impl("int4_fp8_grouped_gemm", torch::kCUDA, &int4_fp8_grouped_gemm);
 
