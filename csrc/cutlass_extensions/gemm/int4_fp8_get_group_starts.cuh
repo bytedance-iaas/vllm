@@ -13,10 +13,10 @@ template <typename ElementA, typename ElementB,
 __global__ void int4_fp8_get_group_gemm_starts(
     int32_t* expert_offsets, ElementA** a_offsets, ElementB** b_offsets,
     ElementC** out_offsets, ElementAccumulator** a_scales_offsets,
-    ElementAccumulator** b_scales_offsets, ElementA* a_base_as_int,
+    cutlass::bfloat16_t** b_scales_offsets, ElementA* a_base_as_int,
     ElementB* b_base_as_int, ElementC* out_base_as_int,
     ElementAccumulator* a_scales_base_as_int,
-    ElementAccumulator* b_scales_base_as_int, int64_t n, int64_t k,
+    cutlass::bfloat16_t* b_scales_base_as_int, int64_t n, int64_t k,
     bool per_act_token, bool per_out_ch) {
   int expert_id = threadIdx.x;
   int32_t expert_offset = expert_offsets[expert_id];
@@ -41,12 +41,12 @@ __global__ void int4_fp8_get_group_gemm_starts(
             static_cast<cutlass::int8_t**>(b_ptrs.data_ptr()),             \
             static_cast<C_TYPE**>(out_ptrs.data_ptr()),                    \
             static_cast<float**>(a_scales_ptrs.data_ptr()),                \
-            static_cast<float**>(b_scales_ptrs.data_ptr()),                \
+            static_cast<cutlass::bfloat16_t**>(b_scales_ptrs.data_ptr()),  \
             static_cast<cutlass::float_e4m3_t*>(a_tensors.data_ptr()),     \
             static_cast<cutlass::int8_t*>(b_tensors.data_ptr()),           \
             static_cast<C_TYPE*>(out_tensors.data_ptr()),                  \
             static_cast<float*>(a_scales.data_ptr()),                      \
-            static_cast<float*>(b_scales.data_ptr()),                      \
+            static_cast<cutlass::bfloat16_t*>(b_scales.data_ptr()),        \
             out_tensors.size(1),                                           \
             a_tensors.size(1), per_act_token, per_out_ch);                 \
   }
@@ -63,7 +63,7 @@ void run_int4_fp8_get_group_gemm_starts(
   TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(b_tensors.dtype() == torch::kInt8);
   TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
-  TORCH_CHECK(b_scales.dtype() == torch::kFloat32);
+  TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
 
   int num_experts = static_cast<int>(expert_offsets.size(0));
   bool per_act_token = a_scales.numel() != 1;

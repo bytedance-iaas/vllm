@@ -102,9 +102,6 @@ def cutlass_w4a8_moe(
     # assert c_strides2.shape[0] == w2_q.shape[
     #     0], "C Strides 2 expert number mismatch"
 
-    w1_scale = w1_scale.to(torch.float32)
-    w2_scale = w2_scale.to(torch.float32)
-
     num_experts = w1_q.size(0)
     m = a.size(0)
     k = w1_q.size(2) * 2  # w1_q is transposed and packed

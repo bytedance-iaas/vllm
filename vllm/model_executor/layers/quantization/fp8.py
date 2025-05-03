@@ -1087,41 +1087,42 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         m = x.shape[0]
         k = x.shape[1]
         n = layer.w13_weight.shape[1] / 2
+        num_experts = layer.w2_weight.shape[0]
         device = layer.w13_weight.device
 
-        num_experts = layer.w2_weight.shape[0]
-        a_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        a_strides1[:, 0] = k
-        a_strides1[:, 1] = 1
-        a_strides1[:, 2] = 0
-        b_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        b_strides1[:, 0] = k // 2
-        b_strides1[:, 1] = 1
-        b_strides1[:, 2] = 0
-        c_strides1 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        c_strides1[:, 0] = 1
-        c_strides1[:, 1] = 2 * n
-        c_strides1[:, 2] = 0
-        a_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        a_strides2[:, 0] = n
-        a_strides2[:, 1] = 1
-        a_strides2[:, 2] = 0
-        b_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        b_strides2[:, 0] = n // 2 # Use integer division
-        b_strides2[:, 1] = 1
-        b_strides2[:, 2] = 0
-        c_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        c_strides2[:, 0] = 1
-        c_strides2[:, 1] = k
-        c_strides2[:, 2] = 0
-        s_strides13 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        s_strides13[:, 0] = 1
-        s_strides13[:, 1] = 2 * n
-        s_strides13[:, 2] = 0
-        s_strides2 = torch.empty((num_experts, 3), device=device, dtype=torch.int64)
-        s_strides2[:, 0] = 1
-        s_strides2[:, 1] = k
-        s_strides2[:, 2] = 0
+        a_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        b_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        c_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+
+        a_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        b_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        c_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        s_strides13 = c_strides1
+        s_strides2  = c_strides2
+
+        a_strides1[:, 0].fill_(k)
+        a_strides1[:, 1].fill_(1)
+        a_strides1[:, 2].zero_()
+
+        b_strides1[:, 0].fill_(k // 2)
+        b_strides1[:, 1].fill_(1)
+        b_strides1[:, 2].zero_()
+
+        c_strides1[:, 0].fill_(1)
+        c_strides1[:, 1].fill_(2 * n)
+        c_strides1[:, 2].zero_()
+
+        a_strides2[:, 0].fill_(n)
+        a_strides2[:, 1].fill_(1)
+        a_strides2[:, 2].zero_()
+
+        b_strides2[:, 0].fill_(n // 2)
+        b_strides2[:, 1].fill_(1)
+        b_strides2[:, 2].zero_()
+
+        c_strides2[:, 0].fill_(1)
+        c_strides2[:, 1].fill_(k)
+        c_strides2[:, 2].zero_()
 
         # device_id = device.index
         # save_dir = f"/nvme0n1/w4a8_debug_tensors/device_{device_id}"
@@ -1180,7 +1181,6 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale,
             apply_router_weight_on_input,
         )
-        # return x
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """
