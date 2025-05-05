@@ -1448,7 +1448,7 @@ class LLMEngine:
                 remote_prefill_request = RemotePrefillRequest(
                     request_id=seq_group_metadata.request_id,
                     # prompt_token_ids=scheduled_seq_group.seq_group.seqs[0].inputs.prompt_token_ids[:-1], # last one will be decoded on decode for sampling anyway
-                    prompt_token_ids=scheduled_seq_group.seq_group.seqs[0].inputs.prompt_token_ids, # TODO ptarasiewicz do not send the last token when NIXL fixes send notif (needed for writing 0 blocks)
+                    prompt_token_ids=scheduled_seq_group.seq_group.seqs[0].prompt_token_ids, # TODO ptarasiewicz do not send the last token when NIXL fixes send notif (needed for writing 0 blocks)
                     sampling_params=scheduled_seq_group.seq_group.sampling_params,
                     block_ids=block_table,
                     engine_id=self.engine_id,
