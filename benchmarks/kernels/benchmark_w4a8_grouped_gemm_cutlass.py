@@ -8,7 +8,8 @@ from benchmark_shapes import WEIGHT_SHAPES_MOE
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe.fused_moe import (fused_experts,
-                                                            fused_topk)
+                                                            fused_topk,
+                                                            grouped_topk)
 from vllm.model_executor.layers.fused_moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from vllm.utils import F, FlexibleArgumentParser
 from vllm import _custom_ops as ops
@@ -66,6 +67,10 @@ def bench_run(results: list[benchmark.Measurement], model: str,
 
     ref_q_weight_1 = unpacker(unprocessed_weight_1.cpu()).cuda()
     ref_q_weight_2 = unpacker(unprocessed_weight_2.cpu()).cuda()
+    ref_weight_1 = ref_q_weight_1 * scale_1.repeat_interleave(group_size,
+                                                              dim=1)
+    ref_weight_2 = ref_q_weight_2 * scale_2.repeat_interleave(group_size,
+                                                              dim=1)
 
     weight_1 = ref_q_weight_1.permute(0, 2, 1).contiguous()
     weight_2 = ref_q_weight_2.permute(0, 2, 1).contiguous()
@@ -143,11 +148,55 @@ def bench_run(results: list[benchmark.Measurement], model: str,
 
     score = torch.randn((m, num_experts), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(a, score, topk, renormalize=False)
+    topk_weights, topk_ids = grouped_topk(a, score, topk, renormalize=False)
 
     expert_map = torch.arange(num_experts, dtype=torch.int32, device="cuda")
 
     apply_router_weight_on_input = False
+
+    # ref
+    def ref_moe(a: torch.Tensor,
+                topk_weights: torch.Tensor,
+                topk_ids: torch.Tensor,
+                ref_weight_1: torch.Tensor,
+                ref_weight_2: torch.Tensor,
+                has_pre_quant: bool = False,
+                has_alpha: bool = False,
+                pre_quant_scale_1: Optional[torch.Tensor] = None,
+                pre_quant_scale_2: Optional[torch.Tensor] = None,
+                alpha_1: Optional[torch.Tensor] = None,
+                alpha_2: Optional[torch.Tensor] = None):
+        inputs = a.cuda().float()
+        inputs_merged = inputs.view(-1, inputs.shape[-1])
+        results = torch.zeros_like(inputs_merged)
+        for i, (scales, experts) in enumerate(zip(topk_weights, topk_ids)):
+            scales /= sum(scales)
+            input = inputs_merged[i, :]
+            for scale, expert in zip(scales, experts):
+                input = inputs_merged[i, :]
+                fc1_qd = ref_weight_1[expert].cuda().float()
+                if has_pre_quant:
+                    input = input * pre_quant_scale_1.squeeze()
+                if has_alpha:
+                    input = input.to(torch.float8_e4m3fn).float()
+                    fc1_qd = fc1_qd.to(torch.float8_e4m3fn).float()
+                    fc1 = torch.matmul(input, fc1_qd) * alpha_1[expert]
+                else:
+                    fc1 = torch.matmul(input, fc1_qd)
+                fc1, gate = fc1.chunk(2, dim=-1)
+                fc1 = fc1 * torch.nn.functional.silu(gate)
+                fc2_qd = ref_weight_2[expert].cuda().float()
+                if has_pre_quant:
+                    fc1 = fc1 * pre_quant_scale_2.squeeze()
+                if has_alpha:
+                    fc1 = fc1.to(torch.float8_e4m3fn).float()
+                    fc2_qd = fc2_qd.to(torch.float8_e4m3fn).float()
+                    final = torch.matmul(fc1, fc2_qd) * alpha_2[expert]
+                else:
+                    final = torch.matmul(fc1, fc2_qd)
+                results[i] += scale * final
+        ref = results.view(*inputs.shape).to(dtype)
+        return ref
 
     def run_cutlass_w4a8_moe(
         num_repeats: int,
@@ -268,12 +317,21 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             apply_router_weight_on_input=apply_router_weight_on_input)
     torch.cuda.synchronize()
 
+    ref_stream = torch.cuda.Stream()
+    ref_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(ref_graph, stream=ref_stream):
+        ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, True,
+                False, a1_scale, a2_scale)
+    torch.cuda.synchronize()
+
     min_run_time = 5
     num_warmup = 5
-    num_runs = 25
+    num_runs = 1
 
     globals = {
         # Baseline params
+        "ref_weight_1": ref_weight_1,
+        "ref_weight_2": ref_weight_2,
         "score": score,
         "topk": topk,
         # Cutlass params
@@ -326,6 +384,42 @@ def bench_run(results: list[benchmark.Measurement], model: str,
     print(f"a1_scale shape: {a1_scale.shape}, dtype: {a1_scale.dtype}")
     print(f"a2_scale shape: {a2_scale.shape}, dtype: {a2_scale.dtype}")
     print(f"expert_map shape: {expert_map.shape}, dtype: {expert_map.dtype}")
+
+    #Warmup
+    ref_moe(
+        a,
+        topk_weights,
+        topk_ids,
+        ref_weight_1,
+        ref_weight_2,
+        has_pre_quant=True,
+        has_alpha=False,
+        pre_quant_scale_1=a1_scale,
+        pre_quant_scale_2=a2_scale,
+    )
+
+    results.append(
+        benchmark.Timer(
+            stmt=
+            "ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, has_pre_quant=True, has_alpha=False, pre_quant_scale_1=a1_scale, pre_quant_scale_2=a2_scale)",
+            globals=globals,
+            label=label,
+            sub_label=sub_label,
+            description="ref_moe",
+        ).blocked_autorange(min_run_time=min_run_time))
+
+    # Warmup
+    replay_graph(ref_graph, num_warmup)
+
+    results.append(
+        benchmark.Timer(
+            stmt="replay_graph(ref_graph, num_runs)",
+            globals=globals,
+            label=label,
+            sub_label=sub_label,
+            description="ref_moe_cuda_graphs",
+        ).blocked_autorange(min_run_time=min_run_time))
+
     # Warmup
     run_cutlass_w4a8_moe(
         num_warmup,
@@ -348,7 +442,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         a2_scale=a2_scale,
         expert_map=expert_map,
         apply_router_weight_on_input=apply_router_weight_on_input)
-    
+
     results.append(
         benchmark.Timer(
             stmt=
@@ -371,6 +465,41 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             description="grouped_gemm_moe_cuda_graphs",
         ).blocked_autorange(min_run_time=min_run_time))
 
+    # correctness verification
+    ref_out = ref_moe(
+        a,
+        topk_weights,
+        topk_ids,
+        ref_weight_1,
+        ref_weight_2,
+        has_pre_quant=True,
+        has_alpha=False,
+        pre_quant_scale_1=a1_scale,
+        pre_quant_scale_2=a2_scale,
+    )
+    cutlass_out = run_cutlass_w4a8_moe(
+        a,
+        w1_q,
+        w2_q,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        a_strides1,
+        b_strides1,
+        c_strides1,
+        a_strides2,
+        b_strides2,
+        c_strides2,
+        s_strides13,
+        s_strides2,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        expert_map=expert_map,
+        apply_router_weight_on_input=apply_router_weight_on_input)
+    print("ref_out: ", ref_out)
+    print("cutlass_out: ", cutlass_out)
+    print("max diff: ", torch.max(torch.abs(ref_out - cutlass_out)))
 
 def main():
 
