@@ -157,6 +157,7 @@ def cutlass_w4a8_moe(
     # print(f"num_experts {num_experts}, n {n}, k {k}")
     # a1_scale and a2_scale are not supported
 
+    # print(f"before get_cutlass_moe_mm_data")
     ops.get_cutlass_moe_mm_data(local_topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map, num_experts, n,
                                 k)
@@ -169,20 +170,28 @@ def cutlass_w4a8_moe(
     # print_tensor("c_map", c_map)
     # print(f"n {n}, k {k}")
 
+    # a_map = torch.clamp(a_map,
+    #                     min=0,
+    #                     max=min(a1_scale.size(0) - 1,
+    #                             a_q.size(0) - 1))
     rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
-    # rep_a1_scales = a1_scale[a_map] if per_act_token else a1_scale
+    #rep_a1_scales = a1_scale[a_map] if per_act_token else a1_scale
 
     # device_id = a.get_device()
-    # torch.save(rep_a_q, f'/nvme0n1/{device_id}_rep_a_q.tensor')
-    # torch.save(w1_q, f'/nvme0n1/{device_id}_w1_q.tensor')
-    # torch.save(rep_a1_scales, f'/nvme0n1/{device_id}_rep_a1_scales.tensor')
-    # torch.save(w1_scale, f'/nvme0n1/{device_id}_w1_scale.tensor')
-    # torch.save(expert_offsets, f'/nvme0n1/{device_id}_expert_offsets.tensor')
-    # torch.save(problem_sizes1, f'/nvme0n1/{device_id}_problem_sizes1.tensor')
-    # torch.save(a_strides1, f'/nvme0n1/{device_id}_a_strides1.tensor')
-    # torch.save(b_strides1, f'/nvme0n1/{device_id}_b_strides1.tensor')
-    # torch.save(c_strides1, f'/nvme0n1/{device_id}_c_strides1.tensor')
-    # torch.save(s_strides13, f'/nvme0n1/{device_id}_s_strides13.tensor')
+    # save_dir = f"/nvme0n1/w4a8_debug_tensors/group_gemm_param/device_{device_id}"
+    # import os
+    # if not os.path.exists(save_dir):
+    #     os.makedirs(save_dir, exist_ok=True)
+    #     torch.save(rep_a_q, f'{save_dir}/rep_a_q.tensor')
+    #     torch.save(w1_q, f'{save_dir}/w1_q.tensor')
+    #     torch.save(a1_scale, f'{save_dir}/a1_scale.tensor')
+    #     torch.save(w1_scale, f'{save_dir}/w1_scale.tensor')
+    #     torch.save(expert_offsets, f'{save_dir}/expert_offsets.tensor')
+    #     torch.save(problem_sizes1, f'{save_dir}/problem_sizes1.tensor')
+    #     torch.save(a_strides1, f'{save_dir}/a_strides1.tensor')
+    #     torch.save(b_strides1, f'{save_dir}/b_strides1.tensor')
+    #     torch.save(c_strides1, f'{save_dir}/c_strides1.tensor')
+    #     torch.save(s_strides13, f'{save_dir}/s_strides13.tensor')
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = c2_initializer((m * topk, k), device=device, dtype=torch.half)

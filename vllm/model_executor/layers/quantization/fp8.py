@@ -1117,6 +1117,7 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
+        # device = layer.w13_weight.device
         # device_id = device.index
         # save_dir = f"/nvme0n1/w4a8_debug_tensors/device_{device_id}"
         # import os
@@ -1132,14 +1133,15 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         #         "topk_ids": topk_ids,
         #         "w13_input_scale": layer.w13_input_scale,
         #         "w2_input_scale": layer.w2_input_scale,
-        #         "a_strides1": a_strides1,
-        #         "b_strides1": b_strides1,
-        #         "c_strides1": c_strides1,
-        #         "a_strides2": a_strides2,
-        #         "b_strides2": b_strides2,
-        #         "c_strides2": c_strides2,
-        #         "s_strides13": s_strides13,
-        #         "s_strides2": s_strides2,
+        #         "a_strides1": self.a_strides1,
+        #         "b_strides1": self.b_strides1,
+        #         "c_strides1": self.c_strides1,
+        #         "a_strides2": self.a_strides2,
+        #         "b_strides2": self.b_strides2,
+        #         "c_strides2": self.c_strides2,
+        #         "s_strides13": self.s_strides13,
+        #         "s_strides2": self.s_strides2,
+        #         "expert_map": expert_map,
         #     }
 
         #     with open(f"{save_dir}/shapes_and_dtypes.txt", "w") as f:
