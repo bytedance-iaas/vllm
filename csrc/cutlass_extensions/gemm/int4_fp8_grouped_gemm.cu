@@ -212,14 +212,14 @@
      using Args = typename GemmScaleOnly::Arguments;
      Args arguments;
      decltype(arguments.epilogue.thread) fusion_args;
-     fusion_args.alpha = 1.0f;
-     fusion_args.beta = 0.0f;
-     fusion_args.alpha_ptr = nullptr;
+     fusion_args.alpha = 0;
+     fusion_args.beta = 0;
+     fusion_args.alpha_ptr = static_cast<const ElementAccumulator **>(a_scales_ptrs.data_ptr());
      fusion_args.beta_ptr = nullptr;
      fusion_args.alpha_ptr_array = nullptr;
      fusion_args.beta_ptr_array = nullptr;
-     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-     fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
+     fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
 
      ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes =
          static_cast<ProblemShape::UnderlyingProblemShape*>(problem_sizes.data_ptr());

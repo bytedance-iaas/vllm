@@ -997,6 +997,39 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
+        # Pre-populate the strides
+        k = layer.w2_weight.shape[1]
+        n = layer.w13_weight.shape[1] / 2
+        num_experts = layer.w2_weight.shape[0]
+        device = layer.w13_weight.device
+
+        self.a_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        self.b_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        self.c_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        self.a_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        self.b_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        self.c_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
+        self.s_strides13 = self.c_strides1
+        self.s_strides2  = self.c_strides2
+        self.a_strides1[:, 0].fill_(k)
+        self.a_strides1[:, 1].fill_(1)
+        self.a_strides1[:, 2].zero_()
+        self.b_strides1[:, 0].fill_(k // 2)
+        self.b_strides1[:, 1].fill_(1)
+        self.b_strides1[:, 2].zero_()
+        self.c_strides1[:, 0].fill_(1)
+        self.c_strides1[:, 1].fill_(2 * n)
+        self.c_strides1[:, 2].zero_()
+        self.a_strides2[:, 0].fill_(n)
+        self.a_strides2[:, 1].fill_(1)
+        self.a_strides2[:, 2].zero_()
+        self.b_strides2[:, 0].fill_(n // 2)
+        self.b_strides2[:, 1].fill_(1)
+        self.b_strides2[:, 2].zero_()
+        self.c_strides2[:, 0].fill_(1)
+        self.c_strides2[:, 1].fill_(k)
+        self.c_strides2[:, 2].zero_()
+
         return
 
     def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
@@ -1084,46 +1117,6 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        m = x.shape[0]
-        k = x.shape[1]
-        n = layer.w13_weight.shape[1] / 2
-        num_experts = layer.w2_weight.shape[0]
-        device = layer.w13_weight.device
-
-        a_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
-        b_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
-        c_strides1 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
-
-        a_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
-        b_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
-        c_strides2 = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
-        s_strides13 = c_strides1
-        s_strides2  = c_strides2
-
-        a_strides1[:, 0].fill_(k)
-        a_strides1[:, 1].fill_(1)
-        a_strides1[:, 2].zero_()
-
-        b_strides1[:, 0].fill_(k // 2)
-        b_strides1[:, 1].fill_(1)
-        b_strides1[:, 2].zero_()
-
-        c_strides1[:, 0].fill_(1)
-        c_strides1[:, 1].fill_(2 * n)
-        c_strides1[:, 2].zero_()
-
-        a_strides2[:, 0].fill_(n)
-        a_strides2[:, 1].fill_(1)
-        a_strides2[:, 2].zero_()
-
-        b_strides2[:, 0].fill_(n // 2)
-        b_strides2[:, 1].fill_(1)
-        b_strides2[:, 2].zero_()
-
-        c_strides2[:, 0].fill_(1)
-        c_strides2[:, 1].fill_(k)
-        c_strides2[:, 2].zero_()
-
         # device_id = device.index
         # save_dir = f"/nvme0n1/w4a8_debug_tensors/device_{device_id}"
         # import os
@@ -1169,16 +1162,17 @@ class Fp8MoEInt4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale_inv,  # Already interleaved
             topk_weights,
             topk_ids,
-            a_strides1,
-            b_strides1,
-            c_strides1,
-            a_strides2,
-            b_strides2,
-            c_strides2,
-            s_strides13,
-            s_strides2,
+            self.a_strides1,
+            self.b_strides1,
+            self.c_strides1,
+            self.a_strides2,
+            self.b_strides2,
+            self.c_strides2,
+            self.s_strides13,
+            self.s_strides2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            expert_map,
             apply_router_weight_on_input,
         )
 
