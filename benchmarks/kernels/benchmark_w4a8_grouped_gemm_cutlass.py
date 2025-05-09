@@ -7,9 +7,7 @@ from benchmark_shapes import WEIGHT_SHAPES_MOE
 
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
-from vllm.model_executor.layers.fused_moe.fused_moe import (fused_experts,
-                                                            fused_topk,
-                                                            grouped_topk)
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from vllm.utils import F, FlexibleArgumentParser
 from vllm import _custom_ops as ops
@@ -148,7 +146,18 @@ def bench_run(results: list[benchmark.Measurement], model: str,
 
     score = torch.randn((m, num_experts), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids = grouped_topk(a, score, topk, renormalize=False)
+    topk_weights, topk_ids = FusedMoE.select_experts(
+        hidden_states=a,
+        router_logits=score,
+        use_grouped_topk=True,
+        top_k=topk,
+        renormalize=False,
+        topk_group=1,
+        num_expert_group=num_experts,
+        custom_routing_function=None,
+        scoring_func="sigmoid",
+        e_score_correction_bias=None,
+    )
 
     expert_map = torch.arange(num_experts, dtype=torch.int32, device="cuda")
 
@@ -220,7 +229,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         expert_map: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
     ):
-        for _ in range(num_repeats):
+        for _ in range(num_repeats - 1):
             cutlass_w4a8_moe(
                 a,
                 w1_q,
@@ -241,6 +250,27 @@ def bench_run(results: list[benchmark.Measurement], model: str,
                 a2_scale=a2_scale,
                 expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input)
+        # Return the output from the last run
+        return cutlass_w4a8_moe(
+            a,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides13,
+            s_strides2,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input)
 
     def run_cutlass_from_graph(
         a: torch.Tensor,
@@ -317,16 +347,12 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             apply_router_weight_on_input=apply_router_weight_on_input)
     torch.cuda.synchronize()
 
-    ref_stream = torch.cuda.Stream()
-    ref_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(ref_graph, stream=ref_stream):
-        ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, True,
-                False, a1_scale, a2_scale)
-    torch.cuda.synchronize()
-
     min_run_time = 5
     num_warmup = 5
     num_runs = 1
+    # Warmup
+    ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, True,
+            False, a1_scale, a2_scale)
 
     globals = {
         # Baseline params
@@ -361,6 +387,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         # Kernels
         "run_cutlass_w4a8_moe": run_cutlass_w4a8_moe,
         "replay_graph": replay_graph,
+        "ref_moe": ref_moe,
     }
 
     print(f"a shape: {a.shape}, dtype: {a.dtype}")
@@ -406,18 +433,6 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             label=label,
             sub_label=sub_label,
             description="ref_moe",
-        ).blocked_autorange(min_run_time=min_run_time))
-
-    # Warmup
-    replay_graph(ref_graph, num_warmup)
-
-    results.append(
-        benchmark.Timer(
-            stmt="replay_graph(ref_graph, num_runs)",
-            globals=globals,
-            label=label,
-            sub_label=sub_label,
-            description="ref_moe_cuda_graphs",
         ).blocked_autorange(min_run_time=min_run_time))
 
     # Warmup
@@ -477,7 +492,9 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         pre_quant_scale_1=a1_scale,
         pre_quant_scale_2=a2_scale,
     )
+
     cutlass_out = run_cutlass_w4a8_moe(
+        1,  # Single run for verification
         a,
         w1_q,
         w2_q,
@@ -497,6 +514,9 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         a2_scale=a2_scale,
         expert_map=expert_map,
         apply_router_weight_on_input=apply_router_weight_on_input)
+    
+    torch.cuda.synchronize()
+
     print("ref_out: ", ref_out)
     print("cutlass_out: ", cutlass_out)
     print("max diff: ", torch.max(torch.abs(ref_out - cutlass_out)))
