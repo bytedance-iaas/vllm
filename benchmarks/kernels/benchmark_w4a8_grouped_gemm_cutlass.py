@@ -91,15 +91,13 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         scale_1.shape[1] * 4)  # [E, K/4, N*4]
     w1_scale = scale_1_interleaved.contiguous()
 
-    scale_2 = scale_2.permute(0, 2, 1)  # [E, N, K]
+    scale_2 = scale_2.permute(0, 2, 1)
     scale_2_interleaved = scale_2.reshape(scale_2.shape[0], scale_2.shape[1],
-                                          (scale_2.shape[2] // 4),
-                                          4)  # [E, N, K/4, 4]
-    scale_2_interleaved = scale_2_interleaved.permute(0, 2, 1,
-                                                      3)  # [E, K/4, N, 4]
-    scale_2_interleaved = scale_2_interleaved.reshape(
-        scale_2.shape[0], scale_2.shape[2] // 4,
-        scale_2.shape[1] * 4)  # [E, K/4, N*4]
+                                          (scale_2.shape[2] // 4), 4)
+    scale_2_interleaved = scale_2_interleaved.permute(0, 2, 1, 3)
+    scale_2_interleaved = scale_2_interleaved.reshape(scale_2.shape[0],
+                                                      scale_2.shape[2] // 4,
+                                                      scale_2.shape[1] * 4)
     w2_scale = scale_2_interleaved.contiguous()
 
     ###############################################################
@@ -145,6 +143,8 @@ def bench_run(results: list[benchmark.Measurement], model: str,
     c_strides2[:, 2].zero_()
 
     score = torch.randn((m, num_experts), device="cuda", dtype=dtype)
+    print(
+        f"score shape: {score.shape}, dtype: {score.dtype}, value: \n{score}")
 
     topk_weights, topk_ids = FusedMoE.select_experts(
         hidden_states=a,
@@ -153,7 +153,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         top_k=topk,
         renormalize=False,
         topk_group=1,
-        num_expert_group=num_experts,
+        num_expert_group=1,
         custom_routing_function=None,
         scoring_func="sigmoid",
         e_score_correction_bias=None,
@@ -185,7 +185,8 @@ def bench_run(results: list[benchmark.Measurement], model: str,
                 input = inputs_merged[i, :]
                 fc1_qd = ref_weight_1[expert].cuda().float()
                 if has_pre_quant:
-                    input = input * pre_quant_scale_1.squeeze()
+                    inv_scale = 1.0 / pre_quant_scale_1.squeeze()
+                    input = input * inv_scale
                 if has_alpha:
                     input = input.to(torch.float8_e4m3fn).float()
                     fc1_qd = fc1_qd.to(torch.float8_e4m3fn).float()
@@ -196,7 +197,8 @@ def bench_run(results: list[benchmark.Measurement], model: str,
                 fc1 = fc1 * torch.nn.functional.silu(gate)
                 fc2_qd = ref_weight_2[expert].cuda().float()
                 if has_pre_quant:
-                    fc1 = fc1 * pre_quant_scale_2.squeeze()
+                    inv_scale = 1.0 / pre_quant_scale_2.squeeze()
+                    fc1 = fc1 * inv_scale
                 if has_alpha:
                     fc1 = fc1.to(torch.float8_e4m3fn).float()
                     fc2_qd = fc2_qd.to(torch.float8_e4m3fn).float()
@@ -229,28 +231,6 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         expert_map: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
     ):
-        for _ in range(num_repeats - 1):
-            cutlass_w4a8_moe(
-                a,
-                w1_q,
-                w2_q,
-                w1_scale,
-                w2_scale,
-                topk_weights,
-                topk_ids,
-                a_strides1,
-                b_strides1,
-                c_strides1,
-                a_strides2,
-                b_strides2,
-                c_strides2,
-                s_strides13,
-                s_strides2,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
-                expert_map=expert_map,
-                apply_router_weight_on_input=apply_router_weight_on_input)
-        # Return the output from the last run
         return cutlass_w4a8_moe(
             a,
             w1_q,
@@ -322,37 +302,34 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             graph.replay()
         torch.cuda.synchronize()
 
-    cutlass_stream = torch.cuda.Stream()
-    cutlass_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(cutlass_graph, stream=cutlass_stream):
-        run_cutlass_from_graph(
-            a,
-            w1_q,
-            w2_q,
-            w1_scale,
-            w2_scale,
-            topk_weights,
-            topk_ids,
-            a_strides1,
-            b_strides1,
-            c_strides1,
-            a_strides2,
-            b_strides2,
-            c_strides2,
-            s_strides13,
-            s_strides2,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input)
-    torch.cuda.synchronize()
+    # cutlass_stream = torch.cuda.Stream()
+    # cutlass_graph = torch.cuda.CUDAGraph()
+    # with torch.cuda.graph(cutlass_graph, stream=cutlass_stream):
+    #     run_cutlass_from_graph(
+    #         a,
+    #         w1_q,
+    #         w2_q,
+    #         w1_scale,
+    #         w2_scale,
+    #         topk_weights,
+    #         topk_ids,
+    #         a_strides1,
+    #         b_strides1,
+    #         c_strides1,
+    #         a_strides2,
+    #         b_strides2,
+    #         c_strides2,
+    #         s_strides13,
+    #         s_strides2,
+    #         a1_scale=a1_scale,
+    #         a2_scale=a2_scale,
+    #         expert_map=expert_map,
+    #         apply_router_weight_on_input=apply_router_weight_on_input)
+    # torch.cuda.synchronize()
 
     min_run_time = 5
     num_warmup = 5
     num_runs = 1
-    # Warmup
-    ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, True,
-            False, a1_scale, a2_scale)
 
     globals = {
         # Baseline params
@@ -376,7 +353,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         "s_strides13": s_strides13,
         "s_strides2": s_strides2,
         # cuda graph params
-        "cutlass_graph": cutlass_graph,
+        # "cutlass_graph": cutlass_graph,
         # Gen params
         "a": a,
         "topk_weights": topk_weights,
@@ -390,95 +367,122 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         "ref_moe": ref_moe,
     }
 
-    print(f"a shape: {a.shape}, dtype: {a.dtype}")
-    print(f"w1_q shape: {w1_q.shape}, dtype: {w1_q.dtype}")
-    print(f"w2_q shape: {w2_q.shape}, dtype: {w2_q.dtype}")
-    print(f"w1_scale shape: {w1_scale.shape}, dtype: {w1_scale.dtype}")
-    print(f"w2_scale shape: {w2_scale.shape}, dtype: {w2_scale.dtype}")
-    print(f"a_strides1 shape: {a_strides1.shape}, dtype: {a_strides1.dtype}")
-    print(f"b_strides1 shape: {b_strides1.shape}, dtype: {b_strides1.dtype}")
-    print(f"c_strides1 shape: {c_strides1.shape}, dtype: {c_strides1.dtype}")
-    print(f"a_strides2 shape: {a_strides2.shape}, dtype: {a_strides2.dtype}")
-    print(f"b_strides2 shape: {b_strides2.shape}, dtype: {b_strides2.dtype}")
-    print(f"c_strides2 shape: {c_strides2.shape}, dtype: {c_strides2.dtype}")
+    print(f"a shape: {a.shape}, dtype: {a.dtype}, value:\n{a}")
+    print(f"w1_q shape: {w1_q.shape}, dtype: {w1_q.dtype}, value:\n{w1_q}")
+    print(f"w2_q shape: {w2_q.shape}, dtype: {w2_q.dtype}, value:\n{w2_q}")
     print(
-        f"s_strides13 shape: {s_strides13.shape}, dtype: {s_strides13.dtype}")
-    print(f"s_strides2 shape: {s_strides2.shape}, dtype: {s_strides2.dtype}")
+        f"w1_scale shape: {w1_scale.shape}, dtype: {w1_scale.dtype}, value:\n{w1_scale}"
+    )
     print(
-        f"topk_weights shape: {topk_weights.shape}, dtype: {topk_weights.dtype}"
+        f"w2_scale shape: {w2_scale.shape}, dtype: {w2_scale.dtype}, value:\n{w2_scale}"
     )
-    print(f"topk_ids shape: {topk_ids.shape}, dtype: {topk_ids.dtype}")
-    print(f"a1_scale shape: {a1_scale.shape}, dtype: {a1_scale.dtype}")
-    print(f"a2_scale shape: {a2_scale.shape}, dtype: {a2_scale.dtype}")
-    print(f"expert_map shape: {expert_map.shape}, dtype: {expert_map.dtype}")
-
-    #Warmup
-    ref_moe(
-        a,
-        topk_weights,
-        topk_ids,
-        ref_weight_1,
-        ref_weight_2,
-        has_pre_quant=True,
-        has_alpha=False,
-        pre_quant_scale_1=a1_scale,
-        pre_quant_scale_2=a2_scale,
+    print(
+        f"a_strides1 shape: {a_strides1.shape}, dtype: {a_strides1.dtype}, value:\n{a_strides1}"
+    )
+    print(
+        f"b_strides1 shape: {b_strides1.shape}, dtype: {b_strides1.dtype}, value:\n{b_strides1}"
+    )
+    print(
+        f"c_strides1 shape: {c_strides1.shape}, dtype: {c_strides1.dtype}, value:\n{c_strides1}"
+    )
+    print(
+        f"a_strides2 shape: {a_strides2.shape}, dtype: {a_strides2.dtype}, value:\n{a_strides2}"
+    )
+    print(
+        f"b_strides2 shape: {b_strides2.shape}, dtype: {b_strides2.dtype}, value:\n{b_strides2}"
+    )
+    print(
+        f"c_strides2 shape: {c_strides2.shape}, dtype: {c_strides2.dtype}, value:\n{c_strides2}"
+    )
+    print(
+        f"s_strides13 shape: {s_strides13.shape}, dtype: {s_strides13.dtype}, value:\n{s_strides13}"
+    )
+    print(
+        f"s_strides2 shape: {s_strides2.shape}, dtype: {s_strides2.dtype}, value:\n{s_strides2}"
+    )
+    print(
+        f"topk_weights shape: {topk_weights.shape}, dtype: {topk_weights.dtype}, value:\n{topk_weights}"
+    )
+    print(
+        f"topk_ids shape: {topk_ids.shape}, dtype: {topk_ids.dtype}, value:\n{topk_ids}"
+    )
+    print(
+        f"a1_scale shape: {a1_scale.shape}, dtype: {a1_scale.dtype}, value:\n{a1_scale}"
+    )
+    print(
+        f"a2_scale shape: {a2_scale.shape}, dtype: {a2_scale.dtype}, value:\n{a2_scale}"
+    )
+    print(
+        f"expert_map shape: {expert_map.shape}, dtype: {expert_map.dtype}, value:\n{expert_map}"
     )
 
-    results.append(
-        benchmark.Timer(
-            stmt=
-            "ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, has_pre_quant=True, has_alpha=False, pre_quant_scale_1=a1_scale, pre_quant_scale_2=a2_scale)",
-            globals=globals,
-            label=label,
-            sub_label=sub_label,
-            description="ref_moe",
-        ).blocked_autorange(min_run_time=min_run_time))
+    # #Warmup
+    # ref_moe(
+    #     a,
+    #     topk_weights,
+    #     topk_ids,
+    #     ref_weight_1,
+    #     ref_weight_2,
+    #     has_pre_quant=True,
+    #     has_alpha=False,
+    #     pre_quant_scale_1=a1_scale,
+    #     pre_quant_scale_2=a2_scale,
+    # )
 
-    # Warmup
-    run_cutlass_w4a8_moe(
-        num_warmup,
-        a,
-        w1_q,
-        w2_q,
-        w1_scale,
-        w2_scale,
-        topk_weights,
-        topk_ids,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides13,
-        s_strides2,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        expert_map=expert_map,
-        apply_router_weight_on_input=apply_router_weight_on_input)
+    # results.append(
+    #     benchmark.Timer(
+    #         stmt=
+    #         "ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, has_pre_quant=True, has_alpha=False, pre_quant_scale_1=a1_scale, pre_quant_scale_2=a2_scale)",
+    #         globals=globals,
+    #         label=label,
+    #         sub_label=sub_label,
+    #         description="ref_moe",
+    #     ).blocked_autorange(min_run_time=min_run_time))
 
-    results.append(
-        benchmark.Timer(
-            stmt=
-            "run_cutlass_w4a8_moe(num_runs, a, w1_q, w2_q, w1_scale, w2_scale, topk_weights, topk_ids, a_strides1, b_strides1, c_strides1, a_strides2, b_strides2, c_strides2, s_strides13, s_strides2, a1_scale=a1_scale, a2_scale=a2_scale, expert_map=expert_map, apply_router_weight_on_input=apply_router_weight_on_input)",
-            globals=globals,
-            label=label,
-            sub_label=sub_label,
-            description="grouped_gemm_moe",
-        ).blocked_autorange(min_run_time=min_run_time))
+    # # Warmup
+    # run_cutlass_w4a8_moe(
+    #     num_warmup,
+    #     a,
+    #     w1_q,
+    #     w2_q,
+    #     w1_scale,
+    #     w2_scale,
+    #     topk_weights,
+    #     topk_ids,
+    #     a_strides1,
+    #     b_strides1,
+    #     c_strides1,
+    #     a_strides2,
+    #     b_strides2,
+    #     c_strides2,
+    #     s_strides13,
+    #     s_strides2,
+    #     a1_scale=a1_scale,
+    #     a2_scale=a2_scale,
+    #     expert_map=expert_map,
+    #     apply_router_weight_on_input=apply_router_weight_on_input)
 
-    # Warmup
-    replay_graph(cutlass_graph, num_warmup)
+    # results.append(
+    #     benchmark.Timer(
+    #         stmt=
+    #         "run_cutlass_w4a8_moe(num_runs, a, w1_q, w2_q, w1_scale, w2_scale, topk_weights, topk_ids, a_strides1, b_strides1, c_strides1, a_strides2, b_strides2, c_strides2, s_strides13, s_strides2, a1_scale=a1_scale, a2_scale=a2_scale, expert_map=expert_map, apply_router_weight_on_input=apply_router_weight_on_input)",
+    #         globals=globals,
+    #         label=label,
+    #         sub_label=sub_label,
+    #         description="grouped_gemm_moe",
+    #     ).blocked_autorange(min_run_time=min_run_time))
 
-    results.append(
-        benchmark.Timer(
-            stmt="replay_graph(cutlass_graph, num_runs)",
-            globals=globals,
-            label=label,
-            sub_label=sub_label,
-            description="grouped_gemm_moe_cuda_graphs",
-        ).blocked_autorange(min_run_time=min_run_time))
+    # # Warmup
+    # replay_graph(cutlass_graph, num_warmup)
+
+    # results.append(
+    #     benchmark.Timer(
+    #         stmt="replay_graph(cutlass_graph, num_runs)",
+    #         globals=globals,
+    #         label=label,
+    #         sub_label=sub_label,
+    #         description="grouped_gemm_moe_cuda_graphs",
+    #     ).blocked_autorange(min_run_time=min_run_time))
 
     # correctness verification
     ref_out = ref_moe(
@@ -514,12 +518,15 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         a2_scale=a2_scale,
         expert_map=expert_map,
         apply_router_weight_on_input=apply_router_weight_on_input)
-    
+
     torch.cuda.synchronize()
 
     print("ref_out: ", ref_out)
     print("cutlass_out: ", cutlass_out)
     print("max diff: ", torch.max(torch.abs(ref_out - cutlass_out)))
+    print("mean diff: ", torch.mean(torch.abs(ref_out - cutlass_out)))
+    print("relative diff: ",
+          torch.mean(torch.abs(ref_out - cutlass_out) / torch.abs(ref_out)))
 
 def main():
 
@@ -532,7 +539,7 @@ def main():
     per_out_ch = False
     size_m = 1
     size_k = 7168
-    size_n = 4096
+    size_n = 2048
     mkn = (size_m, size_k, size_n)
     bench_run(results, model, num_experts, topk, per_act_token, per_out_ch,
               mkn)
