@@ -96,10 +96,14 @@ def cutlass_w4a8_moe(
         0], "A Strides 1 expert number mismatch"
     assert b_strides1.shape[0] == w1_q.shape[
         0], "B Strides 1 expert number mismatch"
+    # assert c_strides1.shape[0] == w1_q.shape[
+    #     0], "C Strides 1 expert number mismatch"
     assert a_strides2.shape[0] == w2_q.shape[
         0], "A Strides 2 expert number  mismatch"
     assert b_strides2.shape[0] == w2_q.shape[
         0], "B Strides 2 expert number mismatch"
+    # assert c_strides2.shape[0] == w2_q.shape[
+    #     0], "C Strides 2 expert number mismatch"
 
     num_experts = w1_q.size(0)
     m = a.size(0)
@@ -122,6 +126,9 @@ def cutlass_w4a8_moe(
         # TODO: this only works for topK=1, will need to update for topK>1
         a = a * topk_weights.to(torch.half)
 
+    # print_tensor("a", a)
+    # print_tensor("a1_scale (before)", a1_scale)
+    # print_tensor("a2_scale (before)", a2_scale)
     a_q, a1_scale = ops.scaled_fp8_quant(
         a, a1_scale.float(), use_per_token_if_dynamic=per_act_token)
     device = a_q.device
@@ -177,11 +184,18 @@ def cutlass_w4a8_moe(
     rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
     #rep_a1_scales = a1_scale[a_map] if per_act_token else a1_scale
 
+    # print_tensor("a_q", a_q)
+    # print_tensor("a1_scale (after)", a1_scale)
+    # print_tensor("a_map", a_map)
+    # print_tensor("rep_a_q", rep_a_q)
+    # print_tensor("rep_a1_scales", rep_a1_scales)
+
     # device_id = a.get_device()
     # save_dir = f"/nvme0n1/w4a8_debug_tensors/group_gemm_param/device_{device_id}"
     # import os
     # if not os.path.exists(save_dir):
     #     os.makedirs(save_dir, exist_ok=True)
+    #     torch.save(a_map, f'{save_dir}/a_map.tensor')
     #     torch.save(rep_a_q, f'{save_dir}/rep_a_q.tensor')
     #     torch.save(w1_q, f'{save_dir}/w1_q.tensor')
     #     torch.save(a1_scale, f'{save_dir}/a1_scale.tensor')
@@ -197,8 +211,11 @@ def cutlass_w4a8_moe(
     c2 = c2_initializer((m * topk, k), device=device, dtype=torch.half)
 
     ops.cutlass_w4a8_moe_mm(c1, rep_a_q, w1_q, a1_scale, w1_scale,
-                            expert_offsets[:-1], problem_sizes1, a_strides1,
-                            b_strides1, c_strides1, s_strides13, 128)
+                              expert_offsets[:-1], problem_sizes1, a_strides1,
+                              b_strides1, c_strides1, s_strides13, 128, m)
+
+    # print("c1", c1)
+    # print("c1.shape", c1.shape)
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     torch.ops._C.silu_and_mul(intermediate, c1)
 
@@ -206,10 +223,15 @@ def cutlass_w4a8_moe(
         intermediate, a2_scale.float(), use_per_token_if_dynamic=per_act_token)
 
     ops.cutlass_w4a8_moe_mm(c2, intemediate_q, w2_q, a2_scale, w2_scale,
-                            expert_offsets[:-1], problem_sizes2, a_strides2,
-                            b_strides2, c_strides2, s_strides2, 128)
+                              expert_offsets[:-1], problem_sizes2, a_strides2,
+                              b_strides2, c_strides2, s_strides2, 128, m)
+    # print("c2", c2)
+    # print("c2.shape", c2.shape)
 
     # Gather tokens
+    # print(f"xx c_map {c_map}")
+    # c_map = torch.clamp(c_map, min=0, max=c2.size(0) - 1)
+    # print(f"ssss_after c_map {c_map}")
     c2 = c2[c_map].view(m, topk, k)
 
     if not apply_router_weight_on_input:

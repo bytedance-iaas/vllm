@@ -81,12 +81,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // Activation ops
   // Activation function used in SwiGLU.
-  ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
+  ops.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
-
-  ops.def(
-      "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
-  ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
 
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
   ops.impl("mul_and_silu", torch::kCUDA, &mul_and_silu);
@@ -133,6 +129,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor! block_table_bounds"
       ") -> ()");
   ops.impl("advance_step_flashinfer", torch::kCUDA, &advance_step_flashinfer);
+
+  // Compute MLA decode using cutlass.
+  ops.def(
+      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe,"
+      "                   Tensor kv_c_and_k_pe_cache, Tensor seq_lens,"
+      "                   Tensor page_table, float scale) -> ()");
+  ops.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
 
   // Layernorm
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
@@ -291,11 +294,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // gptq_marlin Optimized Quantized GEMM for GPTQ.
   ops.def(
-      "gptq_marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
-      "Tensor b_scales, Tensor? b_zeros_or_none, Tensor? g_idx_or_none, "
-      "Tensor? perm_or_none, Tensor workspace, int b_q_type, "
+      "gptq_marlin_gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor b_zeros, Tensor g_idx, Tensor perm, Tensor workspace, "
+      "int b_q_type, "
       "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
-      "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor",
+      "bool has_zp, bool use_atomic_add, bool use_fp32_reduce, "
+      "bool is_zp_float) -> Tensor",
       {stride_tag});
   // conditionally compiled so impl registration is in source file
 
@@ -340,6 +344,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
 
 #ifndef USE_ROCM
+  // fp8_marlin Optimized Quantized GEMM for FP8 weight-only.
+  ops.def(
+      "fp8_marlin_gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor! workspace, int num_bits, SymInt size_m, SymInt size_n, "
+      "SymInt size_k) -> Tensor",
+      {stride_tag});
+  // conditionally compiled so impl registration is in source file
+
   // marlin_qqq_gemm for QQQ.
   ops.def(
       "marlin_qqq_gemm(Tensor a, Tensor b_q_weight, "
@@ -402,7 +414,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                    Tensor experts_offsets, Tensor problem_sizes,"
       "                    Tensor a_strides, Tensor b_strides,"
       "                    Tensor d_strides, Tensor s_strides,"
-      "                    int chunk_size) -> ()",
+      "                    int chunk_size, int M) -> ()",
       {stride_tag});
   ops.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
@@ -448,13 +460,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // CUTLASS sparse matrix compressor
   ops.def("cutlass_sparse_compress(Tensor a) -> Tensor[]");
   ops.impl("cutlass_sparse_compress", &cutlass_sparse_compress);
-
-  // CUTLASS MLA decode
-  ops.def(
-      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe,"
-      "                   Tensor kv_c_and_k_pe_cache, Tensor seq_lens,"
-      "                   Tensor page_table, float scale) -> ()");
-  ops.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
 
   // Mamba selective scan kernel
   ops.def(

@@ -74,12 +74,12 @@ static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
 static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-template <typename TileShape, typename ClusterShape, typename KernelSchedule>
+template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
 struct cutlass_3x_w4a8_group_gemm {
     // using KernelSchedule =
     //     cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
-    using EpilogueSchedule =
-        cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+    // using EpilogueSchedule =
+    //     cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
 
     using CollectiveEpilogue =
         typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -144,7 +144,7 @@ struct cutlass_3x_w4a8_group_gemm {
  * @param s_strides Stride information for scale tensors
  * @param chunk_size Size of each chunk for scales (K / number of scale chunks)
  */
-template <typename TileShape, typename ClusterShape, typename KernelSchedule>
+template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
 void cutlass_w4a8_group_gemm_caller(
     torch::Tensor& d_tensors, torch::Tensor const& a_tensors,
     torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
@@ -153,7 +153,7 @@ void cutlass_w4a8_group_gemm_caller(
     torch::Tensor const& b_strides, torch::Tensor const& d_strides,
     torch::Tensor const& s_strides, int64_t chunk_size) {
 
-  using Gemm = cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule>;
+  using Gemm = cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>;
   using Args = typename Gemm::GemmScaleOnly::Arguments;
 
   int num_experts = static_cast<int>(expert_offsets.size(0));

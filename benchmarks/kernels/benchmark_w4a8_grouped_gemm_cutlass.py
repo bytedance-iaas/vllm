@@ -302,30 +302,30 @@ def bench_run(results: list[benchmark.Measurement], model: str,
             graph.replay()
         torch.cuda.synchronize()
 
-    # cutlass_stream = torch.cuda.Stream()
-    # cutlass_graph = torch.cuda.CUDAGraph()
-    # with torch.cuda.graph(cutlass_graph, stream=cutlass_stream):
-    #     run_cutlass_from_graph(
-    #         a,
-    #         w1_q,
-    #         w2_q,
-    #         w1_scale,
-    #         w2_scale,
-    #         topk_weights,
-    #         topk_ids,
-    #         a_strides1,
-    #         b_strides1,
-    #         c_strides1,
-    #         a_strides2,
-    #         b_strides2,
-    #         c_strides2,
-    #         s_strides13,
-    #         s_strides2,
-    #         a1_scale=a1_scale,
-    #         a2_scale=a2_scale,
-    #         expert_map=expert_map,
-    #         apply_router_weight_on_input=apply_router_weight_on_input)
-    # torch.cuda.synchronize()
+    cutlass_stream = torch.cuda.Stream()
+    cutlass_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cutlass_graph, stream=cutlass_stream):
+        run_cutlass_from_graph(
+            a,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides13,
+            s_strides2,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input)
+    torch.cuda.synchronize()
 
     min_run_time = 5
     num_warmup = 5
@@ -353,7 +353,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         "s_strides13": s_strides13,
         "s_strides2": s_strides2,
         # cuda graph params
-        # "cutlass_graph": cutlass_graph,
+        "cutlass_graph": cutlass_graph,
         # Gen params
         "a": a,
         "topk_weights": topk_weights,
@@ -439,50 +439,50 @@ def bench_run(results: list[benchmark.Measurement], model: str,
     #         description="ref_moe",
     #     ).blocked_autorange(min_run_time=min_run_time))
 
-    # # Warmup
-    # run_cutlass_w4a8_moe(
-    #     num_warmup,
-    #     a,
-    #     w1_q,
-    #     w2_q,
-    #     w1_scale,
-    #     w2_scale,
-    #     topk_weights,
-    #     topk_ids,
-    #     a_strides1,
-    #     b_strides1,
-    #     c_strides1,
-    #     a_strides2,
-    #     b_strides2,
-    #     c_strides2,
-    #     s_strides13,
-    #     s_strides2,
-    #     a1_scale=a1_scale,
-    #     a2_scale=a2_scale,
-    #     expert_map=expert_map,
-    #     apply_router_weight_on_input=apply_router_weight_on_input)
+    # Warmup
+    run_cutlass_w4a8_moe(
+        num_warmup,
+        a,
+        w1_q,
+        w2_q,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        a_strides1,
+        b_strides1,
+        c_strides1,
+        a_strides2,
+        b_strides2,
+        c_strides2,
+        s_strides13,
+        s_strides2,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        expert_map=expert_map,
+        apply_router_weight_on_input=apply_router_weight_on_input)
 
-    # results.append(
-    #     benchmark.Timer(
-    #         stmt=
-    #         "run_cutlass_w4a8_moe(num_runs, a, w1_q, w2_q, w1_scale, w2_scale, topk_weights, topk_ids, a_strides1, b_strides1, c_strides1, a_strides2, b_strides2, c_strides2, s_strides13, s_strides2, a1_scale=a1_scale, a2_scale=a2_scale, expert_map=expert_map, apply_router_weight_on_input=apply_router_weight_on_input)",
-    #         globals=globals,
-    #         label=label,
-    #         sub_label=sub_label,
-    #         description="grouped_gemm_moe",
-    #     ).blocked_autorange(min_run_time=min_run_time))
+    results.append(
+        benchmark.Timer(
+            stmt=
+            "run_cutlass_w4a8_moe(num_runs, a, w1_q, w2_q, w1_scale, w2_scale, topk_weights, topk_ids, a_strides1, b_strides1, c_strides1, a_strides2, b_strides2, c_strides2, s_strides13, s_strides2, a1_scale=a1_scale, a2_scale=a2_scale, expert_map=expert_map, apply_router_weight_on_input=apply_router_weight_on_input)",
+            globals=globals,
+            label=label,
+            sub_label=sub_label,
+            description="grouped_gemm_moe",
+        ).blocked_autorange(min_run_time=min_run_time))
 
-    # # Warmup
-    # replay_graph(cutlass_graph, num_warmup)
+    # Warmup
+    replay_graph(cutlass_graph, num_warmup)
 
-    # results.append(
-    #     benchmark.Timer(
-    #         stmt="replay_graph(cutlass_graph, num_runs)",
-    #         globals=globals,
-    #         label=label,
-    #         sub_label=sub_label,
-    #         description="grouped_gemm_moe_cuda_graphs",
-    #     ).blocked_autorange(min_run_time=min_run_time))
+    results.append(
+        benchmark.Timer(
+            stmt="replay_graph(cutlass_graph, num_runs)",
+            globals=globals,
+            label=label,
+            sub_label=sub_label,
+            description="grouped_gemm_moe_cuda_graphs",
+        ).blocked_autorange(min_run_time=min_run_time))
 
     # correctness verification
     ref_out = ref_moe(
@@ -537,7 +537,7 @@ def main():
     topk = 8
     per_act_token = True
     per_out_ch = False
-    size_m = 1
+    size_m = 32
     size_k = 7168
     size_n = 2048
     mkn = (size_m, size_k, size_n)

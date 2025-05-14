@@ -97,9 +97,6 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
-void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
-                        torch::Tensor& scale);
-
 void mul_and_silu(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -210,7 +207,7 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
     torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
     torch::Tensor const& b_strides, torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides, int64_t chunk_size);
+    torch::Tensor const& s_strides, int64_t chunk_size, int64_t M);
 
 void get_cutlass_moe_mm_data(
     const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
