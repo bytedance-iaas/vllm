@@ -5,6 +5,7 @@
 
 #include "cutlass/cutlass.h"
 #include "grouped_mm_c3x.cuh"
+#include "w4a8_grouped_mm_c3x.cuh"
 
 using namespace cute;
 
@@ -146,6 +147,25 @@ void dispatch_moe_mm_sm90(
   }
 }
 
+void dispatch_w4a8_moe_mm_sm90(
+    torch::Tensor& d_tensors, torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides, torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides, int64_t chunk_size) {
+  constexpr int TileShapeK = 512;
+  using KernelSchedule =
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
+  using TileShape = Shape<_128, _32, cute::Int<TileShapeK>>;
+  using ClusterShape = Shape<_1, _1, _1>;
+
+  cutlass_w4a8_group_gemm_caller<TileShape, ClusterShape, KernelSchedule>(
+      d_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+      problem_sizes, a_strides, b_strides, d_strides, s_strides, chunk_size
+  );
+}
+
 }  // namespace
 
 void cutlass_moe_mm_sm90(
@@ -157,4 +177,17 @@ void cutlass_moe_mm_sm90(
   dispatch_moe_mm_sm90(out_tensors, a_tensors, b_tensors, a_scales, b_scales,
                        expert_offsets, problem_sizes, a_strides, b_strides,
                        c_strides);
+}
+
+void cutlass_w4a8_moe_mm_sm90(
+    torch::Tensor& d_tensors, torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides, torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides, int64_t chunk_size) {
+  dispatch_w4a8_moe_mm_sm90(d_tensors, a_tensors, b_tensors, a_scales,
+                            b_scales, expert_offsets, problem_sizes,
+                            a_strides, b_strides, d_strides, s_strides,
+                            chunk_size);
 }

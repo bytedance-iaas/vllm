@@ -395,6 +395,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       {stride_tag});
   ops.impl("cutlass_moe_mm", torch::kCUDA, &cutlass_moe_mm);
 
+  // CUTLASS w4a8 grouped GEMM
+  ops.def(
+      "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b,"
+      "                    Tensor a_scales, Tensor b_scales,"
+      "                    Tensor experts_offsets, Tensor problem_sizes,"
+      "                    Tensor a_strides, Tensor b_strides,"
+      "                    Tensor d_strides, Tensor s_strides,"
+      "                    int chunk_size) -> ()",
+      {stride_tag});
+  ops.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
+
   // A function that computes data required to run fused MoE with w8a8 grouped
   // GEMM. It takes topk_ids as an input, and computes expert_offsets
   // (token start indices of each expert). In addition to this, it computes
@@ -491,17 +502,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   //       "int4_fp8_gemm(Tensor A, Tensor B,"
   //       "              Tensor scales, int group_size) -> Tensor");
   //   ops.impl("int4_fp8_gemm", torch::kCUDA, &int4_fp8_gemm);
-
-  // fp8 * int4 Grouped GEMM from Cutlass
-  ops.def(
-      "int4_fp8_grouped_gemm(Tensor! d, Tensor a, Tensor b,"
-      "                      Tensor a_scales, Tensor b_scales,"
-      "                      Tensor experts_offsets, Tensor problem_sizes,"
-      "                      Tensor a_strides, Tensor b_strides,"
-      "                      Tensor d_strides, Tensor s_strides,"
-      "                      int chunk_size) -> ()",
-      {stride_tag});
-  ops.impl("int4_fp8_grouped_gemm", torch::kCUDA, &int4_fp8_grouped_gemm);
 
   // Check if cutlass_scaled_mm_fp4 is supported for CUDA devices
   // of the given capability

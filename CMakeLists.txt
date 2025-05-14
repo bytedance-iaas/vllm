@@ -286,7 +286,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/quantization/aqlm/gemm_kernels.cu"
     "csrc/quantization/awq/gemm_kernels.cu"
     "csrc/permute_cols.cu"
-    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu"
+    "csrc/quantization/cutlass_w4a8_w8a8/scaled_mm_entry.cu"
     "csrc/quantization/fp4/nvfp4_quant_entry.cu"
     "csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu"
     "csrc/sparse/cutlass/sparse_scaled_mm_entry.cu"
@@ -387,13 +387,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   cuda_archs_loose_intersection(SCALED_MM_ARCHS "9.0a;" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_ARCHS)
     set(SRCS
-       "csrc/quantization/cutlass_w8a8/scaled_mm_c3x_sm90.cu"
-       "csrc/quantization/cutlass_w8a8/c3x/scaled_mm_sm90_fp8.cu"
-       "csrc/quantization/cutlass_w8a8/c3x/scaled_mm_sm90_int8.cu"
-       "csrc/quantization/cutlass_w8a8/c3x/scaled_mm_azp_sm90_int8.cu"
-       "csrc/quantization/cutlass_w8a8/c3x/scaled_mm_blockwise_sm90_fp8.cu"
+       "csrc/quantization/cutlass_w4a8_w8a8/scaled_mm_c3x_sm90.cu"
+       "csrc/quantization/cutlass_w4a8_w8a8/c3x/scaled_mm_sm90_fp8.cu"
+       "csrc/quantization/cutlass_w4a8_w8a8/c3x/scaled_mm_sm90_int8.cu"
+       "csrc/quantization/cutlass_w4a8_w8a8/c3x/scaled_mm_azp_sm90_int8.cu"
+       "csrc/quantization/cutlass_w4a8_w8a8/c3x/scaled_mm_blockwise_sm90_fp8.cu")
        # "csrc/cutlass_extensions/gemm/int4_fp8_gemm.cu"
-       "csrc/cutlass_extensions/gemm/int4_fp8_grouped_gemm.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "${SCALED_MM_ARCHS}")
@@ -419,8 +418,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.1a;12.0a" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.8 AND SCALED_MM_ARCHS)
     set(SRCS
-      "csrc/quantization/cutlass_w8a8/scaled_mm_c3x_sm100.cu"
-      "csrc/quantization/cutlass_w8a8/c3x/scaled_mm_sm100_fp8.cu"
+      "csrc/quantization/cutlass_w4a8_w8a8/scaled_mm_c3x_sm100.cu"
+      "csrc/quantization/cutlass_w4a8_w8a8/c3x/scaled_mm_sm100_fp8.cu"
     )
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
@@ -450,7 +449,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
   if (SCALED_MM_2X_ARCHS)
-    set(SRCS "csrc/quantization/cutlass_w8a8/scaled_mm_c2x.cu")
+    set(SRCS "csrc/quantization/cutlass_w4a8_w8a8/scaled_mm_c2x.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "${SCALED_MM_2X_ARCHS}")
@@ -537,8 +536,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   # to compile MoE kernels that use its output.
   cuda_archs_loose_intersection(SCALED_MM_ARCHS "9.0a;" "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3 AND SCALED_MM_ARCHS)
-    set(SRCS "csrc/quantization/cutlass_w8a8/moe/grouped_mm_c3x.cu"
-             "csrc/quantization/cutlass_w8a8/moe/moe_data.cu")
+    set(SRCS "csrc/quantization/cutlass_w4a8_w8a8/moe/grouped_mm_c3x.cu"
+             "csrc/quantization/cutlass_w4a8_w8a8/moe/moe_data.cu")
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "${SCALED_MM_ARCHS}")

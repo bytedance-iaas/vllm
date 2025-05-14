@@ -204,6 +204,14 @@ void cutlass_moe_mm(
     torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
     torch::Tensor const& b_strides, torch::Tensor const& c_strides);
 
+void cutlass_w4a8_moe_mm(
+    torch::Tensor& d_tensors, torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides, torch::Tensor const& d_strides,
+    torch::Tensor const& s_strides, int64_t chunk_size);
+
 void get_cutlass_moe_mm_data(
     const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
@@ -237,18 +245,6 @@ void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
 //                             torch::Tensor const& scales,  // fp8 packed scales
 //                             int64_t group_size);
 
-void int4_fp8_grouped_gemm(torch::Tensor& d_tensors,
-                           torch::Tensor const& a_tensors,
-                           torch::Tensor const& b_tensors,
-                           torch::Tensor const& a_scales,
-                           torch::Tensor const& b_scales,
-                           torch::Tensor const& expert_offsets,
-                           torch::Tensor const& problem_sizes,
-                           torch::Tensor const& a_strides,
-                           torch::Tensor const& b_strides,
-                           torch::Tensor const& d_strides,
-                           torch::Tensor const& s_strides,
-                           int64_t chunk_size);
 #endif
 
 void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,

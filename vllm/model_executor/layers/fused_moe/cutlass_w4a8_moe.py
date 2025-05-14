@@ -196,18 +196,18 @@ def cutlass_w4a8_moe(
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = c2_initializer((m * topk, k), device=device, dtype=torch.half)
 
-    ops.int4_fp8_grouped_gemm(c1, rep_a_q, w1_q, a1_scale, w1_scale,
-                              expert_offsets[:-1], problem_sizes1, a_strides1,
-                              b_strides1, c_strides1, s_strides13, 128)
+    ops.cutlass_w4a8_moe_mm(c1, rep_a_q, w1_q, a1_scale, w1_scale,
+                            expert_offsets[:-1], problem_sizes1, a_strides1,
+                            b_strides1, c_strides1, s_strides13, 128)
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     torch.ops._C.silu_and_mul(intermediate, c1)
 
     intemediate_q, a2_scale = ops.scaled_fp8_quant(
         intermediate, a2_scale.float(), use_per_token_if_dynamic=per_act_token)
 
-    ops.int4_fp8_grouped_gemm(c2, intemediate_q, w2_q, a2_scale, w2_scale,
-                              expert_offsets[:-1], problem_sizes2, a_strides2,
-                              b_strides2, c_strides2, s_strides2, 128)
+    ops.cutlass_w4a8_moe_mm(c2, intemediate_q, w2_q, a2_scale, w2_scale,
+                            expert_offsets[:-1], problem_sizes2, a_strides2,
+                            b_strides2, c_strides2, s_strides2, 128)
 
     # Gather tokens
     c2 = c2[c_map].view(m, topk, k)

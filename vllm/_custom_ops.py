@@ -748,6 +748,62 @@ def cutlass_moe_mm(out_tensors: torch.Tensor, a_tensors: torch.Tensor,
                                 b_scales, expert_offsets, problem_sizes,
                                 a_strides, b_strides, c_strides)
 
+# int4_fp8 grouped gemm
+def cutlass_w4a8_moe_mm(
+    d: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    experts_offsets: torch.tensor,
+    problem_sizes: torch.tensor,
+    a_strides: torch.tensor,
+    b_strides: torch.tensor,
+    d_strides: torch.tensor,
+    s_strides: torch.tensor,
+    chunk_size: int = 0,
+):
+    """
+    Perform grouped matrix multiplication between int4 weights and fp8 activations.
+    
+    This function executes multiple GEMM operations in parallel, which is useful for
+    scenarios like Mixture of Experts (MoE) where different inputs go through different
+    experts. The implementation leverages NVIDIA Hopper architecture features for
+    optimal performance with quantized weights.
+    
+    Args:
+        d: Output matrices of shape [total_m, total_n]
+        a: Activation matrices in FP8 (float_e4m3_t) format
+           Each tensor should be of shape [total_m, K] in row-major layout
+        b: Weight matrices in packed int4 format
+           Each tensor should be of shape [E, N, K//2] in column-major layout
+           where each byte contains two 4-bit integers
+        a_scales: Scale factors for the inputs
+        b_scales: Scale factors for the quantized weights
+           Each tensor should be of shape [E, K//512, N*8]
+        experts_offsets: Tensor containing expert offsets for determining group boundaries
+        problem_sizes: with shape [num_experts, 3] (M, N, K for each group) (int32)
+        a_strides: Strides information for A matrices
+        b_strides: Strides information for B matrices
+        d_strides: Strides information for D matrices
+        s_strides: Strides information for b_scales matrices
+        chunk_size: Number of elements each scale value applies to (K//512), default to 128
+        
+    Requirements:
+        - All tensors must be on a CUDA device
+        - Requires an NVIDIA Hopper GPU (H100)
+        - A tensors must be in float8_e4m3fn format
+        - B tensors must contain packed int4 values (stored as int8)
+        
+    Note:
+        The function computes: D = (A * (B * scales))
+        for each group of tensors in parallel
+    """
+
+    torch.ops._C.cutlass_w4a8_moe_mm(
+        d, a, b, a_scales, b_scales, experts_offsets, problem_sizes, 
+        a_strides, b_strides, d_strides, s_strides, chunk_size)
+
 
 # aqlm
 def aqlm_gemm(input: torch.Tensor, codes: torch.Tensor,
@@ -1011,62 +1067,6 @@ def scaled_fp4_quant(
 #     assert scales.is_contiguous(), "Scales must be contiguous"
 
 #     return torch.ops._C.int4_fp8_gemm(A, B, scales, group_size)
-
-# int4_fp8 grouped gemm
-def int4_fp8_grouped_gemm(
-    d: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scales: torch.Tensor,
-    b_scales: torch.Tensor,
-    experts_offsets: torch.tensor,
-    problem_sizes: torch.tensor,
-    a_strides: torch.tensor,
-    b_strides: torch.tensor,
-    d_strides: torch.tensor,
-    s_strides: torch.tensor,
-    chunk_size: int = 0,
-):
-    """
-    Perform grouped matrix multiplication between int4 weights and fp8 activations.
-    
-    This function executes multiple GEMM operations in parallel, which is useful for
-    scenarios like Mixture of Experts (MoE) where different inputs go through different
-    experts. The implementation leverages NVIDIA Hopper architecture features for
-    optimal performance with quantized weights.
-    
-    Args:
-        d: Output matrices of shape [total_m, total_n]
-        a: Activation matrices in FP8 (float_e4m3_t) format
-           Each tensor should be of shape [total_m, K] in row-major layout
-        b: Weight matrices in packed int4 format
-           Each tensor should be of shape [E, N, K//2] in column-major layout
-           where each byte contains two 4-bit integers
-        a_scales: NOT USED
-        b_scales: Scale factors for the quantized weights
-           Each tensor should be of shape [E, K//512, N*8]
-        experts_offsets: Tensor containing expert offsets for determining group boundaries
-        problem_sizes: with shape [num_experts, 3] (M, N, K for each group) (int32)
-        a_strides: Strides information for A matrices
-        b_strides: Strides information for B matrices
-        d_strides: Strides information for D matrices
-        s_strides: Strides information for b_scales matrices
-        chunk_size: Number of elements each scale value applies to (K//512), default to 128
-        
-    Requirements:
-        - All tensors must be on a CUDA device
-        - Requires an NVIDIA Hopper GPU (H100)
-        - A tensors must be in float8_e4m3fn format
-        - B tensors must contain packed int4 values (stored as int8)
-        
-    Note:
-        The function computes: D = (A * (B * scales))
-        for each group of tensors in parallel
-    """
-
-    torch.ops._C.int4_fp8_grouped_gemm(
-        d, a, b, a_scales, b_scales, experts_offsets, problem_sizes, 
-        a_strides, b_strides, d_strides, s_strides, chunk_size)
 
 # fp8
 def scaled_fp8_quant(
