@@ -1029,6 +1029,124 @@ class Scheduler:
         self.running = running_queue
         return force_preemption_count
 
+    def _schedule_prefills_optimized(
+        self,
+        budget: SchedulingBudget,
+        curr_loras: Optional[Set[int]],
+        enable_chunking: bool = False,
+        partial_prefill_metadata: Optional[PartialPrefillMetadata] = None,
+    ) -> SchedulerPrefillOutputs:
+        """Schedule sequence groups that are in prefill stage.
+
+        Uses a two-stage batching strategy combining EDF and SJF.
+
+        Returns:
+            SchedulerPrefillOutputs.
+        """
+
+        # import pdb
+        # pdb.set_trace()
+
+        if budget.remaining_token_budget() == 0:
+            return SchedulerPrefillOutputs(
+                seq_groups=[],
+                ignored_seq_groups=[],
+                num_lookahead_slots=self._get_num_lookahead_slots(
+                    is_prefill=True, enable_chunking=enable_chunking),
+            )
+
+        if not self.waiting:
+            return SchedulerPrefillOutputs(
+                seq_groups=[],
+                ignored_seq_groups=[],
+                num_lookahead_slots=self._get_num_lookahead_slots(
+                    is_prefill=True, enable_chunking=enable_chunking),
+            )
+
+        now = time.time()
+        target_ttft = getattr(self.scheduler_config, 'target_ttft', 5)
+        bucket_size = getattr(self.scheduler_config, 'deadline_bucket_ms', 0.2)
+
+        def estimate_deadline(sg):
+            predicted = getattr(sg, '_predicted_prefill_time', 2)
+            length = sg.get_seqs()[0].get_len()
+            return sg.arrival_time + target_ttft - predicted - 0.01 * length
+
+        # Turn on this function if we want to filter out requests doomed to violate TTFT
+        def schedulable(sg):
+            # predicted = getattr(sg, '_predicted_prefill_time', 1.8) + 0.1*sg.get_seqs()[0].get_len()
+            # return estimate_deadline(sg) >= now
+            return True
+
+        # Filter and bucketize
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        schedulable_sgs = [sg for sg in list(self.waiting) if sg.is_prefill() and schedulable(sg)]
+
+        for sg in schedulable_sgs:
+            deadline = estimate_deadline(sg)
+            bucket_key = int((deadline - now) // bucket_size)
+            buckets[bucket_key].append(sg)
+        for b in buckets.values():
+            b.sort(key=lambda sg: sg.get_seqs()[0].get_len())
+        sorted_keys = sorted(buckets.keys())
+
+        seq_groups = []
+        ignored_seq_groups = []
+        accumulated_tokens = 0
+        max_tokens = budget.remaining_token_budget()
+        max_prompt_len = 0
+
+        if len(sorted_keys) == 0:
+            return SchedulerPrefillOutputs(
+                seq_groups=[],
+                ignored_seq_groups=[],
+                num_lookahead_slots=self._get_num_lookahead_slots(
+                    is_prefill=True, enable_chunking=enable_chunking),
+            )
+
+        # Stage 1: pick from tightest EDF bucket
+        for sg in buckets[sorted_keys[0]]:
+            prompt_len = sg.get_seqs()[0].get_len()
+            if accumulated_tokens + prompt_len > max_tokens:
+                break
+            self.waiting.remove(sg)
+            self._allocate_and_set_running(sg)
+            seq_groups.append(ScheduledSequenceGroup(sg, prompt_len))
+            budget.add_num_batched_tokens(sg.request_id, prompt_len)
+            budget.add_num_seqs(sg.request_id, 1)
+            accumulated_tokens += prompt_len
+            max_prompt_len = max(max_prompt_len, prompt_len)
+
+        # Stage 2: fill with longest within max_prompt_len
+        if accumulated_tokens < max_tokens:
+            for k in sorted_keys:
+                for sg in sorted(buckets[k], key=lambda s: s.get_seqs()[0].get_len(), reverse=True):
+                    if sg in [g.seq_group for g in seq_groups]:
+                        continue
+                    prompt_len = sg.get_seqs()[0].get_len()
+                    if prompt_len > max_prompt_len:
+                        continue
+                    if accumulated_tokens + prompt_len > max_tokens:
+                        continue
+                    self.waiting.remove(sg)
+                    self._allocate_and_set_running(sg)
+                    seq_groups.append(ScheduledSequenceGroup(sg, prompt_len))
+                    budget.add_num_batched_tokens(sg.request_id, prompt_len)
+                    budget.add_num_seqs(sg.request_id, 1)
+                    accumulated_tokens += prompt_len
+                    if accumulated_tokens >= max_tokens:
+                        break
+                if accumulated_tokens >= max_tokens:
+                    break
+
+        return SchedulerPrefillOutputs(
+            seq_groups=seq_groups,
+            ignored_seq_groups=ignored_seq_groups,
+            num_lookahead_slots=self._get_num_lookahead_slots(
+                is_prefill=True, enable_chunking=enable_chunking),
+        )
+
     def _schedule_prefills(
         self,
         budget: SchedulingBudget,
@@ -1239,6 +1357,9 @@ class Scheduler:
             token_budget=self.scheduler_config.max_num_batched_tokens,
             max_num_seqs=self.scheduler_config.max_num_seqs,
         )
+        
+        enable_prefill_optimizer = self.scheduler_config.enable_prefill_optimizer
+
         # Make sure we include num running seqs before scheduling prefill,
         # so that we don't schedule beyond max_num_seqs for prefill.
         for seq_group in self.running:
@@ -1254,9 +1375,14 @@ class Scheduler:
 
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
-            prefills = self._schedule_prefills(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
+            if enable_prefill_optimizer:
+                prefills = self._schedule_prefills_optimized(budget,
+                                                             curr_loras,
+                                                             enable_chunking=False)
+            else:
+                prefills = self._schedule_prefills(budget,
+                                                   curr_loras,
+                                                   enable_chunking=False)
 
         if len(prefills.seq_groups
                ) == 0 and self.scheduler_config.policy == "priority":

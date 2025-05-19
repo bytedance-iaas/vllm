@@ -413,6 +413,8 @@ class EngineArgs:
 
     calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
 
+    enable_prefill_optimizer: bool = False
+
     additional_config: Optional[Dict[str, Any]] = None
     enable_reasoning: Optional[bool] = None  # DEPRECATED
     reasoning_parser: str = DecodingConfig.reasoning_backend
@@ -848,6 +850,10 @@ class EngineArgs:
                             action='store_true',
                             help='Disable logging statistics.')
 
+        parser.add_argument('--enable-prefill-optimizer',
+                            action='store_true',
+                            help='Enable optimized prefill scheduling.')
+
         return parser
 
     @classmethod
@@ -1127,6 +1133,7 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            enable_prefill_optimizer=self.enable_prefill_optimizer,
         )
 
         lora_config = LoRAConfig(

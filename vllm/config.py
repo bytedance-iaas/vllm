@@ -2026,6 +2026,8 @@ class SchedulerConfig:
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
 
+    enable_prefill_optimizer: bool = False
+
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
     partially schedule a multimodal item. Only used in V1
@@ -4476,6 +4478,7 @@ class VllmConfig:
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size},"
             f" pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"disable_custom_all_reduce={self.parallel_config.disable_custom_all_reduce}, "  # noqa
+            f"enable_prefill_optimizer={self.scheduler_config.enable_prefill_optimizer!r}, "
             f"quantization={self.model_config.quantization}, "
             f"enforce_eager={self.model_config.enforce_eager}, "
             f"kv_cache_dtype={self.cache_config.cache_dtype}, "
