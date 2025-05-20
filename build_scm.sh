@@ -31,7 +31,7 @@ else
 fi
 
 echo "VERSION_SUFFIX: $VERSION_SUFFIX"
-VERSION=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n 1 | sed 's/^v//')
+VERSION=$(git tag --merged HEAD -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n 1 | sed 's/^v//')
 if [ -z "$VERSION" ]; then
     echo "no version found, please check the git tag. (DO NOT use git shallow clone)"
     exit 1
