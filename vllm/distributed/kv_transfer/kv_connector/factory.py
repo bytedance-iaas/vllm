@@ -40,6 +40,10 @@ class KVConnectorFactory:
             raise ValueError("Attempting to initialize a V0 Connector, "
                              f"but found {envs.VLLM_USE_V1=}")
 
+        if (config.kv_transfer_config.kv_connector == "DynamoNixlConnector"
+                    and config.kv_transfer_config.kv_use_eic):
+            from vllm.distributed.kv_transfer.kv_connector.lmcache_connector import LMCacheConnector
+            return LMCacheConnector(rank, local_rank, config)
         connector_name = config.kv_transfer_config.kv_connector
         if connector_name not in cls._registry:
             raise ValueError(f"Unsupported connector type: {connector_name}")
