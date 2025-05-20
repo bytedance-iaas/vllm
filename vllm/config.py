@@ -3686,14 +3686,19 @@ class KVTransferConfig:
     """The KV connector ip, used to build distributed connection."""
 
     kv_port: int = 14579
-    """The KV connector port, used to build distributed connection."""
 
-    kv_connector_extra_config: dict[str, Any] = field(default_factory=dict)
-    """any extra config that the connector may need."""
+    # Whether use eic for kv cache reuse for prefill instanceAdd commentMore actions
+    kv_use_eic: bool = False
 
-    kv_connector_module_path: Optional[str] = None
-    """The Python module path to dynamically load the KV connector from.
-    Only supported in V1."""
+    # any extra config that the connector may need
+    kv_connector_extra_config: dict[str, Any] = {}
+
+    # This does not need to be set by the user. It is set by the connector.
+    kv_producers_parallel_size: Optional[int] = None
+    kv_producers_tensor_parallel_size: Optional[int] = None
+    kv_producers_pipeline_parallel_size: Optional[int] = None
+    kv_consumers_tensor_parallel_size: Optional[int] = None
+    kv_consumers_pipeline_parallel_size: Optional[int] = None
 
     def compute_hash(self) -> str:
         """
