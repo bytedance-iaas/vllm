@@ -32,8 +32,22 @@ fi
 
 echo "VERSION_SUFFIX: $VERSION_SUFFIX"
 VERSION=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -n 1 | sed 's/^v//')
+if [ -z "$VERSION" ]; then
+    echo "no version found, please check the git tag. (DO NOT use git shallow clone)"
+    exit 1
+fi
 WHEEL_VERSION=$VERSION$VERSION_SUFFIX
 echo "WHEEL_VERSION: $WHEEL_VERSION"
+
+# 如果是 SCM 构建，则准备 docker 环境
+if [ $SCM_BUILD == "True" ]; then
+    dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock &
+    while ! docker info > /dev/null 2>&1; do
+        sleep 1
+        echo "Waiting for dockerd to start..."
+    done
+    export DOCKER_HOST="tcp://localhost:2375"
+fi
 
 # 备份 Dockerfile
 cp docker/Dockerfile docker/Dockerfile.bak
@@ -42,7 +56,15 @@ cp docker/Dockerfile docker/Dockerfile.bak
 sed -i 's/FROM nvidia\/cuda/FROM iaas-gpu-cn-beijing.cr.volces.com\/nvcr.io\/nvidia\/cuda/' docker/Dockerfile
 sed -i "s/python3 setup.py bdist_wheel/SETUPTOOLS_SCM_PRETEND_VERSION=$WHEEL_VERSION python3 setup.py bdist_wheel/" docker/Dockerfile
 
-DOCKER_BUILDKIT=1 docker build --no-cache --build-arg http_proxy=http://sys-proxy-rd-relay.byted.org:8118 --build-arg https_proxy=http://sys-proxy-rd-relay.byted.org:8118 --build-arg max_jobs=256 --build-arg USE_SCCACHE=0 --build-arg GIT_REPO_CHECK=0 --build-arg CUDA_VERSION=$CUDA_VERSION --build-arg RUN_WHEEL_CHECK=false --tag vllm-ci:build-image --target build --progress plain -f docker/Dockerfile .
+proxy_args=""
+if [ ! -z "$http_proxy" ]; then
+    proxy_args="$proxy_args --build-arg http_proxy=$http_proxy"
+fi
+if [ ! -z "$https_proxy" ]; then
+    proxy_args="$proxy_args --build-arg https_proxy=$https_proxy"
+fi
+
+DOCKER_BUILDKIT=1 docker build --network host --no-cache $proxy_args --build-arg max_jobs=256 --build-arg USE_SCCACHE=0 --build-arg GIT_REPO_CHECK=0 --build-arg CUDA_VERSION=$CUDA_VERSION --build-arg RUN_WHEEL_CHECK=false --tag vllm-ci:build-image --target build --progress plain -f docker/Dockerfile .
 
 # 恢复 Dockerfile
 mv docker/Dockerfile.bak docker/Dockerfile
