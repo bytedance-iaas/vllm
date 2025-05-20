@@ -3265,6 +3265,9 @@ class KVTransferConfig(BaseModel):
     # The KV connector port, used to build distributed connection
     kv_port: int = 14579
 
+    # Whether use eic for kv cache reuse for prefill instance
+    kv_use_eic: bool = False
+
     # any extra config that the connector may need
     kv_connector_extra_config: dict[str, Any] = {}
 
