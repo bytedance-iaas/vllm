@@ -40,13 +40,8 @@ WHEEL_VERSION=$VERSION$VERSION_SUFFIX
 echo "WHEEL_VERSION: $WHEEL_VERSION"
 
 # 如果是 SCM 构建，则准备 docker 环境
-if [ $SCM_BUILD == "True" ]; then
-    dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock &
-    while ! docker info > /dev/null 2>&1; do
-        sleep 1
-        echo "Waiting for dockerd to start..."
-    done
-    export DOCKER_HOST="tcp://localhost:2375"
+if [[ "${SCM_BUILD}" == "True" ]]; then
+    source /root/start_dockerd.sh
 fi
 
 # 备份 Dockerfile
