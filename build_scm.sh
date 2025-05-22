@@ -51,6 +51,8 @@ cp docker/Dockerfile docker/Dockerfile.bak
 sed -i 's/FROM nvidia\/cuda/FROM iaas-gpu-cn-beijing.cr.volces.com\/nvcr.io\/nvidia\/cuda/' docker/Dockerfile
 sed -i "s/python3 setup.py bdist_wheel/SETUPTOOLS_SCM_PRETEND_VERSION=$WHEEL_VERSION python3 setup.py bdist_wheel/" docker/Dockerfile
 
+cp -r examples vllm/examples
+
 proxy_args=""
 if [ ! -z "$http_proxy" ]; then
     proxy_args="$proxy_args --build-arg http_proxy=$http_proxy"
