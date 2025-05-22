@@ -1892,7 +1892,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if self.vllm_config.kv_transfer_config is None:
             return False
 
-        if self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector":
+        if self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector" and \
+            not self.vllm_config.kv_transfer_config.kv_use_eic:
             return False
 
         prefill_meta = model_input.attn_metadata.prefill_metadata
@@ -1930,7 +1931,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if self.vllm_config.kv_transfer_config is None:
             return False
 
-        if self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector":
+        if (self.vllm_config.kv_transfer_config.kv_connector == "DynamoNixlConnector"
+                and not self.vllm_config.kv_transfer_config.kv_use_eic):
             return False
 
         prefill_meta = model_input.attn_metadata.prefill_metadata
