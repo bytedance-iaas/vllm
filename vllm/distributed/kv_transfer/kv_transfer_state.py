@@ -68,5 +68,5 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
                 rank=get_world_group().rank,
                 local_rank=get_world_group().local_rank,
                 config=vllm_config,
-                worker_group=get_world_group(),
+                world_group=get_world_group(),
             )
