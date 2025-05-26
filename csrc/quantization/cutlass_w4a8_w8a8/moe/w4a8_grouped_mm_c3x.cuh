@@ -39,7 +39,7 @@ namespace {
 using MmaType = cutlass::float_e4m3_t;  // FP8 e4m3 type
 using QuantType = cutlass::int4b_t;     // 4-bit integer type
 using ElementAccumulator = float;       // Accumulator type
-using ElementScale = cutlass::half_t;   // Scale type
+using ElementScale = cutlass::bfloat16_t;   // Scale type
 using ElementScalePacked = cutlass::Array<ElementScale, 4>;
 using ElementC = cutlass::half_t;  // Default output type (FP16)
 using ElementD = ElementC;         // Default output type (FP16)
@@ -162,8 +162,9 @@ void cutlass_w4a8_group_gemm_caller(
 
   // Check inputs
   TORCH_CHECK(a_tensors.dim() == 2, "A tensor must be 2D");
-  TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
+//   TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
   TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
+  TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D [1]");
   TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
 
@@ -176,18 +177,18 @@ void cutlass_w4a8_group_gemm_caller(
               "B tensor first dimension must match number of groups");
   TORCH_CHECK(b_scales.size(0) == num_experts,
               "Scale tensor first dimension must match number of groups");
-  TORCH_CHECK(b_tensors.size(2) * 2 == a_tensors.size(1),
-              "B tensor K/2 dimension must match A tensor K dimension");
+//   TORCH_CHECK(b_tensors.size(2) * 2 == a_tensors.size(1),
+//               "B tensor K/2 dimension must match A tensor K dimension");
   TORCH_CHECK(b_scales.size(1) == a_tensors.size(1) / 512,
-              "Scale tensor second dimension must be K//512");
-  TORCH_CHECK(b_scales.size(2) == 4 * b_tensors.size(1),
-              "Scale tensor last dimension must be 4*N");
+             "Scale tensor second dimension must be K//512");
+//   TORCH_CHECK(b_scales.size(2) == 4 * b_tensors.size(1),
+//              "Scale tensor last dimension must be 4*N");
 
   // Check tensor types
   TORCH_CHECK(a_tensors.scalar_type() == torch::kFloat8_e4m3fn,
               "A tensor must be fp8 (float_e4m3_t) type");
-  TORCH_CHECK(b_tensors.scalar_type() == torch::kInt8,
-              "B tensor must contain packed int4 values (stored as int8)");
+//   TORCH_CHECK(b_tensors.scalar_type() == torch::kInt8,
+//               "B tensor must contain packed int4 values (stored as int8)");
   TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32,
               "Expert offsets must be int32 type");
   TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32,
@@ -203,34 +204,48 @@ void cutlass_w4a8_group_gemm_caller(
   torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
   torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
 
-  // int debug_node = 0;
-  // int current_device = a_tensors.device().index();
-  //  if (current_device == debug_node) {
-  //      printf("=== Debug Info ===\n");
-  //      printf("Debug node: %d\n", debug_node);
-  //      int k_size = a_tensors.size(1);
-  //      int n_size = b_tensors.size(1);
-  //      printf("\n=== Input Tensor Information (Device %d) ===\n",
-  //      current_device); printf("a_tensors shape: [%ld, %ld], device: %s\n",
-  //      a_tensors.size(0), a_tensors.size(1),
-  //      a_tensors.device().str().c_str()); printf("b_tensors shape: [%ld, %ld,
-  //      %ld], device: %s\n", b_tensors.size(0), b_tensors.size(1),
-  //      b_tensors.size(2), b_tensors.device().str().c_str()); printf("a_scales
-  //      shape: [%ld], device: %s\n", a_scales.size(0),
-  //      a_scales.device().str().c_str()); printf("b_scales shape: [%ld, %ld,
-  //      %ld], device: %s\n", b_scales.size(0), b_scales.size(1),
-  //      b_scales.size(2), b_scales.device().str().c_str());
-  //      printf("expert_offsets shape: [%ld], device: %s\n",
-  //      expert_offsets.size(0), expert_offsets.device().str().c_str());
-  //      printf("chunk_size: %ld\n", chunk_size);
-  //
-  //      printf("\n=== Derived Parameters ===\n");
-  //      printf("num_experts: %d\n", num_experts);
-  //      printf("k_size: %d\n", k_size);
-  //      printf("n_size: %d\n", n_size);
-  //      printf("per_act_token: %d\n", per_act_token);
-  //      printf("per_out_ch: %d\n", per_out_ch);
-  //  }
+  int debug_node = 0;
+  int current_device = a_tensors.device().index();
+   if (current_device == debug_node) {
+       printf("=== Debug Info ===\n");
+    //    printf("Debug node: %d\n", debug_node);
+       int k_size = a_tensors.size(1);
+       int n_size = b_tensors.size(1);
+       printf("\n=== Input Tensor Information (Device %d) ===\n", current_device); 
+       printf("a_tensors shape: [%ld, %ld], device: %s\n", a_tensors.size(0), a_tensors.size(1), a_tensors.device().str().c_str());
+       printf("b_tensors shape: [%ld, %ld, %ld], device: %s\n", b_tensors.size(0), b_tensors.size(1), b_tensors.size(2), b_tensors.device().str().c_str());
+       printf("a_scales shape: [%ld], device: %s\n", a_scales.size(0),a_scales.device().str().c_str());
+       printf("b_scales shape: [%ld, %ld, %ld], device: %s\n", b_scales.size(0), b_scales.size(1), b_scales.size(2), b_scales.device().str().c_str());
+       printf("expert_offsets shape: [%ld], device: %s\n", expert_offsets.size(0), expert_offsets.device().str().c_str());
+       printf("chunk_size: %ld\n", chunk_size);
+  
+       printf("\n=== Derived Parameters ===\n");
+       printf("num_experts: %d\n", num_experts);
+       printf("k_size: %d\n", k_size);
+       printf("n_size: %d\n", n_size);
+       printf("per_act_token: %d\n", per_act_token);
+       printf("per_out_ch: %d\n", per_out_ch);
+    
+       printf("\n=== a_tensors ===\n");
+       auto a_tensors_cpu = a_tensors.to(torch::kCPU);
+       c10::Float8_e4m3fn* native_f8_ptr = a_tensors_cpu.data_ptr<c10::Float8_e4m3fn>();
+       auto* a_tensors_ptr = reinterpret_cast<MmaType*>(native_f8_ptr);
+       long m_dim = a_tensors_cpu.size(0);
+       long k_dim = a_tensors_cpu.size(1);
+       for (long i = 0; i < std::min(10L, m_dim); ++i) {
+           printf("  Row %ld: [", i);
+           for (long j = 0; j < std::min(10L, k_dim); ++j) {
+            printf("%.4f ", static_cast<float>(a_tensors_ptr[i * k_dim + j]));
+           }
+           if (k_dim > 10) {
+               printf("...");
+           }
+           printf("]\n");
+       }
+       if (m_dim > 10) {
+            printf("  ...\n");
+       }
+   }
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = a_tensors.device().index();
@@ -239,101 +254,109 @@ void cutlass_w4a8_group_gemm_caller(
           hw_info.device_id);
 
   // Set up fusion arguments
+//   Args arguments;
+//   decltype(arguments.epilogue.thread) fusion_args;
+//   fusion_args.alpha = 0;
+//   fusion_args.beta = 0;
+//   fusion_args.alpha_ptr = nullptr;
+//   fusion_args.beta_ptr = nullptr;
+//   fusion_args.alpha_ptr_array =
+//       static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr());
+//   fusion_args.beta_ptr_array = nullptr;
+//   fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
+//   fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 0;
+  fusion_args.alpha = a_scales[0].item<float>();
   fusion_args.beta = 0;
   fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr = nullptr;
-  fusion_args.alpha_ptr_array =
-      static_cast<const ElementAccumulator**>(a_scales_ptrs.data_ptr());
+  fusion_args.alpha_ptr_array = nullptr;
   fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
-  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
+  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
 
   ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes =
       static_cast<ProblemShape::UnderlyingProblemShape*>(
           problem_sizes.data_ptr());
 
-  //  if (current_device == debug_node) {
-  //      auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
-  //      auto* problem_sizes_cpu_ptr = problem_sizes_cpu.data_ptr<int32_t>();
-  //      printf("\n=== Problem Sizes ===\n");
-  //      for (int i = 0; i < num_experts; ++i) {
-  //          printf("Expert %d: N=%d, M=%d, K=%d\n",
-  //              i,
-  //              problem_sizes_cpu_ptr[i * 3],     // N
-  //              problem_sizes_cpu_ptr[i * 3 + 1], // M
-  //              problem_sizes_cpu_ptr[i * 3 + 2]  // K
-  //          );
-  //      }
-  //      printf("Expert Offsets:\n");
-  //      auto expert_offsets_cpu = expert_offsets.to(torch::kCPU);
-  //      auto* expert_offsets_cpu_ptr = expert_offsets_cpu.data_ptr<int32_t>();
-  //      for (int i = 0; i < std::min(32, num_experts); ++i) {
-  //          printf("  expert_offsets[%d]: %d\n", i,
-  //          expert_offsets_cpu_ptr[i]);
-  //      }
-  //  }
+
+   if (current_device == debug_node) {
+       auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
+       auto* problem_sizes_cpu_ptr = problem_sizes_cpu.data_ptr<int32_t>();
+       printf("\n=== Problem Sizes ===\n");
+       for (int i = 0; i < num_experts; ++i) {
+           printf("Expert %d: N=%d, M=%d, K=%d\n",
+               i,
+               problem_sizes_cpu_ptr[i * 3],     // N
+               problem_sizes_cpu_ptr[i * 3 + 1], // M
+               problem_sizes_cpu_ptr[i * 3 + 2]  // K
+           );
+       }
+       printf("Expert Offsets:\n");
+       auto expert_offsets_cpu = expert_offsets.to(torch::kCPU);
+       auto* expert_offsets_cpu_ptr = expert_offsets_cpu.data_ptr<int32_t>();
+       for (int i = 0; i < std::min(32, num_experts); ++i) {
+           printf("  expert_offsets[%d]: %d\n", i,
+           expert_offsets_cpu_ptr[i]);
+       }
+   }
 
   run_int4_fp8_get_group_gemm_starts(expert_offsets, a_ptrs, b_ptrs, out_ptrs,
                                      a_scales_ptrs, b_scales_ptrs, a_tensors,
                                      b_tensors, d_tensors, a_scales, b_scales);
 
-  //  if (current_device == debug_node) {
-  //      printf("\n=== Pointer Arrays (Before GEMM) ===\n");
-  //      // Copy pointer arrays to CPU
-  //      auto a_ptrs_cpu = a_ptrs.to(torch::kCPU);
-  //      auto b_ptrs_cpu = b_ptrs.to(torch::kCPU);
-  //      auto out_ptrs_cpu = out_ptrs.to(torch::kCPU);
-  //      auto a_scales_ptrs_cpu = a_scales_ptrs.to(torch::kCPU);
-  //      auto b_scales_ptrs_cpu = b_scales_ptrs.to(torch::kCPU);
-  //
-  //      auto* a_ptrs_cpu_ptr = a_ptrs_cpu.data_ptr<int64_t>();
-  //      auto* b_ptrs_cpu_ptr = b_ptrs_cpu.data_ptr<int64_t>();
-  //      auto* out_ptrs_cpu_ptr = out_ptrs_cpu.data_ptr<int64_t>();
-  //      auto* a_scales_ptrs_cpu_ptr = a_scales_ptrs_cpu.data_ptr<int64_t>();
-  //      auto* b_scales_ptrs_cpu_ptr = b_scales_ptrs_cpu.data_ptr<int64_t>();
-  //
-  //      for (int i = 0; i < std::min(32, num_experts); ++i) {
-  //          printf("Expert %d:\n", i);
-  //          printf("  a_ptrs[%d]: %p\n", i,
-  //          reinterpret_cast<void*>(a_ptrs_cpu_ptr[i])); printf("  b_ptrs[%d]:
-  //          %p\n", i, reinterpret_cast<void*>(b_ptrs_cpu_ptr[i])); printf("
-  //          out_ptrs[%d]: %p\n", i,
-  //          reinterpret_cast<void*>(out_ptrs_cpu_ptr[i])); printf("
-  //          a_scales_ptrs[%d]: %p\n", i,
-  //          reinterpret_cast<void*>(a_scales_ptrs_cpu_ptr[i])); printf("
-  //          b_scales_ptrs[%d]: %p\n", i,
-  //          reinterpret_cast<void*>(b_scales_ptrs_cpu_ptr[i]));
-  //      }
+   if (current_device == debug_node) {
+       printf("\n=== Pointer Arrays (Before GEMM) ===\n");
+       // Copy pointer arrays to CPU
+       auto a_ptrs_cpu = a_ptrs.to(torch::kCPU);
+       auto b_ptrs_cpu = b_ptrs.to(torch::kCPU);
+       auto out_ptrs_cpu = out_ptrs.to(torch::kCPU);
+       auto a_scales_ptrs_cpu = a_scales_ptrs.to(torch::kCPU);
+       auto b_scales_ptrs_cpu = b_scales_ptrs.to(torch::kCPU);
+  
+       auto* a_ptrs_cpu_ptr = a_ptrs_cpu.data_ptr<int64_t>();
+       auto* b_ptrs_cpu_ptr = b_ptrs_cpu.data_ptr<int64_t>();
+       auto* out_ptrs_cpu_ptr = out_ptrs_cpu.data_ptr<int64_t>();
+       auto* a_scales_ptrs_cpu_ptr = a_scales_ptrs_cpu.data_ptr<int64_t>();
+       auto* b_scales_ptrs_cpu_ptr = b_scales_ptrs_cpu.data_ptr<int64_t>();
+  
+       for (int i = 0; i < std::min(32, num_experts); ++i) {
+           printf("Expert %d:\n", i);
+           printf("  a_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(a_ptrs_cpu_ptr[i]));
+           printf("  b_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(b_ptrs_cpu_ptr[i]));
+           printf("out_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(out_ptrs_cpu_ptr[i])); 
+           printf("a_scales_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(a_scales_ptrs_cpu_ptr[i]));
+           printf("b_scales_ptrs[%d]: %p\n", i, reinterpret_cast<void*>(b_scales_ptrs_cpu_ptr[i]));
+       }
 
-  //  printf("\n=== Stride Information ===\n");
-  //  auto a_strides_cpu = a_strides.to(torch::kCPU);
-  //  auto b_strides_cpu = b_strides.to(torch::kCPU);
-  //  auto d_strides_cpu = d_strides.to(torch::kCPU);
-  //  auto s_strides_cpu = s_strides.to(torch::kCPU);
+        printf("\n=== Stride Information ===\n");
+        auto a_strides_cpu = a_strides.to(torch::kCPU);
+        auto b_strides_cpu = b_strides.to(torch::kCPU);
+        auto d_strides_cpu = d_strides.to(torch::kCPU);
+        auto s_strides_cpu = s_strides.to(torch::kCPU);
 
-  //  auto* a_strides_cpu_ptr = a_strides_cpu.data_ptr<int64_t>();
-  //  auto* b_strides_cpu_ptr = b_strides_cpu.data_ptr<int64_t>();
-  //  auto* d_strides_cpu_ptr = d_strides_cpu.data_ptr<int64_t>();
-  //  auto* s_strides_cpu_ptr = s_strides_cpu.data_ptr<int64_t>();
+        auto* a_strides_cpu_ptr = a_strides_cpu.data_ptr<int64_t>();
+        auto* b_strides_cpu_ptr = b_strides_cpu.data_ptr<int64_t>();
+        auto* d_strides_cpu_ptr = d_strides_cpu.data_ptr<int64_t>();
+        auto* s_strides_cpu_ptr = s_strides_cpu.data_ptr<int64_t>();
 
-  //  for (int i = 0; i < std::min(32, num_experts); ++i) {
-  //      printf("Expert %d:\n", i);
-  //      printf("  a_strides[%d]: %ld %ld %ld\n", i,
-  //          a_strides_cpu_ptr[i * 3], a_strides_cpu_ptr[i * 3 + 1],
-  //          a_strides_cpu_ptr[i * 3 + 2]);
-  //      printf("  b_strides[%d]: %ld %ld %ld\n", i,
-  //          b_strides_cpu_ptr[i * 3], b_strides_cpu_ptr[i * 3 + 1],
-  //          b_strides_cpu_ptr[i * 3 + 2]);
-  //      printf("  d_strides[%d]: %ld %ld %ld\n", i,
-  //          d_strides_cpu_ptr[i * 3], d_strides_cpu_ptr[i * 3 + 1],
-  //          d_strides_cpu_ptr[i * 3 + 2]);
-  //      printf("  s_strides[%d]: %ld %ld %ld\n", i,
-  //          s_strides_cpu_ptr[i * 3], d_strides_cpu_ptr[i * 3 + 1],
-  //          d_strides_cpu_ptr[i * 3 + 2]);
-  //  }
+        for (int i = 0; i < std::min(32, num_experts); ++i) {
+            printf("Expert %d:\n", i);
+            printf("  a_strides[%d]: %ld %ld %ld\n", i,
+                a_strides_cpu_ptr[i * 3], a_strides_cpu_ptr[i * 3 + 1],
+                a_strides_cpu_ptr[i * 3 + 2]);
+            printf("  b_strides[%d]: %ld %ld %ld\n", i,
+                b_strides_cpu_ptr[i * 3], b_strides_cpu_ptr[i * 3 + 1],
+                b_strides_cpu_ptr[i * 3 + 2]);
+            printf("  d_strides[%d]: %ld %ld %ld\n", i,
+                d_strides_cpu_ptr[i * 3], d_strides_cpu_ptr[i * 3 + 1],
+                d_strides_cpu_ptr[i * 3 + 2]);
+            printf("  s_strides[%d]: %ld %ld %ld\n", i,
+                s_strides_cpu_ptr[i * 3], s_strides_cpu_ptr[i * 3 + 1],
+                s_strides_cpu_ptr[i * 3 + 2]);
+        }
+   }
 
   arguments =
       Args{cutlass::gemm::GemmUniversalMode::kGrouped,
