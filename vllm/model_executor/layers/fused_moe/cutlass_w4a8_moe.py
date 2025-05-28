@@ -6,6 +6,7 @@ import torch
 
 from vllm import _custom_ops as ops
 
+
 def cutlass_w4a8_moe(
     a: torch.Tensor,
     w1_q: torch.Tensor,
@@ -115,7 +116,7 @@ def cutlass_w4a8_moe(
         "Translate info from expert_map to topk_ids"
         local_topk_ids = torch.where(expert_map[topk_ids_] != -1,
                                      expert_map[topk_ids_], -1)
-    
+
     topk = local_topk_ids.size(1)
 
     per_act_token = a1_scale.numel() != 1 if a1_scale is not None else (
@@ -142,7 +143,7 @@ def cutlass_w4a8_moe(
     problem_sizes2 = torch.empty((num_experts, 3),
                                  dtype=torch.int32,
                                  device=device)
-    
+
     a_map_initializer = torch.empty
     c2_initializer = torch.empty
     if expert_map is not None:
@@ -209,24 +210,41 @@ def cutlass_w4a8_moe(
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = c2_initializer((m * topk, k), device=device, dtype=torch.half)
+    tensors_collector = []
 
     ops.cutlass_w4a8_moe_mm(c1, rep_a_q, w1_q, a1_scale, w1_scale,
-                              expert_offsets[:-1], problem_sizes1, a_strides1,
-                              b_strides1, c_strides1, s_strides13, 128, m)
+                            expert_offsets[:-1], problem_sizes1, a_strides1,
+                            b_strides1, c_strides1, s_strides13, 128, m)
 
-    # print("c1", c1)
-    # print("c1.shape", c1.shape)
+    print_tensor("c1", c1)
+    tensors_collector.append({"name": "c1", "tensor": c1.clone().detach()})
+
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     torch.ops._C.silu_and_mul(intermediate, c1)
+    print_tensor("intermediate", intermediate)
+    tensors_collector.append({
+        "name": "silu_intermediate",
+        "tensor": intermediate.clone().detach()
+    })
 
     intemediate_q, a2_scale = ops.scaled_fp8_quant(
         intermediate, a2_scale.float(), use_per_token_if_dynamic=per_act_token)
+    print_tensor("intemediate_q", intermediate)
+    tensors_collector.append({
+                "name": "intermediate_q",
+                "tensor": intemediate_q.to(torch.bfloat16).clone().detach()
+            })
 
+    # intemediate_q = torch.load("ref_intermediate_q_fp8")
+    # tensors_collector.append({
+    #             "name": "intermediate_q",
+    #             "tensor": intemediate_q.clone().detach().to(torch.bfloat16)
+    #         })
     ops.cutlass_w4a8_moe_mm(c2, intemediate_q, w2_q, a2_scale, w2_scale,
-                              expert_offsets[:-1], problem_sizes2, a_strides2,
-                              b_strides2, c_strides2, s_strides2, 128, m)
-    # print("c2", c2)
-    # print("c2.shape", c2.shape)
+                            expert_offsets[:-1], problem_sizes2, a_strides2,
+                            b_strides2, c_strides2, s_strides2, 128, m)
+    print_tensor("c2", c2)
+    tensors_collector.append({"name": "c2", "tensor": c2.clone().detach()})
 
     # Gather tokens
     # print(f"xx c_map {c_map}")
@@ -237,7 +255,14 @@ def cutlass_w4a8_moe(
     if not apply_router_weight_on_input:
         c2 = c2 * topk_weights.view(m, topk, 1)
 
-    return c2.sum(dim=1).to(torch.bfloat16)
+    result = c2.sum(dim=1).to(torch.bfloat16)
+    print_tensor("result", result)
+    tensors_collector.append({
+        "name": "results",
+        "tensor": result.clone().detach()
+    })
+    # return result, tensors_collector
+    return result
 
 
 def print_tensor(name: str, t: torch.Tensor):

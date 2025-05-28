@@ -232,19 +232,27 @@ void cutlass_w4a8_group_gemm_caller(
        auto* a_tensors_ptr = reinterpret_cast<MmaType*>(native_f8_ptr);
        long m_dim = a_tensors_cpu.size(0);
        long k_dim = a_tensors_cpu.size(1);
-       for (long i = 0; i < std::min(10L, m_dim); ++i) {
-           printf("  Row %ld: [", i);
-           for (long j = 0; j < std::min(10L, k_dim); ++j) {
-            printf("%.4f ", static_cast<float>(a_tensors_ptr[i * k_dim + j]));
-           }
-           if (k_dim > 10) {
-               printf("...");
-           }
-           printf("]\n");
-       }
-       if (m_dim > 10) {
-            printf("  ...\n");
-       }
+       for (long i = 0; i < m_dim; ++i) {
+        if (i < 10 || i >= m_dim - 10) { // Print first 10 and last 10 rows
+            printf("  Row %ld: [", i);
+            if (k_dim <= 20) { // If 20 or fewer columns, print all
+                for (long j = 0; j < k_dim; ++j) {
+                    printf("%.4f ", static_cast<float>(a_tensors_ptr[i * k_dim + j]));
+                }
+            } else { // More than 20 columns, print first 10, ..., last 10
+                for (long j = 0; j < 10; ++j) { // First 10 columns
+                    printf("%.4f ", static_cast<float>(a_tensors_ptr[i * k_dim + j]));
+                }
+                printf("... ");
+                for (long j = k_dim - 10; j < k_dim; ++j) { // Last 10 columns
+                    printf("%.4f ", static_cast<float>(a_tensors_ptr[i * k_dim + j]));
+                }
+            }
+            printf("]\n");
+        } else if (i == 10 && m_dim > 20) { // If there are skipped rows in the middle
+            printf("  ...\n"); // Separator for skipped rows
+        }
+    }
    }
 
   cutlass::KernelHardwareInfo hw_info;
@@ -398,6 +406,65 @@ void cutlass_w4a8_group_gemm_caller(
     //  }
     TORCH_CHECK(false, "GEMM execution failed");
   }
+
+  // print output
+  if (current_device == debug_node) {
+    cudaError_t cuda_err_sync = cudaStreamSynchronize(stream);
+    if (cuda_err_sync != cudaSuccess) {
+        printf("CUDA Stream Synchronize failed after GEMM run: %s\n", cudaGetErrorString(cuda_err_sync));
+        // Consider re-throwing or TORCH_CHECKing
+    }
+
+    printf("\n=== Output Tensors (D) After GEMM ===\n");
+
+    auto out_ptrs_cpu = out_ptrs.to(torch::kCPU);
+    auto* out_ptrs_cpu_ptr = out_ptrs_cpu.data_ptr<int64_t>();
+
+    auto problem_sizes_cpu_for_output = problem_sizes.to(torch::kCPU); // Re-copy for this scope
+    auto* problem_sizes_cpu_ptr_for_output = problem_sizes_cpu_for_output.data_ptr<int32_t>();
+
+    for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+        int32_t N_expert = problem_sizes_cpu_ptr_for_output[expert_idx * 3];
+        int32_t M_expert = problem_sizes_cpu_ptr_for_output[expert_idx * 3 + 1];
+        // K_expert is problem_sizes_cpu_ptr_for_output[expert_idx * 3 + 2]
+
+        printf("Expert %d Output (Shape: M=%d, N=%d):\n", expert_idx, M_expert, N_expert);
+
+        ElementD* d_ptr_device_expert = reinterpret_cast<ElementD*>(out_ptrs_cpu_ptr[expert_idx]);
+        size_t expert_output_size_bytes = static_cast<size_t>(M_expert) * N_expert * sizeof(ElementD);
+        
+        std::vector<ElementD> d_expert_host(M_expert * N_expert);
+        cudaError_t cuda_err_memcpy = cudaMemcpy(d_expert_host.data(), d_ptr_device_expert, expert_output_size_bytes, cudaMemcpyDeviceToHost);
+        
+        if (cuda_err_memcpy != cudaSuccess) {
+            printf("  Failed to copy output for expert %d to CPU: %s\n", expert_idx, cudaGetErrorString(cuda_err_memcpy));
+            continue;
+        }
+
+        for(long i = 0; i < M_expert * N_expert; ++i) {
+            printf("%.4f ", static_cast<float>(d_expert_host[i]));
+        }
+
+        // for (long i = 0; i < M_expert; ++i) {
+        //     printf("  Row %ld: [", i);
+        //     if (N_expert <= 20) { // If 20 or fewer columns, print all
+        //         for (long j = 0; j < N_expert; ++j) {
+        //             printf("%.4f ", static_cast<float>(d_expert_host[i * N_expert + j]));
+        //         }
+        //     } else { // More than 20 columns, print first 10, ..., last 10
+        //         for (long j = 0; j < 10; ++j) { // First 10 columns
+        //             printf("%.4f ", static_cast<float>(d_expert_host[i * N_expert + j]));
+        //         }
+        //         printf("... ");
+        //         for (long j = N_expert - 10; j < N_expert; ++j) { // Last 10 columns
+        //             printf("%.4f ", static_cast<float>(d_expert_host[i * N_expert + j]));
+        //         }
+        //     }
+        //     printf("]\n");
+        // }
+        printf("\n");
+    }
+}
 }
 
 } //namespace

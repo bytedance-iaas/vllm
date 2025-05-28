@@ -13,6 +13,12 @@ from vllm.utils import F, FlexibleArgumentParser
 from vllm import _custom_ops as ops
 
 
+def print_tensor_info(name, tensor):
+    print(f"\n{name}:")
+    print(f"  shape: {tensor.shape}")
+    print(f"  values: {tensor.flatten()}[:10]")  # Print first 10 values
+
+
 def bench_run(results: list[benchmark.Measurement], model: str,
               num_experts: int, topk: int, per_act_token: bool,
               per_out_ch: bool, mkn: tuple[int, int, int]):
@@ -29,58 +35,43 @@ def bench_run(results: list[benchmark.Measurement], model: str,
 
     dtype = torch.bfloat16
 
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-
-    num_weights_in_32_bits = 8
-    assert n % num_weights_in_32_bits == 0, f"n must be a multiple of {num_weights_in_32_bits}"
-    unprocessed_int_weight_1 = torch.randint(
-        -2**31,
-        2**31, (num_experts, k, n * 2 // num_weights_in_32_bits),
-        dtype=torch.int32,
-        device="cuda")
-    unprocessed_int_weight_2 = torch.randint(
-        -2**31,
-        2**31, (num_experts, n, k // num_weights_in_32_bits),
-        dtype=torch.int32,
-        device="cuda")
-    a1_scale = torch.randn(k, dtype=dtype, device="cuda")
-    a2_scale = torch.randn(n, dtype=dtype, device="cuda")
+    a = torch.ones((m, k), dtype=torch.bfloat16, device='cuda')
+    unprocessed_int_weight_1 = torch.ones((num_experts, n * 2, k),
+                                          dtype=torch.int8,
+                                          device="cuda")
+    unprocessed_int_weight_2 = torch.ones((num_experts, k, n),
+                                          dtype=torch.int8,
+                                          device="cuda")
+    a1_scale = torch.ones(k, dtype=dtype, device="cuda")
+    a2_scale = torch.ones(n, dtype=dtype, device="cuda")
 
     group_size = 128
 
-    scale_1 = torch.randn(num_experts,
-                          k // group_size,
-                          n * 2,
-                          dtype=torch.bfloat16,
-                          device="cuda") * 0.1
-    scale_2 = torch.randn(
-        num_experts, n // group_size, k, dtype=torch.bfloat16,
-        device="cuda") * 0.1
+    scale_1 = torch.ones(num_experts,
+                         n * 2,
+                         k // group_size,
+                         dtype=torch.bfloat16,
+                         device="cuda")
+    scale_2 = torch.ones(num_experts,
+                         k,
+                         n // group_size,
+                         dtype=torch.bfloat16,
+                         device="cuda")
 
-    unprocessed_weight_1 = unprocessed_int_weight_1.view(torch.int8)
-    unprocessed_weight_2 = unprocessed_int_weight_2.view(torch.int8)
-
-    unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
     packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
 
-    ref_q_weight_1 = unpacker(unprocessed_weight_1.cpu()).cuda()
-    ref_q_weight_2 = unpacker(unprocessed_weight_2.cpu()).cuda()
-    ref_weight_1 = ref_q_weight_1 * scale_1.repeat_interleave(group_size,
-                                                              dim=1)
-    ref_weight_2 = ref_q_weight_2 * scale_2.repeat_interleave(group_size,
-                                                              dim=1)
+    ref_weight_1 = unprocessed_int_weight_1 * scale_1.repeat_interleave(
+        group_size, dim=2)
+    ref_weight_2 = unprocessed_int_weight_2 * scale_2.repeat_interleave(
+        group_size, dim=2)
 
-    weight_1 = ref_q_weight_1.permute(0, 2, 1).contiguous()
-    weight_2 = ref_q_weight_2.permute(0, 2, 1).contiguous()
-    weight_1 = packer(weight_1.cpu()).cuda()
-    weight_2 = packer(weight_2.cpu()).cuda()
+    weight_1 = packer(unprocessed_int_weight_1.cpu()).cuda()
+    weight_2 = packer(unprocessed_int_weight_2.cpu()).cuda()
     w1_q = weight_1.view((num_experts, n * 2, k // 2)).view(torch.int8)
     w2_q = weight_2.view((num_experts, k, n // 2)).view(torch.int8)
 
     ###############################################################
     # scale interleave
-    # scale_1 [E, K, N]
-    scale_1 = scale_1.permute(0, 2, 1)  # [E, N, K]
     scale_1_interleaved = scale_1.reshape(scale_1.shape[0], scale_1.shape[1],
                                           (scale_1.shape[2] // 4),
                                           4)  # [E, N, K/4, 4]
@@ -91,7 +82,6 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         scale_1.shape[1] * 4)  # [E, K/4, N*4]
     w1_scale = scale_1_interleaved.contiguous()
 
-    scale_2 = scale_2.permute(0, 2, 1)
     scale_2_interleaved = scale_2.reshape(scale_2.shape[0], scale_2.shape[1],
                                           (scale_2.shape[2] // 4), 4)
     scale_2_interleaved = scale_2_interleaved.permute(0, 2, 1, 3)
@@ -143,8 +133,7 @@ def bench_run(results: list[benchmark.Measurement], model: str,
     c_strides2[:, 2].zero_()
 
     score = torch.randn((m, num_experts), device="cuda", dtype=dtype)
-    print(
-        f"score shape: {score.shape}, dtype: {score.dtype}, value: \n{score}")
+    print_tensor_info("score", score)
 
     topk_weights, topk_ids = FusedMoE.select_experts(
         hidden_states=a,
@@ -190,22 +179,28 @@ def bench_run(results: list[benchmark.Measurement], model: str,
                 if has_alpha:
                     input = input.to(torch.float8_e4m3fn).float()
                     fc1_qd = fc1_qd.to(torch.float8_e4m3fn).float()
-                    fc1 = torch.matmul(input, fc1_qd) * alpha_1[expert]
+                    fc1 = torch.matmul(input, fc1_qd.T) * alpha_1[expert]
                 else:
-                    fc1 = torch.matmul(input, fc1_qd)
-                fc1, gate = fc1.chunk(2, dim=-1)
+                    fc1 = torch.matmul(input, fc1_qd.T)
+                # print(f"fc1: {fc1[:10]}")
+                gate, fc1 = fc1.chunk(2, dim=-1)
+                # print(f"gate: {gate[:10]}")
                 fc1 = fc1 * torch.nn.functional.silu(gate)
+                # print(f"fc1_silu: {fc1[:10]}")
                 fc2_qd = ref_weight_2[expert].cuda().float()
+                # print(f"fc2_qd: {fc2_qd[:10]}")
                 if has_pre_quant:
                     inv_scale = 1.0 / pre_quant_scale_2.squeeze()
                     fc1 = fc1 * inv_scale
                 if has_alpha:
                     fc1 = fc1.to(torch.float8_e4m3fn).float()
                     fc2_qd = fc2_qd.to(torch.float8_e4m3fn).float()
-                    final = torch.matmul(fc1, fc2_qd) * alpha_2[expert]
+                    final = torch.matmul(fc1, fc2_qd.T) * alpha_2[expert]
                 else:
-                    final = torch.matmul(fc1, fc2_qd)
+                    final = torch.matmul(fc1, fc2_qd.T)
+                    # print(f"final: {final[:10]}")
                 results[i] += scale * final
+                # print(f"results[i]: {results[i]}")
         ref = results.view(*inputs.shape).to(dtype)
         return ref
 
@@ -367,77 +362,49 @@ def bench_run(results: list[benchmark.Measurement], model: str,
         "ref_moe": ref_moe,
     }
 
-    print(f"a shape: {a.shape}, dtype: {a.dtype}, value:\n{a}")
-    print(f"w1_q shape: {w1_q.shape}, dtype: {w1_q.dtype}, value:\n{w1_q}")
-    print(f"w2_q shape: {w2_q.shape}, dtype: {w2_q.dtype}, value:\n{w2_q}")
-    print(
-        f"w1_scale shape: {w1_scale.shape}, dtype: {w1_scale.dtype}, value:\n{w1_scale}"
-    )
-    print(
-        f"w2_scale shape: {w2_scale.shape}, dtype: {w2_scale.dtype}, value:\n{w2_scale}"
-    )
-    print(
-        f"a_strides1 shape: {a_strides1.shape}, dtype: {a_strides1.dtype}, value:\n{a_strides1}"
-    )
-    print(
-        f"b_strides1 shape: {b_strides1.shape}, dtype: {b_strides1.dtype}, value:\n{b_strides1}"
-    )
-    print(
-        f"c_strides1 shape: {c_strides1.shape}, dtype: {c_strides1.dtype}, value:\n{c_strides1}"
-    )
-    print(
-        f"a_strides2 shape: {a_strides2.shape}, dtype: {a_strides2.dtype}, value:\n{a_strides2}"
-    )
-    print(
-        f"b_strides2 shape: {b_strides2.shape}, dtype: {b_strides2.dtype}, value:\n{b_strides2}"
-    )
-    print(
-        f"c_strides2 shape: {c_strides2.shape}, dtype: {c_strides2.dtype}, value:\n{c_strides2}"
-    )
-    print(
-        f"s_strides13 shape: {s_strides13.shape}, dtype: {s_strides13.dtype}, value:\n{s_strides13}"
-    )
-    print(
-        f"s_strides2 shape: {s_strides2.shape}, dtype: {s_strides2.dtype}, value:\n{s_strides2}"
-    )
-    print(
-        f"topk_weights shape: {topk_weights.shape}, dtype: {topk_weights.dtype}, value:\n{topk_weights}"
-    )
-    print(
-        f"topk_ids shape: {topk_ids.shape}, dtype: {topk_ids.dtype}, value:\n{topk_ids}"
-    )
-    print(
-        f"a1_scale shape: {a1_scale.shape}, dtype: {a1_scale.dtype}, value:\n{a1_scale}"
-    )
-    print(
-        f"a2_scale shape: {a2_scale.shape}, dtype: {a2_scale.dtype}, value:\n{a2_scale}"
-    )
-    print(
-        f"expert_map shape: {expert_map.shape}, dtype: {expert_map.dtype}, value:\n{expert_map}"
+    print_tensor_info("a", a)
+    print_tensor_info("ref_weight_1", ref_weight_1)
+    print_tensor_info("ref_weight_2", ref_weight_2)
+    print_tensor_info("w1_q", w1_q)
+    print_tensor_info("w2_q", w2_q)
+    print_tensor_info("w1_scale", w1_scale)
+    print_tensor_info("w2_scale", w2_scale)
+    print_tensor_info("a_strides1", a_strides1)
+    print_tensor_info("b_strides1", b_strides1)
+    print_tensor_info("c_strides1", c_strides1)
+    print_tensor_info("a_strides2", a_strides2)
+    print_tensor_info("b_strides2", b_strides2)
+    print_tensor_info("c_strides2", c_strides2)
+    print_tensor_info("s_strides13", s_strides13)
+    print_tensor_info("s_strides2", s_strides2)
+    print_tensor_info("topk_weights", topk_weights)
+    print_tensor_info("topk_ids", topk_ids)
+    print_tensor_info("a1_scale", a1_scale)
+    print_tensor_info("a2_scale", a2_scale)
+    print_tensor_info("expert_map", expert_map)
+
+    #Warmup
+    ref_moe(
+        a,
+        topk_weights,
+        topk_ids,
+        ref_weight_1,
+        ref_weight_2,
+        has_pre_quant=True,
+        has_alpha=False,
+        pre_quant_scale_1=a1_scale,
+        pre_quant_scale_2=a2_scale,
     )
 
-    # #Warmup
-    # ref_moe(
-    #     a,
-    #     topk_weights,
-    #     topk_ids,
-    #     ref_weight_1,
-    #     ref_weight_2,
-    #     has_pre_quant=True,
-    #     has_alpha=False,
-    #     pre_quant_scale_1=a1_scale,
-    #     pre_quant_scale_2=a2_scale,
-    # )
-
-    # results.append(
-    #     benchmark.Timer(
-    #         stmt=
-    #         "ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, has_pre_quant=True, has_alpha=False, pre_quant_scale_1=a1_scale, pre_quant_scale_2=a2_scale)",
-    #         globals=globals,
-    #         label=label,
-    #         sub_label=sub_label,
-    #         description="ref_moe",
-    #     ).blocked_autorange(min_run_time=min_run_time))
+    results.append(
+        benchmark.Timer(
+            stmt=
+            "ref_moe(a, topk_weights, topk_ids, ref_weight_1, ref_weight_2, has_pre_quant=True, has_alpha=False, pre_quant_scale_1=a1_scale, pre_quant_scale_2=a2_scale)",
+            globals=globals,
+            label=label,
+            sub_label=sub_label,
+            description="ref_moe",
+        ).blocked_autorange(min_run_time=min_run_time))
 
     # Warmup
     run_cutlass_w4a8_moe(
@@ -521,8 +488,10 @@ def bench_run(results: list[benchmark.Measurement], model: str,
 
     torch.cuda.synchronize()
 
-    print("ref_out: ", ref_out)
-    print("cutlass_out: ", cutlass_out)
+    print("ref_out: ", ref_out[:10])
+    print("cutlass_out: ", cutlass_out[:10])
+    print_tensor_info("ref_out", ref_out)
+    print_tensor_info("cutlass_out", cutlass_out)
     print("max diff: ", torch.max(torch.abs(ref_out - cutlass_out)))
     print("mean diff: ", torch.mean(torch.abs(ref_out - cutlass_out)))
     print("relative diff: ",
@@ -533,13 +502,13 @@ def main():
     results: list[benchmark.Measurement] = []
 
     model = "dpsk-w4a8"
-    num_experts = 8
-    topk = 8
+    num_experts = 1
+    topk = 1
     per_act_token = True
     per_out_ch = False
-    size_m = 32
-    size_k = 7168
-    size_n = 2048
+    size_m = 1
+    size_k = 1024
+    size_n = 512
     mkn = (size_m, size_k, size_n)
     bench_run(results, model, num_experts, topk, per_act_token, per_out_ch,
               mkn)
@@ -547,5 +516,42 @@ def main():
     compare.print()
 
 
+def postprocess(w):
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+    unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+    unpacked_tensor = unpacker(w.cpu().T.contiguous())
+    print(
+        f"unpacked_tensor: {unpacked_tensor}, unpacked_tensor.shape: {unpacked_tensor.shape}, unpacked_tensor.dtype: {unpacked_tensor.dtype}"
+    )
+    unpacked_tensor_t = unpacked_tensor.T.contiguous()
+    print(
+        f"unpacked_tensor_t: {unpacked_tensor_t}, unpacked_tensor_t.shape: {unpacked_tensor_t.shape}, unpacked_tensor_t.dtype: {unpacked_tensor_t.dtype}"
+    )
+    packed_tensor = packer(unpacked_tensor_t)
+    print(
+        f"packed_tensor: {packed_tensor}, packed_tensor.shape: {packed_tensor.shape}, packed_tensor.dtype: {packed_tensor.dtype}"
+    )
+    return packed_tensor
+
+
+def test_weight_pack():
+    a = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 6]], dtype=torch.int8)
+    print(f"a: {a}, a.shape: {a.shape}, a.dtype: {a.dtype}")
+    packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
+
+    a_pack = packer(a.T.cpu().contiguous())
+    print(
+        f"a_pack: {a_pack}, a_pack.shape: {a_pack.shape}, a_pack.dtype: {a_pack.dtype}"
+    )
+    a_pack_t = a_pack.T
+    print(
+        f"a_pack_t: {a_pack_t}, a_pack_t.shape: {a_pack_t.shape}, a_pack_t.dtype: {a_pack_t.dtype}"
+    )
+
+    a_q = postprocess(a_pack_t)
+    print(f"a_q: {a_q}, a_q.shape: {a_q.shape}, a_q.dtype: {a_q.dtype}")
+
+
 if __name__ == "__main__":
     main()
+    # test_weight_pack()

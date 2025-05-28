@@ -47,13 +47,13 @@ def woq_assert_near_eq(ref, act, wTypeId):
     torch.testing.assert_close(ref, act, atol=atol, rtol=1e-7)
 
 
-@pytest.mark.parametrize("batch_size", [1])
-def test_int4_fp8_grouped_gemm_single_expert(batch_size):
+@pytest.mark.parametrize("batch_size", [2])
+def test_int4_fp8_grouped_gemm(batch_size):
     # Test parameters
-    num_experts = 1
+    num_experts = 2
     m = batch_size  # batch size
-    k = 7168  # input dimension
-    n = 2048  # output dimension
+    k = 512  # input dimension
+    n = 1024  # output dimension
     #torch.manual_seed(0)
     dtype = torch.bfloat16
 
@@ -61,8 +61,8 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
 
     # Create input tensors with ones
     a = torch.randn(m, k, dtype=dtype, device='cuda')
-    # a = torch.abs(torch.randn(m, k, dtype=torch.bfloat16, device='cuda'))
     # a = torch.ones(m, k, dtype=torch.bfloat16, device='cuda')
+    # a[1:] = 2
     #a = torch.full((m, k), -1, dtype=torch.bfloat16, device='cuda')
     ref_w = torch.randint(-8,
                           8, (num_experts, n, k),
@@ -72,22 +72,20 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
 
     # Create scales with ones
     affine_coeff = 0.005
-    # a_scale = torch.ones(1, k, dtype=torch.float, device='cuda')
+    # a_scale = torch.ones(1, dtype=torch.float, device='cuda')
     a_scale = torch.randn(1, dtype=torch.float32).cuda() * 0.02
     # ref_w_scale = torch.ones(num_experts,
-    #                          k // 128,
     #                          n,
+    #                          k // 128,
     #                          dtype=dtype,
-    #                          device='cuda') * affine_coeff
-    # ref_w_scale = torch.randn(
-    #     num_experts, k // 128, n, dtype=dtype, device='cuda') * affine_coeff
+    #                          device='cuda')
     ref_w_scale = torch.randn(
         num_experts, n, k // 128, dtype=dtype, device='cuda') * affine_coeff
     w, w_scale = pack_interleave(num_experts, ref_w, ref_w_scale)
 
     # Create expert offsets and problem sizes
-    expert_offsets = torch.tensor([0, m], dtype=torch.int32, device='cuda')
-    problem_sizes = torch.tensor([[n, m, k]], dtype=torch.int32, device='cuda')
+    expert_offsets = torch.tensor([0, 0, m], dtype=torch.int32, device='cuda')
+    problem_sizes = torch.tensor([[n, 0, k], [n, m, k]], dtype=torch.int32, device='cuda')
 
     device = "cuda"
     a_strides = torch.empty((num_experts, 3), dtype=torch.int64, device=device)
@@ -104,11 +102,11 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     # b_strides[:, 0].fill_(1)
     # b_strides[:, 1].fill_(k)
     # b_strides[:, 2].zero_()
-    c_strides[:, 0].fill_(n)
-    c_strides[:, 1].fill_(1)
+    c_strides[:, 0].fill_(1)
+    c_strides[:, 1].fill_(n)
     c_strides[:, 2].zero_()
-    s_strides[:, 0].fill_(n)
-    s_strides[:, 1].fill_(1)
+    s_strides[:, 0].fill_(1)
+    s_strides[:, 1].fill_(n)
     s_strides[:, 2].zero_()
 
     # Print all input parameters
@@ -131,6 +129,7 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
 
     # Create output tensor
     c = torch.empty((m, n), dtype=torch.float16, device='cuda')
+    # c = c.T
 
     # Run the operator
     # w = w.view(torch.quint4x2)
@@ -138,15 +137,17 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
                             problem_sizes, a_strides, b_strides, c_strides,
                             s_strides, 128, m)
     c = c.to(dtype)
+    # c = c.T
 
     print_tensor_info("Output c", c)
 
     # Reference implementation
+    e_idx = 1
     a = torch.clamp((a / a_scale), -448.0, 448.0).to(torch.float8_e4m3fn)
-    ref_w_scale_repeat = ref_w_scale[0].repeat_interleave(128,
+    ref_w_scale_repeat = ref_w_scale[e_idx].repeat_interleave(128,
                                                               dim=1).to(float)
     print_tensor_info("ref_w_scale_repeat", ref_w_scale_repeat)
-    ref_w_one_expert = (ref_w[0].to(float) * ref_w_scale_repeat).to(dtype)
+    ref_w_one_expert = (ref_w[e_idx].to(float) * ref_w_scale_repeat).to(dtype)
     print_tensor_info("ref_w_one_expert", ref_w_one_expert)
     c_ref = torch.matmul(a.to(dtype), ref_w_one_expert.t().to(dtype)) * a_scale
     c_ref = c_ref.to(dtype)
@@ -161,7 +162,17 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
           torch.mean(torch.abs(c - c_ref) / torch.abs(c_ref)))
 
     # woq_assert_near_eq(c_ref, c, 2)
-    torch.testing.assert_close(c, c_ref, rtol=1e-2, atol=0.1)
+    try:
+        torch.testing.assert_close(c, c_ref, rtol=1e-2, atol=0.1)
+    except AssertionError as e:
+        # torch.set_printoptions(threshold=10_000)
+        print(f"  FAILURE: tensors are NOT close.")
+        print(f"    Ref tensor: {c_ref.flatten()}")
+        print(f"    Cutlass tensor: {c.flatten()}")
+        print(f"    Max absolute difference: {torch.max(torch.abs(c.to(c_ref.dtype) - c_ref))}")
+        print(f"    Mean absolute difference: {torch.mean(torch.abs(c.to(c_ref.dtype) - c_ref))}")
+        print(f"    AssertionError: {e}")
+        raise
 
     # Basic shape checks
     assert c.shape == (m, n)

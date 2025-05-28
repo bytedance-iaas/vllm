@@ -57,51 +57,51 @@ def woq_assert_near_eq(ref, act, wTypeId):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_moe_w4afp8(dtype):
 
-    m = 2
-    k = 512
-    n = 1024
+    m = 4
+    k = 7168
+    n = 2048
     group_size = 128
-    num_experts = 3
-    topk = 1
-    a = torch.ones((m, k), dtype=dtype, device='cuda') * 0.01
-    a[1:] = 0.02
-    # a = torch.randn(m, k, dtype=dtype, device='cuda') * 0.1
-    print_tensor_info("a1", a[0])
-    print_tensor_info("a2", a[1])
+    num_experts = 32
+    topk = 8
+    # a = torch.ones((m, k), dtype=dtype, device='cuda') * 0.01
+    # a[1:] = 0.02
+    a = torch.randn(m, k, dtype=dtype, device='cuda') * 0.1
+    # print_tensor_info("a1", a[0])
+    # print_tensor_info("a2", a[1])
     dtype = torch.bfloat16
 
     affine_coeff = 0.005
-    ref_weight_1 = torch.ones((num_experts, n * 2, k),
-                              dtype=torch.int8,
-                              device="cuda")
-    ref_weight_2 = torch.ones((num_experts, k, n),
-                              dtype=torch.int8,
-                              device="cuda")
-    # ref_weight_1 = torch.randint(-8,
-    #                              8, (num_experts, n * 2, k),
-    #                              dtype=torch.int8,
-    #                              device='cuda')
-    # ref_weight_2 = torch.randint(-8,
-    #                              8, (num_experts, k, n),
-    #                              dtype=torch.int8,
-    #                              device='cuda')
-    # a1_scale = torch.randn(1, dtype=torch.float32, device="cuda")
-    # a2_scale = torch.randn(1, dtype=torch.float32, device="cuda")
-    a1_scale = torch.ones(1, dtype=torch.float32, device="cuda")
-    a2_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    # ref_weight_1 = torch.ones((num_experts, n * 2, k),
+    #                           dtype=torch.int8,
+    #                           device="cuda")
+    # ref_weight_2 = torch.ones((num_experts, k, n),
+    #                           dtype=torch.int8,
+    #                           device="cuda")
+    ref_weight_1 = torch.randint(-8,
+                                 8, (num_experts, n * 2, k),
+                                 dtype=torch.int8,
+                                 device='cuda')
+    ref_weight_2 = torch.randint(-8,
+                                 8, (num_experts, k, n),
+                                 dtype=torch.int8,
+                                 device='cuda')
+    a1_scale = torch.randn(1, dtype=torch.float32, device="cuda")
+    a2_scale = torch.randn(1, dtype=torch.float32, device="cuda")
+    # a1_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    # a2_scale = torch.ones(1, dtype=torch.float32, device="cuda")
 
-    # scale_1 = torch.randn(
-    #     num_experts, k // group_size, n * 2, dtype=dtype,
-    #     device="cuda") * affine_coeff
-    # scale_2 = torch.randn(
-    #     num_experts, n // group_size, k, dtype=dtype,
-    #     device="cuda") * affine_coeff
-    scale_1 = torch.ones(
-        (num_experts, k // group_size, n * 2), dtype=dtype,
-        device="cuda")
-    scale_2 = torch.ones(
-        (num_experts, n // group_size, k), dtype=dtype,
-        device="cuda")
+    scale_1 = torch.randn(
+        num_experts, k // group_size, n * 2, dtype=dtype,
+        device="cuda") * affine_coeff
+    scale_2 = torch.randn(
+        num_experts, n // group_size, k, dtype=dtype,
+        device="cuda") * affine_coeff
+    # scale_1 = torch.ones(
+    #     (num_experts, k // group_size, n * 2), dtype=dtype,
+    #     device="cuda")
+    # scale_2 = torch.ones(
+    #     (num_experts, n // group_size, k), dtype=dtype,
+    #     device="cuda")
 
     # ref_weight_1 = unprocessed_int_weight_1 * scale_1.repeat_interleave(
     #     group_size, dim=2)
@@ -147,15 +147,12 @@ def test_fused_moe_w4afp8(dtype):
     b_strides1[:, 1].fill_(1)
     b_strides1[:, 2].zero_()
 
-    # c_strides1[:, 0].fill_(1)
-    # c_strides1[:, 1].fill_(2 * n)
-    # c_strides1[:, 2].zero_()
-    c_strides1[:, 0].fill_(2 * n)
-    c_strides1[:, 1].fill_(1)
+    c_strides1[:, 0].fill_(1)
+    c_strides1[:, 1].fill_(2 * n)
     c_strides1[:, 2].zero_()
 
-    s_strides13[:, 0].fill_(2 * n)
-    s_strides13[:, 1].fill_(1)
+    s_strides13[:, 0].fill_(1)
+    s_strides13[:, 1].fill_(2 * n)
     s_strides13[:, 2].zero_()
 
     a_strides2[:, 0].fill_(n)
@@ -166,15 +163,12 @@ def test_fused_moe_w4afp8(dtype):
     b_strides2[:, 1].fill_(1)
     b_strides2[:, 2].zero_()
 
-    # c_strides2[:, 0].fill_(1)
-    # c_strides2[:, 1].fill_(k)
-    # c_strides2[:, 2].zero_()
-    c_strides2[:, 0].fill_(k)
-    c_strides2[:, 1].fill_(1)
+    c_strides2[:, 0].fill_(1)
+    c_strides2[:, 1].fill_(k)
     c_strides2[:, 2].zero_()
 
-    s_strides2[:, 0].fill_(k)
-    s_strides2[:, 1].fill_(1)
+    s_strides2[:, 0].fill_(1)
+    s_strides2[:, 1].fill_(k)
     s_strides2[:, 2].zero_()
 
     score = torch.randn((m, num_experts), device="cuda", dtype=dtype)
@@ -192,8 +186,8 @@ def test_fused_moe_w4afp8(dtype):
     )
     # topk_weights = torch.tensor([[0.8086, 0.4180], [0.7695, 0.6523]], dtype=torch.float, device='cuda')
     # topk_ids = torch.tensor([[2, 1], [0, 2]], dtype=torch.int32, device='cuda')
-    # topk_ids = torch.tensor([[0], [2]], dtype=torch.int32, device='cuda')
-    topk_ids = torch.tensor([[1], [1]], dtype=torch.int32, device='cuda')
+    # topk_ids = torch.tensor([[0], [0]], dtype=torch.int32, device='cuda')
+    # topk_ids = torch.tensor([[1], [1]], dtype=torch.int32, device='cuda')
     print_tensor_info("topk_weights", topk_weights)
     print_tensor_info("topk_ids", topk_ids)
     expert_map = torch.arange(num_experts, dtype=torch.int32, device="cuda")
