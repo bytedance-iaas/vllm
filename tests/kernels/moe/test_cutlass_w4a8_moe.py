@@ -57,7 +57,7 @@ def woq_assert_near_eq(ref, act, wTypeId):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_moe_w4afp8(dtype):
 
-    m = 4
+    m = 5
     k = 7168
     n = 2048
     group_size = 128
@@ -103,73 +103,36 @@ def test_fused_moe_w4afp8(dtype):
     #     (num_experts, n // group_size, k), dtype=dtype,
     #     device="cuda")
 
-    # ref_weight_1 = unprocessed_int_weight_1 * scale_1.repeat_interleave(
-    #     group_size, dim=2)
-    # ref_weight_2 = unprocessed_int_weight_2 * scale_2.repeat_interleave(
-    #     group_size, dim=2)
-
     w1_q, w1_scale = pack_interleave(num_experts, ref_weight_1, scale_1)
     w2_q, w2_scale = pack_interleave(num_experts, ref_weight_2, scale_2)
 
     device = "cuda"
-    a_strides1 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    b_strides1 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    c_strides1 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    s_strides13 = torch.empty((num_experts, 3),
-                              dtype=torch.int64,
-                              device=device)
-    a_strides2 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    b_strides2 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    c_strides2 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    s_strides2 = torch.empty((num_experts, 3),
-                             dtype=torch.int64,
-                             device=device)
-    # s_strides13 = c_strides1
-    # s_strides2 = c_strides2
-
-    a_strides1[:, 0].fill_(k)
-    a_strides1[:, 1].fill_(1)
-    a_strides1[:, 2].zero_()
-
-    b_strides1[:, 0].fill_(k)
-    b_strides1[:, 1].fill_(1)
-    b_strides1[:, 2].zero_()
-
-    c_strides1[:, 0].fill_(1)
-    c_strides1[:, 1].fill_(2 * n)
-    c_strides1[:, 2].zero_()
-
-    s_strides13[:, 0].fill_(1)
-    s_strides13[:, 1].fill_(2 * n)
-    s_strides13[:, 2].zero_()
-
-    a_strides2[:, 0].fill_(n)
-    a_strides2[:, 1].fill_(1)
-    a_strides2[:, 2].zero_()
-
-    b_strides2[:, 0].fill_(n)
-    b_strides2[:, 1].fill_(1)
-    b_strides2[:, 2].zero_()
-
-    c_strides2[:, 0].fill_(1)
-    c_strides2[:, 1].fill_(k)
-    c_strides2[:, 2].zero_()
-
-    s_strides2[:, 0].fill_(1)
-    s_strides2[:, 1].fill_(k)
-    s_strides2[:, 2].zero_()
+    a_strides1 = torch.full((num_experts, 3),
+                                    k,
+                                    device=device,
+                                    dtype=torch.int64)
+    c_strides1 = torch.full((num_experts, 3),
+                                    2 * n,
+                                    device=device,
+                                    dtype=torch.int64)
+    a_strides2 = torch.full((num_experts, 3),
+                                    n,
+                                    device=device,
+                                    dtype=torch.int64)
+    c_strides2 = torch.full((num_experts, 3),
+                                    k,
+                                    device=device,
+                                    dtype=torch.int64)
+    s_strides13 = torch.full((num_experts, 3),
+                                    2 * n,
+                                    device=device,
+                                    dtype=torch.int64)
+    s_strides2 = torch.full((num_experts, 3),
+                                    k,
+                                    device=device,
+                                    dtype=torch.int64)
+    b_strides1 = a_strides1
+    b_strides2 = a_strides2
 
     score = torch.randn((m, num_experts), device="cuda", dtype=dtype)
     topk_weights, topk_ids = FusedMoE.select_experts(
@@ -184,10 +147,6 @@ def test_fused_moe_w4afp8(dtype):
         scoring_func="sigmoid",
         e_score_correction_bias=None,
     )
-    # topk_weights = torch.tensor([[0.8086, 0.4180], [0.7695, 0.6523]], dtype=torch.float, device='cuda')
-    # topk_ids = torch.tensor([[2, 1], [0, 2]], dtype=torch.int32, device='cuda')
-    # topk_ids = torch.tensor([[0], [0]], dtype=torch.int32, device='cuda')
-    # topk_ids = torch.tensor([[1], [1]], dtype=torch.int32, device='cuda')
     print_tensor_info("topk_weights", topk_weights)
     print_tensor_info("topk_ids", topk_ids)
     expert_map = torch.arange(num_experts, dtype=torch.int32, device="cuda")
@@ -319,7 +278,7 @@ def test_fused_moe_w4afp8(dtype):
                 })
         return results, tensors_collector
 
-    output, cutlass_tensors = cutlass_w4a8_moe(
+    output = cutlass_w4a8_moe(
         a,
         w1_q,
         w2_q,
@@ -359,7 +318,7 @@ def test_fused_moe_w4afp8(dtype):
     # compare
     torch.cuda.synchronize()
 
-    compare_intermediate_val(cutlass_tensors, ref_tensors)
+    # compare_intermediate_val(cutlass_tensors, ref_tensors)
 
     # compare final output
     print("\nComparing final output tensors...")

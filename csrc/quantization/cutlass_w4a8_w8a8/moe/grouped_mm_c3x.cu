@@ -162,14 +162,10 @@ void dispatch_w4a8_moe_mm_sm90(
   uint32_t const m = M / 32;
   uint32_t const n = d_tensors.size(1);
   uint32_t const k = a_tensors.size(1);
-//   printf("m,n,k: %d, %d, %d\n", m, n, k);
 
   if (m <= 16) {
     using TileShape = Shape<_128, _16, cute::Int<TileShapeK>>;
     using ClusterShape = Shape<_2, _1, _1>;
-    // printf("TileShape: %d, %d, %d\nClusterShape: %d, %d, %d\n",  
-    //    int(cute::size<0>(TileShape{})), int(cute::size<1>(TileShape{})), int(cute::size<2>(TileShape{})),
-    //    int(cute::size<0>(ClusterShape{})), int(cute::size<1>(ClusterShape{})), int(cute::size<2>(ClusterShape{})));
     cutlass_w4a8_group_gemm_caller<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>(
         d_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, d_strides, s_strides, chunk_size
@@ -177,9 +173,6 @@ void dispatch_w4a8_moe_mm_sm90(
   } else if (m <= 32) {
     using TileShape = Shape<_128, _32, cute::Int<TileShapeK>>;
     using ClusterShape = Shape<_1, _1, _1>;
-    // printf("TileShape: %d, %d, %d\nClusterShape: %d, %d, %d\n",  
-    //    int(cute::size<0>(TileShape{})), int(cute::size<1>(TileShape{})), int(cute::size<2>(TileShape{})),
-    //    int(cute::size<0>(ClusterShape{})), int(cute::size<1>(ClusterShape{})), int(cute::size<2>(ClusterShape{})));
     cutlass_w4a8_group_gemm_caller<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>(
         d_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, d_strides, s_strides, chunk_size
@@ -187,9 +180,6 @@ void dispatch_w4a8_moe_mm_sm90(
   } else if (m <= 64) {
     using TileShape = Shape<_128, _64, cute::Int<TileShapeK>>;
     using ClusterShape = Shape<_2, _1, _1>;
-    // printf("TileShape: %d, %d, %d\nClusterShape: %d, %d, %d\n",  
-    //    int(cute::size<0>(TileShape{})), int(cute::size<1>(TileShape{})), int(cute::size<2>(TileShape{})),
-    //    int(cute::size<0>(ClusterShape{})), int(cute::size<1>(ClusterShape{})), int(cute::size<2>(ClusterShape{})));
     cutlass_w4a8_group_gemm_caller<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>(
         d_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, d_strides, s_strides, chunk_size
@@ -197,9 +187,6 @@ void dispatch_w4a8_moe_mm_sm90(
   } else {
     using TileShape = Shape<_128, _64, cute::Int<TileShapeK>>;
     using ClusterShape = Shape<_1, _2, _1>;
-    // printf("TileShape: %d, %d, %d\nClusterShape: %d, %d, %d\n",  
-    //    int(cute::size<0>(TileShape{})), int(cute::size<1>(TileShape{})), int(cute::size<2>(TileShape{})),
-    //    int(cute::size<0>(ClusterShape{})), int(cute::size<1>(ClusterShape{})), int(cute::size<2>(ClusterShape{})));
     cutlass_w4a8_group_gemm_caller<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>(
         d_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, d_strides, s_strides, chunk_size

@@ -88,23 +88,15 @@ def cutlass_w4a8_moe(
     assert w2_scale.shape[1] == w2_q.shape[2] * 2 / 512 and \
         w2_scale.shape[2] == w2_q.shape[1] * 4, "W2 scale shape mismatch"
 
-    # assert a1_scale is None or a1_scale.dim() == 0 or \
-    #     a1_scale.shape[0] == 1 or \
-    #     a1_scale.shape[0] == a.shape[0], "Input scale shape mismatch"
-    # assert a2_scale is None or a1_scale is None or \
-    #     a2_scale.shape == a1_scale.shape, "Intermediate scale shape mismatch"  # noqa: E501
+
     assert a_strides1.shape[0] == w1_q.shape[
         0], "A Strides 1 expert number mismatch"
     assert b_strides1.shape[0] == w1_q.shape[
         0], "B Strides 1 expert number mismatch"
-    # assert c_strides1.shape[0] == w1_q.shape[
-    #     0], "C Strides 1 expert number mismatch"
     assert a_strides2.shape[0] == w2_q.shape[
         0], "A Strides 2 expert number  mismatch"
     assert b_strides2.shape[0] == w2_q.shape[
         0], "B Strides 2 expert number mismatch"
-    # assert c_strides2.shape[0] == w2_q.shape[
-    #     0], "C Strides 2 expert number mismatch"
 
     num_experts = w1_q.size(0)
     m = a.size(0)
@@ -116,7 +108,7 @@ def cutlass_w4a8_moe(
         "Translate info from expert_map to topk_ids"
         local_topk_ids = torch.where(expert_map[topk_ids_] != -1,
                                      expert_map[topk_ids_], -1)
-
+    
     topk = local_topk_ids.size(1)
 
     per_act_token = a1_scale.numel() != 1 if a1_scale is not None else (
@@ -127,9 +119,6 @@ def cutlass_w4a8_moe(
         # TODO: this only works for topK=1, will need to update for topK>1
         a = a * topk_weights.to(torch.half)
 
-    # print_tensor("a", a)
-    # print_tensor("a1_scale (before)", a1_scale)
-    # print_tensor("a2_scale (before)", a2_scale)
     a_q, a1_scale = ops.scaled_fp8_quant(
         a, a1_scale.float(), use_per_token_if_dynamic=per_act_token)
     device = a_q.device
@@ -160,113 +149,36 @@ def cutlass_w4a8_moe(
                         dtype=torch.int32,
                         device=device)
 
-    # print(f"topk_ids {topk_ids}, expert_offsets {expert_offsets}, problem_sizes1 {problem_sizes1}")
-    # print(f"problem_sizes2 {problem_sizes2}, a_map {a_map}, c_map {c_map}")
-    # print(f"num_experts {num_experts}, n {n}, k {k}")
-    # a1_scale and a2_scale are not supported
-
-    # print(f"before get_cutlass_moe_mm_data")
     ops.get_cutlass_moe_mm_data(local_topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map, num_experts, n,
                                 k)
-    # print(f"finish get_cutlass_moe_mm_data")
-    # print_tensor("topk_ids", topk_ids)
-    # print_tensor("expert_offsets", expert_offsets)
-    # print_tensor("problem_sizes1", problem_sizes1)
-    # print_tensor("problem_sizes2", problem_sizes2)
-    # print_tensor("a_map", a_map)
-    # print_tensor("c_map", c_map)
-    # print(f"n {n}, k {k}")
-
-    # a_map = torch.clamp(a_map,
-    #                     min=0,
-    #                     max=min(a1_scale.size(0) - 1,
-    #                             a_q.size(0) - 1))
+    
     rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
-    #rep_a1_scales = a1_scale[a_map] if per_act_token else a1_scale
-
-    # print_tensor("a_q", a_q)
-    # print_tensor("a1_scale (after)", a1_scale)
-    # print_tensor("a_map", a_map)
-    # print_tensor("rep_a_q", rep_a_q)
-    # print_tensor("rep_a1_scales", rep_a1_scales)
-
-    # device_id = a.get_device()
-    # save_dir = f"/nvme0n1/w4a8_debug_tensors/group_gemm_param/device_{device_id}"
-    # import os
-    # if not os.path.exists(save_dir):
-    #     os.makedirs(save_dir, exist_ok=True)
-    #     torch.save(a_map, f'{save_dir}/a_map.tensor')
-    #     torch.save(rep_a_q, f'{save_dir}/rep_a_q.tensor')
-    #     torch.save(w1_q, f'{save_dir}/w1_q.tensor')
-    #     torch.save(a1_scale, f'{save_dir}/a1_scale.tensor')
-    #     torch.save(w1_scale, f'{save_dir}/w1_scale.tensor')
-    #     torch.save(expert_offsets, f'{save_dir}/expert_offsets.tensor')
-    #     torch.save(problem_sizes1, f'{save_dir}/problem_sizes1.tensor')
-    #     torch.save(a_strides1, f'{save_dir}/a_strides1.tensor')
-    #     torch.save(b_strides1, f'{save_dir}/b_strides1.tensor')
-    #     torch.save(c_strides1, f'{save_dir}/c_strides1.tensor')
-    #     torch.save(s_strides13, f'{save_dir}/s_strides13.tensor')
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = c2_initializer((m * topk, k), device=device, dtype=torch.half)
-    tensors_collector = []
 
     ops.cutlass_w4a8_moe_mm(c1, rep_a_q, w1_q, a1_scale, w1_scale,
                             expert_offsets[:-1], problem_sizes1, a_strides1,
                             b_strides1, c_strides1, s_strides13, 128, m)
 
-    print_tensor("c1", c1)
-    tensors_collector.append({"name": "c1", "tensor": c1.clone().detach()})
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.half)
     torch.ops._C.silu_and_mul(intermediate, c1)
-    print_tensor("intermediate", intermediate)
-    tensors_collector.append({
-        "name": "silu_intermediate",
-        "tensor": intermediate.clone().detach()
-    })
 
-    intemediate_q, a2_scale = ops.scaled_fp8_quant(
+    intermediate_q, a2_scale = ops.scaled_fp8_quant(
         intermediate, a2_scale.float(), use_per_token_if_dynamic=per_act_token)
-    print_tensor("intemediate_q", intermediate)
-    tensors_collector.append({
-                "name": "intermediate_q",
-                "tensor": intemediate_q.to(torch.bfloat16).clone().detach()
-            })
-
-    # intemediate_q = torch.load("ref_intermediate_q_fp8")
-    # tensors_collector.append({
-    #             "name": "intermediate_q",
-    #             "tensor": intemediate_q.clone().detach().to(torch.bfloat16)
-    #         })
-    ops.cutlass_w4a8_moe_mm(c2, intemediate_q, w2_q, a2_scale, w2_scale,
+    
+    ops.cutlass_w4a8_moe_mm(c2, intermediate_q, w2_q, a2_scale, w2_scale,
                             expert_offsets[:-1], problem_sizes2, a_strides2,
                             b_strides2, c_strides2, s_strides2, 128, m)
-    print_tensor("c2", c2)
-    tensors_collector.append({"name": "c2", "tensor": c2.clone().detach()})
 
-    # Gather tokens
-    # print(f"xx c_map {c_map}")
-    # c_map = torch.clamp(c_map, min=0, max=c2.size(0) - 1)
-    # print(f"ssss_after c_map {c_map}")
     c2 = c2[c_map].view(m, topk, k)
 
     if not apply_router_weight_on_input:
         c2 = c2 * topk_weights.view(m, topk, 1)
 
     result = c2.sum(dim=1).to(torch.bfloat16)
-    print_tensor("result", result)
-    tensors_collector.append({
-        "name": "results",
-        "tensor": result.clone().detach()
-    })
-    # return result, tensors_collector
+    
     return result
 
-
-def print_tensor(name: str, t: torch.Tensor):
-    print(f"{name}: shape {t.shape}, dtype {t.dtype}, device {t.device}")
-    elements_to_print = min(20, t.numel())
-    values_cpu = t.flatten()[:elements_to_print].cpu()
-    print(f"{name} values (first {elements_to_print}): {values_cpu}")

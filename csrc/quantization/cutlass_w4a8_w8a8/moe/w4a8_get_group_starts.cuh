@@ -26,11 +26,6 @@ __global__ void int4_fp8_get_group_gemm_starts(
   a_offsets[expert_id] = a_base_as_int + expert_offset * k;
   b_offsets[expert_id] = b_base_as_int + expert_id * k * n / 2;
   out_offsets[expert_id] = out_base_as_int + expert_offset * n;
-  // a_offsets[expert_id] = a_base_as_int;
-  // b_offsets[expert_id] = b_base_as_int;
-  out_offsets[expert_id] = out_base_as_int + expert_offset * n;
-  // a_scales_offsets[expert_id] = a_scales_base_as_int;
-  // b_scales_offsets[expert_id] = b_scales_base_as_int;
   a_scales_offsets[expert_id] =
       a_scales_base_as_int + (per_act_token ? expert_offset : 0);
   b_scales_offsets[expert_id] =
@@ -66,9 +61,9 @@ void run_int4_fp8_get_group_gemm_starts(
     torch::Tensor& out_tensors, torch::Tensor const& a_scales,
     torch::Tensor const& b_scales) {
   TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn);
-  // TORCH_CHECK(b_tensors.dtype() == torch::kInt8);
+  TORCH_CHECK(b_tensors.dtype() == torch::kInt8);
   TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
-  //TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
+  TORCH_CHECK(b_scales.dtype() == torch::kBFloat16);
 
   int num_experts = static_cast<int>(expert_offsets.size(0));
   bool per_act_token = a_scales.numel() != 1;
