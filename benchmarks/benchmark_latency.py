@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+import vllm
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
@@ -38,7 +39,9 @@ def main(args: argparse.Namespace):
     print(args)
 
     engine_args = EngineArgs.from_cli_args(args)
-
+    if vllm.envs.VLLM_USE_SP_PREFILL:
+        engine_args.enable_chunked_prefill = False
+        engine_args.max_num_seqs = 1
     # NOTE(woosuk): If the request cannot be processed in a single batch,
     # the engine will automatically process the request in multiple batches.
     llm = LLM(**dataclasses.asdict(engine_args))
@@ -123,7 +126,7 @@ def main(args: argparse.Namespace):
         save_to_pytorch_benchmark_format(args, results)
 
 
-if __name__ == "__main__":
+def create_argument_parser():
     parser = FlexibleArgumentParser(
         description="Benchmark the latency of processing a single batch of "
         "requests till completion."
@@ -171,6 +174,12 @@ if __name__ == "__main__":
     # V1 enables prefix caching by default which skews the latency
     # numbers. We need to disable prefix caching by default.
     parser.set_defaults(enable_prefix_caching=False)
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = create_argument_parser()
     args = parser.parse_args()
     if args.profile and not envs.VLLM_TORCH_PROFILER_DIR:
         raise OSError(
