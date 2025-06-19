@@ -4,6 +4,11 @@ set -e
 ROOT_DIR=$(pwd)
 BUILD_TIME=$(date +%Y%m%d%H%M)
 CUDA_VERSION=12.4.0
+CUDA_VERSION_FROM_DOCKERFILE=$(awk '/ARG CUDA_VERSION=/ {split($0, a, "="); print a[2]; exit}' docker/Dockerfile)
+if [ ! -z "$CUDA_VERSION_FROM_DOCKERFILE" ]; then
+    CUDA_VERSION=$CUDA_VERSION_FROM_DOCKERFILE
+fi
+
 BYTED_MIRROR="mirrors.byted.org"
 
 if [ ! -z "$CUSTOM_CUDA_VERSION" ]; then
