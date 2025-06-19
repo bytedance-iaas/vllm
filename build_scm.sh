@@ -4,6 +4,7 @@ set -e
 ROOT_DIR=$(pwd)
 BUILD_TIME=$(date +%Y%m%d%H%M)
 CUDA_VERSION=12.4.0
+BYTED_MIRROR="mirrors.byted.org"
 
 if [ ! -z "$CUSTOM_CUDA_VERSION" ]; then
     CUDA_VERSION=$CUSTOM_CUDA_VERSION
@@ -53,10 +54,12 @@ cp docker/Dockerfile docker/Dockerfile.bak
 # sed -i "s/version\s*=\s*get_vllm_version(),/version=\"$WHEEL_VERSION\",/" setup.py
 sed -i 's/FROM nvidia\/cuda/FROM iaas-gpu-cn-beijing.cr.volces.com\/nvcr.io\/nvidia\/cuda/' docker/Dockerfile
 sed -i "s/python3 setup.py bdist_wheel/SETUPTOOLS_SCM_PRETEND_VERSION=$WHEEL_VERSION python3 setup.py bdist_wheel/" docker/Dockerfile
+sed -i "s@apt-get update@sed -i \"s|http://archive.ubuntu.com|http://$BYTED_MIRROR|g\" /etc/apt/sources.list ; sed -i \"s|http://security.ubuntu.com|http://$BYTED_MIRROR|g\" /etc/apt/sources.list ; apt-get update@" ./docker/Dockerfile
+sed -i "s@add-apt-repository@http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= add-apt-repository@" ./docker/Dockerfile
 
 cp -r examples vllm/examples
 
-proxy_args=""
+proxy_args=" --build-arg no_proxy=ppa.launchpad.net,$no_proxy"
 if [ ! -z "$http_proxy" ]; then
     proxy_args="$proxy_args --build-arg http_proxy=$http_proxy"
 fi
