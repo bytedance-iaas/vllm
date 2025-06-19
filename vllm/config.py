@@ -3661,6 +3661,9 @@ class KVTransferConfig:
     engine_id: Optional[str] = None
     """The engine id for KV transfers."""
 
+    # Whether to use NIXL prepped xfer for KV cache transfer.
+    use_prepped_xfer: bool = False
+
     kv_buffer_device: Optional[str] = "cuda"
     """The device used by kv connector to buffer the KV cache.
     Currently only support 'cuda'."""
@@ -3727,14 +3730,27 @@ class KVTransferConfig:
             raise ValueError(f"Unsupported kv_role: {self.kv_role}. "
                              f"Supported roles are {get_args(KVRole)}")
 
-        if self.kv_connector is not None and self.kv_role is None:
+        if self.kv_connector is not None and self.kv_connector != "DynamoNixlConnector" and self.kv_role is None:
             raise ValueError("Please specify kv_disagg_role when kv_connector "
                              f"is set, supported roles are {get_args(KVRole)}")
+
+        if self.use_prepped_xfer is False:
+            logger.warning("`use_prepped_xfer` parameter is deprecated. All transfers will be done using prepped xfer.")
+            self.use_prepped_xfer = True
+
 
     @property
     def is_kv_transfer_instance(self) -> bool:
         return self.kv_connector is not None and \
             self.kv_role in get_args(KVRole)
+
+    @property
+    def need_kv_parallel_group(self) -> bool:
+        # for those database-based connector, vLLM does not need to create
+        # parallel group, and in that case the kv parallel size will be 1.
+        if self.kv_connector == "DynamoNixlConnector":
+            return False
+        return self.kv_connector is not None and self.kv_parallel_size > 1
 
     @property
     def is_kv_producer(self) -> bool:
@@ -3748,6 +3764,18 @@ class KVTransferConfig:
 
     def get_from_extra_config(self, key, default) -> Any:
         return self.kv_connector_extra_config.get(key, default)
+
+    @property
+    def tensor_parallel_multiplier(self) -> int:
+        return self.kv_consumers_tensor_parallel_size // self.kv_producers_tensor_parallel_size
+
+    @property
+    def kv_consumers_parallel_size(self) -> int:
+        return self.kv_parallel_size - self.kv_producers_parallel_size
+
+    @property
+    def kv_world_size(self) -> int:
+        return self.kv_producers_parallel_size + self.kv_consumers_parallel_size * self.tensor_parallel_multiplier
 
 
 @config
