@@ -3,18 +3,7 @@ set -e
 
 ROOT_DIR=$(pwd)
 BUILD_TIME=$(date +%Y%m%d%H%M)
-CUDA_VERSION=12.4.0
-CUDA_VERSION_FROM_DOCKERFILE=$(awk '/ARG CUDA_VERSION=/ {split($0, a, "="); print a[2]; exit}' docker/Dockerfile)
-if [ ! -z "$CUDA_VERSION_FROM_DOCKERFILE" ]; then
-    CUDA_VERSION=$CUDA_VERSION_FROM_DOCKERFILE
-fi
-
 BYTED_MIRROR="mirrors.byted.org"
-
-if [ ! -z "$CUSTOM_CUDA_VERSION" ]; then
-    CUDA_VERSION=$CUSTOM_CUDA_VERSION
-fi
-echo "CUDA_VERSION: $CUDA_VERSION"
 
 # 获取 git 分支名
 BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
@@ -72,7 +61,11 @@ if [ ! -z "$https_proxy" ]; then
     proxy_args="$proxy_args --build-arg https_proxy=$https_proxy"
 fi
 
-DOCKER_BUILDKIT=1 docker build --network host --no-cache $proxy_args --build-arg max_jobs=256 --build-arg USE_SCCACHE=0 --build-arg GIT_REPO_CHECK=0 --build-arg CUDA_VERSION=$CUDA_VERSION --build-arg RUN_WHEEL_CHECK=false --tag vllm-ci:build-image --target build --progress plain -f docker/Dockerfile .
+if [ ! -z "$CUSTOM_CUDA_VERSION" ]; then
+    cuda_version_build_arg="--build-arg CUDA_VERSION=$CUSTOM_CUDA_VERSION"
+fi
+
+DOCKER_BUILDKIT=1 docker build --network host --no-cache $proxy_args --build-arg max_jobs=256 --build-arg USE_SCCACHE=0 --build-arg GIT_REPO_CHECK=0 $cuda_version_build_arg --build-arg RUN_WHEEL_CHECK=false --tag vllm-ci:build-image --target build --progress plain -f docker/Dockerfile .
 
 # 恢复 Dockerfile
 mv docker/Dockerfile.bak docker/Dockerfile
