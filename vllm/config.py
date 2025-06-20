@@ -3661,8 +3661,8 @@ class KVTransferConfig:
     engine_id: Optional[str] = None
     """The engine id for KV transfers."""
 
-    # Whether to use NIXL prepped xfer for KV cache transfer.
     use_prepped_xfer: bool = False
+    """Whether to use NIXL prepped xfer for KV cache transfer."""
 
     kv_buffer_device: Optional[str] = "cuda"
     """The device used by kv connector to buffer the KV cache.
@@ -3689,19 +3689,29 @@ class KVTransferConfig:
     """The KV connector ip, used to build distributed connection."""
 
     kv_port: int = 14579
+    """The KV connector port."""
 
-    # Whether use eic for kv cache reuse for prefill instanceAdd commentMore actions
     kv_use_eic: bool = False
-
-    # any extra config that the connector may need
-    kv_connector_extra_config: dict[str, Any] = {}
-
+    """Whether use eic for kv cache reuse for prefill instanceAdd commentMore actions."""
+    
+    kv_connector_extra_config: dict[str, Any] = field(default_factory=dict)
+    """Any extra config that the connector may need"""
+    
     # This does not need to be set by the user. It is set by the connector.
     kv_producers_parallel_size: Optional[int] = None
+    """The KV producer parallel size"""
+
     kv_producers_tensor_parallel_size: Optional[int] = None
+    """The KV producer tp size"""
+
     kv_producers_pipeline_parallel_size: Optional[int] = None
+    """The KV producer pp size"""
+
     kv_consumers_tensor_parallel_size: Optional[int] = None
+    """The KV consumer tp size"""
+
     kv_consumers_pipeline_parallel_size: Optional[int] = None
+    """The KV consumer pp size"""
 
     def compute_hash(self) -> str:
         """
