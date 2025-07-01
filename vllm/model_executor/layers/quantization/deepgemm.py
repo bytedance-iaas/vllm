@@ -5,7 +5,7 @@ import logging
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
+import triton
 from vllm.utils import direct_register_custom_op
 
 has_deep_gemm = importlib.util.find_spec("deep_gemm") is not None
