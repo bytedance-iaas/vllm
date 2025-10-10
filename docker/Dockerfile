@@ -83,6 +83,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG GET_PIP_URL
 
 # Install system dependencies and uv, then create Python virtual environment
+# 使用火山源
+RUN sed -i 's/archive.ubuntu.com/mirrors.ivolces.com/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.ivolces.com/g' /etc/apt/sources.list
+
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update -y \
@@ -129,10 +133,12 @@ RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 WORKDIR /workspace
 
 # install build and runtime dependencies
+# 指定pip源
 COPY requirements/common.txt requirements/common.txt
 COPY requirements/cuda.txt requirements/cuda.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
+    --index-url $UV_INDEX_URL --extra-index-url $UV_EXTRA_INDEX_URL \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # cuda arch list used by torch
@@ -161,8 +167,10 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
 
+# 指定pip源
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python3 -r requirements/build.txt \
+    --index-url $UV_INDEX_URL --extra-index-url $UV_EXTRA_INDEX_URL \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 COPY . .
@@ -254,12 +262,18 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 
 # Install libnuma-dev, required by fastsafetensors (fixes #20384)
+# 配置火山源
+RUN sed -i 's/archive.ubuntu.com/mirrors.ivolces.com/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.ivolces.com/g' /etc/apt/sources.list
+
 RUN apt-get update && apt-get install -y libnuma-dev && rm -rf /var/lib/apt/lists/*
 COPY requirements/lint.txt requirements/lint.txt
 COPY requirements/test.txt requirements/test.txt
 COPY requirements/dev.txt requirements/dev.txt
+# 指定pip源
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
+    --index-url $UV_INDEX_URL --extra-index-url $UV_EXTRA_INDEX_URL \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 #################### DEV IMAGE ####################
 
@@ -287,6 +301,10 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
 # Install Python and other dependencies
+# 配置火山源
+RUN sed -i 's/archive.ubuntu.com/mirrors.ivolces.com/g' /etc/apt/sources.list && \
+    sed -i 's/security.ubuntu.com/mirrors.ivolces.com/g' /etc/apt/sources.list
+
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update -y \
@@ -351,16 +369,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi
 
 # Install vllm wheel first, so that torch etc will be installed.
+# 指定pip源
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system dist/*.whl --verbose \
+        --index-url $UV_INDEX_URL --extra-index-url $UV_EXTRA_INDEX_URL \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # Install FlashInfer pre-compiled kernel cache and binaries
 # https://docs.flashinfer.ai/installation.html
+# 指定pip源
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system flashinfer-cubin==0.4.0 \
     && uv pip install --system flashinfer-jit-cache==0.4.0 \
+        --index-url $UV_INDEX_URL --extra-index-url $UV_EXTRA_INDEX_URL \
         --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
     && flashinfer show-config
 
@@ -377,8 +399,10 @@ uv pip list
 # install build dependencies for JIT compilation.
 # TODO: Remove this once FlashInfer AOT wheel is fixed
 COPY requirements/build.txt requirements/build.txt
+# 指定pip源
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r requirements/build.txt \
+        --index-url $UV_INDEX_URL --extra-index-url $UV_EXTRA_INDEX_URL \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # Install DeepGEMM from source
