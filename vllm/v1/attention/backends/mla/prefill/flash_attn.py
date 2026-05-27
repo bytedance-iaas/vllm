@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.envs as envs
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
@@ -86,6 +87,12 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
         # Track whether we're using vllm's FA or upstream (for ROCm)
         self._is_vllm_fa = current_platform.is_cuda() or current_platform.is_xpu()
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
 
     def _flash_attn_varlen_diff_headdims(
         self,
@@ -141,6 +148,61 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         v: torch.Tensor,
         return_softmax_lse: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        pcp_metadata = self._prefill_metadata.pcp_metadata
+        if self.pcp_world_size > 1:
+            assert pcp_metadata is not None
+            output_head, lse_head = self._flash_attn_varlen_diff_headdims(
+                q=torch.index_select(q, 0, pcp_metadata.query_head_indices),
+                k=torch.index_select(k, 0, pcp_metadata.kv_head_indices),
+                v=torch.index_select(v, 0, pcp_metadata.kv_head_indices),
+                cu_seqlens_q=self._prefill_metadata.query_start_loc // 2,
+                cu_seqlens_k=(
+                    self._prefill_metadata.query_start_loc
+                    // 2
+                    * (self.pcp_rank + 1)
+                ),
+                max_seqlen_q=self._prefill_metadata.max_query_len // 2,
+                max_seqlen_k=(
+                    self._prefill_metadata.max_query_len
+                    // 2
+                    * (self.pcp_rank + 1)
+                ),
+                softmax_scale=self.scale,
+                causal=True,
+                return_softmax_lse=True,
+            )
+            output_tail, lse_tail = self._flash_attn_varlen_diff_headdims(
+                q=torch.index_select(q, 0, pcp_metadata.query_tail_indices),
+                k=torch.index_select(k, 0, pcp_metadata.kv_tail_indices),
+                v=torch.index_select(v, 0, pcp_metadata.kv_tail_indices),
+                cu_seqlens_q=self._prefill_metadata.query_start_loc // 2,
+                cu_seqlens_k=(
+                    self._prefill_metadata.query_start_loc
+                    // 2
+                    * (self.pcp_world_size * 2 - self.pcp_rank)
+                ),
+                max_seqlen_q=self._prefill_metadata.max_query_len // 2,
+                max_seqlen_k=(
+                    self._prefill_metadata.max_query_len
+                    // 2
+                    * (self.pcp_world_size * 2 - self.pcp_rank)
+                ),
+                softmax_scale=self.scale,
+                causal=True,
+                return_softmax_lse=True,
+            )
+            output = torch.cat([output_head, output_tail], dim=0)
+            assert pcp_metadata.output_restore_idx is not None
+            if return_softmax_lse:
+                assert lse_head is not None
+                assert lse_tail is not None
+                lse = torch.cat([lse_head, lse_tail], dim=-1)
+                return (
+                    torch.index_select(output, 0, pcp_metadata.output_restore_idx),
+                    torch.index_select(lse, -1, pcp_metadata.output_restore_idx),
+                )
+            return torch.index_select(output, 0, pcp_metadata.output_restore_idx)
+
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,

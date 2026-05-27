@@ -98,6 +98,13 @@ class MLAPrefillBackend(ABC):
 
         Called by the metadata builder after constructing the prefill metadata.
         """
+        if (
+            prefill_metadata.pcp_metadata is not None
+            and self.get_name() != "FLASH_ATTN"
+        ):
+            raise NotImplementedError(
+                f"{self.get_name()} MLA prefill backend does not support PCP."
+            )
         self._prefill_metadata = prefill_metadata
 
     @abstractmethod

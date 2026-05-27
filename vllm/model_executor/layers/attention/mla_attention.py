@@ -266,9 +266,11 @@ from vllm.v1.attention.backends.mla.prefill import (
     get_mla_prefill_backend,
 )
 from vllm.v1.attention.backends.utils import (
+    get_cp_local_seq_lens,
     get_dcp_local_seq_lens,
     get_pcp_kv_indices,
     get_pcp_query_indices,
+    pcp_kv_allgather_and_restore,
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
@@ -464,9 +466,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
-        self.use_direct_call = not current_platform.opaque_attention_op()
-
         vllm_config = get_current_vllm_config()
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.use_direct_call = (
+            not current_platform.opaque_attention_op() or self.pcp_world_size > 1
+        )
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -565,15 +569,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             assert isinstance(slot_mapping, dict), (
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_c_normed,
-                k_pe,
-                self_kv_cache,
-                slot_mapping.get(self.layer_name),
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+            if self.pcp_world_size <= 1:
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    slot_mapping.get(self.layer_name),
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
             self.forward_impl(
                 q,
                 kv_c_normed,
@@ -660,6 +665,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         if self.impl.dcp_world_size == -1:
             self.impl.dcp_world_size = get_dcp_group().world_size
+        self.impl.pcp_world_size = self.pcp_world_size
+        self.impl.cp_world_size = self.impl.dcp_world_size * self.impl.pcp_world_size
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
 
@@ -690,11 +697,37 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
+        if self.pcp_world_size > 1:
+            assert not is_sparse_impl, "PCP does not support sparse MLA yet."
+            assert num_mqa_tokens == 0, (
+                "PCP MLA path currently supports prefill-only batches."
+            )
+            assert attn_metadata.prefill is not None
+            pcp_metadata = attn_metadata.prefill.pcp_metadata
+            assert pcp_metadata is not None
+            assert pcp_metadata.pcp_allgather_restore_idx is not None
+            k_c_normed, k_pe = pcp_kv_allgather_and_restore(
+                k_c_normed,
+                k_pe,
+                num_actual_toks,
+                pcp_metadata.pcp_allgather_restore_idx,
+                get_pcp_group(),
+            )
+            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                k_c_normed,
+                k_pe,
+                kv_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                self._k_scale,
+            )
+
         if num_mha_tokens > 0:
+            mha_kv_start = num_mqa_tokens * self.pcp_world_size
             self.impl.forward_mha(  # type: ignore[attr-defined]
                 q[num_mqa_tokens:],
-                k_c_normed[num_mqa_tokens:],
-                k_pe[num_mqa_tokens:],
+                k_c_normed[mha_kv_start:],
+                k_pe[mha_kv_start:],
                 kv_cache,
                 attn_metadata,
                 self._k_scale,
@@ -1510,6 +1543,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.cp_world_size = self.dcp_world_size * self.pcp_world_size
+        self.cp_local_block_size = parallel_config.cp_kv_cache_interleave_size
+        self.cp_virtual_block_size = self.cp_local_block_size * self.cp_world_size
 
         # Don't try to access the runner on AMD
         if self.aot_schedule:
@@ -1519,16 +1555,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.determine_chunked_prefill_workspace_size(vllm_config)
         )
 
-        if self.dcp_world_size > 1:
+        if self.cp_world_size > 1:
             # Note(hc): The local kvcache is incomplete when DCP is triggered,
             # an additional kvcache allgather across the DCP group is therefore
             # required, so the workspace has to be enlarged by 1/DCP relative
             # to the original TP allocation.
-            assert self.chunked_prefill_workspace_size % self.dcp_world_size == 0
+            assert self.chunked_prefill_workspace_size % self.cp_world_size == 0
             self.chunked_prefill_workspace = torch.empty(
                 (
                     self.chunked_prefill_workspace_size
-                    + self.chunked_prefill_workspace_size // self.dcp_world_size,
+                    + self.chunked_prefill_workspace_size // self.cp_world_size,
                     self.model_config.get_head_size(),
                 ),
                 dtype=self.model_config.dtype,
@@ -1710,34 +1746,34 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     chunk_len = chunk_token_to_seq_tensor.shape[0]
                     token_to_seq_tensor_cpu[i, :chunk_len] = chunk_token_to_seq_tensor
 
-                if self.dcp_world_size > 1:
-                    local_context_lens_allranks = get_dcp_local_seq_lens(
+                if self.cp_world_size > 1:
+                    local_context_lens_allranks = get_cp_local_seq_lens(
                         context_lens_cpu,
-                        self.dcp_world_size,
+                        self.cp_world_size,
                         None,
-                        self.dcp_local_block_size,
+                        self.cp_local_block_size,
                     )
                     # Note(qcs): The max local context lengths
-                    # padded to `dcp_local_block_size`.
+                    # padded to `cp_local_block_size`.
                     padded_local_context_lens_cpu: torch.Tensor = (
                         cdiv(
                             context_lens_cpu,
-                            self.dcp_virtual_block_size,
+                            self.cp_virtual_block_size,
                         )
-                        * self.dcp_local_block_size
+                        * self.cp_local_block_size
                     )
                     # Note(hc): The above max_context_chunk already enforces
-                    # block_size alignment, DCP just need the block_size can
-                    # be divisible by dcp_world_size, because DCP use
+                    # block_size alignment, CP just needs the block_size can
+                    # be divisible by cp_world_size, because CP uses
                     # cp_gather_cache which not require `cp_chunk_starts`
                     # aligned to page_size.
-                    assert max_context_chunk % self.dcp_world_size == 0
+                    assert max_context_chunk % self.cp_world_size == 0
                     padded_local_max_context_chunk_across_ranks = (
                         cdiv(
                             max_context_chunk,
-                            self.dcp_virtual_block_size,
+                            self.cp_virtual_block_size,
                         )
-                        * self.dcp_local_block_size
+                        * self.cp_local_block_size
                     )
                     local_chunk_starts = (
                         torch.arange(num_chunks, dtype=torch.int32)
@@ -1770,7 +1806,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         num_prefills_with_context_cpu
                     ].item()
                 _ChunkedMetadata = MLACommonPrefillMetadata.ChunkedContextMetadata
-                if self.dcp_world_size > 1:
+                if self.cp_world_size > 1:
                     chunked_context_metadata = _ChunkedMetadata(
                         cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
                         starts=local_chunk_starts.to(device, non_blocking=True),
@@ -2055,6 +2091,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
         self.dcp_world_size: int = -1
+        self.pcp_world_size: int = (
+            get_current_vllm_config().parallel_config.prefill_context_parallel_size
+        )
+        self.cp_world_size: int = self.pcp_world_size
 
         self.cp_kv_cache_interleave_size: int = (
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
@@ -2204,7 +2244,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
-        dcp_world_size: int,
+        cp_world_size: int,
     ):
         assert k_scale is None, "DCP not support scaled kvcache now."
         assert attn_metadata.prefill is not None
@@ -2235,20 +2275,27 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 seq_starts=prefill_metadata.chunked_context.starts[i],
             )
             # workspace
-            # |------- N tokens --------|--------- N*dcp_size tokens ----------|
+            # |------- N tokens --------|---------- N*cp_size tokens ----------|
             # |<- use for local_gather ->|<--------- use for allgather -------->|
-            allgather_offset = workspace.shape[0] // (dcp_world_size + 1)
-            assert allgather_offset * (dcp_world_size + 1) == workspace.shape[0]
+            allgather_offset = workspace.shape[0] // (cp_world_size + 1)
+            assert allgather_offset * (cp_world_size + 1) == workspace.shape[0]
             assert toks <= allgather_offset
             local_gathered_kvcache = workspace[:toks]
             cur_allgather_workspace = workspace[
-                allgather_offset : allgather_offset * (1 + dcp_world_size)
+                allgather_offset : allgather_offset * (1 + cp_world_size)
             ]
-            assert toks * dcp_world_size <= cur_allgather_workspace.shape[0]
-            cur_allgather_kvcache = cur_allgather_workspace[: toks * dcp_world_size]
-            cur_allgather_kvcache.copy_(
-                get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
-            )
+            assert toks * cp_world_size <= cur_allgather_workspace.shape[0]
+            cur_allgather_kvcache = cur_allgather_workspace[: toks * cp_world_size]
+            gathered_kvcache = local_gathered_kvcache
+            if self.dcp_world_size > 1:
+                gathered_kvcache = get_dcp_group().all_gather(
+                    gathered_kvcache, dim=0
+                )
+            if self.pcp_world_size > 1:
+                gathered_kvcache = get_pcp_group().all_gather(
+                    gathered_kvcache, dim=0
+                )
+            cur_allgather_kvcache.copy_(gathered_kvcache)
             assert (
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim
@@ -2349,14 +2396,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if has_context:
             assert prefill_metadata.chunked_context is not None
             suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
+            if self.cp_world_size > 1:
                 context_output, context_lse = (
                     self._context_parallel_compute_prefill_context(
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
                         k_scale=None,
-                        dcp_world_size=self.dcp_world_size,
+                        cp_world_size=self.cp_world_size,
                     )
                 )
             else:
