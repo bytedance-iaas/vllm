@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
@@ -335,7 +336,11 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        if current_platform.is_cuda():
+        use_cutedsl_compressor = (
+            os.environ.get("VLLM_DSV4_USE_CUTEDSL_COMPRESSOR") == "1"
+        )
+
+        if current_platform.is_cuda() and use_cutedsl_compressor:
             # NVIDIA GPUs.
             if self.head_dim == 512:
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (
@@ -350,8 +355,8 @@ class DeepseekCompressor(nn.Module):
                 # Use a triton kernel.
                 compress_norm_rope_store_fn = compress_norm_rope_store_triton
         else:
-            # AMD GPUs.
-            # Always use a triton kernel.
+            # The CuTe DSL sparse compressor is optional because it is sensitive
+            # to nvidia-cutlass-dsl API compatibility at startup compile time.
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
 
         compress_norm_rope_store_fn(
