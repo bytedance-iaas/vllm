@@ -1202,6 +1202,17 @@ class VllmConfig:
                         CUDAGraphMode.FULL_DECODE_ONLY
                     )
 
+            if (
+                self.parallel_config.prefill_context_parallel_size > 1
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                logger.warning_once(
+                    "Prefill context parallelism is enabled and is not "
+                    "compatible with full CUDA graphs. Overriding "
+                    "cudagraph_mode to PIECEWISE."
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
             # Check if KV connector requires PIECEWISE mode for CUDA graphs
             if (
                 self.kv_transfer_config is not None

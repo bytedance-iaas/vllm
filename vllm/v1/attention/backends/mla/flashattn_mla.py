@@ -122,7 +122,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             vllm_config,
             device,
             FlashAttnMLAMetadata,
-            supports_dcp_with_varlen=(interleave_size == 1),
+            supports_cp_with_varlen=(interleave_size == 1),
         )
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.fa_aot_schedule = get_flash_attn_version() == 3
@@ -254,6 +254,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
 
 class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_pcp: bool = True
 
     def __init__(
         self,
