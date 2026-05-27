@@ -210,6 +210,7 @@ from vllm.config import (
 )
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_pcp_group,
     is_global_first_rank,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -266,6 +267,8 @@ from vllm.v1.attention.backends.mla.prefill import (
 )
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
+    get_pcp_kv_indices,
+    get_pcp_query_indices,
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
@@ -1227,10 +1230,20 @@ class MLACommonPrefillMetadata:
         chunk_size: int | None = None
         prefill_tokens_with_context: int | None = None
 
+    @dataclass
+    class PCPMetadata:
+        pcp_allgather_restore_idx: torch.Tensor | None = None
+        kv_head_indices: torch.Tensor | None = None
+        kv_tail_indices: torch.Tensor | None = None
+        query_head_indices: torch.Tensor | None = None
+        query_tail_indices: torch.Tensor | None = None
+        output_restore_idx: torch.Tensor | None = None
+
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
     max_query_len: int
     chunked_context: ChunkedContextMetadata | None = None
+    pcp_metadata: PCPMetadata | None = None
     q_data_type: torch.dtype | None = None
     output_dtype: torch.dtype | None = None
     prefill_backend: MLAPrefillBackend | None = None
@@ -1487,6 +1500,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        try:
+            self.pcp_world_size = get_pcp_group().world_size
+            self.pcp_rank = get_pcp_group().rank_in_group
+        except AssertionError:
+            # PCP might not be initialized in testing
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
         self.dcp_local_block_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_virtual_block_size = self.dcp_local_block_size * self.dcp_world_size
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
@@ -1791,11 +1811,54 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     <= self.chunked_prefill_workspace_size
                 )
 
+            pcp_metadata = None
+            if self.pcp_world_size > 1:
+                pcp_allgather_restore_idx = (
+                    common_attn_metadata.pcp_allgather_restore_idx
+                )
+                assert pcp_allgather_restore_idx is not None, (
+                    "PCP MLA prefill metadata requires "
+                    "pcp_allgather_restore_idx."
+                )
+                query_head_indices, query_tail_indices = get_pcp_query_indices(
+                    prefill_query_start_loc_cpu
+                )
+                output_restore_idx = torch.cat(
+                    [query_head_indices, query_tail_indices]
+                ).argsort()
+                prefill_kv_start_loc_cpu = (
+                    prefill_query_start_loc_cpu * self.pcp_world_size
+                )
+                kv_head_indices, kv_tail_indices = get_pcp_kv_indices(
+                    prefill_kv_start_loc_cpu,
+                    self.pcp_rank,
+                    self.pcp_world_size,
+                )
+                pcp_metadata = MLACommonPrefillMetadata.PCPMetadata(
+                    pcp_allgather_restore_idx=pcp_allgather_restore_idx,
+                    kv_head_indices=kv_head_indices.to(
+                        device, dtype=torch.int64, non_blocking=True
+                    ),
+                    kv_tail_indices=kv_tail_indices.to(
+                        device, dtype=torch.int64, non_blocking=True
+                    ),
+                    query_head_indices=query_head_indices.to(
+                        device, dtype=torch.int64, non_blocking=True
+                    ),
+                    query_tail_indices=query_tail_indices.to(
+                        device, dtype=torch.int64, non_blocking=True
+                    ),
+                    output_restore_idx=output_restore_idx.to(
+                        device, dtype=torch.int64, non_blocking=True
+                    ),
+                )
+
             prefill_metadata = MLACommonPrefillMetadata(
                 block_table=block_table_tensor[reqs_start:, ...],
                 query_start_loc=prefill_query_start_loc,
                 max_query_len=max_query_len,
                 chunked_context=chunked_context_metadata,
+                pcp_metadata=pcp_metadata,
                 output_dtype=self.model_config.dtype,
                 q_data_type=self.q_data_type,
                 prefill_backend=self._prefill_backend,
