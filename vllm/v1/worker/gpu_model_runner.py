@@ -43,6 +43,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -133,7 +134,7 @@ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilde
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
-    get_dcp_local_seq_lens,
+    get_cp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
@@ -192,6 +193,7 @@ from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
+    PCPManager,
     check_attention_cp_compatibility,
     get_total_cp_world_size,
 )
@@ -460,7 +462,11 @@ class GPUModelRunner(
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
+        self.pcp_world_size = self.parallel_config.prefill_context_parallel_size
+        self.cp_world_size = self.dcp_world_size * self.pcp_world_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        self.pcp_rank = 0 if self.pcp_world_size <= 1 else get_pcp_group().rank_in_group
+        self.cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
@@ -701,14 +707,23 @@ class GPUModelRunner(
         # Cache the device properties.
         self._init_device_properties()
 
+        self.max_buffer_num_tokens = self.max_num_tokens
+        if self.pcp_world_size > 1:
+            # PCP pads each request to a multiple of 2 * pcp_world_size before
+            # splitting. Keep scheduler limits unchanged, but size staging
+            # buffers for the padded local view.
+            self.max_buffer_num_tokens += self.max_num_reqs * 2 * self.pcp_world_size
+
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
 
         # Persistent buffers for CUDA graphs.
-        self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self.input_ids = self._make_buffer(
+            self.max_buffer_num_tokens, dtype=torch.int32
+        )
         self.positions = torch.zeros(
-            self.max_num_tokens, dtype=torch.int64, device=self.device
+            self.max_buffer_num_tokens, dtype=torch.int64, device=self.device
         )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
@@ -725,7 +740,9 @@ class GPUModelRunner(
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
-        self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        self.req_indices = self._make_buffer(
+            self.max_buffer_num_tokens, dtype=torch.int64
+        )
         # Maps current batch position -> previous batch position (-1 for new reqs)
         self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_scheduled_tokens = self._make_buffer(
@@ -733,7 +750,7 @@ class GPUModelRunner(
         )
 
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        if self.dcp_world_size > 1:
+        if self.cp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
@@ -741,9 +758,14 @@ class GPUModelRunner(
         # version of this tensor, avoid a RuntimeError by not creating a
         # numpy buffer.
         self.inputs_embeds = self._make_buffer(
-            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+            self.max_buffer_num_tokens,
+            self.inputs_embeds_size,
+            dtype=self.dtype,
+            numpy=False,
         )
-        self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
+        self.is_token_ids = self._make_buffer(
+            self.max_buffer_num_tokens, dtype=torch.bool
+        )
         self.discard_request_mask = self._make_buffer(
             self.max_num_reqs, dtype=torch.bool
         )
@@ -767,14 +789,15 @@ class GPUModelRunner(
             # 1D-RoPE.
             # See page 5 of https://arxiv.org/abs/2409.12191
             self.mrope_positions = self._make_buffer(
-                (3, self.max_num_tokens + 1), dtype=torch.int64
+                (3, self.max_buffer_num_tokens + 1), dtype=torch.int64
             )
 
         # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
         if self.uses_xdrope_dim > 0:
             # Similar to mrope but use assigned dimension number for RoPE, 4 as default.
             self.xdrope_positions = self._make_buffer(
-                (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
+                (self.uses_xdrope_dim, self.max_buffer_num_tokens + 1),
+                dtype=torch.int64,
             )
 
         # None in the first PP rank. The rest are set after load_model.
@@ -784,10 +807,22 @@ class GPUModelRunner(
         # every step. Keep in int64 to avoid overflow with long context.
         # - arange_np: immutable [0, 1, 2, ...] used as source for batched computation
         # - query_pos: CpuGpuBuffer for the computed batched arange result
-        arange_size = max(self.max_num_reqs + 1, self.max_num_tokens)
+        arange_size = max(
+            self.max_num_reqs + 1, self.max_model_len, self.max_buffer_num_tokens
+        )
         self.arange_np = np.arange(arange_size, dtype=np.int64)
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
+
+        if self.pcp_world_size > 1:
+            self.pcp_manager = PCPManager(
+                pcp_world_size=self.pcp_world_size,
+                pcp_rank=self.pcp_rank,
+                max_buffer_num_tokens=self.max_buffer_num_tokens,
+                max_num_reqs=self.max_num_reqs,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
 
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
@@ -799,7 +834,7 @@ class GPUModelRunner(
         self.kv_sharing_fast_prefill_logits_indices = None
         if self.cache_config.kv_sharing_fast_prefill:
             self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
-                self.max_num_tokens, dtype=torch.int32, device=self.device
+                self.max_buffer_num_tokens, dtype=torch.int32, device=self.device
             )
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
@@ -1898,6 +1933,47 @@ class GPUModelRunner(
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
 
+        if self.pcp_world_size > 1:
+            assert not scheduler_output.scheduled_spec_decode_tokens, (
+                "PCP does not support speculative decoding yet."
+            )
+            self.query_start_loc.np[0] = 0
+            self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+            self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+            self.query_start_loc.copy_to_gpu()
+            self.positions[:total_num_scheduled_tokens].copy_(
+                torch.from_numpy(positions_np).to(
+                    self.device, dtype=torch.int64, non_blocking=True
+                )
+            )
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
+
+            pcp_num_scheduled_tokens, pcp_positions = (
+                self.pcp_manager.update_tokens_for_pcp(
+                    num_scheduled_tokens[:num_reqs],
+                    self.arange_np,
+                    num_reqs,
+                    reorder_batch_threshold=self.reorder_batch_threshold,
+                )
+            )
+            num_scheduled_tokens[:num_reqs] = pcp_num_scheduled_tokens
+            total_num_scheduled_tokens = int(
+                np.sum(num_scheduled_tokens[:num_reqs], dtype=np.int64)
+            )
+            scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens
+            req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+            cu_num_tokens = self._get_cumsum_and_arange(
+                num_scheduled_tokens, self.query_pos.np
+            )
+            positions_np = (
+                self.input_batch.num_computed_tokens_cpu[req_indices]
+                + pcp_positions[:total_num_scheduled_tokens]
+            )
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2003,9 +2079,16 @@ class GPUModelRunner(
 
         # Record which requests should not be sampled,
         # so that we could clear the sampled tokens before returning
-        self.discard_request_mask.np[:num_reqs] = (
-            self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
-        )
+        if self.pcp_world_size > 1:
+            self.discard_request_mask.np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                + num_scheduled_tokens[:num_reqs] * self.pcp_world_size
+                - self.pcp_manager.num_pcp_pads_cpu[:num_reqs]
+            ) < num_tokens_np
+        else:
+            self.discard_request_mask.np[:num_reqs] = (
+                self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
+            )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
@@ -2090,11 +2173,12 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        if self.pcp_world_size == 1:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2132,10 +2216,23 @@ class GPUModelRunner(
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            if self.pcp_world_size > 1:
+                logits_indices = (
+                    torch.from_numpy(cu_num_tokens).to(
+                        self.device, dtype=torch.int64, non_blocking=True
+                    )
+                    * self.pcp_world_size
+                    - self.pcp_manager.num_pcp_pads_cpu_tensor[:num_reqs].to(
+                        self.device, dtype=torch.int64, non_blocking=True
+                    )
+                    - 1
+                )
+            else:
+                logits_indices = query_start_loc[1:] - 1
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
         else:
+            assert self.pcp_world_size == 1, "PCP does not support spec decode yet."
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
             # requests have draft tokens.
@@ -2295,11 +2392,11 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
         )
 
-        if self.dcp_world_size > 1:
-            self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
+        if self.cp_world_size > 1:
+            self.dcp_local_seq_lens.cpu[:num_reqs] = get_cp_local_seq_lens(
                 self.optimistic_seq_lens_cpu[:num_reqs],
-                self.dcp_world_size,
-                self.dcp_rank,
+                self.cp_world_size,
+                self.cp_rank,
                 self.parallel_config.cp_kv_cache_interleave_size,
             )
             self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
@@ -2309,6 +2406,12 @@ class GPUModelRunner(
             cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
                 :num_reqs_padded
             ]
+            if self.pcp_world_size > 1:
+                cm_base.pcp_allgather_restore_idx = (
+                    self.pcp_manager.pcp_allgather_restore_idx.gpu[
+                        : num_tokens * self.pcp_world_size
+                    ]
+                )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -3912,6 +4015,22 @@ class GPUModelRunner(
                 )
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
+                if self.pcp_world_size > 1:
+                    pcp_full_tokens = num_tokens_unpadded * self.pcp_world_size
+                    pcp_num_pads = np.sum(
+                        self.pcp_manager.num_pcp_pads_cpu[
+                            : self.input_batch.num_reqs
+                        ]
+                    )
+                    pcp_unpadded_tokens = pcp_full_tokens - int(pcp_num_pads)
+                    slot_mapping = self.pcp_manager.pcp_padded_slot_mapping[
+                        :pcp_full_tokens
+                    ]
+                    slot_mapping.fill_(-1)
+                    slot_mapping[
+                        self.pcp_manager.pcp_unpad_mask_gpu_tensor[:pcp_full_tokens]
+                    ] = blk_table.slot_mapping.gpu[:pcp_unpadded_tokens]
+                    return slot_mapping
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
@@ -3932,6 +4051,7 @@ class GPUModelRunner(
                 slot_mappings_by_layer[layer_name] = slot_mapping
 
         if ubatch_slices is not None:
+            assert self.pcp_world_size == 1, "PCP does not support ubatch slicing yet."
             result: list[dict[str, torch.Tensor]] = []
             for ubatch in ubatch_slices:
                 sliced_mappings: dict[str, torch.Tensor] = {}

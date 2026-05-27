@@ -58,11 +58,14 @@ class PCPManager:
             (max_num_reqs,), device="cpu", dtype=torch.int64
         )
         self.num_pcp_pads_cpu = self.num_pcp_pads_cpu_tensor.numpy()
-        self.pcp_unpad_mask_cpu_tensor = torch.zeros(
+        self.pcp_unpad_mask = CpuGpuBuffer(
             (max_buffer_num_tokens,),
-            device="cpu",
             dtype=torch.bool,
+            device=device,
+            pin_memory=pin_memory,
         )
+        self.pcp_unpad_mask_cpu_tensor = self.pcp_unpad_mask.cpu
+        self.pcp_unpad_mask_gpu_tensor = self.pcp_unpad_mask.gpu
         self.pcp_unpad_mask_cpu = self.pcp_unpad_mask_cpu_tensor.numpy()
 
     @staticmethod
@@ -127,6 +130,7 @@ class PCPManager:
         self.pcp_unpad_mask_cpu[: pcp_padded_arange.shape[0]] = (
             pcp_padded_arange < np.repeat(tokens, num_padded_scheduled_tokens)
         )
+        self.pcp_unpad_mask.copy_to_gpu(pcp_padded_arange.shape[0])
 
         pcp_tokens = num_padded_scheduled_tokens // self.pcp_world_size
         pcp_chunk_sizes = (pcp_tokens // 2).clip(min=1)

@@ -392,6 +392,9 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    pcp_allgather_restore_idx: torch.Tensor | None = None
+    """Indices that restore PCP all-gathered tensors to original token order"""
+
     positions: torch.Tensor | None = None
     """(num_actual_tokens,) token positions.  Optional; set when the caller
     has positions available so that builders can pre-compute position-dependent
@@ -489,6 +492,7 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            pcp_allgather_restore_idx=self.pcp_allgather_restore_idx,
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
         )
 
