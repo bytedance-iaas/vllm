@@ -100,6 +100,7 @@ class ExpertTokensMetadata:
 
     expert_num_tokens: torch.Tensor
     expert_num_tokens_cpu: torch.Tensor | None
+    num_tokens_upper_bound_cpu: int | None = None
 
     @staticmethod
     def make_from_list(
@@ -111,6 +112,7 @@ class ExpertTokensMetadata:
         return ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens_cpu.to(device, non_blocking=True),
             expert_num_tokens_cpu=expert_num_tokens_cpu,
+            num_tokens_upper_bound_cpu=sum(expert_num_tokens_list),
         )
 
 

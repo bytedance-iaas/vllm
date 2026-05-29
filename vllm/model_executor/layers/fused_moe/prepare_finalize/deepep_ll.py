@@ -287,6 +287,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
+        num_tokens_upper_bound_cpu = (
+            a1.size(0) * topk_ids.size(1) * self.num_dispatchers_
+        )
+
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
         (
@@ -322,6 +326,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 quant_config.a1_scale,
                 a1.dtype,
                 quant_config,
+                num_tokens_upper_bound_cpu,
             ),
         )
 
@@ -332,11 +337,14 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_scale: torch.Tensor | None,
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
+        num_tokens_upper_bound_cpu: int | None,
     ) -> mk.PrepareResultType:
         expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
+            expert_num_tokens=expert_num_tokens,
+            expert_num_tokens_cpu=None,
+            num_tokens_upper_bound_cpu=num_tokens_upper_bound_cpu,
         )
 
         return expert_x, expert_x_scale, expert_tokens_meta, None, None

@@ -3,7 +3,6 @@
 from math import prod
 
 import torch
-import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -424,18 +423,158 @@ def trtllm_moe_pack_topk_ids_weights(
     return output.reshape(original_shape)
 
 
-@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+@triton.jit
+def _swiglu_limit_kernel(
+    output_ptr,
+    input_ptr,
+    d: tl.constexpr,
+    output_stride_m: tl.constexpr,
+    output_stride_n: tl.constexpr,
+    input_stride_m: tl.constexpr,
+    input_stride_n: tl.constexpr,
+    swiglu_limit: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    token_idx = tl.program_id(0)
+    dim_block_idx = tl.program_id(1)
+    dim_offsets = dim_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    dim_mask = dim_offsets < d
+
+    gate_offsets = token_idx * input_stride_m + dim_offsets * input_stride_n
+    up_offsets = gate_offsets + d * input_stride_n
+    output_offsets = token_idx * output_stride_m + dim_offsets * output_stride_n
+
+    gate = tl.load(input_ptr + gate_offsets, mask=dim_mask, other=0.0).to(tl.float32)
+    up = tl.load(input_ptr + up_offsets, mask=dim_mask, other=0.0).to(tl.float32)
+
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, swiglu_limit)
+        up = tl.minimum(tl.maximum(up, -swiglu_limit), swiglu_limit)
+
+    sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+    tl.store(output_ptr + output_offsets, gate * sigmoid * up, mask=dim_mask)
+
+
+@triton.jit
+def _batched_swiglu_limit_kernel(
+    output_ptr,
+    input_ptr,
+    sorted_token_ids_ptr,
+    num_tokens_post_padded_ptr,
+    total_rows: tl.constexpr,
+    d: tl.constexpr,
+    output_stride_m: tl.constexpr,
+    output_stride_n: tl.constexpr,
+    input_stride_m: tl.constexpr,
+    input_stride_n: tl.constexpr,
+    swiglu_limit: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    sorted_idx = tl.program_id(0)
+    dim_block_idx = tl.program_id(1)
+    dim_offsets = dim_block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    dim_mask = dim_offsets < d
+
+    valid_rows = tl.load(num_tokens_post_padded_ptr)
+    token_idx = tl.load(
+        sorted_token_ids_ptr + sorted_idx,
+        mask=sorted_idx < valid_rows,
+        other=total_rows,
+    ).to(tl.int64)
+    token_mask = (sorted_idx < valid_rows) & (token_idx >= 0) & (token_idx < total_rows)
+
+    gate_offsets = token_idx * input_stride_m + dim_offsets * input_stride_n
+    up_offsets = gate_offsets + d * input_stride_n
+    output_offsets = token_idx * output_stride_m + dim_offsets * output_stride_n
+    mask = token_mask & dim_mask
+
+    gate = tl.load(input_ptr + gate_offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(input_ptr + up_offsets, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, swiglu_limit)
+        up = tl.minimum(tl.maximum(up, -swiglu_limit), swiglu_limit)
+
+    sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+    tl.store(output_ptr + output_offsets, gate * sigmoid * up, mask=mask)
+
+
+def _swiglu_block_size(d: int) -> int:
+    return min(triton.next_power_of_2(d), 1024)
+
+
 def swiglu_limit_func(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
     swiglu_limit: float = 0.0,
 ) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d]
-    up = input[:, d:]
+    assert input.ndim == 2
+    assert output.ndim == 2
+    assert input.shape[1] == output.shape[1] * 2
+    assert input.shape[0] == output.shape[0]
 
-    if swiglu_limit > 0:
-        gate = torch.clamp(gate, max=swiglu_limit)
-        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+    n_tokens = input.shape[0]
+    if n_tokens == 0:
+        return
 
-    output.copy_(F.silu(gate) * up)
+    d = output.shape[1]
+    block_size = _swiglu_block_size(d)
+    grid = (n_tokens, triton.cdiv(d, block_size))
+    _swiglu_limit_kernel[grid](
+        output,
+        input,
+        d,
+        output.stride(0),
+        output.stride(1),
+        input.stride(0),
+        input.stride(1),
+        swiglu_limit,
+        HAS_LIMIT=swiglu_limit > 0,
+        BLOCK_SIZE=block_size,
+    )
+
+
+def batched_swiglu_limit_func(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    swiglu_limit: float = 0.0,
+    bucket_size: int | None = None,
+) -> None:
+    assert input.ndim == 2
+    assert output.ndim == 2
+    assert input.shape[1] == output.shape[1] * 2
+    assert input.shape[0] == output.shape[0]
+    assert sorted_token_ids.ndim == 1
+    assert num_tokens_post_padded.numel() == 1
+
+    total_rows = input.shape[0]
+    if total_rows == 0:
+        return
+
+    n_tokens = bucket_size if bucket_size is not None else total_rows
+    n_tokens = min(n_tokens, sorted_token_ids.numel())
+    if n_tokens == 0:
+        return
+
+    d = output.shape[1]
+    block_size = _swiglu_block_size(d)
+    grid = (n_tokens, triton.cdiv(d, block_size))
+    _batched_swiglu_limit_kernel[grid](
+        output,
+        input,
+        sorted_token_ids,
+        num_tokens_post_padded,
+        total_rows,
+        d,
+        output.stride(0),
+        output.stride(1),
+        input.stride(0),
+        input.stride(1),
+        swiglu_limit,
+        HAS_LIMIT=swiglu_limit > 0,
+        BLOCK_SIZE=block_size,
+    )
