@@ -459,7 +459,7 @@ def _batched_swiglu_limit_kernel(
     token_idx = tl.load(
         sorted_token_ids_ptr + sorted_idx,
         mask=sorted_idx < valid_rows,
-        other=total_rows,
+        other=0,
     ).to(tl.int64)
     token_mask = (sorted_idx < valid_rows) & (token_idx >= 0) & (token_idx < total_rows)
 
@@ -482,7 +482,7 @@ def _batched_swiglu_limit_kernel(
 def _swiglu_block_size(d: int) -> int:
     return min(triton.next_power_of_2(d), 1024)
 
-
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def swiglu_limit_func(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
