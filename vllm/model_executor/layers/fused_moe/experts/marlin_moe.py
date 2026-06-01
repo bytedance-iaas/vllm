@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     disable_inplace,
+    batched_swiglu_limit_func,
     swiglu_limit_func,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -52,6 +53,46 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+_BATCHED_SWIGLU_BUCKET_SIZES = (
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+)
+
+
+def _select_batched_swiglu_bucket_size(
+    expert_num_tokens_cpu: torch.Tensor | None,
+    num_tokens_upper_bound_cpu: int | None,
+    num_experts: int,
+    block_size_m: int,
+    sorted_token_window_capacity: int,
+) -> int | None:
+    if expert_num_tokens_cpu is not None:
+        valid_rows = 0
+        for num_tokens in expert_num_tokens_cpu.tolist():
+            num_tokens = int(num_tokens)
+            valid_rows += (
+                (num_tokens + block_size_m - 1) // block_size_m
+            ) * block_size_m
+    elif num_tokens_upper_bound_cpu is not None:
+        valid_rows = int(num_tokens_upper_bound_cpu)
+        valid_rows += num_experts * (block_size_m - 1)
+    else:
+        return None
+
+    valid_rows = min(valid_rows, sorted_token_window_capacity)
+    for bucket_size in _BATCHED_SWIGLU_BUCKET_SIZES:
+        if valid_rows <= bucket_size:
+            return min(bucket_size, sorted_token_window_capacity)
+    return sorted_token_window_capacity
 
 
 def _fused_marlin_moe(
@@ -92,6 +133,8 @@ def _fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     is_k_full: bool = True,
     clamp_limit: float | None = None,
+    batched_activation: bool = False,
+    activation_bucket_size: int | None = None,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -159,17 +202,27 @@ def _fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
-    if clamp_limit is not None and activation == MoEActivation.SILU:
+    activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
+    if activation == MoEActivation.SILU and batched_activation:
+        batched_swiglu_limit_func(
+            intermediate_cache2,
+            activation_input,
+            sorted_token_ids,
+            num_tokens_post_padded,
+            clamp_limit or 0.0,
+            bucket_size=activation_bucket_size,
+        )
+    elif activation == MoEActivation.SILU and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
-            intermediate_cache1.view(-1, w13_num_shards * N),
+            activation_input,
             clamp_limit,
         )
     else:
         activation_func(
             activation,
             intermediate_cache2,
-            intermediate_cache1.view(-1, w13_num_shards * N),
+            activation_input,
         )
 
     if output is None:
@@ -419,6 +472,8 @@ def batched_fused_marlin_moe(
     input_dtype: torch.dtype | None = None,
     inplace: bool = False,
     clamp_limit: float | None = None,
+    expert_num_tokens_cpu: torch.Tensor | None = None,
+    num_tokens_upper_bound_cpu: int | None = None,
 ) -> torch.Tensor:
     """
     This function massages the inputs so the batched hidden_states can be
@@ -516,6 +571,16 @@ def batched_fused_marlin_moe(
     topk_weights = torch.ones(
         (M, topk), device=hidden_states.device, dtype=torch.float32
     )
+    # Use fixed buckets for CUDA graph reuse; if valid rows exceed the largest
+    # bucket, _select_batched_swiglu_bucket_size() falls back to the full
+    # sorted-token window.
+    activation_bucket_size = _select_batched_swiglu_bucket_size(
+        expert_num_tokens_cpu=expert_num_tokens_cpu,
+        num_tokens_upper_bound_cpu=num_tokens_upper_bound_cpu,
+        num_experts=E,
+        block_size_m=block_size_m,
+        sorted_token_window_capacity=sorted_token_ids.numel(),
+    )
 
     assert activation is not None
     output = _fused_marlin_moe(
@@ -553,6 +618,8 @@ def batched_fused_marlin_moe(
         input_dtype=input_dtype,
         is_k_full=is_k_full,
         clamp_limit=clamp_limit,
+        batched_activation=True,
+        activation_bucket_size=activation_bucket_size,
     )
 
     output = output.view(B, BATCH_TOKENS_MAX, K)
@@ -1005,4 +1072,8 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             input_dtype=self.input_dtype,
             is_k_full=self.is_k_full,
             clamp_limit=self.gemm1_clamp_limit,
+            expert_num_tokens_cpu=expert_tokens_meta.expert_num_tokens_cpu,
+            num_tokens_upper_bound_cpu=(
+                expert_tokens_meta.num_tokens_upper_bound_cpu
+            ),
         )
