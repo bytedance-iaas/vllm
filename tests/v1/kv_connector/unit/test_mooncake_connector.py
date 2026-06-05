@@ -393,6 +393,102 @@ async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
         prefill_worker.shutdown()
 
 
+def test_align_transfer_regions_matches_shared_aliases():
+    """Shared physical regions should align by alias overlap."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.self_attn",
+                "model.layers.4.swa_attn",
+            ),
+            layer_indices=(4, 4),
+            group_indices=(0, 1),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.swa_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.swa_attn",
+                "model.layers.4.self_attn",
+            ),
+            layer_indices=(4, 4),
+            group_indices=(1, 0),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions,
+        remote_regions,
+    )
+
+    assert err is None
+    assert aligned_local == local_regions
+    assert aligned_remote == remote_regions
+
+
+def test_align_transfer_regions_rejects_split_alias_occurrence_mismatch():
+    """Alias matching should not drop extra consumer regions silently."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.self_attn",
+                "model.layers.4.swa_attn",
+            ),
+            layer_indices=(4, 4),
+            group_indices=(0, 1),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            group_indices=(0,),
+        ),
+        TransferRegion(
+            layer_name="model.layers.4.swa_attn",
+            layer_index=4,
+            base_addr=0x3000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.swa_attn",),
+            layer_indices=(4,),
+            group_indices=(1,),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions,
+        remote_regions,
+    )
+
+    assert aligned_local == []
+    assert aligned_remote == []
+    assert err is not None
+    assert "alias occurrence mismatch" in err
+
+
 def test_basic_interface():
     """Unit test for basic MooncakeConnector interface functionality."""
 
