@@ -57,6 +57,434 @@ class FakeMooncakeWrapper:
         return 0
 
 
+def test_align_transfer_regions_supports_pp_layer_subset():
+    """PP producer stages should match decoder regions by layer identity."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0x1000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.3.self_attn",
+            layer_index=3,
+            base_addr=0x3000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0xA000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.2.self_attn",
+            layer_index=2,
+            base_addr=0xC000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.3.self_attn",
+            layer_index=3,
+            base_addr=0xD000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert err is None
+    assert [r.layer_name for r in aligned_local] == [
+        "model.layers.1.self_attn",
+        "model.layers.3.self_attn",
+    ]
+    assert [r.layer_name for r in aligned_remote] == [
+        "model.layers.1.self_attn",
+        "model.layers.3.self_attn",
+    ]
+    assert [r.base_addr for r in aligned_remote] == [0xB000, 0xD000]
+
+
+def test_align_transfer_regions_uses_layer_name_occurrences():
+    """Repeated layer names should align by occurrence order."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0x1000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0x1100,
+            block_len=256,
+            kv_block_len=128,
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0xA000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB000,
+            block_len=256,
+            kv_block_len=128,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB100,
+            block_len=256,
+            kv_block_len=128,
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert err is None
+    assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
+    assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+
+@pytest.mark.asyncio
+async def test_build_transfer_params_separates_prefill_pp_layers():
+    """Each producer PP stage should send only its registered layer shard."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
+
+    block_len = 256
+    remote_regions = [
+        TransferRegion(
+            layer_name=f"model.layers.{layer_index}.self_attn",
+            layer_index=layer_index,
+            base_addr=base_addr,
+            block_len=block_len,
+            kv_block_len=block_len,
+        )
+        for layer_index, base_addr in [
+            (0, 0xA000),
+            (1, 0xB000),
+            (2, 0xC000),
+            (3, 0xD000),
+        ]
+    ]
+    producer_pp_regions = {
+        0: [
+            TransferRegion(
+                layer_name="model.layers.0.self_attn",
+                layer_index=0,
+                base_addr=0x1000,
+                block_len=block_len,
+                kv_block_len=block_len,
+            ),
+            TransferRegion(
+                layer_name="model.layers.1.self_attn",
+                layer_index=1,
+                base_addr=0x2000,
+                block_len=block_len,
+                kv_block_len=block_len,
+            ),
+        ],
+        1: [
+            TransferRegion(
+                layer_name="model.layers.2.self_attn",
+                layer_index=2,
+                base_addr=0x3000,
+                block_len=block_len,
+                kv_block_len=block_len,
+            ),
+            TransferRegion(
+                layer_name="model.layers.3.self_attn",
+                layer_index=3,
+                base_addr=0x4000,
+                block_len=block_len,
+                kv_block_len=block_len,
+            ),
+        ],
+    }
+    expected_by_pp_rank = {
+        0: {
+            "layers": [0, 1],
+            "src_ptrs": [0x1000 + 10 * block_len, 0x2000 + 10 * block_len],
+            "dst_ptrs": [0xA000 + 20 * block_len, 0xB000 + 20 * block_len],
+        },
+        1: {
+            "layers": [2, 3],
+            "src_ptrs": [0x3000 + 10 * block_len, 0x4000 + 10 * block_len],
+            "dst_ptrs": [0xC000 + 20 * block_len, 0xD000 + 20 * block_len],
+        },
+    }
+
+    transfer_id = "xfer-pp-split"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-pp",
+        transfer_id=transfer_id,
+        local_block_ids=[[10, 11]],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"d-req-pp": (transfer_id, [[20, 21]])},
+        kv_caches_base_addr=[region.base_addr for region in remote_regions],
+        block_lens=[region.block_len for region in remote_regions],
+        registered_layer_names=[region.layer_name for region in remote_regions],
+        registered_layer_indices=[region.layer_index for region in remote_regions],
+    )
+
+    for pp_rank, local_regions in producer_pp_regions.items():
+        aligned_local, aligned_remote, err = _align_transfer_regions(
+            local_regions, remote_regions
+        )
+
+        assert err is None
+        assert [r.layer_index for r in aligned_local] == (
+            expected_by_pp_rank[pp_rank]["layers"]
+        )
+        assert [r.layer_index for r in aligned_remote] == (
+            expected_by_pp_rank[pp_rank]["layers"]
+        )
+
+        (
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+            err_reqs,
+            err_msg,
+        ) = await worker._build_transfer_params(
+            ready_reqs=[("d-req-pp", send_meta)],
+            agent_meta=xfer_meta,
+            local_regions=aligned_local,
+            remote_regions=aligned_remote,
+        )
+
+        assert err_reqs == []
+        assert err_msg is None
+        assert src_ptrs == expected_by_pp_rank[pp_rank]["src_ptrs"]
+        assert dst_ptrs == expected_by_pp_rank[pp_rank]["dst_ptrs"]
+        assert lengths == [2 * block_len, 2 * block_len]
+
+
+@pytest.mark.asyncio
+async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
+    monkeypatch,
+):
+    """Producer sends its PP layer shard to the matching consumer layer address."""
+
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        prefill_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        prefill_worker = prefill_connector.connector_worker
+
+        block_len = 4096
+        kv_half = block_len // 2
+        prefill_worker.kv_caches_base_addr = [0x1000]
+        prefill_worker.block_len_per_layer = [block_len]
+        prefill_worker.registered_layer_names = ["model.layers.1.self_attn"]
+        prefill_worker.registered_layer_indices = [1]
+
+        class InlineSenderLoop:
+            async def run_in_executor(self, executor, func, *args):
+                return func(*args)
+
+        origin_sender_loop = prefill_worker.sender_loop
+        prefill_worker.sender_loop = InlineSenderLoop()
+
+        transfer_id = "xfer-layer-align"
+        send_meta = SendBlockMeta(
+            p_req_id="p-req-layer-align",
+            transfer_id=transfer_id,
+            local_block_ids=[[10]],
+            ready=asyncio.Event(),
+        )
+        prefill_worker.reqs_need_send[transfer_id] = send_meta
+        send_meta.ready.set()
+
+        xfer_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={"d-req-layer-align": (transfer_id, [[20]])},
+            kv_caches_base_addr=[0xA000, 0xB000],
+            block_lens=[block_len, block_len],
+            registered_layer_names=[
+                "model.layers.0.self_attn",
+                "model.layers.1.self_attn",
+            ],
+            registered_layer_indices=[0, 1],
+        )
+        mock_socket = AsyncMock(spec=zmq.asyncio.Socket)
+        mock_socket.send_multipart = AsyncMock()
+        identity = b"consumer-layer-align"
+
+        with patch.object(
+            prefill_worker, "_send_blocks", return_value=0
+        ) as mock_send_blocks:
+            await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
+
+        src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0][1:]
+        assert src_ptrs == [
+            0x1000 + 10 * block_len,
+            0x1000 + 10 * block_len + kv_half,
+        ]
+        assert dst_ptrs == [
+            0xB000 + 20 * block_len,
+            0xB000 + 20 * block_len + kv_half,
+        ]
+        assert lengths == [kv_half, kv_half]
+
+        sent_identity, sent_payload = mock_socket.send_multipart.call_args[0][0]
+        assert sent_identity == identity
+        response = prefill_worker._xfer_resp_decoder.decode(sent_payload)
+        assert response.status == MooncakeXferResponseStatus.FINISH
+        assert response.ok_reqs == ["d-req-layer-align"]
+
+        prefill_worker.sender_loop = origin_sender_loop
+        prefill_worker.shutdown()
+
+
+def test_align_transfer_regions_matches_shared_aliases():
+    """Shared physical regions should align by alias overlap."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.self_attn",
+                "model.layers.4.swa_attn",
+            ),
+            layer_indices=(4, 4),
+            group_indices=(0, 1),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.swa_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.swa_attn",
+                "model.layers.4.self_attn",
+            ),
+            layer_indices=(4, 4),
+            group_indices=(1, 0),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions,
+        remote_regions,
+    )
+
+    assert err is None
+    assert aligned_local == local_regions
+    assert aligned_remote == remote_regions
+
+
+def test_align_transfer_regions_rejects_split_alias_occurrence_mismatch():
+    """Alias matching should not drop extra consumer regions silently."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.self_attn",
+                "model.layers.4.swa_attn",
+            ),
+            layer_indices=(4, 4),
+            group_indices=(0, 1),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            group_indices=(0,),
+        ),
+        TransferRegion(
+            layer_name="model.layers.4.swa_attn",
+            layer_index=4,
+            base_addr=0x3000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.swa_attn",),
+            layer_indices=(4,),
+            group_indices=(1,),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions,
+        remote_regions,
+    )
+
+    assert aligned_local == []
+    assert aligned_remote == []
+    assert err is not None
+    assert "alias occurrence mismatch" in err
+
+
 def test_basic_interface():
     """Unit test for basic MooncakeConnector interface functionality."""
 
