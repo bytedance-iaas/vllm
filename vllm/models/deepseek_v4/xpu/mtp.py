@@ -25,7 +25,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -56,14 +58,6 @@ logger = init_logger(__name__)
 # ``.weight_scale_inv``. Mirrors the per-instance mapper built by
 # ``_make_deepseek_v4_weights_mapper`` in deepseek_v4.py.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
-_OPTIONAL_SCALE_SUFFIXES = (
-    ".weight_scale",
-    ".weight_scale_inv",
-    ".input_scale",
-    "_weight_scale",
-    "_weight_scale_inv",
-    "_input_scale",
-)
 
 
 class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
@@ -72,7 +66,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         vllm_config: VllmConfig,
         topk_indices_buffer: torch.Tensor,
         prefix: str,
-        aux_stream_list: list[torch.cuda.Stream] | None = None,
+        aux_stream_list: list | None = None,
     ) -> None:
         super().__init__()
 
@@ -157,10 +151,6 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        if current_platform.is_cuda():
-            hidden_states = self.mtp_block.hc_post(
-                hidden_states, residual, post_mix, res_mix
-            )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
@@ -183,13 +173,8 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             device=self.device,
         )
 
-        # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model. ROCm runs the same work serially for now.
-        aux_stream_list = (
-            None
-            if current_platform.is_rocm()
-            else [torch.cuda.Stream() for _ in range(3)]
-        )
+        # Disable aux streams on XPU — no multi-stream overlap support.
+        aux_stream_list = None
 
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
@@ -302,6 +287,11 @@ class DeepSeekV4MTP(nn.Module):
             ".emb.tok_emb.weight": ".embed_tokens.weight",
             ".head.weight": ".shared_head.head.weight",
             ".norm.weight": ".shared_head.norm.weight",
+            # Pre-MoE norm + gate are now owned by
+            # ``DeepseekV4MoE.norm_gate`` (see NormGatedLinear).
+            ".ffn_norm.weight": ".ffn.norm_gate.norm.weight",
+            ".ffn.gate.weight": ".ffn.norm_gate.gate.weight",
+            ".ffn.gate.tid2eid": ".ffn.norm_gate.tid2eid",
         }
 
         def _remap_weight_name(name: str) -> str:
@@ -346,7 +336,7 @@ class DeepSeekV4MTP(nn.Module):
                 self.config.n_routed_experts
             )
         else:
-            expert_mapping = FusedMoE.make_expert_params_mapping(
+            expert_mapping = fused_moe_make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="w1",
                 ckpt_down_proj_name="w2",
@@ -417,10 +407,6 @@ class DeepSeekV4MTP(nn.Module):
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
-                        if name_mapped not in params_dict:
-                            if name_mapped.endswith(_OPTIONAL_SCALE_SUFFIXES):
-                                continue
-                            raise KeyError(name_mapped)
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -437,6 +423,7 @@ class DeepSeekV4MTP(nn.Module):
                             return_success=True,
                         )
                         if success:
+                            name = name_mapped
                             loaded_params.add(name_mapped)
                             break
                     continue
@@ -452,16 +439,12 @@ class DeepSeekV4MTP(nn.Module):
                             ".shared_experts.w2", ".shared_experts.down_proj"
                         )
                     if name.endswith(".ffn.gate.bias"):
-                        # ``e_score_correction_bias`` lives on the gate
-                        # under a different attribute name.
+                        # ``e_score_correction_bias`` lives on
+                        # ``norm_gate`` directly (not on the inner gate).
                         name = name.replace(
                             ".ffn.gate.bias",
-                            ".ffn.gate.e_score_correction_bias",
+                            ".ffn.norm_gate.e_score_correction_bias",
                         )
-                    if name not in params_dict:
-                        if name.endswith(_OPTIONAL_SCALE_SUFFIXES):
-                            continue
-                        raise KeyError(name)
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
