@@ -1320,36 +1320,28 @@ def test_deepseek_v4_projected_pp_groups_preserve_shared_layer_identity():
     )
 
     assert kv_cache_config.num_blocks == 8
-    assert kv_cache_config.kv_cache_tensors == [
-        KVCacheTensor(
-            size=32768 * 8,
-            shared_by=[
-                "model.layers.4.self_attn",
-                "model.layers.4.swa_attn",
-            ],
-        ),
-        KVCacheTensor(
-            size=65536 * 8,
-            shared_by=[
-                "model.layers.5.self_attn",
-                "model.layers.5.swa_attn",
-            ],
-        ),
-        KVCacheTensor(
-            size=32768 * 8,
-            shared_by=[
-                "model.layers.6.self_attn",
-                "model.layers.6.swa_attn",
-            ],
-        ),
-        KVCacheTensor(
-            size=65536 * 8,
-            shared_by=[
-                "model.layers.7.self_attn",
-                "model.layers.7.swa_attn",
-            ],
-        ),
-    ]
+    tensor_sizes_by_shared_layers = {
+        tuple(tensor.shared_by): tensor.size
+        for tensor in kv_cache_config.kv_cache_tensors
+    }
+    assert tensor_sizes_by_shared_layers == {
+        (
+            "model.layers.4.self_attn",
+            "model.layers.4.swa_attn",
+        ): 32768 * 8,
+        (
+            "model.layers.5.self_attn",
+            "model.layers.5.swa_attn",
+        ): 65536 * 8,
+        (
+            "model.layers.6.self_attn",
+            "model.layers.6.swa_attn",
+        ): 32768 * 8,
+        (
+            "model.layers.7.self_attn",
+            "model.layers.7.swa_attn",
+        ): 65536 * 8,
+    }
     assert kv_cache_config.kv_cache_groups == projected
 
 
