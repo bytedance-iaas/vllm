@@ -370,6 +370,159 @@ def test_select_region_block_ids_skips_empty_remote_groups():
     ".mooncake_connector.TransferEngine",
     FakeMooncakeWrapper,
 )
+async def test_build_transfer_params_filters_groups_per_shared_alias(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+    )
+    kv_cache_config = make_kv_cache_config(
+        block_size=vllm_config.cache_config.block_size,
+        swa_enabled=True,
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            kv_cache_config,
+        )
+        worker = connector.connector_worker
+
+        try:
+            block_len = 100
+            transfer_id = "xfer-dsv4-shifted-alias"
+            send_meta = SendBlockMeta(
+                p_req_id="p-dsv4-shifted-alias",
+                transfer_id=transfer_id,
+                local_block_ids=[
+                    [10],
+                    [20],
+                    [30],
+                    [40],
+                    [50],
+                ],
+                ready=asyncio.Event(),
+            )
+            xfer_meta = MooncakeXferMetadata(
+                remote_hostname="consumer-host",
+                remote_port=54321,
+                remote_tp_size=1,
+                remote_tp_rank=0,
+                req_blocks={
+                    "d-dsv4-shifted-alias": (
+                        transfer_id,
+                        [
+                            [110],
+                            [120],
+                            [130],
+                            [140],
+                            [150],
+                        ],
+                    )
+                },
+                kv_caches_base_addr=[0x2000, 0x3000],
+                block_lens=[block_len, block_len],
+            )
+
+            local_region = TransferRegion(
+                layer_name="model.layers.30.attn",
+                layer_index=30,
+                base_addr=0x1000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                layer_aliases=(
+                    "model.layers.30.attn",
+                    "model.layers.30.attn.swa_cache",
+                    "model.layers.31.attn.swa_cache",
+                    "model.layers.30.attn.compressor.state_cache",
+                    "model.layers.31.attn.compressor.state_cache",
+                ),
+                layer_indices=(30, 30, 31, 30, 31),
+                group_indices=(0, 1, 2, 3, 4),
+                alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+            )
+            remote_current_layer = TransferRegion(
+                layer_name="model.layers.30.attn",
+                layer_index=30,
+                base_addr=0x2000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                layer_aliases=(
+                    "model.layers.30.attn",
+                    "model.layers.28.attn.swa_cache",
+                    "model.layers.29.attn.swa_cache",
+                    "model.layers.30.attn.compressor.state_cache",
+                    "model.layers.31.attn.compressor.state_cache",
+                ),
+                layer_indices=(30, 28, 29, 30, 31),
+                group_indices=(0, 1, 2, 3, 4),
+                alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+            )
+            remote_shifted_layer = TransferRegion(
+                layer_name="model.layers.32.attn",
+                layer_index=32,
+                base_addr=0x3000,
+                block_len=block_len,
+                kv_block_len=block_len,
+                layer_aliases=(
+                    "model.layers.32.attn",
+                    "model.layers.30.attn.swa_cache",
+                    "model.layers.31.attn.swa_cache",
+                    "model.layers.32.attn.compressor.state_cache",
+                    "model.layers.33.attn.compressor.state_cache",
+                ),
+                layer_indices=(32, 30, 31, 32, 33),
+                group_indices=(0, 1, 2, 3, 4),
+                alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+            )
+
+            (
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                err_reqs,
+                err_msg,
+            ) = await worker._build_transfer_params(
+                [("d-dsv4-shifted-alias", send_meta)],
+                xfer_meta,
+                [local_region, local_region],
+                [remote_current_layer, remote_shifted_layer],
+            )
+
+            assert err_reqs == []
+            assert err_msg is None
+            assert lengths == [block_len] * 5
+            assert [(ptr - 0x1000) // block_len for ptr in src_ptrs] == [
+                10,
+                40,
+                50,
+                20,
+                30,
+            ]
+            assert [
+                (ptr - base) // block_len
+                for ptr, base in zip(
+                    dst_ptrs,
+                    [0x2000, 0x2000, 0x2000, 0x3000, 0x3000],
+                )
+            ] == [
+                110,
+                140,
+                150,
+                120,
+                130,
+            ]
+        finally:
+            worker.shutdown()
+
+
+@pytest.mark.asyncio
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
+    ".mooncake_connector.TransferEngine",
+    FakeMooncakeWrapper,
+)
 async def test_build_transfer_params_filters_groups_per_shared_region(monkeypatch):
     monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
     vllm_config = create_vllm_config(
