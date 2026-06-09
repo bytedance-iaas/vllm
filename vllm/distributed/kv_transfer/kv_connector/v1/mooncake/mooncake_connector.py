@@ -804,6 +804,7 @@ class MooncakeConnectorScheduler:
         kv_cache_config: "KVCacheConfig",
     ):
         self.vllm_config = vllm_config
+        self.engine_id = engine_id
         self.block_size = vllm_config.cache_config.block_size
 
         assert vllm_config.kv_transfer_config
@@ -1033,7 +1034,14 @@ class MooncakeConnectorScheduler:
                 self.get_sw_clipped_blocks(block_ids),
             )
 
-        return delay_free_blocks, None
+        bootstrap_host, bootstrap_port = get_mooncake_bootstrap_addr(self.vllm_config)
+        return delay_free_blocks, dict(
+            do_remote_prefill=True,
+            do_remote_decode=False,
+            remote_engine_id=self.engine_id,
+            remote_bootstrap_addr=f"http://{bootstrap_host}:{bootstrap_port}",
+            transfer_id=params["transfer_id"],
+        )
 
 
 class MooncakeConnectorWorker:

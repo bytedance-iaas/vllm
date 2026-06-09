@@ -728,8 +728,17 @@ def test_scheduler_request_finished():
 
     # Case: Capped length (Successful prefill, need to send to decoder)
     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
-    delay_free, _ = scheduler_connector.request_finished(request, block_ids=([10, 11],))
+    delay_free, kv_transfer_params = scheduler_connector.request_finished(
+        request, block_ids=([10, 11],)
+    )
     assert delay_free is True
+    assert kv_transfer_params == {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "remote_engine_id": scheduler_connector.engine_id,
+        "remote_bootstrap_addr": "http://127.0.0.1:8998",
+        "transfer_id": request.request_id,
+    }
     assert "id-1" in scheduler_connector._reqs_need_send
     assert scheduler_connector._reqs_need_send["id-1"][1] == [[10, 11]]
 
