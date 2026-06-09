@@ -56,6 +56,14 @@ logger = init_logger(__name__)
 # ``.weight_scale_inv``. Mirrors the per-instance mapper built by
 # ``_make_deepseek_v4_weights_mapper`` in deepseek_v4.py.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+_OPTIONAL_SCALE_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".input_scale",
+    "_weight_scale",
+    "_weight_scale_inv",
+    "_input_scale",
+)
 
 
 class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
@@ -407,6 +415,10 @@ class DeepSeekV4MTP(nn.Module):
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
+                        if name_mapped not in params_dict:
+                            if name_mapped.endswith(_OPTIONAL_SCALE_SUFFIXES):
+                                continue
+                            raise KeyError(name_mapped)
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -423,7 +435,6 @@ class DeepSeekV4MTP(nn.Module):
                             return_success=True,
                         )
                         if success:
-                            name = name_mapped
                             loaded_params.add(name_mapped)
                             break
                     continue
@@ -445,6 +456,10 @@ class DeepSeekV4MTP(nn.Module):
                             ".ffn.gate.bias",
                             ".ffn.gate.e_score_correction_bias",
                         )
+                    if name not in params_dict:
+                        if name.endswith(_OPTIONAL_SCALE_SUFFIXES):
+                            continue
+                        raise KeyError(name)
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
