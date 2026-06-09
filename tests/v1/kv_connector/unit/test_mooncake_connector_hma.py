@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
+    _align_transfer_regions,
     _common_group_indices_for_regions,
     _select_region_block_ids,
 )
@@ -362,6 +363,132 @@ def test_select_region_block_ids_skips_empty_remote_groups():
     assert local_block_ids == [20, 21]
     assert remote_block_ids == [120, 121]
     assert len(local_block_ids) == len(remote_block_ids)
+
+
+def test_align_transfer_regions_fans_out_shared_alias_groups():
+    local_swa_layer = TransferRegion(
+        layer_name="model.layers.4.attn.swa_cache",
+        layer_index=4,
+        base_addr=0x1000,
+        block_len=100,
+        kv_block_len=100,
+        layer_aliases=(
+            "model.layers.4.attn.swa_cache",
+            "model.layers.4.attn.compressor.state_cache",
+        ),
+        layer_indices=(4, 4),
+        group_indices=(1, 3),
+        alias_group_indices=((1,), (3,)),
+    )
+    local_layer = TransferRegion(
+        layer_name="model.layers.6.attn",
+        layer_index=6,
+        base_addr=0x2000,
+        block_len=100,
+        kv_block_len=100,
+        layer_aliases=(
+            "model.layers.6.attn",
+            "model.layers.6.attn.swa_cache",
+            "model.layers.5.attn.swa_cache",
+            "model.layers.6.attn.compressor.state_cache",
+            "model.layers.5.attn.compressor.state_cache",
+        ),
+        layer_indices=(6, 6, 5, 6, 5),
+        group_indices=(0, 1, 2, 3, 4),
+        alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+    )
+    remote_prev_layer = TransferRegion(
+        layer_name="model.layers.4.attn",
+        layer_index=4,
+        base_addr=0x3000,
+        block_len=100,
+        kv_block_len=100,
+        layer_aliases=(
+            "model.layers.4.attn",
+            "model.layers.2.attn.swa_cache",
+            "model.layers.3.attn.swa_cache",
+            "model.layers.4.attn.compressor.state_cache",
+            "model.layers.5.attn.compressor.state_cache",
+        ),
+        layer_indices=(4, 2, 3, 4, 5),
+        group_indices=(0, 1, 2, 3, 4),
+        alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+    )
+    remote_current_layer = TransferRegion(
+        layer_name="model.layers.6.attn",
+        layer_index=6,
+        base_addr=0x4000,
+        block_len=100,
+        kv_block_len=100,
+        layer_aliases=(
+            "model.layers.6.attn",
+            "model.layers.4.attn.swa_cache",
+            "model.layers.5.attn.swa_cache",
+            "model.layers.6.attn.compressor.state_cache",
+            "model.layers.7.attn.compressor.state_cache",
+        ),
+        layer_indices=(6, 4, 5, 6, 7),
+        group_indices=(0, 1, 2, 3, 4),
+        alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+    )
+    remote_next_layer = TransferRegion(
+        layer_name="model.layers.8.attn",
+        layer_index=8,
+        base_addr=0x5000,
+        block_len=100,
+        kv_block_len=100,
+        layer_aliases=(
+            "model.layers.8.attn",
+            "model.layers.6.attn.swa_cache",
+            "model.layers.7.attn.swa_cache",
+            "model.layers.8.attn.compressor.state_cache",
+            "model.layers.9.attn.compressor.state_cache",
+        ),
+        layer_indices=(8, 6, 7, 8, 9),
+        group_indices=(0, 1, 2, 3, 4),
+        alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
+    )
+
+    local_regions, remote_regions, err = _align_transfer_regions(
+        [local_swa_layer, local_layer],
+        [remote_prev_layer, remote_current_layer, remote_next_layer],
+    )
+
+    assert err is None
+    aligned_groups = [
+        (
+            local_region.layer_name,
+            remote_region.layer_name,
+            _common_group_indices_for_regions(
+                local_region,
+                remote_region,
+                num_groups=5,
+            ),
+        )
+        for local_region, remote_region in zip(local_regions, remote_regions)
+    ]
+    assert aligned_groups == [
+        (
+            "model.layers.4.attn.swa_cache",
+            "model.layers.6.attn",
+            (1,),
+        ),
+        (
+            "model.layers.6.attn",
+            "model.layers.4.attn",
+            (4,),
+        ),
+        (
+            "model.layers.6.attn",
+            "model.layers.6.attn",
+            (0, 2, 3),
+        ),
+        (
+            "model.layers.6.attn",
+            "model.layers.8.attn",
+            (1,),
+        ),
+    ]
 
 
 @pytest.mark.asyncio

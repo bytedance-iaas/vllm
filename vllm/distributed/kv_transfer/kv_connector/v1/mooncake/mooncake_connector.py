@@ -378,6 +378,71 @@ def _align_transfer_regions(
         _region_has_aliases(region) for region in local_regions + remote_regions
     )
     if has_aliases:
+        has_alias_group_metadata = all(
+            not _region_has_aliases(region) or bool(region.alias_group_indices)
+            for region in local_regions + remote_regions
+        )
+        if has_alias_group_metadata:
+            alias_group_aligned_local: list[TransferRegion] = []
+            alias_group_aligned_remote: list[TransferRegion] = []
+            matched_local_indices: set[int] = set()
+
+            for local_idx, local_region in enumerate(local_regions):
+                alias_group_index_mismatch_region: TransferRegion | None = None
+                for candidate_remote_region in remote_regions:
+                    if not _regions_share_layer_identity(
+                        local_region, candidate_remote_region
+                    ):
+                        continue
+                    if not _regions_have_compatible_layer_indices(
+                        local_region, candidate_remote_region
+                    ):
+                        if alias_group_index_mismatch_region is None:
+                            alias_group_index_mismatch_region = candidate_remote_region
+                        continue
+                    shared_groups = _shared_alias_group_indices(
+                        local_region, candidate_remote_region
+                    )
+                    if shared_groups is None or not shared_groups:
+                        continue
+                    alias_group_aligned_local.append(local_region)
+                    alias_group_aligned_remote.append(candidate_remote_region)
+                    matched_local_indices.add(local_idx)
+
+                if (
+                    local_idx not in matched_local_indices
+                    and alias_group_index_mismatch_region is not None
+                ):
+                    return (
+                        [],
+                        [],
+                        (
+                            "Mooncake registered layer index mismatch for "
+                            f"{local_region.match_layer_names}: producer="
+                            f"{local_region.match_layer_indices}, consumer="
+                            f"{alias_group_index_mismatch_region.match_layer_indices}."
+                        ),
+                    )
+
+            for local_idx, local_region in enumerate(local_regions):
+                if local_idx in matched_local_indices:
+                    continue
+                if any(
+                    _regions_share_layer_identity(local_region, remote_region)
+                    for remote_region in remote_regions
+                ):
+                    return (
+                        [],
+                        [],
+                        (
+                            "Mooncake producer registered layer aliases have no "
+                            "matching consumer alias groups: "
+                            f"{sorted(local_region.match_layer_names)}."
+                        ),
+                    )
+
+            return alias_group_aligned_local, alias_group_aligned_remote, None
+
         alias_aligned_local: list[TransferRegion] = []
         alias_aligned_remote: list[TransferRegion] = []
         used_remote_indices: set[int] = set()
@@ -561,19 +626,26 @@ def _common_group_indices_for_regions(
 def _common_group_indices_from_aliases(
     local_region: TransferRegion, remote_region: TransferRegion, num_groups: int
 ) -> tuple[int, ...] | None:
+    group_indices = _shared_alias_group_indices(local_region, remote_region)
+    if group_indices is None:
+        return None
+    return tuple(g for g in group_indices if 0 <= g < num_groups)
+
+
+def _shared_alias_group_indices(
+    local_region: TransferRegion, remote_region: TransferRegion
+) -> tuple[int, ...] | None:
     if not local_region.alias_group_indices or not remote_region.alias_group_indices:
         return None
 
     local_alias_groups = _alias_group_map(local_region)
     remote_alias_groups = _alias_group_map(remote_region)
     common_aliases = set(local_alias_groups) & set(remote_alias_groups)
-    if not common_aliases:
-        return None
 
     group_indices: set[int] = set()
     for alias in common_aliases:
         group_indices.update(local_alias_groups[alias] & remote_alias_groups[alias])
-    return tuple(sorted(g for g in group_indices if 0 <= g < num_groups))
+    return tuple(sorted(group_indices))
 
 
 def _alias_group_map(region: TransferRegion) -> dict[str, set[int]]:
