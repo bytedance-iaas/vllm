@@ -64,6 +64,15 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 
+_OPTIONAL_SCALE_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".input_scale",
+    "_weight_scale",
+    "_weight_scale_inv",
+    "_input_scale",
+)
+
 
 class DeepseekV4MLP(nn.Module):
     def __init__(
@@ -1288,9 +1297,7 @@ class DeepseekV4Model(nn.Module):
                 if mapped_name not in params_dict:
                     if (
                         param_name == "compressor.fused_wkv_wgate"
-                        and mapped_name.endswith(
-                            (".weight_scale", ".weight_scale_inv", ".input_scale")
-                        )
+                        and mapped_name.endswith(_OPTIONAL_SCALE_SUFFIXES)
                     ):
                         break
                     raise KeyError(mapped_name)
@@ -1317,6 +1324,10 @@ class DeepseekV4Model(nn.Module):
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
+                        if name_mapped not in params_dict:
+                            if name_mapped.endswith(_OPTIONAL_SCALE_SUFFIXES):
+                                continue
+                            raise KeyError(name_mapped)
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -1333,9 +1344,8 @@ class DeepseekV4Model(nn.Module):
                             return_success=True,
                         )
                         if success:
-                            name = name_mapped
+                            loaded_params.add(name_mapped)
                             break
-                    loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
@@ -1349,9 +1359,7 @@ class DeepseekV4Model(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
                     if name not in params_dict:
-                        if name.endswith(
-                            (".weight_scale", ".weight_scale_inv", ".input_scale")
-                        ):
+                        if name.endswith(_OPTIONAL_SCALE_SUFFIXES):
                             continue
                         raise KeyError(name)
                     param = params_dict[name]
