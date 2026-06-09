@@ -199,6 +199,21 @@ def _get_region_group_indices(
     return ()
 
 
+def _summarize_transfer_regions(regions: list[TransferRegion]) -> list[dict[str, Any]]:
+    return [
+        {
+            "layer_name": region.layer_name,
+            "layer_index": region.layer_index,
+            "block_len": region.block_len,
+            "kv_block_len": region.kv_block_len,
+            "aliases": list(region.layer_aliases),
+            "layer_indices": list(region.layer_indices),
+            "group_indices": list(region.group_indices),
+        }
+        for region in regions
+    ]
+
+
 def _compute_sender_transfer_plan(
     local_tp_rank: int,
     local_tp_size: int,
@@ -1073,6 +1088,11 @@ class MooncakeConnectorWorker:
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
+        self.log_transfer_metadata = bool(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "log_transfer_metadata", False
+            )
+        )
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
@@ -1109,6 +1129,8 @@ class MooncakeConnectorWorker:
         self.registered_layer_index_aliases: list[list[int]] = []
         self.registered_group_indices: list[list[int]] = []
         self.seen_base_addresses: list[int] = []
+        self._logged_transfer_metadata = False
+        self._logged_selected_region_blocks = False
 
         assert (parallel_config := vllm_config.parallel_config)
         dp_rank = parallel_config.data_parallel_index
@@ -1373,6 +1395,21 @@ class MooncakeConnectorWorker:
                 )
                 await sock.send_multipart((identity, self._encoder.encode(response)))
                 return
+        if self.log_transfer_metadata and not self._logged_transfer_metadata:
+            logger.info(
+                "Mooncake transfer metadata summary: local_pp=%d local_tp=%d "
+                "remote_pp=%d remote_tp_rank=%d remote_tp_size=%d "
+                "local_replicates=%s local_regions=%s remote_regions=%s",
+                self.pp_rank,
+                self.tp_rank,
+                meta.remote_pp_rank,
+                meta.remote_tp_rank,
+                meta.remote_tp_size,
+                self._producer_cache_is_replicated(),
+                _summarize_transfer_regions(local_regions),
+                _summarize_transfer_regions(remote_regions),
+            )
+            self._logged_transfer_metadata = True
         validation_err = _validate_asymmetric_region_lengths(
             local_regions=local_regions,
             remote_regions=remote_regions,
@@ -1549,6 +1586,9 @@ class MooncakeConnectorWorker:
 
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
+            log_selected_region_blocks = (
+                self.log_transfer_metadata and not self._logged_selected_region_blocks
+            )
 
             if not remote_block_ids_per_group or all(
                 len(g) == 0 for g in remote_block_ids_per_group
@@ -1602,12 +1642,26 @@ class MooncakeConnectorWorker:
                 if not local_block_ids:
                     continue
                 selected_block_count += len(local_block_ids)
+                if log_selected_region_blocks:
+                    logger.info(
+                        "Mooncake selected region blocks for request %s: "
+                        "local_layer=%s remote_layer=%s groups=%s "
+                        "local_blocks=%s remote_blocks=%s",
+                        d_req_id,
+                        local_region.layer_name,
+                        remote_region.layer_name,
+                        region_group_indices,
+                        local_block_ids,
+                        remote_block_ids,
+                    )
                 selected_region_blocks.append(
                     (local_region, remote_region, local_block_ids, remote_block_ids)
                 )
 
             if not selected_region_blocks:
                 continue
+            if log_selected_region_blocks:
+                self._logged_selected_region_blocks = True
 
             logged_transfer_plan = False
             for (
@@ -1884,6 +1938,26 @@ class MooncakeConnectorWorker:
             self.num_blocks,
             self.block_len_per_layer,
         )
+        if self.log_transfer_metadata:
+            logger.info(
+                "Mooncake registered KV transfer metadata: pp_rank=%d tp_rank=%d "
+                "num_blocks=%d block_size=%d use_mla=%s local_replicates=%s "
+                "base_count=%d layer_names=%s layer_indices=%s layer_aliases=%s "
+                "layer_index_aliases=%s group_indices=%s block_lens=%s",
+                self.pp_rank,
+                self.tp_rank,
+                self.num_blocks,
+                self.block_size,
+                self.use_mla,
+                self._producer_cache_is_replicated(),
+                len(self.kv_caches_base_addr),
+                self.registered_layer_names,
+                self.registered_layer_indices,
+                self.registered_layer_aliases,
+                self.registered_layer_index_aliases,
+                self.registered_group_indices,
+                self.block_len_per_layer,
+            )
 
         # No need to launch server for D node.
         if self.is_kv_consumer:
