@@ -326,6 +326,10 @@ def _regions_have_compatible_layer_indices(
     )
 
 
+def _region_can_fan_out_to_split_aliases(region: TransferRegion) -> bool:
+    return len(set(region.match_layer_names)) > 1 or len(set(region.group_indices)) > 1
+
+
 def _align_transfer_regions(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
@@ -399,6 +403,11 @@ def _align_transfer_regions(
                     if reverse_index_mismatch_region is None:
                         reverse_index_mismatch_region = local_region
                     continue
+                if _region_can_fan_out_to_split_aliases(local_region):
+                    alias_aligned_local.append(local_region)
+                    alias_aligned_remote.append(remote_region)
+                    used_remote_indices.add(remote_idx)
+                    break
                 return (
                     [],
                     [],

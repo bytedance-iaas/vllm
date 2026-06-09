@@ -437,8 +437,8 @@ def test_align_transfer_regions_matches_shared_aliases():
     assert aligned_remote == remote_regions
 
 
-def test_align_transfer_regions_rejects_split_alias_occurrence_mismatch():
-    """Alias matching should not drop extra consumer regions silently."""
+def test_align_transfer_regions_fans_out_split_alias_regions():
+    """Shared producer regions can feed consumer regions split by alias."""
 
     local_regions = [
         TransferRegion(
@@ -475,6 +475,54 @@ def test_align_transfer_regions_rejects_split_alias_occurrence_mismatch():
             layer_aliases=("model.layers.4.swa_attn",),
             layer_indices=(4,),
             group_indices=(1,),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions,
+        remote_regions,
+    )
+
+    assert err is None
+    assert aligned_local == [local_regions[0], local_regions[0]]
+    assert aligned_remote == remote_regions
+
+
+def test_align_transfer_regions_rejects_single_alias_occurrence_mismatch():
+    """Single-alias regions should still preserve occurrence counts."""
+
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            group_indices=(0,),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            group_indices=(0,),
+        ),
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x3000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            group_indices=(0,),
         ),
     ]
 
