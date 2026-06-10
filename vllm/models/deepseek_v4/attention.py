@@ -167,6 +167,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         tp_size = get_tensor_model_parallel_world_size()
 
         # DeepseekV4-specific attributes (num_heads is already TP-adjusted)
+        self.compress_ratio = max(1, self.compress_ratio)
         self.eps = config.rms_norm_eps
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = head_dim - self.rope_head_dim
