@@ -221,11 +221,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        wo_a_quant_config = quant_config
+        if getattr(config, "expert_dtype", "fp4") == "fp8":
+            # Some DeepSeek V4 FP8 checkpoints keep wo_a in BF16 and omit a
+            # real wo_a.scale tensor. Keep wo_a unquantized so the attention
+            # wrapper can safely fall back to the BF16 reference o-proj path.
+            wo_a_quant_config = None
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
-            quant_config=quant_config,
+            quant_config=wo_a_quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_a",
         )
