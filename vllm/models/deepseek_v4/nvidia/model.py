@@ -482,8 +482,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         self._transformed_l1_weights, self._transformed_l2_weights = (
             deep_gemm.transform_weights_for_mega_moe_sm90(
-                (w13.view(torch.int8).contiguous(), w13_sf),
-                (w2.view(torch.int8).contiguous(), w2_sf),
+                (w13.contiguous(), w13_sf),
+                (w2.contiguous(), w2_sf),
             )
         )
 

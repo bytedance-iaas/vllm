@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
+import vllm.utils.deep_gemm as deep_gemm_utils
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 
 
@@ -182,3 +183,48 @@ def test_fp4_loader_params_unchanged():
     )
     assert not hasattr(experts, "w13_weight_scale_inv")
     assert not hasattr(experts, "w2_weight_scale_inv")
+
+
+def test_sm90_finalize_passes_fp8_weights_to_deep_gemm(monkeypatch):
+    experts = _make_fp8_experts()
+
+    class FakeDeepGemm:
+        def transform_sf_into_required_layout(
+            self,
+            scale,
+            rows,
+            cols,
+            block_shape,
+            num_experts,
+            *,
+            disable_ue8m0_cast=False,
+        ):
+            assert scale.dtype == torch.float32
+            assert block_shape == (128, 128)
+            assert num_experts == experts.num_local_experts
+            assert disable_ue8m0_cast is True
+            return scale
+
+        def transform_weights_for_mega_moe_sm90(self, l1_weight, l2_weight):
+            w13, w13_sf = l1_weight
+            w2, w2_sf = l2_weight
+
+            assert w13.dtype == torch.float8_e4m3fn
+            assert w2.dtype == torch.float8_e4m3fn
+            assert w13.is_contiguous()
+            assert w2.is_contiguous()
+            assert w13_sf.dtype == torch.float32
+            assert w2_sf.dtype == torch.float32
+            return w13, w2
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+    experts._use_sm90_mega_moe = True
+
+    experts._finalize_weights_sm90()
+
+    assert experts._transformed_l1_weights.dtype == torch.float8_e4m3fn
+    assert experts._transformed_l2_weights.dtype == torch.float8_e4m3fn
