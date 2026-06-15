@@ -470,6 +470,11 @@ def _align_transfer_regions(
 
             return alias_group_aligned_local, alias_group_aligned_remote, None
 
+        # Legacy alias metadata can identify shared layer names without
+        # per-alias KV group ownership. DeepSeek V4 shared-cache regions
+        # carry alias_group_indices from register_kv_caches and take the
+        # alias-group path above, where alias, layer index, and group index
+        # are matched as a bound entry with per-remote-group de-duplication.
         alias_aligned_local: list[TransferRegion] = []
         alias_aligned_remote: list[TransferRegion] = []
         used_remote_indices: set[int] = set()
