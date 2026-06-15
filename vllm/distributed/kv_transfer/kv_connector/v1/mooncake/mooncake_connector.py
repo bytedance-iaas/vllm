@@ -663,8 +663,6 @@ class MooncakeXferMetadata(
     registered_alias_group_indices: list[list[list[int]]] = msgspec.field(
         default_factory=list
     )
-    remote_pp_size: int = 1
-    remote_pp_rank: int = 0
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -2081,8 +2079,6 @@ class MooncakeConnectorWorker:
             registered_layer_index_aliases=self.registered_layer_index_aliases,
             registered_group_indices=self.registered_group_indices,
             registered_alias_group_indices=self.registered_alias_group_indices,
-            remote_pp_size=self.pp_size,
-            remote_pp_rank=self.pp_rank,
         )
 
         encoded_data = self._encoder.encode(metadata)
