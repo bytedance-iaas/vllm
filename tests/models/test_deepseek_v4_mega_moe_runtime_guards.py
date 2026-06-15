@@ -45,6 +45,27 @@ def _make_fp8_experts(
     )
 
 
+def _make_fp4_experts(
+    hidden_size: int = 256,
+    intermediate_size: int = 256,
+    num_experts: int = 4,
+    num_local_experts: int = 2,
+    experts_start_idx: int = 2,
+    top_k: int = 2,
+) -> DeepseekV4MegaMoEExperts:
+    return DeepseekV4MegaMoEExperts(
+        _make_vllm_config(),
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        experts_start_idx=experts_start_idx,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        prefix="model.layers.0.ffn.experts",
+        expert_dtype="fp4",
+    )
+
+
 def test_fp8_loader_params_have_expected_shapes_and_dtypes():
     hidden_size = 256
     intermediate_size = 256
@@ -160,16 +181,8 @@ def test_fp8_weight_loader_shards_scales_by_block_count():
 def test_fp4_loader_params_unchanged():
     hidden_size = 256
     intermediate_size = 256
-    experts = DeepseekV4MegaMoEExperts(
-        _make_vllm_config(),
-        num_experts=4,
-        num_local_experts=2,
-        experts_start_idx=2,
-        top_k=2,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        prefix="model.layers.0.ffn.experts",
-        expert_dtype="fp4",
+    experts = _make_fp4_experts(
+        hidden_size=hidden_size, intermediate_size=intermediate_size
     )
 
     assert experts.expert_dtype == "fp4"
@@ -228,3 +241,49 @@ def test_sm90_finalize_passes_fp8_weights_to_deep_gemm(monkeypatch):
 
     assert experts._transformed_l1_weights.dtype == torch.float8_e4m3fn
     assert experts._transformed_l2_weights.dtype == torch.float8_e4m3fn
+
+
+def test_sm90_finalize_passes_fp4_weights_to_deep_gemm(monkeypatch):
+    experts = _make_fp4_experts()
+    experts.w13_weight_scale.data.fill_(127)
+    experts.w2_weight_scale.data.fill_(126)
+
+    class FakeDeepGemm:
+        def transform_weights_for_mega_moe_sm90_fp4(self, l1_weight, l2_weight):
+            w13, w13_sf = l1_weight
+            w2, w2_sf = l2_weight
+
+            assert w13.dtype == torch.int8
+            assert w2.dtype == torch.int8
+            assert w13.is_contiguous()
+            assert w2.is_contiguous()
+            assert w13.shape == (
+                experts.num_local_experts,
+                2 * experts.intermediate_size,
+                experts.hidden_size // 2,
+            )
+            assert w2.shape == (
+                experts.num_local_experts,
+                experts.hidden_size,
+                experts.intermediate_size // 2,
+            )
+            assert w13_sf.dtype == torch.float32
+            assert w2_sf.dtype == torch.float32
+            assert torch.all(w13_sf == 1.0)
+            assert torch.all(w2_sf == 0.5)
+            return (w13, w13_sf), (w2, w2_sf)
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+    experts._use_sm90_mega_moe = True
+    experts._use_sm90_fp4_mega_moe = True
+
+    experts._finalize_weights_sm90()
+
+    assert experts._transformed_l1_weights[0].dtype == torch.int8
+    assert experts._transformed_l1_weights[1].dtype == torch.float32
+    assert experts._transformed_l2_weights[0].dtype == torch.int8
+    assert experts._transformed_l2_weights[1].dtype == torch.float32

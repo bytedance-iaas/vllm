@@ -174,6 +174,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.expert_dtype = expert_dtype
         self._device_capability_major: int | None = None
         self._use_sm90_mega_moe = False
+        self._use_sm90_fp4_mega_moe = False
+        self._use_sm90_fp8_mega_moe = False
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -382,8 +384,17 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "DeepSeek V4 MegaMoE requires SM90 or SM100 GPUs."
             )
         self._use_sm90_mega_moe = major == 9
-        if self._use_sm90_mega_moe and self.expert_dtype != "fp8":
-            raise NotImplementedError("SM90 MegaMoE PoC requires fp8 experts.")
+        self._use_sm90_fp4_mega_moe = self._use_sm90_mega_moe and (
+            self.expert_dtype == "fp4"
+        )
+        self._use_sm90_fp8_mega_moe = self._use_sm90_mega_moe and (
+            self.expert_dtype == "fp8"
+        )
+        if self._use_sm90_mega_moe and self.expert_dtype not in ("fp4", "fp8"):
+            raise NotImplementedError(
+                "SM90 MegaMoE requires fp4 or fp8 experts; "
+                f"got expert_dtype={self.expert_dtype!r}."
+            )
         if not self._use_sm90_mega_moe and self.expert_dtype != "fp4":
             raise NotImplementedError("SM100 MegaMoE path requires fp4 experts.")
         if self.hidden_size % 128 != 0 or self.intermediate_size % 128 != 0:
@@ -395,12 +406,18 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         deep_gemm = _import_deep_gemm()
         if self._use_sm90_mega_moe:
-            required = (
-                "fp8_mega_moe",
-                "transform_weights_for_mega_moe_sm90",
-                "transform_sf_into_required_layout",
-                "get_symm_buffer_for_mega_moe",
-            )
+            required = ("get_symm_buffer_for_mega_moe",)
+            if self._use_sm90_fp4_mega_moe:
+                required += (
+                    "fp8_fp4_mega_moe",
+                    "transform_weights_for_mega_moe_sm90_fp4",
+                )
+            else:
+                required += (
+                    "fp8_mega_moe",
+                    "transform_weights_for_mega_moe_sm90",
+                    "transform_sf_into_required_layout",
+                )
         else:
             required = (
                 "fp8_fp4_mega_moe",
@@ -456,6 +473,25 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
+        if self._use_sm90_fp4_mega_moe:
+            # SM90 FP4 MegaMoE consumes FP8 activations and packed E2M1 weights
+            # with per-32-K UE8M0 scales. vLLM stores FP4 checkpoint scales as
+            # uint8 exponents, so decode them to raw FP32 before DeepGEMM packs
+            # them into its SM90 FP4 SFB layout.
+            w13_sf = self._ue8m0_uint8_to_float(
+                self.w13_weight_scale.data
+            ).contiguous()
+            w2_sf = self._ue8m0_uint8_to_float(
+                self.w2_weight_scale.data
+            ).contiguous()
+            self._transformed_l1_weights, self._transformed_l2_weights = (
+                deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
+                    (self.w13_weight.data.view(torch.int8).contiguous(), w13_sf),
+                    (self.w2_weight.data.view(torch.int8).contiguous(), w2_sf),
+                )
+            )
+            return
+
         w13 = self.w13_weight.data
         w2 = self.w2_weight.data
         w13_sf = self.w13_weight_scale_inv.data.contiguous()
@@ -506,7 +542,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
-        buffer_mode = "sm90" if self._use_sm90_mega_moe else "sm100"
+        if self._use_sm90_fp4_mega_moe:
+            buffer_mode = "sm90_fp4"
+        elif self._use_sm90_fp8_mega_moe:
+            buffer_mode = "sm90_fp8"
+        else:
+            buffer_mode = "sm100"
         key = (
             id(group),
             device,
@@ -731,16 +772,28 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
-        deep_gemm.fp8_mega_moe(
-            y,
-            self._transformed_l1_weights,
-            self._transformed_l2_weights,
-            symm_buffer,
-            recipe=(128, 128, 128),
-            activation="swiglu",
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
-        )
+        if self._use_sm90_fp4_mega_moe:
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self._transformed_l1_weights,
+                self._transformed_l2_weights,
+                symm_buffer,
+                recipe=(1, 1, 32),
+                activation="swiglu",
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+        else:
+            deep_gemm.fp8_mega_moe(
+                y,
+                self._transformed_l1_weights,
+                self._transformed_l2_weights,
+                symm_buffer,
+                recipe=(128, 128, 128),
+                activation="swiglu",
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
 
 
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
