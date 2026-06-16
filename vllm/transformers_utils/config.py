@@ -296,6 +296,7 @@ class HFConfigParser(ConfigParserBase):
                     raise RuntimeError(err_msg) from e
                 else:
                     raise e
+        config = _maybe_patch_dsv4_runtime_expert_dtype(config, model)
         config = _maybe_remap_hf_config_attrs(config)
         return config_dict, config
 
@@ -582,6 +583,36 @@ def _maybe_update_auto_config_kwargs(kwargs: dict[str, Any], model_type: str):
     if model_type in _AUTO_CONFIG_KWARGS_OVERRIDES:
         kwargs.update(_AUTO_CONFIG_KWARGS_OVERRIDES[model_type])
     return kwargs
+
+
+def _get_quant_method(quant_cfg: Any) -> Any:
+    if quant_cfg is None:
+        return None
+    if isinstance(quant_cfg, dict):
+        return quant_cfg.get("quant_method")
+    return getattr(quant_cfg, "quant_method", None)
+
+
+def _maybe_patch_dsv4_runtime_expert_dtype(
+    config: PretrainedConfig, model: str | Path
+) -> PretrainedConfig:
+    mode = os.environ.get("VLLM_DSV4_RUNTIME_EXPERT_DTYPE_PATCH", "auto").lower()
+    if mode in ("0", "false", "off", "no"):
+        return config
+    if (
+        getattr(config, "model_type", None) != "deepseek_v4"
+        or _get_quant_method(getattr(config, "quantization_config", None)) != "fp8"
+        or getattr(config, "expert_dtype", None) is not None
+    ):
+        return config
+
+    source_name = str(model).rstrip("/").split("/")[-1].lower()
+    if mode in ("1", "true", "on", "yes", "fp8", "force") or (
+        mode == "auto" and "fp8" in source_name
+    ):
+        config.expert_dtype = "fp8"
+        logger.info_once("Applied DeepSeek-V4 expert_dtype=fp8 runtime patch")
+    return config
 
 
 def _maybe_remap_hf_config_attrs(config: PretrainedConfig) -> PretrainedConfig:
