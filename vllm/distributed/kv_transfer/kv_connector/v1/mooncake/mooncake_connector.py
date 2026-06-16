@@ -81,6 +81,13 @@ BlockIds = list[list[int]]
 
 @dataclass(frozen=True)
 class TransferRegion:
+    """A Mooncake-registered KV buffer plus vLLM cache identity metadata.
+
+    layer_aliases mirrors KVCacheTensor.shared_by for tensors shared by
+    multiple layer names. group_indices and alias_group_indices preserve the
+    KV cache group ownership needed to filter transfers for hybrid caches.
+    """
+
     layer_name: str
     layer_index: int
     base_addr: int
@@ -376,12 +383,13 @@ def _align_transfer_regions(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
-    """Align KV transfer regions by registered layer-name occurrence.
+    """Align KV transfer regions by vLLM cache identity.
 
     PP shards own different layer subsets. Positional matching is therefore
-    wrong once producer and consumer have different PP layouts. Multiple
-    registered transfer buffers for the same layer are represented by repeated
-    layer names and matched by occurrence order.
+    wrong once producer and consumer have different PP layouts. For shared
+    physical tensors, alias metadata carries the KVCacheTensor.shared_by layer
+    names and group metadata carries KVCacheGroupSpec ownership across the
+    Mooncake wire boundary.
     """
     has_aliases = any(
         _region_has_aliases(region) for region in local_regions + remote_regions
@@ -392,6 +400,10 @@ def _align_transfer_regions(
             for region in local_regions + remote_regions
         )
         if has_alias_group_metadata:
+            # DeepSeek V4 shared-cache regions bind each alias to the layer
+            # index and cache groups that own that view of the shared tensor.
+            # Matching the bound identity avoids transferring unrelated groups
+            # when one physical region backs multiple logical cache entries.
             alias_group_aligned_local: list[TransferRegion] = []
             alias_group_aligned_remote: list[TransferRegion] = []
             matched_local_indices: set[int] = set()
@@ -609,6 +621,8 @@ def _align_transfer_regions(
 def _common_group_indices_for_regions(
     local_region: TransferRegion, remote_region: TransferRegion, num_groups: int
 ) -> tuple[int, ...]:
+    """Return the KV cache groups shared by two aligned transfer regions."""
+
     if num_groups <= 0:
         return ()
     groups_from_aliases = _common_group_indices_from_aliases(
@@ -618,6 +632,8 @@ def _common_group_indices_for_regions(
         return groups_from_aliases
     all_group_indices = tuple(range(num_groups))
     if not local_region.group_indices or not remote_region.group_indices:
+        # Legacy metadata did not carry per-region group ownership, so keep the
+        # historical all-groups behavior instead of treating it as an error.
         return all_group_indices
     common_group_indices = sorted(
         set(local_region.group_indices) & set(remote_region.group_indices)
@@ -1897,6 +1913,9 @@ class MooncakeConnectorWorker:
         kv_data_lens = []
         seen_base_addresses: list[int] = []
         base_addr_to_region_idx: dict[int, int] = {}
+        # Track vLLM cache identity per registered Mooncake region. A single
+        # physical tensor can be shared by multiple layer names, and each alias
+        # may belong to a different KV cache group.
         region_aliases_by_base: dict[int, list[str]] = defaultdict(list)
         region_index_aliases_by_base: dict[int, list[int]] = defaultdict(list)
         region_groups_by_base: dict[int, list[int]] = defaultdict(list)
