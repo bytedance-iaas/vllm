@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
