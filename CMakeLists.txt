@@ -669,6 +669,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
                    "in CUDA target architectures.")
   endif()
 
+  # DeepSeek V4 MegaMoE SM90 input staging kernel (requires SM 9.0+).
+  cuda_archs_sm90plus(MEGA_MOE_PRE_DISPATCH_SM90_ARCHS "${CUDA_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND MEGA_MOE_PRE_DISPATCH_SM90_ARCHS)
+    set(SRCS "csrc/libtorch_stable/mega_moe_pre_dispatch_sm90.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "${MEGA_MOE_PRE_DISPATCH_SM90_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${SRCS}")
+    message(STATUS "Building mega_moe_pre_dispatch_sm90 for archs: ${MEGA_MOE_PRE_DISPATCH_SM90_ARCHS}")
+  else()
+    message(STATUS "Not building mega_moe_pre_dispatch_sm90 as no compatible archs found "
+                   "(requires SM90+ and CUDA >= 12.0).")
+  endif()
+
   # FP32 router GEMM (H=3072, E=256, M<=32). Requires SM90+ and CUDA >= 12.0.
   cuda_archs_sm90plus(FP32_ROUTER_GEMM_ARCHS "${CUDA_ARCHS}")
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0 AND FP32_ROUTER_GEMM_ARCHS)

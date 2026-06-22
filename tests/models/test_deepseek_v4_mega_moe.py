@@ -49,8 +49,12 @@ def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
 
 def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=4,
+            max_num_seqs=4,
+        ),
         compilation_config=SimpleNamespace(static_forward_context={}),
+        speculative_config=None,
     )
     experts = DeepseekV4MegaMoEExperts(
         vllm_config,
@@ -193,10 +197,19 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
     or torch.cuda.get_device_capability()[0] != 9,
     reason="DeepSeek V4 SM90 MegaMoE input staging requires an SM90 GPU.",
 )
-def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference():
+@pytest.mark.parametrize(
+    "num_tokens,max_num_tokens",
+    [
+        (5, 8),       # normal: some valid + some padding
+        (0, 8),       # decode warmup / empty batch: all padding
+        (8, 8),       # full buffer: no padding
+        (1, 4096),    # decode single token, large symm buffer (big pad fill)
+    ],
+)
+def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference(
+    num_tokens, max_num_tokens
+):
     device = torch.device("cuda")
-    num_tokens = 5
-    max_num_tokens = 8
     hidden_size = 256
     top_k = 8
     routed_scaling_factor = 2.5
@@ -213,8 +226,10 @@ def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference():
         )
         * 13.0
     ).to(torch.bfloat16)
-    hidden_states[0, :128] = 0
-    hidden_states[1, 128:] = 1.0e-7
+    if num_tokens > 0:
+        hidden_states[0, :128] = 0
+    if num_tokens > 1:
+        hidden_states[1, 128:] = 1.0e-7
 
     topk_ids = torch.randint(
         0,
@@ -266,10 +281,16 @@ def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference():
     )
     torch.accelerator.synchronize()
 
-    # Valid rows.
-    assert torch.equal(
-        x_fp8[:num_tokens].view(torch.uint8), ref_x.view(torch.uint8)
-    )
+    # Valid rows. The CUDA kernel quantizes via `x * (1 / scale)` (matching the
+    # SGLang reference), so compare FP8 codes allowing the occasional 1-ULP
+    # rounding difference vs the division-based reference above.
+    if num_tokens > 0:
+        got_codes = x_fp8[:num_tokens].view(torch.uint8).to(torch.int32)
+        ref_codes = ref_x.view(torch.uint8).to(torch.int32)
+        code_delta = (got_codes - ref_codes).abs()
+        assert int(code_delta.max()) <= 1
+        # at most a tiny fraction of elements may differ by 1 code
+        assert int((code_delta != 0).sum()) <= max(1, got_codes.numel() // 100)
     assert torch.allclose(x_sf[:num_tokens], ref_scale, rtol=1e-6)
     assert torch.equal(topk_idx_out[:num_tokens], topk_ids.to(torch.int64))
     assert torch.allclose(

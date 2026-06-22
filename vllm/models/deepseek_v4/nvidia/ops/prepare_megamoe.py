@@ -7,6 +7,8 @@ routing top-k tensors into the int64/float32 layout that the DeepGEMM
 MegaMoE kernels consume.
 """
 
+import functools
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -172,6 +174,7 @@ def prepare_megamoe_inputs(
         num_warps=4,
     )
 
+
 @triton.jit
 def _prepare_megamoe_sm90_quant_kernel(
     hidden_states,
@@ -187,7 +190,7 @@ def _prepare_megamoe_sm90_quant_kernel(
     GROUP_K: tl.constexpr,
 ) -> None:
     # Launched over valid tokens only (grid = (num_tokens, hidden / GROUP_K)).
-    # Padded rows are handled by the lightweight topk kernel below, so this
+    # Padded rows are handled by the lightweight topk pad kernel below, so this
     # kernel never wastes hidden-group programs on padding.
     token_id = tl.program_id(0)
     k_block_id = tl.program_id(1)
@@ -204,8 +207,7 @@ def _prepare_megamoe_sm90_quant_kernel(
     amax = tl.maximum(amax, 1.0e-10)
     scale = amax / 448.0
 
-    scaled = hidden * (1.0 / scale)
-    fp8 = scaled.to(tl.float8e4nv)
+    fp8 = (hidden * (1.0 / scale)).to(tl.float8e4nv)
     tl.store(
         x_fp8 + token_id * x_stride_m + k_offsets * x_stride_k,
         fp8,
@@ -219,12 +221,11 @@ def _prepare_megamoe_sm90_quant_kernel(
 
 
 @triton.jit
-def _prepare_megamoe_sm90_topk_kernel(
+def _prepare_megamoe_sm90_topk_copy_kernel(
     topk_ids,
     topk_weights,
     topk_idx_out,
     topk_weights_out,
-    num_tokens,
     routed_scaling_factor,
     topk_ids_stride_m: tl.constexpr,
     topk_ids_stride_k: tl.constexpr,
@@ -237,30 +238,25 @@ def _prepare_megamoe_sm90_topk_kernel(
     top_k: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ) -> None:
-    # Launched over the full symmetric buffer (grid = (max_num_tokens,)).
-    # Valid rows get the real routing; padded rows get -1 / 0.0 so the
-    # MegaMoE kernel skips them.
+    # One program per *valid* token (grid = (num_tokens,)). Padded rows are
+    # written by the flattened pad kernel below.
     token_id = tl.program_id(0)
     topk_offsets = tl.arange(0, BLOCK_TOPK)
     topk_mask = topk_offsets < top_k
 
-    if token_id < num_tokens:
-        ids = tl.load(
-            topk_ids + token_id * topk_ids_stride_m + topk_offsets * topk_ids_stride_k,
-            mask=topk_mask,
-            other=0,
-        ).to(tl.int64)
-        weights = tl.load(
-            topk_weights
-            + token_id * topk_weights_stride_m
-            + topk_offsets * topk_weights_stride_k,
-            mask=topk_mask,
-            other=0.0,
-        ).to(tl.float32)
-        weights = weights * routed_scaling_factor
-    else:
-        ids = tl.full([BLOCK_TOPK], -1, tl.int64)
-        weights = tl.zeros([BLOCK_TOPK], tl.float32)
+    ids = tl.load(
+        topk_ids + token_id * topk_ids_stride_m + topk_offsets * topk_ids_stride_k,
+        mask=topk_mask,
+        other=0,
+    ).to(tl.int64)
+    weights = tl.load(
+        topk_weights
+        + token_id * topk_weights_stride_m
+        + topk_offsets * topk_weights_stride_k,
+        mask=topk_mask,
+        other=0.0,
+    ).to(tl.float32)
+    weights = weights * routed_scaling_factor
 
     tl.store(
         topk_idx_out
@@ -278,7 +274,36 @@ def _prepare_megamoe_sm90_topk_kernel(
     )
 
 
-def prepare_megamoe_inputs_sm90(
+@triton.jit
+def _prepare_megamoe_sm90_topk_pad_kernel(
+    topk_idx_out,
+    topk_weights_out,
+    pad_base,
+    total_slots,
+    topk_idx_stride_m,
+    topk_idx_stride_k,
+    topk_weights_out_stride_m,
+    topk_weights_out_stride_k,
+    top_k,
+    BLOCK: tl.constexpr,
+) -> None:
+    # Flattened padding fill: grid = (ceil(pad_slots / BLOCK),), where
+    # pad_slots = (max_num_tokens - num_tokens) * top_k. The launch size scales
+    # with the *padding amount*, not with max_num_tokens.
+    pid = tl.program_id(0)
+    slot = pad_base + pid * BLOCK + tl.arange(0, BLOCK)
+    mask = slot < total_slots
+
+    row = slot // top_k
+    col = slot % top_k
+    idx_off = row * topk_idx_stride_m + col * topk_idx_stride_k
+    w_off = row * topk_weights_out_stride_m + col * topk_weights_out_stride_k
+
+    tl.store(topk_idx_out + idx_off, tl.full([BLOCK], -1, tl.int64), mask=mask)
+    tl.store(topk_weights_out + w_off, tl.zeros([BLOCK], tl.float32), mask=mask)
+
+
+def _prepare_megamoe_inputs_sm90_triton(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -289,19 +314,11 @@ def prepare_megamoe_inputs_sm90(
     *,
     routed_scaling_factor: float = 1.0,
 ) -> None:
-    """SM90 (Hopper) MegaMoE input staging.
+    """Triton fallback for SM90 MegaMoE input staging.
 
-    Unlike the SM100 staging kernel, this one:
-
-    - quantizes BF16 hidden states into FP8 E4M3 with a fixed group size of
-      128 and writes the *raw* FP32 activation scale (not packed UE8M0);
-    - receives the *full* symmetric buffers (size ``max_num_tokens``) and
-      fills padded topk rows ``[num_tokens:]`` with ``-1`` ids and ``0.0``
-      weights, matching the SGLang SM90 reference;
-    - optionally folds ``routed_scaling_factor`` into the topk weights.
-
-    The ``x_fp8``/``x_sf`` rows beyond ``num_tokens`` are left untouched; the
-    DeepGEMM kernel skips them because their topk ids are ``-1``.
+    Split into quant (over valid tokens) + topk copy (over valid tokens) +
+    flattened padding fill, so the launch size scales with the real token /
+    padding counts rather than ``max_num_tokens``.
     """
     num_tokens, hidden_size = hidden_states.shape
     max_num_tokens = topk_idx_out.shape[0]
@@ -328,8 +345,6 @@ def prepare_megamoe_inputs_sm90(
     group_k = 128
     block_topk = triton.next_power_of_2(top_k)
 
-    # Quantization only runs over the valid tokens, so decode (num_tokens=1,
-    # max_num_tokens large) never launches hidden-group programs for padding.
     if num_tokens > 0:
         _prepare_megamoe_sm90_quant_kernel[
             (num_tokens, triton.cdiv(hidden_size, group_k))
@@ -347,25 +362,113 @@ def prepare_megamoe_inputs_sm90(
             GROUP_K=group_k,
             num_warps=4,
         )
+        _prepare_megamoe_sm90_topk_copy_kernel[(num_tokens,)](
+            topk_ids,
+            topk_weights,
+            topk_idx_out,
+            topk_weights_out,
+            float(routed_scaling_factor),
+            topk_ids.stride(0),
+            topk_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            topk_idx_out.stride(0),
+            topk_idx_out.stride(1),
+            topk_weights_out.stride(0),
+            topk_weights_out.stride(1),
+            top_k,
+            BLOCK_TOPK=block_topk,
+            num_warps=4,
+        )
 
-    # The topk fill covers the full symmetric buffer so padded rows get
-    # -1 / 0.0; each program is a single 1D row, no hidden-group blow-up.
-    _prepare_megamoe_sm90_topk_kernel[(max_num_tokens,)](
-        topk_ids,
+    pad_slots = (max_num_tokens - num_tokens) * top_k
+    if pad_slots > 0:
+        pad_block = 1024
+        _prepare_megamoe_sm90_topk_pad_kernel[(triton.cdiv(pad_slots, pad_block),)](
+            topk_idx_out,
+            topk_weights_out,
+            num_tokens * top_k,
+            max_num_tokens * top_k,
+            topk_idx_out.stride(0),
+            topk_idx_out.stride(1),
+            topk_weights_out.stride(0),
+            topk_weights_out.stride(1),
+            top_k,
+            BLOCK=pad_block,
+            num_warps=4,
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _has_mega_moe_pre_dispatch_sm90_op() -> bool:
+    """Return True only when the CUDA implementation is actually registered.
+
+    The op *schema* is unconditionally declared in ``torch_bindings.cpp``, but
+    the CUDA kernel is conditionally compiled (SM90+ and CUDA >= 12). A bare
+    ``hasattr(torch.ops._C, ...)`` would be True even on a build without the
+    kernel, so we additionally check that a CUDA dispatch kernel exists;
+    otherwise we must fall back to Triton.
+    """
+    try:
+        if not hasattr(torch.ops._C, "mega_moe_pre_dispatch_sm90"):
+            return False
+        return torch._C._dispatch_has_kernel_for_dispatch_key(
+            "_C::mega_moe_pre_dispatch_sm90", "CUDA"
+        )
+    except Exception:
+        return False
+
+
+def prepare_megamoe_inputs_sm90(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    topk_idx_out: torch.Tensor,
+    topk_weights_out: torch.Tensor,
+    *,
+    routed_scaling_factor: float = 1.0,
+) -> None:
+    """SM90 (Hopper) MegaMoE input staging.
+
+    Prefers the fused CUDA op ``torch.ops._C.mega_moe_pre_dispatch_sm90``
+    (ported from SGLang); falls back to the Triton implementation when the
+    custom op is unavailable (e.g. a build without the SM90 CUDA kernel). Both
+    paths:
+
+    - quantize BF16 hidden states into FP8 E4M3 with a fixed group size of 128
+      and write the *raw* FP32 activation scale (not packed UE8M0);
+    - receive the *full* symmetric buffers (size ``max_num_tokens``) and fill
+      padded topk rows ``[num_tokens:]`` with ``-1`` ids and ``0.0`` weights;
+    - fold ``routed_scaling_factor`` into the topk weights.
+
+    The ``x_fp8``/``x_sf`` rows beyond ``num_tokens`` are left untouched; the
+    DeepGEMM kernel skips them because their topk ids are ``-1``. With the CUDA
+    op, set ``VLLM_ENABLE_PDL=1`` to enable programmatic dependent launch.
+    """
+    if _has_mega_moe_pre_dispatch_sm90_op():
+        from vllm import _custom_ops as ops
+
+        ops.mega_moe_pre_dispatch_sm90(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_fp8,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
+            routed_scaling_factor=float(routed_scaling_factor),
+        )
+        return
+
+    _prepare_megamoe_inputs_sm90_triton(
+        hidden_states,
         topk_weights,
+        topk_ids,
+        x_fp8,
+        x_sf,
         topk_idx_out,
         topk_weights_out,
-        num_tokens,
-        float(routed_scaling_factor),
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        topk_idx_out.stride(0),
-        topk_idx_out.stride(1),
-        topk_weights_out.stride(0),
-        topk_weights_out.stride(1),
-        top_k,
-        BLOCK_TOPK=block_topk,
-        num_warps=4,
+        routed_scaling_factor=routed_scaling_factor,
     )

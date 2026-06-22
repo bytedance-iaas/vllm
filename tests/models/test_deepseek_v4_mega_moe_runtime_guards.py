@@ -9,18 +9,29 @@ PyTorch/host operations and do not require a GPU.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.utils.deep_gemm as deep_gemm_utils
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 
 
-def _make_vllm_config(max_num_batched_tokens: int = 4) -> SimpleNamespace:
+def _make_vllm_config(
+    max_num_batched_tokens: int = 4,
+    max_num_seqs: int = 4,
+    num_speculative_tokens: int | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=max_num_batched_tokens
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
         ),
         compilation_config=SimpleNamespace(static_forward_context={}),
+        speculative_config=(
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        ),
     )
 
 
@@ -64,6 +75,109 @@ def _make_fp4_experts(
         prefix="model.layers.0.ffn.experts",
         expert_dtype="fp4",
     )
+
+
+def test_resolve_mega_moe_decode_capacity_defaults_to_decode_capacity():
+    cfg = _make_vllm_config(max_num_batched_tokens=512, max_num_seqs=16)
+    assert (
+        DeepseekV4MegaMoEExperts._resolve_mega_moe_decode_capacity(cfg) == 16
+    )
+
+
+def test_resolve_mega_moe_decode_capacity_accounts_for_spec_decode():
+    cfg = _make_vllm_config(
+        max_num_batched_tokens=256,
+        max_num_seqs=16,
+        num_speculative_tokens=4,
+    )
+    assert (
+        DeepseekV4MegaMoEExperts._resolve_mega_moe_decode_capacity(cfg) == 80
+    )
+
+
+def test_resolve_mega_moe_decode_capacity_default_clamped_to_batched():
+    cfg = _make_vllm_config(
+        max_num_batched_tokens=64,
+        max_num_seqs=16,
+        num_speculative_tokens=4,
+    )
+    assert (
+        DeepseekV4MegaMoEExperts._resolve_mega_moe_decode_capacity(cfg) == 64
+    )
+
+
+def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 80
+    experts.max_num_batched_tokens = 256
+    calls = []
+
+    def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
+        calls.append((max_num_tokens, cache))
+        return object()
+
+    monkeypatch.setattr(experts, "get_symm_buffer", fake_get_symm_buffer)
+
+    experts.get_symm_buffer_for_num_tokens(16)
+
+    assert calls == [(None, True)]
+
+
+def test_get_symm_buffer_for_num_tokens_uses_uncached_oversized_buffer(
+    monkeypatch,
+):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 80
+    experts.max_num_batched_tokens = 256
+    calls = []
+    monkeypatch.setattr(
+        DeepseekV4MegaMoEExperts,
+        "_is_cuda_graph_capturing",
+        staticmethod(lambda: False),
+    )
+
+    def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
+        calls.append((max_num_tokens, cache))
+        return object()
+
+    monkeypatch.setattr(experts, "get_symm_buffer", fake_get_symm_buffer)
+
+    experts.get_symm_buffer_for_num_tokens(256)
+
+    assert calls == [(256, False)]
+
+
+def test_get_symm_buffer_for_num_tokens_caches_oversized_buffer_during_capture(
+    monkeypatch,
+):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 80
+    experts.max_num_batched_tokens = 256
+    calls = []
+    monkeypatch.setattr(
+        DeepseekV4MegaMoEExperts,
+        "_is_cuda_graph_capturing",
+        staticmethod(lambda: True),
+    )
+
+    def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
+        calls.append((max_num_tokens, cache))
+        return object()
+
+    monkeypatch.setattr(experts, "get_symm_buffer", fake_get_symm_buffer)
+
+    experts.get_symm_buffer_for_num_tokens(256)
+
+    assert calls == [(256, True)]
+
+
+def test_get_symm_buffer_for_num_tokens_rejects_beyond_batched():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 80
+    experts.max_num_batched_tokens = 256
+
+    with pytest.raises(ValueError):
+        experts.get_symm_buffer_for_num_tokens(257)
 
 
 def test_fp8_loader_params_have_expected_shapes_and_dtypes():

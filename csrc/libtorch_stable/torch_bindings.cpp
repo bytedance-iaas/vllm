@@ -313,6 +313,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
 
+  // DeepSeek V4 MegaMoE SM90 input staging (SM 9.0+): bf16->fp8 per-128 quant
+  // with raw fp32 scale, topk copy, and padded-row fill into the symm buffer.
+  // conditionally compiled so impl registration is in source file
+  ops.def(
+      "mega_moe_pre_dispatch_sm90(Tensor x, Tensor topk_idx, Tensor "
+      "topk_weights, Tensor! buf_x, Tensor! buf_x_sf, Tensor! buf_topk_idx, "
+      "Tensor! buf_topk_weights, float routed_scaling_factor) -> ()");
+
   // BF16/FP32 x FP32 -> FP32 router GEMM for H=3072, E=256, M<=32 (SM90+).
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");

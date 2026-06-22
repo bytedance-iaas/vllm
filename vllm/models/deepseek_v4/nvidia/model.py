@@ -17,6 +17,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
@@ -70,6 +71,17 @@ from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+_OPTIONAL_SCALE_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".input_scale",
+    "_weight_scale",
+    "_weight_scale_inv",
+    "_input_scale",
+)
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -170,7 +182,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self.max_num_tokens = self._resolve_mega_moe_decode_capacity(vllm_config)
         self.expert_dtype = expert_dtype
         self._device_capability_major: int | None = None
         self._use_sm90_mega_moe = False
@@ -202,6 +217,24 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     @staticmethod
     def _ceil_div_128(value: int) -> int:
         return (value + 127) // 128
+
+    @staticmethod
+    def _resolve_mega_moe_decode_capacity(vllm_config: VllmConfig) -> int:
+        """Resolve the MegaMoE symm-buffer / staging token capacity.
+
+        Use decode-shaped capacity so a PD decode worker can decouple MegaMoE
+        steady-state buffer size from the prefill/profile-tuned global budget.
+        """
+        scheduler_config = vllm_config.scheduler_config
+        max_batched = scheduler_config.max_num_batched_tokens
+        decode_tokens_per_seq = 1
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None:
+            decode_tokens_per_seq += (
+                getattr(speculative_config, "num_speculative_tokens", None) or 0
+            )
+        decode_capacity = scheduler_config.max_num_seqs * decode_tokens_per_seq
+        return min(max_batched, decode_capacity)
 
     def _init_fp4_loader_params(self, weight_attrs: dict) -> None:
         num_local_experts = self.num_local_experts
@@ -535,10 +568,18 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if getattr(self, "w2_weight_scale_inv", None) is not None:
             self.w2_weight_scale_inv = None
 
-    def get_symm_buffer(self):
+    def get_symm_buffer(
+        self,
+        max_num_tokens: int | None = None,
+        *,
+        cache: bool = True,
+    ):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
+        max_num_tokens = (
+            self.max_num_tokens if max_num_tokens is None else max_num_tokens
+        )
 
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
@@ -552,19 +593,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             id(group),
             device,
             self.num_experts,
-            self.max_num_tokens,
+            max_num_tokens,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
             buffer_mode,
         )
-        symm_buffer = self._symm_buffer_cache.get(key)
+        symm_buffer = self._symm_buffer_cache.get(key) if cache else None
         if symm_buffer is None:
             if self._use_sm90_mega_moe:
                 symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
                     group,
                     self.num_experts,
-                    self.max_num_tokens,
+                    max_num_tokens,
                     self.top_k,
                     self.hidden_size,
                     self.intermediate_size,
@@ -575,13 +616,53 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
                     group,
                     self.num_experts,
-                    self.max_num_tokens,
+                    max_num_tokens,
                     self.top_k,
                     self.hidden_size,
                     self.intermediate_size,
                 )
-            self._symm_buffer_cache[key] = symm_buffer
+            logger.info(
+                "DeepSeek V4 MegaMoE symm buffer created: "
+                "max_num_tokens=%d, mode=%s, cache=%s, device=%s, "
+                "num_experts=%d, top_k=%d, hidden_size=%d, "
+                "intermediate_size=%d",
+                max_num_tokens,
+                buffer_mode,
+                cache,
+                device,
+                self.num_experts,
+                self.top_k,
+                self.hidden_size,
+                self.intermediate_size,
+            )
+            if cache:
+                self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
+
+    def get_symm_buffer_for_num_tokens(self, num_tokens: int):
+        if num_tokens > self.max_num_batched_tokens:
+            raise ValueError(
+                f"DeepSeek V4 MegaMoE got {num_tokens} tokens, but "
+                "max_num_batched_tokens is "
+                f"{self.max_num_batched_tokens}."
+            )
+        if num_tokens <= self.max_num_tokens:
+            return self.get_symm_buffer()
+        # Profile/warmup can still feed max_num_batched_tokens-shaped dummy
+        # batches. Keep the steady-state decode buffer small, and allocate an
+        # uncached temporary buffer for oversized calls unless CUDA graph
+        # capture needs the buffer object to stay alive for replay.
+        return self.get_symm_buffer(
+            num_tokens,
+            cache=self._is_cuda_graph_capturing(),
+        )
+
+    @staticmethod
+    def _is_cuda_graph_capturing() -> bool:
+        try:
+            return bool(torch.cuda.is_current_stream_capturing())
+        except Exception:
+            return False
 
     def set_eplb_state(
         self,
@@ -638,10 +719,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         activation_clamp: float | None,
         fast_math: bool = True,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] > self.max_num_tokens:
+        if hidden_states.shape[0] > self.max_num_batched_tokens:
             raise ValueError(
                 f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
-                f"but the symmetric buffer was sized for {self.max_num_tokens}."
+                "but max_num_batched_tokens is "
+                f"{self.max_num_batched_tokens}."
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
         if hidden_states.shape[0] == 0:
@@ -717,8 +799,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
-        symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
+        symm_buffer = self.get_symm_buffer_for_num_tokens(num_tokens)
 
         prepare_megamoe_inputs(
             hidden_states,
@@ -755,7 +837,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
-        symm_buffer = self.get_symm_buffer()
+        symm_buffer = self.get_symm_buffer_for_num_tokens(hidden_states.shape[0])
         # SM90 staging fills the full symmetric buffer (padded topk rows get
         # -1 / 0.0). routed_scaling_factor is already folded into topk_weights
         # by fused_topk_bias upstream, so pass 1.0 here to avoid double-apply.
