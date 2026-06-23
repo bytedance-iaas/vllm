@@ -1,0 +1,5 @@
+self-hosted-runner:
+  labels:
+    - x64-vllm-docker-build-node
+    - x64-vllm-wheel-build-node
+config-variables: null
