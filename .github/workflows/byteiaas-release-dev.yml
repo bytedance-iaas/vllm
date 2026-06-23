@@ -1,6 +1,9 @@
 name: ByteIAAS vLLM Development Build
 
 on:
+  push:
+    branches:
+      - iaas_main
   workflow_dispatch:
     inputs:
       checkout_ref:
@@ -21,7 +24,7 @@ jobs:
     if: github.repository == 'bytedance-iaas/vllm'
     uses: ./.github/workflows/_byteiaas-build-wheel.yml
     with:
-      checkout_ref: ${{ inputs.checkout_ref || github.ref }}
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || github.ref }}
       cuda_version: "13.0.2"
       artifact_name: vllm-cu130-wheel-dev
 
@@ -29,8 +32,8 @@ jobs:
     if: github.repository == 'bytedance-iaas/vllm'
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
-      checkout_ref: ${{ inputs.checkout_ref || github.ref }}
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || github.ref }}
       cuda_version: "13.0.2"
       tag_mode: dev
-      vllm_version: ${{ inputs.vllm_version }}
+      vllm_version: ${{ github.event_name == 'workflow_dispatch' && inputs.vllm_version || '' }}
     secrets: inherit
