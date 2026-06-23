@@ -1,0 +1,128 @@
+name: ByteIAAS Build And Publish vLLM Image
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      cuda_version:
+        description: "CUDA_VERSION build arg"
+        required: false
+        type: string
+        default: "13.0.2"
+      tag_mode:
+        description: "Image tag mode: dev or release"
+        required: true
+        type: string
+      tag_value:
+        description: "Internal tag value required for release mode"
+        required: false
+        type: string
+        default: ""
+      vllm_version:
+        description: "Explicit vLLM version override"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-and-publish-image:
+    if: github.repository == 'bytedance-iaas/vllm'
+    runs-on: x64-vllm-docker-build-node
+    env:
+      HTTP_PROXY: http://100.68.162.211:3128
+      HTTPS_PROXY: http://100.68.162.211:3128
+      ALL_PROXY: http://100.68.162.211:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+    steps:
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve Volcengine publish target
+        run: |
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+            echo "::error::VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE variables are required"
+            exit 1
+          fi
+          if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "::error::VOLCENGINE_CR_USERNAME and VOLCENGINE_CR_PASSWORD secrets are required"
+            exit 1
+          fi
+          IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "Resolved image repository ${IMAGE_REPO}"
+
+      - name: Resolve ByteIAAS image tag
+        id: image-tag
+        env:
+          BYTEIAAS_VLLM_VERSION: ${{ inputs.vllm_version }}
+        run: |
+          set -euo pipefail
+          tag_args=(--mode "${{ inputs.tag_mode }}" --cuda-suffix cu130)
+          if [ -n "${{ inputs.tag_value }}" ]; then
+            tag_args+=(--tag-value "${{ inputs.tag_value }}")
+          fi
+          if [ -n "${BYTEIAAS_VLLM_VERSION}" ]; then
+            tag_args+=(--vllm-version "${BYTEIAAS_VLLM_VERSION}")
+          fi
+          IMAGE_TAG="$(python3 scripts/ci/get_byteiaas_image_tag.py "${tag_args[@]}")"
+          echo "image-tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved image tag ${IMAGE_TAG}"
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Build and push AMD64 image by digest
+        id: build
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --target vllm-openai \
+            --platform linux/amd64 \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+            --build-arg ALL_PROXY="${ALL_PROXY}" \
+            --build-arg NO_PROXY="${NO_PROXY}" \
+            --metadata-file /tmp/byteiaas-vllm-image-metadata.json \
+            .
+          DIGEST="$(python3 -c "import json; print(json.load(open('/tmp/byteiaas-vllm-image-metadata.json'))['containerimage.digest'])")"
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create Volcengine image tag
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.digest }}"
+          echo "Published ${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}"
