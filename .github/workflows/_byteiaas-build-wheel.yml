@@ -45,6 +45,7 @@ jobs:
           set -euo pipefail
           DOCKER_BUILDKIT=1 docker build \
             --target build \
+            --network=host \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
             --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu22.04" \
@@ -52,6 +53,10 @@ jobs:
             --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
             --build-arg ALL_PROXY="${ALL_PROXY}" \
             --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg http_proxy="${HTTP_PROXY}" \
+            --build-arg https_proxy="${HTTPS_PROXY}" \
+            --build-arg all_proxy="${ALL_PROXY}" \
+            --build-arg no_proxy="${NO_PROXY}" \
             --build-arg RUN_WHEEL_CHECK=false \
             -t "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}" \
             .
