@@ -197,7 +197,20 @@ class SiluAndMulWithClamp(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
+        if self.alpha == 1.0 and self.beta == 0.0:
+            # The deployed wheel may still expose the old 3-argument CUDA op.
+            self.op(out, x, self.swiglu_limit)
+        else:
+            try:
+                self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
+            except RuntimeError as e:
+                msg = str(e)
+                if (
+                    "silu_and_mul_with_clamp()" not in msg
+                    or "expected at most 3 argument" not in msg
+                ):
+                    raise
+                return self.forward_native(x)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
