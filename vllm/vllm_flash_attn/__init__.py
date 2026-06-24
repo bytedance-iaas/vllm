@@ -20,24 +20,22 @@ if os.path.islink(_cute_dir) and "flash_attn" not in sys.modules:
     _fa_mod.__spec__.submodule_search_locations = _fa_mod.__path__
     sys.modules["flash_attn"] = _fa_mod
 
-from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
-    FA2_AVAILABLE,
-    FA3_AVAILABLE,
-    fa_version_unsupported_reason,
-    flash_attn_varlen_func,
-    get_scheduler_metadata,
-    is_fa_version_supported,
-)
-
-if not (FA2_AVAILABLE or FA3_AVAILABLE):
-    raise ImportError(
-        "vllm.vllm_flash_attn requires the CUDA flash attention extensions "
-        "(_vllm_fa2_C or _vllm_fa3_C). On ROCm, use upstream flash_attn."
-    )
-
 __all__ = [
     "fa_version_unsupported_reason",
     "flash_attn_varlen_func",
     "get_scheduler_metadata",
     "is_fa_version_supported",
 ]
+
+
+def __getattr__(name: str):
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    # Keep C-extension imports lazy so `vllm.vllm_flash_attn.cute.*` users do
+    # not need the FA2/FA3 extension when they only need CUTE helper modules.
+    from vllm.vllm_flash_attn import flash_attn_interface
+
+    value = getattr(flash_attn_interface, name)
+    globals()[name] = value
+    return value
