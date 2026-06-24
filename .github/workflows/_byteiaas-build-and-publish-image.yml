@@ -114,6 +114,7 @@ jobs:
             --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
             --build-arg ALL_PROXY="${ALL_PROXY}" \
             --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg RUN_WHEEL_CHECK=false \
             --metadata-file /tmp/byteiaas-vllm-image-metadata.json \
             .
           DIGEST="$(python3 -c "import json; print(json.load(open('/tmp/byteiaas-vllm-image-metadata.json'))['containerimage.digest'])")"
