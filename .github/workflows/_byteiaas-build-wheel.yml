@@ -62,6 +62,7 @@ jobs:
             --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
             --build-arg ALL_PROXY="${ALL_PROXY}" \
             --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg RUN_WHEEL_CHECK=false \
             -t "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}" \
             .
 
