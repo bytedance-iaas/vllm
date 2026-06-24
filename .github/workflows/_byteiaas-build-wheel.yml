@@ -64,18 +64,18 @@ jobs:
       - name: Copy wheels from build stage
         run: |
           set -euo pipefail
-          rm -rf .byteiaas-wheel-dist
-          mkdir -p .byteiaas-wheel-dist
+          rm -rf byteiaas-wheel-dist
+          mkdir -p byteiaas-wheel-dist
           container="$(docker create "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}")"
           trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
-          docker cp "${container}:/workspace/dist/." .byteiaas-wheel-dist/
-          ls -lh .byteiaas-wheel-dist
-          test -n "$(find .byteiaas-wheel-dist -maxdepth 1 -name '*.whl' -print -quit)"
+          docker cp "${container}:/workspace/dist/." byteiaas-wheel-dist/
+          ls -lh byteiaas-wheel-dist
+          test -n "$(find byteiaas-wheel-dist -maxdepth 1 -name '*.whl' -print -quit)"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          path: .byteiaas-wheel-dist/*.whl
+          path: byteiaas-wheel-dist/*.whl
           if-no-files-found: error
           retention-days: 14
