@@ -107,6 +107,36 @@ def activation_without_mul(activation: str) -> str:
     return MoEActivation.from_str(activation).without_mul().value
 
 
+def _silu_and_mul_with_clamp_compat(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    clamp_limit: float,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> None:
+    if alpha == 1.0 and beta == 0.0:
+        # The deployed wheel may still expose the old 3-argument CUDA op.
+        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit)
+        return
+
+    try:
+        torch.ops._C.silu_and_mul_with_clamp(
+            output, input, clamp_limit, alpha, beta
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if (
+            "silu_and_mul_with_clamp()" not in msg
+            or "expected at most 3 argument" not in msg
+        ):
+            raise
+
+        d = input.shape[-1] // 2
+        gate = torch.clamp(input[..., :d], max=clamp_limit)
+        up = torch.clamp(input[..., d:], min=-clamp_limit, max=clamp_limit)
+        output.copy_(gate * torch.sigmoid(alpha * gate) * (up + beta))
+
+
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
@@ -139,7 +169,7 @@ def apply_moe_activation(
     if activation == MoEActivation.SILU:
         if clamp_limit is not None:
             # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
-            torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
+            _silu_and_mul_with_clamp_compat(output, input, clamp_limit, 1.0, 0.0)
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
@@ -151,7 +181,7 @@ def apply_moe_activation(
     elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
         # SwiGLU-OAI on packed w13 (gate = first half, up = second half).
         assert clamp_limit is not None, "SWIGLUOAI_UNINTERLEAVE requires clamp_limit"
-        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, alpha, beta)
+        _silu_and_mul_with_clamp_compat(output, input, clamp_limit, alpha, beta)
     elif activation == MoEActivation.SWIGLUSTEP:
         from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
 
