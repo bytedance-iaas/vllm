@@ -35,13 +35,18 @@ def _compressed_slot_mapping_kernel(
         mask = offset < query_len
 
         pos = start_pos + i + tl.arange(0, TRITON_BLOCK_SIZE)
-        is_valid = (pos + 1) % COMPRESS_RATIO == 0
+        # During profiling / CUDA graph capture the dummy metadata can contain
+        # padded requests whose seq_len is smaller than query_len. Negative
+        # positions would produce negative block ids and can trigger illegal
+        # memory accesses in the block table load.
+        is_valid = (pos >= 0) & ((pos + 1) % COMPRESS_RATIO == 0)
         pos_after_compress = pos // COMPRESS_RATIO
 
         block_ids = pos_after_compress // block_size
         block_numbers = tl.load(
             block_table_ptr + batch_idx * block_table_stride + block_ids,
             mask=mask & is_valid,
+            other=0,
         )
         slot_ids = block_numbers * block_size + pos_after_compress % block_size
 
