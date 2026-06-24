@@ -40,24 +40,14 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Set up Docker Buildx with local Docker Hub mirror
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            network=host
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["127.0.0.1:5000"]
-
       - name: Build wheel stage image
         run: |
           set -euo pipefail
-          docker buildx build \
+          DOCKER_BUILDKIT=1 docker build \
             --target build \
-            --platform linux/amd64 \
-            --load \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu22.04" \
             --build-arg HTTP_PROXY="${HTTP_PROXY}" \
             --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
             --build-arg ALL_PROXY="${ALL_PROXY}" \
