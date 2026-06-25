@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       internal_tag: ${{ steps.release.outputs.internal_tag }}
-      release_ref: ${{ steps.release.outputs.release_ref }}
+      checkout_ref: ${{ steps.release.outputs.checkout_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,15 +56,16 @@ jobs:
             exit 1
           fi
           echo "internal_tag=${internal_tag}" >> "${GITHUB_OUTPUT}"
-          echo "release_ref=refs/tags/${raw_tag}" >> "${GITHUB_OUTPUT}"
+          echo "checkout_ref=${GITHUB_REF}" >> "${GITHUB_OUTPUT}"
           echo "Resolved existing release tag ${raw_tag}"
+          echo "Build checkout ref ${GITHUB_REF}"
 
   build-wheel:
     if: github.repository == 'bytedance-iaas/vllm'
     needs: resolve-release
     uses: ./.github/workflows/_byteiaas-build-wheel.yml
     with:
-      checkout_ref: ${{ needs.resolve-release.outputs.release_ref }}
+      checkout_ref: ${{ needs.resolve-release.outputs.checkout_ref }}
       cuda_version: "13.0.2"
       artifact_name: vllm-cu130-wheel-release-${{ needs.resolve-release.outputs.internal_tag }}
 
@@ -73,7 +74,7 @@ jobs:
     needs: resolve-release
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
-      checkout_ref: ${{ needs.resolve-release.outputs.release_ref }}
+      checkout_ref: ${{ needs.resolve-release.outputs.checkout_ref }}
       cuda_version: "13.0.2"
       tag_mode: release
       tag_value: ${{ needs.resolve-release.outputs.internal_tag }}
