@@ -616,6 +616,11 @@ def async_tensor_h2d(
     return t.to(device=device, non_blocking=True)
 
 
+def np_to_pinned_tensor(array: np.ndarray) -> torch.Tensor:
+    t = torch.from_numpy(array)
+    return t.pin_memory() if PIN_MEMORY else t
+
+
 def make_ndarray_with_pad(
     x: list[list[T]],
     pad: T,
