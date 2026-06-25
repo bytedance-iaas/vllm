@@ -31,21 +31,14 @@ on:
 jobs:
   build-and-publish-image:
     if: github.repository == 'bytedance-iaas/vllm'
-    name: build-and-publish-image (${{ matrix.image_flavor }})
+    name: build-and-publish-image
     runs-on: x64-vllm-docker-build-node
     timeout-minutes: 1440
-    strategy:
-      fail-fast: false
-      matrix:
-        image_flavor:
-          - openai
-          - openai-devel
     env:
       HTTP_PROXY: http://100.68.162.211:3128
       HTTPS_PROXY: http://100.68.162.211:3128
       ALL_PROXY: http://100.68.162.211:3128
       NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com,.astral.sh,astral.sh,releases.astral.sh
-      IMAGE_FLAVOR: ${{ matrix.image_flavor }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
@@ -77,26 +70,34 @@ jobs:
           echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
           echo "Resolved image repository ${IMAGE_REPO}"
 
-      - name: Resolve ByteIAAS image tag
-        id: image-tag
+      - name: Resolve ByteIAAS image tags
+        id: image-tags
         env:
           BYTEIAAS_VLLM_VERSION: ${{ inputs.vllm_version }}
         run: |
           set -euo pipefail
-          tag_args=(
-            --mode "${{ inputs.tag_mode }}"
-            --image-flavor "${IMAGE_FLAVOR}"
-            --cuda-suffix cu130
-          )
-          if [ -n "${{ inputs.tag_value }}" ]; then
-            tag_args+=(--tag-value "${{ inputs.tag_value }}")
-          fi
-          if [ -n "${BYTEIAAS_VLLM_VERSION}" ]; then
-            tag_args+=(--vllm-version "${BYTEIAAS_VLLM_VERSION}")
-          fi
-          IMAGE_TAG="$(python3 scripts/ci/get_byteiaas_image_tag.py "${tag_args[@]}")"
-          echo "image-tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "Resolved image tag ${IMAGE_TAG}"
+          resolve_tag() {
+            local image_flavor="$1"
+            local tag_args=(
+              --mode "${{ inputs.tag_mode }}"
+              --image-flavor "${image_flavor}"
+              --cuda-suffix cu130
+            )
+            if [ -n "${{ inputs.tag_value }}" ]; then
+              tag_args+=(--tag-value "${{ inputs.tag_value }}")
+            fi
+            if [ -n "${BYTEIAAS_VLLM_VERSION}" ]; then
+              tag_args+=(--vllm-version "${BYTEIAAS_VLLM_VERSION}")
+            fi
+            python3 scripts/ci/get_byteiaas_image_tag.py "${tag_args[@]}"
+          }
+
+          OPENAI_IMAGE_TAG="$(resolve_tag openai)"
+          OPENAI_DEVEL_IMAGE_TAG="$(resolve_tag openai-devel)"
+          echo "openai_image_tag=${OPENAI_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "openai_devel_image_tag=${OPENAI_DEVEL_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved openai image tag ${OPENAI_IMAGE_TAG}"
+          echo "Resolved openai-devel image tag ${OPENAI_DEVEL_IMAGE_TAG}"
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
@@ -118,19 +119,19 @@ jobs:
           set -euo pipefail
           ubuntu_version="22.04"
           final_base_image="nvidia/cuda:${{ inputs.cuda_version }}-base-ubuntu${ubuntu_version}"
-          metadata_file="/tmp/byteiaas-vllm-image-${IMAGE_FLAVOR}.json"
+          openai_metadata_file="/tmp/byteiaas-vllm-openai-image.json"
+          openai_devel_metadata_file="/tmp/byteiaas-vllm-openai-devel-image.json"
 
           build_vllm_openai() {
             local output_name="$1"
             local metadata_path="$2"
-            local final_base="$3"
             docker buildx build \
               --target vllm-openai \
               --platform linux/amd64 \
               --output "type=image,name=${output_name},push-by-digest=true,name-canonical=true,push=true" \
               -f docker/Dockerfile \
               --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
-              --build-arg FINAL_BASE_IMAGE="${final_base}" \
+              --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
               --build-arg INSTALL_KV_CONNECTORS=true \
               --build-arg HTTP_PROXY="${HTTP_PROXY}" \
               --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
@@ -145,43 +146,40 @@ jobs:
               .
           }
 
-          if [ "${IMAGE_FLAVOR}" = "openai" ]; then
-            build_vllm_openai "${IMAGE_REPO}" "${metadata_file}" "${final_base_image}"
-          elif [ "${IMAGE_FLAVOR}" = "openai-devel" ]; then
-            devel_base_image="nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu${ubuntu_version}"
-            base_metadata_file="/tmp/byteiaas-vllm-image-${IMAGE_FLAVOR}-base.json"
-            build_vllm_openai "${IMAGE_REPO}" "${base_metadata_file}" "${devel_base_image}"
-            base_digest="$(python3 -c "import json; print(json.load(open('${base_metadata_file}'))['containerimage.digest'])")"
-            echo "Pushed openai-devel base digest: ${base_digest}"
+          build_vllm_openai "${IMAGE_REPO}" "${openai_metadata_file}"
+          openai_digest="$(python3 -c "import json; print(json.load(open('${openai_metadata_file}'))['containerimage.digest'])")"
+          echo "Pushed openai digest: ${openai_digest}"
 
-            docker buildx build \
-              --platform linux/amd64 \
-              --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
-              -f docker/byteiaas-openai-devel.Dockerfile \
-              --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${base_digest}" \
-              --build-arg HTTP_PROXY="${HTTP_PROXY}" \
-              --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
-              --build-arg ALL_PROXY="${ALL_PROXY}" \
-              --build-arg NO_PROXY="${NO_PROXY}" \
-              --build-arg http_proxy="${HTTP_PROXY}" \
-              --build-arg https_proxy="${HTTPS_PROXY}" \
-              --build-arg all_proxy="${ALL_PROXY}" \
-              --build-arg no_proxy="${NO_PROXY}" \
-              --metadata-file "${metadata_file}" \
-              .
-          else
-            echo "::error::Unsupported image flavor: ${IMAGE_FLAVOR}"
-            exit 1
-          fi
+          docker buildx build \
+            --platform linux/amd64 \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
+            -f docker/byteiaas-openai-devel.Dockerfile \
+            --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${openai_digest}" \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+            --build-arg ALL_PROXY="${ALL_PROXY}" \
+            --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg http_proxy="${HTTP_PROXY}" \
+            --build-arg https_proxy="${HTTPS_PROXY}" \
+            --build-arg all_proxy="${ALL_PROXY}" \
+            --build-arg no_proxy="${NO_PROXY}" \
+            --metadata-file "${openai_devel_metadata_file}" \
+            .
 
-          DIGEST="$(python3 -c "import json; print(json.load(open('${metadata_file}'))['containerimage.digest'])")"
-          echo "Pushed ${IMAGE_FLAVOR} digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          openai_devel_digest="$(python3 -c "import json; print(json.load(open('${openai_devel_metadata_file}'))['containerimage.digest'])")"
+          echo "Pushed openai-devel digest: ${openai_devel_digest}"
+          echo "openai_digest=${openai_digest}" >> "${GITHUB_OUTPUT}"
+          echo "openai_devel_digest=${openai_devel_digest}" >> "${GITHUB_OUTPUT}"
 
-      - name: Create Volcengine image tag
+      - name: Create Volcengine image tags
         run: |
           set -euo pipefail
           docker buildx imagetools create \
-            -t "${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}" \
-            "${IMAGE_REPO}@${{ steps.build.outputs.digest }}"
-          echo "Published image ${IMAGE_FLAVOR}: ${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}"
+            -t "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_image_tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.openai_digest }}"
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_image_tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.openai_devel_digest }}"
+          echo "Published openai image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_image_tag }}"
+          echo "Published openai-devel image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_image_tag }}"
