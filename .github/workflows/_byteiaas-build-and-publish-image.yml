@@ -31,13 +31,21 @@ on:
 jobs:
   build-and-publish-image:
     if: github.repository == 'bytedance-iaas/vllm'
+    name: build-and-publish-image (${{ matrix.image_flavor }})
     runs-on: x64-vllm-docker-build-node
     timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        image_flavor:
+          - openai
+          - openai-devel
     env:
       HTTP_PROXY: http://100.68.162.211:3128
       HTTPS_PROXY: http://100.68.162.211:3128
       ALL_PROXY: http://100.68.162.211:3128
       NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com,.astral.sh,astral.sh,releases.astral.sh
+      IMAGE_FLAVOR: ${{ matrix.image_flavor }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
@@ -75,7 +83,11 @@ jobs:
           BYTEIAAS_VLLM_VERSION: ${{ inputs.vllm_version }}
         run: |
           set -euo pipefail
-          tag_args=(--mode "${{ inputs.tag_mode }}" --cuda-suffix cu130)
+          tag_args=(
+            --mode "${{ inputs.tag_mode }}"
+            --image-flavor "${IMAGE_FLAVOR}"
+            --cuda-suffix cu130
+          )
           if [ -n "${{ inputs.tag_value }}" ]; then
             tag_args+=(--tag-value "${{ inputs.tag_value }}")
           fi
@@ -104,21 +116,66 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          docker buildx build \
-            --target vllm-openai \
-            --platform linux/amd64 \
-            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
-            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
-            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
-            --build-arg ALL_PROXY="${ALL_PROXY}" \
-            --build-arg NO_PROXY="${NO_PROXY}" \
-            --build-arg RUN_WHEEL_CHECK=false \
-            --metadata-file /tmp/byteiaas-vllm-image-metadata.json \
-            .
-          DIGEST="$(python3 -c "import json; print(json.load(open('/tmp/byteiaas-vllm-image-metadata.json'))['containerimage.digest'])")"
-          echo "Pushed digest: ${DIGEST}"
+          ubuntu_version="22.04"
+          final_base_image="nvidia/cuda:${{ inputs.cuda_version }}-base-ubuntu${ubuntu_version}"
+          metadata_file="/tmp/byteiaas-vllm-image-${IMAGE_FLAVOR}.json"
+
+          build_vllm_openai() {
+            local output_name="$1"
+            local metadata_path="$2"
+            local final_base="$3"
+            docker buildx build \
+              --target vllm-openai \
+              --platform linux/amd64 \
+              --output "type=image,name=${output_name},push-by-digest=true,name-canonical=true,push=true" \
+              -f docker/Dockerfile \
+              --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+              --build-arg FINAL_BASE_IMAGE="${final_base}" \
+              --build-arg INSTALL_KV_CONNECTORS=true \
+              --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+              --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+              --build-arg ALL_PROXY="${ALL_PROXY}" \
+              --build-arg NO_PROXY="${NO_PROXY}" \
+              --build-arg http_proxy="${HTTP_PROXY}" \
+              --build-arg https_proxy="${HTTPS_PROXY}" \
+              --build-arg all_proxy="${ALL_PROXY}" \
+              --build-arg no_proxy="${NO_PROXY}" \
+              --build-arg RUN_WHEEL_CHECK=false \
+              --metadata-file "${metadata_path}" \
+              .
+          }
+
+          if [ "${IMAGE_FLAVOR}" = "openai" ]; then
+            build_vllm_openai "${IMAGE_REPO}" "${metadata_file}" "${final_base_image}"
+          elif [ "${IMAGE_FLAVOR}" = "openai-devel" ]; then
+            devel_base_image="nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu${ubuntu_version}"
+            base_metadata_file="/tmp/byteiaas-vllm-image-${IMAGE_FLAVOR}-base.json"
+            build_vllm_openai "${IMAGE_REPO}" "${base_metadata_file}" "${devel_base_image}"
+            base_digest="$(python3 -c "import json; print(json.load(open('${base_metadata_file}'))['containerimage.digest'])")"
+            echo "Pushed openai-devel base digest: ${base_digest}"
+
+            docker buildx build \
+              --platform linux/amd64 \
+              --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
+              -f docker/byteiaas-openai-devel.Dockerfile \
+              --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${base_digest}" \
+              --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+              --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+              --build-arg ALL_PROXY="${ALL_PROXY}" \
+              --build-arg NO_PROXY="${NO_PROXY}" \
+              --build-arg http_proxy="${HTTP_PROXY}" \
+              --build-arg https_proxy="${HTTPS_PROXY}" \
+              --build-arg all_proxy="${ALL_PROXY}" \
+              --build-arg no_proxy="${NO_PROXY}" \
+              --metadata-file "${metadata_file}" \
+              .
+          else
+            echo "::error::Unsupported image flavor: ${IMAGE_FLAVOR}"
+            exit 1
+          fi
+
+          DIGEST="$(python3 -c "import json; print(json.load(open('${metadata_file}'))['containerimage.digest'])")"
+          echo "Pushed ${IMAGE_FLAVOR} digest: ${DIGEST}"
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
 
       - name: Create Volcengine image tag
@@ -127,4 +184,4 @@ jobs:
           docker buildx imagetools create \
             -t "${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}" \
             "${IMAGE_REPO}@${{ steps.build.outputs.digest }}"
-          echo "Published ${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}"
+          echo "Published image ${IMAGE_FLAVOR}: ${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}"
