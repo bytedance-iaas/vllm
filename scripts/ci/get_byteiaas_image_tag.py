@@ -90,6 +90,7 @@ def current_timestamp(timestamp_arg: str) -> str:
 def build_tag(
     *,
     mode: str,
+    image_flavor: str,
     vllm_version: str,
     timestamp: str,
     tag_value: str,
@@ -106,6 +107,13 @@ def build_tag(
     else:
         raise SystemExit(f"unsupported mode: {mode}")
 
+    if image_flavor == "openai":
+        pass
+    elif image_flavor == "openai-devel":
+        tag = f"{tag}-openai-devel"
+    else:
+        raise SystemExit(f"unsupported image flavor: {image_flavor}")
+
     if cuda_suffix:
         tag = f"{tag}-{cuda_suffix}"
     return tag
@@ -116,6 +124,12 @@ def main() -> None:
         description="Generate ByteIAAS Volcengine CR image tags for vLLM."
     )
     parser.add_argument("--mode", choices=["dev", "release"], required=True)
+    parser.add_argument(
+        "--image-flavor",
+        choices=["openai", "openai-devel"],
+        default="openai",
+        help="Image flavor. The default preserves the existing openai tag format.",
+    )
     parser.add_argument(
         "--tag-value",
         default="",
@@ -141,6 +155,7 @@ def main() -> None:
 
     tag = build_tag(
         mode=args.mode,
+        image_flavor=args.image_flavor,
         vllm_version=get_vllm_version(args.vllm_version),
         timestamp=current_timestamp(args.timestamp),
         tag_value=args.tag_value,

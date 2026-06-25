@@ -22,6 +22,7 @@ def test_build_dev_tag_with_cuda_suffix() -> None:
     assert (
         helper.build_tag(
             mode="dev",
+            image_flavor="openai",
             vllm_version="0.12.0",
             timestamp="202606231234",
             tag_value="",
@@ -35,6 +36,7 @@ def test_build_release_tag_with_internal_tag_and_cuda_suffix() -> None:
     assert (
         helper.build_tag(
             mode="release",
+            image_flavor="openai",
             vllm_version="0.12.0",
             timestamp="202606231234",
             tag_value="0.0.11",
@@ -44,10 +46,51 @@ def test_build_release_tag_with_internal_tag_and_cuda_suffix() -> None:
     )
 
 
+def test_build_dev_openai_devel_tag_with_cuda_suffix() -> None:
+    assert (
+        helper.build_tag(
+            mode="dev",
+            image_flavor="openai-devel",
+            vllm_version="0.12.0",
+            timestamp="202606231234",
+            tag_value="",
+            cuda_suffix="cu130",
+        )
+        == "v0.12.0.iaas.dev.202606231234-openai-devel-cu130"
+    )
+
+
+def test_build_release_openai_devel_tag_with_cuda_suffix() -> None:
+    assert (
+        helper.build_tag(
+            mode="release",
+            image_flavor="openai-devel",
+            vllm_version="0.12.0",
+            timestamp="202606231234",
+            tag_value="0.0.11",
+            cuda_suffix="cu130",
+        )
+        == "v0.12.0.byted.0.0.11.202606231234-openai-devel-cu130"
+    )
+
+
+def test_build_tag_rejects_unknown_image_flavor() -> None:
+    with pytest.raises(SystemExit, match="unsupported image flavor"):
+        helper.build_tag(
+            mode="dev",
+            image_flavor="runtime",
+            vllm_version="0.12.0",
+            timestamp="202606231234",
+            tag_value="",
+            cuda_suffix="cu130",
+        )
+
+
 def test_release_requires_tag_value() -> None:
     with pytest.raises(SystemExit, match="--tag-value is required"):
         helper.build_tag(
             mode="release",
+            image_flavor="openai",
             vllm_version="0.12.0",
             timestamp="202606231234",
             tag_value="",
@@ -59,6 +102,7 @@ def test_release_rejects_unsafe_tag_value() -> None:
     with pytest.raises(SystemExit, match="Docker tag-safe suffix"):
         helper.build_tag(
             mode="release",
+            image_flavor="openai",
             vllm_version="0.12.0",
             timestamp="202606231234",
             tag_value="../bad",
