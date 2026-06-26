@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - iaas_main
+  schedule:
+    # Daily at 02:00 Asia/Shanghai.
+    - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:
       checkout_ref:
