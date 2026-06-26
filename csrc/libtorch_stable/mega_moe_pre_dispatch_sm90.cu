@@ -62,12 +62,21 @@ constexpr float kEps = 1e-10f;
 constexpr uint32_t kGroupSize = 128;   // SM90 per-128-channel scale
 constexpr uint32_t kVecElems = 8;      // 8 bf16 = 16B vector load per thread
 constexpr uint32_t kThreadsPerGroup = kGroupSize / kVecElems;  // 16
+constexpr uint32_t kWarpSize = 32;
 
 __device__ __forceinline__ float warpGroupReduceMax(float val) {
-  // Reduce within the kThreadsPerGroup-sized subgroup (16 lanes).
+  // Reduce within each kThreadsPerGroup-lane (16) subgroup. Build a mask that
+  // covers only this thread's subgroup lanes so a partially populated final
+  // warp (blockDim.x not a multiple of 32, e.g. hidden=384) never pulls
+  // inactive lanes into the shuffle. hidden % 128 == 0 guarantees blockDim.x is
+  // a multiple of kThreadsPerGroup, so every subgroup is fully populated and
+  // stays within a single warp.
+  const uint32_t lane = threadIdx.x % kWarpSize;
+  const uint32_t group_mask = ((1u << kThreadsPerGroup) - 1u)
+                              << ((lane / kThreadsPerGroup) * kThreadsPerGroup);
 #pragma unroll
   for (int offset = kThreadsPerGroup / 2; offset > 0; offset >>= 1) {
-    val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, offset, 32));
+    val = fmaxf(val, __shfl_xor_sync(group_mask, val, offset, kWarpSize));
   }
   return val;
 }
@@ -199,6 +208,8 @@ void mega_moe_pre_dispatch_sm90(
   STD_TORCH_CHECK(topk_weights.size(0) == num_tokens &&
                       topk_weights.size(1) == top_k,
                   "topk_weights shape must match topk_idx");
+  STD_TORCH_CHECK(topk_idx.size(0) == num_tokens,
+                  "topk_idx.size(0) must equal num_tokens (x.size(0))");
   STD_TORCH_CHECK(buf_x.size(1) == hidden, "buf_x hidden mismatch");
   STD_TORCH_CHECK(buf_x_sf.size(0) == padded_max &&
                       buf_x_sf.size(1) == num_groups,
@@ -225,12 +236,21 @@ void mega_moe_pre_dispatch_sm90(
   STD_TORCH_CHECK(buf_topk_weights.scalar_type() == ScalarType::Float,
                   "buf_topk_weights must be float32");
 
-  // Contiguity: the kernel uses linear/vectorized addressing.
-  STD_TORCH_CHECK(x.stride(1) == 1 && buf_x.stride(1) == 1,
-                  "x and buf_x must be row-major contiguous");
-  STD_TORCH_CHECK(buf_x_sf.stride(1) == 1 && buf_topk_idx.stride(1) == 1 &&
-                      buf_topk_weights.stride(1) == 1,
-                  "scale/topk buffers must be row-major contiguous");
+  // Contiguity: the kernel addresses every tensor with linear/vectorized
+  // offsets (token * hidden, token * top_k, token * num_groups), so all
+  // inputs and outputs must be compact row-major.
+  STD_TORCH_CHECK(x.is_contiguous(), "x must be row-major contiguous");
+  STD_TORCH_CHECK(topk_idx.is_contiguous(),
+                  "topk_idx must be row-major contiguous");
+  STD_TORCH_CHECK(topk_weights.is_contiguous(),
+                  "topk_weights must be row-major contiguous");
+  STD_TORCH_CHECK(buf_x.is_contiguous(), "buf_x must be row-major contiguous");
+  STD_TORCH_CHECK(buf_x_sf.is_contiguous(),
+                  "buf_x_sf must be row-major contiguous");
+  STD_TORCH_CHECK(buf_topk_idx.is_contiguous(),
+                  "buf_topk_idx must be row-major contiguous");
+  STD_TORCH_CHECK(buf_topk_weights.is_contiguous(),
+                  "buf_topk_weights must be row-major contiguous");
 
   STD_TORCH_CHECK(getSMVersion() >= 90, "required CUDA ARCH >= SM_90");
 

@@ -206,8 +206,9 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
         (1, 4096),    # decode single token, large symm buffer (big pad fill)
     ],
 )
+@pytest.mark.parametrize("topk_ids_dtype", [torch.int32, torch.int64])
 def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference(
-    num_tokens, max_num_tokens
+    num_tokens, max_num_tokens, topk_ids_dtype
 ):
     device = torch.device("cuda")
     hidden_size = 256
@@ -236,7 +237,7 @@ def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference(
         256,
         (num_tokens, top_k),
         device=device,
-        dtype=torch.int32,
+        dtype=topk_ids_dtype,
         generator=generator,
     )
     topk_weights = torch.randn(

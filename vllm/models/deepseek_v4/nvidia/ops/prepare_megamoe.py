@@ -450,9 +450,11 @@ def prepare_megamoe_inputs_sm90(
     if _has_mega_moe_pre_dispatch_sm90_op():
         from vllm import _custom_ops as ops
 
+        # vLLM MegaMoE routing emits int64 topk ids (hash_indices_dtype), but the
+        # CUDA op requires int32. Cast here to match the SGLang reference path.
         ops.mega_moe_pre_dispatch_sm90(
             hidden_states,
-            topk_ids,
+            topk_ids.to(torch.int32),
             topk_weights,
             x_fp8,
             x_sf,
