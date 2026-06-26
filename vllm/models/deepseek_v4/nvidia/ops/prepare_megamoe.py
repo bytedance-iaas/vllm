@@ -432,10 +432,9 @@ def prepare_megamoe_inputs_sm90(
 ) -> None:
     """SM90 (Hopper) MegaMoE input staging.
 
-    Prefers the fused CUDA op ``torch.ops._C.mega_moe_pre_dispatch_sm90``
-    (ported from SGLang); falls back to the Triton implementation when the
-    custom op is unavailable (e.g. a build without the SM90 CUDA kernel). Both
-    paths:
+    Temporarily uses the Triton implementation unconditionally while the fused
+    CUDA op ``torch.ops._C.mega_moe_pre_dispatch_sm90`` is disabled for
+    validation. This path:
 
     - quantize BF16 hidden states into FP8 E4M3 with a fixed group size of 128
       and write the *raw* FP32 activation scale (not packed UE8M0);
@@ -444,26 +443,10 @@ def prepare_megamoe_inputs_sm90(
     - fold ``routed_scaling_factor`` into the topk weights.
 
     The ``x_fp8``/``x_sf`` rows beyond ``num_tokens`` are left untouched; the
-    DeepGEMM kernel skips them because their topk ids are ``-1``. With the CUDA
-    op, set ``VLLM_ENABLE_PDL=1`` to enable programmatic dependent launch.
+    DeepGEMM kernel skips them because their topk ids are ``-1``.
     """
-    if _has_mega_moe_pre_dispatch_sm90_op():
-        from vllm import _custom_ops as ops
-
-        # vLLM MegaMoE routing emits int64 topk ids (hash_indices_dtype), but the
-        # CUDA op requires int32. Cast here to match the SGLang reference path.
-        ops.mega_moe_pre_dispatch_sm90(
-            hidden_states,
-            topk_ids.to(torch.int32),
-            topk_weights,
-            x_fp8,
-            x_sf,
-            topk_idx_out,
-            topk_weights_out,
-            routed_scaling_factor=float(routed_scaling_factor),
-        )
-        return
-
+    # Keep the CUDA op registered/buildable, but route through Triton until the
+    # fused SM90 implementation has been fully validated.
     _prepare_megamoe_inputs_sm90_triton(
         hidden_states,
         topk_weights,
