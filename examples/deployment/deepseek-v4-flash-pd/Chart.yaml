@@ -1,0 +1,6 @@
+apiVersion: v2
+name: deepseek-v4-flash-pd
+description: Helm chart for vLLM DeepSeek-V4-Flash prefill/decode disaggregated serving
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

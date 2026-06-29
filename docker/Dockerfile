@@ -1061,6 +1061,27 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
+# Install the community router package in the image so deployment manifests do
+# not install Python packages at runtime.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system vllm-router \
+    && command -v vllm-router
+
+# Install Onion AI Data tooling at image build time. The deployment uses
+# oniond only for idempotent model preparation; it must not apt-install tools
+# from inside the running service Pods.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends curl gpg \
+    && curl -fsSL https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system \
+      | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/ubuntu noble main" \
+      > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends onion-ai-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && command -v oniond \
+    && oniond --help >/dev/null
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \

@@ -1,0 +1,43 @@
+{{- if .Values.service.prefill.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-prefill" (include "deepseek-v4-flash-pd.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "deepseek-v4-flash-pd.labels" . | nindent 4 }}
+    storm-service-name: {{ include "deepseek-v4-flash-pd.fullname" . }}
+    role-name: prefill
+spec:
+  type: {{ .Values.service.prefill.type }}
+  selector:
+    storm-service-name: {{ include "deepseek-v4-flash-pd.fullname" . }}
+    role-name: prefill
+  ports:
+    - name: http
+      port: {{ .Values.service.prefill.port }}
+      targetPort: {{ .Values.service.prefill.targetPort }}
+      protocol: TCP
+---
+{{- end }}
+{{- if .Values.service.decode.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-decode" (include "deepseek-v4-flash-pd.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "deepseek-v4-flash-pd.labels" . | nindent 4 }}
+    storm-service-name: {{ include "deepseek-v4-flash-pd.fullname" . }}
+    role-name: decode
+spec:
+  type: {{ .Values.service.decode.type }}
+  selector:
+    storm-service-name: {{ include "deepseek-v4-flash-pd.fullname" . }}
+    role-name: decode
+  ports:
+    - name: http
+      port: {{ .Values.service.decode.port }}
+      targetPort: {{ .Values.service.decode.targetPort }}
+      protocol: TCP
+{{- end }}

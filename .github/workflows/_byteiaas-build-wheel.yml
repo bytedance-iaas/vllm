@@ -1,0 +1,81 @@
+name: ByteIAAS Build vLLM Wheel
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      cuda_version:
+        description: "CUDA_VERSION build arg"
+        required: false
+        type: string
+        default: "13.0.2"
+      artifact_name:
+        description: "Uploaded wheel artifact name"
+        required: false
+        type: string
+        default: "vllm-cu130-wheel"
+
+jobs:
+  build-wheel:
+    if: github.repository == 'bytedance-iaas/vllm'
+    runs-on: x64-vllm-wheel-build-node
+    timeout-minutes: 1440
+    env:
+      HTTP_PROXY: http://100.68.162.211:3128
+      HTTPS_PROXY: http://100.68.162.211:3128
+      ALL_PROXY: http://100.68.162.211:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com,.astral.sh,astral.sh,releases.astral.sh
+    steps:
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Build wheel stage image
+        run: |
+          set -euo pipefail
+          DOCKER_BUILDKIT=1 docker build \
+            --target build \
+            --network=host \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu22.04" \
+            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+            --build-arg ALL_PROXY="${ALL_PROXY}" \
+            --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg http_proxy="${HTTP_PROXY}" \
+            --build-arg https_proxy="${HTTPS_PROXY}" \
+            --build-arg all_proxy="${ALL_PROXY}" \
+            --build-arg no_proxy="${NO_PROXY}" \
+            --build-arg RUN_WHEEL_CHECK=false \
+            -t "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}" \
+            .
+
+      - name: Copy wheels from build stage
+        run: |
+          set -euo pipefail
+          rm -rf byteiaas-wheel-dist
+          mkdir -p byteiaas-wheel-dist
+          container="$(docker create "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}")"
+          trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container}:/workspace/dist/." byteiaas-wheel-dist/
+          ls -lh byteiaas-wheel-dist
+          test -n "$(find byteiaas-wheel-dist -maxdepth 1 -name '*.whl' -print -quit)"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: byteiaas-wheel-dist/*.whl
+          if-no-files-found: error
+          retention-days: 14

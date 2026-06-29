@@ -1,0 +1,194 @@
+# vLLM DSV4 Flash P/D Fork-Base Build Migration Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task. Use `superpowers:subagent-driven-development` only if one worker owns GitHub branch/backup operations and another worker owns ByteIAAS build-file restoration. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make `wangyicong52/vllm.git` `dev/dsv4-mooncake-pp-megamoe` the new source base for `bytedance-iaas/vllm:iaas_main`, preserve only the necessary ByteIAAS build/publish capabilities, build a runnable image, deploy it on `dev-cluster` without runtime hotfix/install, and benchmark the requested 64k/1 TTFT and cache-hit decode BS512 throughput cases.
+
+**Architecture:** First create a remote GitHub backup branch named `backup/iaas_main-YYYYMMDD` pointing at the original `origin/iaas_main` SHA, then add a GitHub ruleset protecting `backup/iaas_main-*`. Then create a new integration branch from `wangyicong52/vllm.git` and restore only ByteIAAS build-related files from the backed-up old `iaas_main`; do not port old vLLM model/runtime/source logic. After the image is built, add a vLLM-owned deployment example based on the servingkit Helm chart, but remove runtime hotfixes, `git clone`, `pip install`, wheel download/install, and router package install paths because the image must contain all required code and libraries. The newly built vLLM image must also contain `oniond`; if the base image lacks it, install `onion-ai-data` during image build using the `onion-ai-data` skill's Volcengine apt source flow. The deployment template should use the same new vLLM image for Onion model preparation and serving, relying on Onion's idempotent skip behavior when the target model already exists. Deploy on `dev-cluster` with workspace-env GPU permits, then use evalscope for the requested benchmark runs and preserve raw artifacts. Only after the image, deployment, router smoke, and required evalscope measured runs complete or have explicitly accepted blockers should the remote `iaas_main` be updated.
+
+**Tech Stack:** `bytedance-iaas/vllm`, `wangyicong52/vllm`, GitHub remote branches, GitHub Actions, Docker Buildx, CUDA 13.0.2, `uv`, ByteIAAS Volcengine CR publish workflow, Mooncake, DeepEP, DeepGEMM, `vllm-router`.
+
+## Global Constraints
+
+- 计划、命令引用、进展日志、目标、背景、假设、约束、非目标、里程碑、风险、审批说明、验证说明、进展摘要和最终摘要使用中文。
+- 命令、文件路径、代码标识、错误信息、API 名称和专有名词保持原文。
+- 主计划路径：`docs/superpowers/plans/2026-06-29-vllm-dsv4-flash-pd-build.md`
+- 命令引用路径：`docs/superpowers/plans/2026-06-29-vllm-dsv4-flash-pd-build.commands.md`
+- 进展日志路径：`docs/superpowers/plans/2026-06-29-vllm-dsv4-flash-pd-build.progress.md`
+- 不创建 `.codex/plans`。
+- 执行前必须在 GitHub 远端创建原始 `iaas_main` 备份分支；本地备份不满足要求。
+- 新 `iaas_main` 起点必须是 `https://github.com/wangyicong52/vllm.git` 的 `dev/dsv4-mooncake-pp-megamoe`。
+- 只从旧 `iaas_main` 保留构建相关能力；旧 `iaas_main` 的模型、运行时、调度、kernel、connector、API 逻辑不保留。
+- Mooncake 保持当前 vLLM Dockerfile 中已有 KV connector/Mooncake 处理方式，不强制改为 Helm chart 中的 `mooncake-transfer-engine-cuda13==0.3.11`。
+- servingkit Helm chart 不直接迁入本仓库；本任务在 vLLM 仓库新建一份参考其 P/D 形态的部署模板，但必须移除 runtime hotfix 和运行时安装逻辑。模型准备例外：部署模板应通过同一个新构建 vLLM 镜像中的 `oniond download model ... --turbo --dir ...` 做幂等模型下载，不能在 Pod 启动时安装 Onion 或其他代码库。
+- 不新增、不恢复 `scripts/ci/check_byteiaas_dsv4_runtime.py`，也不在镜像构建流程补充 import/CLI smoke；构建后只做镜像构建结果、部署渲染、真实服务路径和 benchmark 验证。
+- Kubernetes 目标环境固定为 `dev-cluster`，通过 `/data00/home/hanhan.hank/workspace/env/bin/envctl` 访问；当前只读验证 `envctl validate dev-cluster` 通过。
+- dev-cluster GPU 工作必须先通过 workspace-env GPU Permit Queue 获取 permit；本计划默认 namespace 为 `vllm-dsv4-flash-pd`，release 为 `dsv4-flash-pd`。servingkit 模板中 `global.gpuCount=8` 会同时用于 prefill 和 decode 的 `nvidia.com/gpu` request/limit，因此本计划 GPU 总量默认 `16`，且必须选择两台不同的 8-GPU 节点分别承载 prefill 和 decode。
+- benchmark 默认使用 evalscope；若 evalscope 不可安装或不能满足该请求，执行者必须停止并报告 blocker，不得擅自切换自定义 harness。
+- 用户已在 2026-06-29 本线程同意本计划内的远端备份、备份分支保护规则、远端 `iaas_main` 更新、workflow 发布镜像、以及 chart 已出现外部 wheel URL 使用；执行阶段若命令、目标仓库、分支名、外部 URL 或发布范围偏离本计划，必须重新确认。
+
+---
+
+## Context Summary
+
+- servingkit Helm chart 使用 `wangyicong52/vllm.git` `dev/dsv4-mooncake-pp-megamoe` 作为 runtime overlay，因此新的源码基线应直接使用该 fork，而不是把 fork 源码拆 port 到旧 `iaas_main`。
+- servingkit `vllm/deepseek/deepseek-v4-flash-pd` 当前模板中 `global.gpuCount: 8`，prefill 和 decode 均通过 `nvidia.com/gpu: {{ .Values.global.gpuCount }}` 请求 8 张 GPU；现有 values 中 prefill/decode 都是 `replicas: 1`，prefill 使用 `dataParallelSize: 8`，decode 使用 `dataParallelSize: 8`，因此本迁移部署的 `1P1D` 必须跨两个不同节点，而不是同节点尝试调度 16 卡。
+- 旧 `origin/iaas_main` 当前已知 SHA：`1ad5c27d4`，包含 ByteIAAS 日构建 workflow、Volcengine CR publish workflow、CUDA 13.0.2 image build、`INSTALL_KV_CONNECTORS=true`、`docker/byteiaas-openai-devel.Dockerfile` 和 image tag 脚本。
+- fork 当前已知 SHA：`cde7799cc`，包含 DSV4 Flash/Mooncake/PP/MegaMoE 相关源码变化；它缺少 ByteIAAS release workflow 和 `docker/byteiaas-openai-devel.Dockerfile`。
+- 关键迁移方向已经变更为：fork 源码是主线，旧 `iaas_main` 只作为构建能力来源。
+
+## Owner And Write Scope
+
+- Owner：当前执行 agent，执行时需在 `bytedance-iaas/vllm` 的干净工作区操作。
+- Claimed write scope：
+  - `.github/workflows/byteiaas-release-dev.yml`
+  - `.github/workflows/byteiaas-release.yml`
+  - `.github/workflows/_byteiaas-build-and-publish-image.yml`
+  - `.github/workflows/_byteiaas-build-wheel.yml`
+  - `scripts/ci/get_byteiaas_image_tag.py`
+  - `docker/byteiaas-openai-devel.Dockerfile`
+  - `docker/Dockerfile` 中 ByteIAAS image build 必需的最小构建参数
+  - `examples/deployment/deepseek-v4-flash-pd/**`
+  - `docs/superpowers/plans/2026-06-29-vllm-dsv4-flash-pd-build*.md`
+- Explicitly out of write scope：
+  - vLLM 旧 `iaas_main` 业务逻辑回拷
+  - `infcp/servingkit` 仓库中的 Helm chart
+  - production deployment config
+  - unrelated GitHub Actions and Buildkite cleanup
+
+## Milestones
+
+### M1: 远端备份原始 `iaas_main`
+
+- [x] 按命令引用 `C1` fetch 最新 `origin/iaas_main` 和 fork ref。
+- [x] 按命令引用 `C2` 创建远端 GitHub 备份分支 `backup/iaas_main-YYYYMMDD`，本次默认 `backup/iaas_main-20260629`。
+- [x] 按命令引用 `C2A` 为 `backup/iaas_main-*` 添加 GitHub 保护规则。
+- [x] 在进展日志记录旧 `iaas_main` SHA、远端备份分支、`git ls-remote` 证据。
+- Acceptance: `git ls-remote origin refs/heads/backup/iaas_main-20260629` 返回的 SHA 等于执行时的 `origin/iaas_main` SHA；GitHub ruleset 覆盖 `refs/heads/backup/iaas_main-*`，至少禁止 deletion 和 non-fast-forward。
+
+### M2: 以 fork 创建新集成分支
+
+- [ ] 按命令引用 `C3` 从 `wangyicong52/dev/dsv4-mooncake-pp-megamoe` 创建 `codex/vllm-dsv4-fork-base-byteiaas-build`。
+- [ ] 确认工作区源码来自 fork SHA，而不是旧 `iaas_main`。
+- [ ] 在进展日志记录 fork SHA、分支名、非目标说明。
+- Acceptance: `git merge-base --is-ancestor <fork_sha> HEAD` 成功，且 `git diff --name-only <fork_sha>...HEAD` 仅出现计划内 ByteIAAS 构建文件。
+
+### M3: 从旧 `iaas_main` 回拷 ByteIAAS 构建能力
+
+- [ ] 按命令引用 `C4` 回拷 ByteIAAS workflow、tag 脚本和 `byteiaas-openai-devel` Dockerfile。
+- [ ] 只对 `docker/Dockerfile` 做最小构建兼容 edits；不要整文件恢复旧 `iaas_main` Dockerfile。
+- [ ] 保持 fork 源码逻辑；不回拷 `vllm/`、`csrc/`、`cmake/`、`vllm/models/` 等旧源码逻辑。
+- [ ] 在进展日志记录每个被回拷文件的理由。
+- Acceptance: `git diff --name-status <fork_sha>...HEAD` 中源码逻辑文件没有旧 `iaas_main` 回拷痕迹。
+
+### M4: 补齐 fork-base image 的最小依赖能力
+
+- [ ] Mooncake：保持 fork/current Dockerfile 的 `INSTALL_KV_CONNECTORS` 和 optional `MOONCAKE_WHEEL_*` 处理，不强制 pin chart 版本。
+- [ ] DeepEP：复用 fork/current Dockerfile 中社区 DeepEP build/install stage；如 workflow build 未启用，补 build args，不 fork DeepEP。
+- [ ] DeepGEMM：保留 fork 中的 DeepGEMM/MegaMoE 源码路径；如 image runtime 仍需要 `wangyicong52/DeepGEMM` wheel，按命令引用 `C6` 添加构建或安装路径。
+- [ ] `vllm-router`：按社区包安装，不 fork。
+- [ ] Onion：同一个新构建 vLLM 镜像必须提供 `oniond`；若 base image 中不存在，按 `onion-ai-data` skill 在 Dockerfile 中添加 Volcengine extra-tools apt source 并安装 `onion-ai-data`，然后 build-time `command -v oniond` 校验。
+- [ ] 不新增、不恢复 `scripts/ci/check_byteiaas_dsv4_runtime.py`；不在构建流程补充 import/CLI smoke。
+- Acceptance: Dockerfile/workflow 从结构上把 DeepEP、DeepGEMM、Mooncake/KV connector、`vllm-router` 和 Onion CLI 能力放进同一个新构建 vLLM 镜像；不依赖部署时 hotfix 或运行时安装。
+
+### M5: 验证 workflow 并构建镜像
+
+- [ ] 按命令引用 `C7` 做 YAML/actionlint 和 tag script 验证。
+- [ ] 按命令引用 `C8` 做本地或 build-node Docker build；不做镜像内 import/CLI smoke。
+- [ ] 按命令引用 `C9` 或 ByteIAAS workflow 构建并发布 openai/openai-devel 镜像，记录实际 image tag/digest。
+- [ ] 更新主计划 current status 和进展日志。
+- Acceptance: 至少产出一个可用于 deployment values 的 image tag/digest；若本地 Docker 不可用，则 ByteIAAS workflow 成功并输出 tag/digest。
+
+### M7: 编写无 runtime hotfix/install 的 DSV4 P/D 部署模板
+
+- [ ] 在 `examples/deployment/deepseek-v4-flash-pd/` 创建 vLLM-owned Helm/example deployment。
+- [ ] 参考 servingkit `vllm/deepseek/deepseek-v4-flash-pd` 的 P/D 形态、router 参数、StormService/Service/ConfigMap 结构和 values 命名。
+- [ ] 继续使用 servingkit 现有实现中的 `StormService` 作为 prefill/decode workload 形态；不改写为 StatefulSet、Deployment 或自定义控制逻辑。
+- [ ] 删除或不引入所有 runtime hotfix/install 路径：`runtimePatch`、`git clone`、`pip install`、`install_deepgemm_wheel`、`ensure_pip_package`、wheel download、runtime DeepEP build、runtime Mooncake install、runtime `vllm-router` install。
+- [ ] values 只接受 image tag/digest、model path、参数化 node placement、P/D/router shape、env、resources、ports、hostPath/hostNetwork 等部署参数；执行部署时再填写实际节点，`prefill.hostNetwork`、`decode.hostNetwork`、`router.hostNetwork` 保留 servingkit 现状并默认开启。
+- [ ] 部署形态固定为 `1P1D`：`stormService.replicas=1`、`prefill.replicas=1`、`decode.replicas=1`、`router.replicas=1`，且 `global.gpuCount=8`。prefill 与 decode 各自请求 8 张 GPU，执行时必须填写非空且不同的 `prefill.nodeAffinity.values[0]` 和 `decode.nodeAffinity.values[0]`；router 默认跟随 decode 节点，除非执行时明确给出第三个节点。
+- [ ] `C13` render 和 `C15` deploy 必须在 `PREFILL_NODE` 或 `DECODE_NODE` 缺失、两者相同、或 `GLOBAL_GPU_COUNT` 不是 `8` 时失败；`C14` 必须在部署前检查这两个节点均存在且 allocatable `nvidia.com/gpu` 至少为 8。
+- [ ] BS512/1.5k output throughput 是该 `1P1D` router-path 结果，全部 output 来自单个 decode 节点，不是多 decode 聚合吞吐。
+- [ ] values 增加 Onion 模型准备参数：`onion.enabled=true`、`onion.model=DeepSeek-V4-Flash`、`onion.dir=/data01`；模板用 initContainer 或等价启动前步骤执行 `oniond download model "${onion.model}" --turbo --dir "${onion.dir}"`，initContainer image 必须是同一个 `global.image`，已有模型时由 Onion 幂等跳过。
+- [ ] 按命令引用 `C13` render 并 grep forbidden patterns。
+- Acceptance: rendered manifest 使用新构建 image，prefill/decode 由 `StormService` 管理，`1P1D` replica 形态明确，prefill/decode 均渲染为 `nvidia.com/gpu: 8`，并带有不同节点的 required nodeAffinity；router 默认渲染到 decode 节点；模型数据由 Onion 准备；prefill/decode/router 命令没有运行时安装和 hotfix，P/D 形态与 servingkit chart 等价。
+
+### M8: 在 `dev-cluster` 部署
+
+- [ ] 按命令引用 `C14` 解析 env root、验证 `dev-cluster`、注册 workspace-env session、申请 16 GPU permit，并确认执行者选定的 `PREFILL_NODE` 与 `DECODE_NODE` 是两个不同且各自 allocatable GPU 至少为 8 的节点。
+- [ ] 在 `C14` 中确认 `dev-cluster` 已存在 `stormservices.orchestration.aibrix.ai` CRD；如不存在，停止并记录 blocker，不在本任务中安装 Aibrix/StormService 控制面。
+- [ ] 按命令引用 `C15` 创建 namespace、注册 Helm release、`helm upgrade --install`。
+- [ ] 按命令引用 `C16` 收集 evidence ladder：render、Onion 模型准备日志、模型完整性检查、实际 argv/env、pod-local package/source evidence、稳定 readiness、router `/v1/models` 和一次真实 completion。
+- [ ] 如果资源 Pending 或 readiness/real request 失败，按 workspace-env 规则清理本任务创建的资源，记录 blocker。
+- Acceptance: Onion 模型准备成功或幂等跳过且模型完整性检查通过；prefill pod 和 decode pod 分别落在 `PREFILL_NODE` 与 `DECODE_NODE` 两个不同节点，且各自请求 8 张 GPU；prefill/decode/router 通过真实 router path 可生成非空输出，且没有 runtime hotfix/install 证据。
+
+### M9: 使用 evalscope benchmark 64k/1 TTFT 和 cache-hit decode BS512/1.5k output
+
+- [ ] 按命令引用 `C17` 准备 evalscope 环境；如果 evalscope 不可用或安装受阻，停止并记录 blocker。
+- [ ] 按命令引用 `C18` 跳过 Prometheus 部署，仅采集 pod-local `/metrics` 头部、日志和 skipped note；最终 summary 必须明确 Prometheus skipped by user。
+- [ ] 按命令引用 `C19` 先运行真实服务路径 smoke 和 warmup。
+- [ ] 按命令引用 `C20` 运行 64k input / 1 output TTFT measured run。
+- [ ] 按命令引用 `C21` 用固定 `--seed 42` 预热 prefix cache，再运行全命中 cache 的 decode BS512 output throughput measured run；固定 output length 为 1.5k，即 1536 tokens。
+- [ ] 保存 raw evalscope output、timestamps、serving logs、pod-local metrics heads、rendered manifests 和 Markdown summary 到 artifact path。
+- Acceptance: 两个 measured run 均有开始/结束时间、exit code、raw output、artifact 路径、TTFT/throughput 摘要；性能 gate 看 Avg，不看 P50/P95/P99；64k/1 Avg TTFT 必须小于 10s；BS512/1.5k evalscope overall output token throughput 必须达到 14000 tokens/s 以上；该 throughput 口径为 `1P1D` router-path，总 output 来自单个 decode 节点；summary 明确 Prometheus skipped by user，不能声称有完整服务侧 monitoring 诊断；若 run invalid 或性能未达阈值，必须明确 invalid/blocker 原因。
+
+### M10: 使用已授权审批更新远端 `iaas_main`
+
+- [ ] 确认 M5/M7/M8/M9 已完成，或任何未完成项都已在进展日志中记录为明确可接受 blocker。
+- [ ] 可接受 blocker 仅限外部环境或资源问题，例如 GPU permit 长时间排队、`dev-cluster` 临时资源不足、CR/image pull 临时失败、Onion 模型源临时不可用；这些 blocker 只能进入人工发布决策，不能自动视为通过。
+- [ ] 不可接受 blocker 包括 render/config 表达错误、镜像缺依赖、Onion init 或模型完整性失败、vLLM 启动失败、router real request 失败、KV transfer 错误、DeepGEMM/DeepEP/Mooncake import 或 runtime 错误；出现这些问题时不得更新远端 `iaas_main`。
+- [ ] benchmark 跑通但性能未达阈值时也不得更新远端 `iaas_main`；本计划性能 gate 看 Avg，不看 P50/P95/P99；阈值为 64k/1 Avg TTFT < 10s，`1P1D` router-path BS512/1.5k evalscope overall output token throughput >= 14000 tokens/s。
+- [ ] 确认远端备份分支仍指向原始 `iaas_main` SHA。
+- [ ] 使用本线程已有授权更新远端 `iaas_main`；无需再次停下来请求审批，除非目标仓库、备份分支、源 SHA、验证门槛或更新方式偏离本计划。
+- [ ] 按命令引用 `C10` 使用 `--force-with-lease` 或仓库允许的受保护分支流程更新 `iaas_main`。
+- [ ] 若 branch protection 拒绝直接更新，按命令引用 `C11` 创建 PR 或临时迁移分支，并在进展日志记录 blocker。
+- Acceptance: `origin/iaas_main` 指向通过构建、部署和 benchmark gate 的 fork-base integration SHA，且远端备份分支仍可追溯原始 SHA。
+
+## Acceptance Criteria
+
+- GitHub 远端存在原始 `iaas_main` 备份分支，且 SHA 与替换前 `origin/iaas_main` 一致。
+- 新 `iaas_main` 基线来自 `wangyicong52/vllm.git` `dev/dsv4-mooncake-pp-megamoe`。
+- 旧 `iaas_main` 只回拷 ByteIAAS 构建、日构建、镜像发布、tag 生成相关文件。
+- 旧 `iaas_main` 的 vLLM 业务源码逻辑没有被回拷。
+- Mooncake 仍使用当前 Dockerfile 中已有处理方式，不被强制改成 Helm chart 的版本。
+- ByteIAAS dev image workflow 能解析 tag、构建 openai/openai-devel image，并保留 `INSTALL_KV_CONNECTORS=true`。
+- vLLM 仓库包含一份无 runtime hotfix/install 的 DSV4 Flash P/D 部署模板。
+- 部署模板固定表达 `1P1D`、`global.gpuCount=8`、prefill/decode 各 8 GPU，且强制 P/D 节点参数非空并不同；router 默认跟 decode 节点。
+- 部署模板包含 Onion 模型准备路径，已有模型时幂等跳过，模型不完整时不得继续宣称服务验证通过。
+- `dev-cluster` 部署使用新镜像，真实 router path 可生成非空输出。
+- benchmark 完成 64k input / 1 output TTFT 和 cache-hit decode BS512 / 1.5k output throughput 两个 measured run，并保存 raw artifacts、pod-local metrics heads 与 Markdown summary。
+
+## Approval Forecast
+
+- 已授权：用户已在 2026-06-29 本线程明确同意本计划内全部审批项。
+- 可直接执行的已授权动作：
+  - 在 `bytedance-iaas/vllm` 远端创建 `backup/iaas_main-20260629`，指向执行时当前 `origin/iaas_main` SHA。
+  - 为 `backup/iaas_main-*` 添加 GitHub 保护规则。
+  - 在 image、deployment、router smoke 和 benchmark gate 之后，将远端 `iaas_main` 更新为 fork-base integration 分支。
+  - 触发 ByteIAAS dev image workflow 并发布 openai/openai-devel 镜像到 Volcengine CR。
+  - 使用 Helm chart 中已出现的 `wangyicong52/DeepGEMM` release wheel URL。
+  - 在 `dev-cluster` 创建 namespace、Helm release、GPU workload、port-forward/evalscope benchmark 资源，并在完成后清理。
+- 仍需重新确认的情况：目标仓库不是 `bytedance-iaas/vllm`、备份分支名不是 `backup/iaas_main-YYYYMMDD`、外部 URL 不是 Helm chart 已出现 URL、需要生产部署、或需要本计划以外的 force push。
+
+## Risks And Fallbacks
+
+- Branch protection 可能拒绝直接替换 `iaas_main`：fallback 是保留远端备份，推送 fork-base integration 分支，并通过 PR 或管理员流程迁移。
+- fork Dockerfile 与旧 ByteIAAS workflow 参数不完全兼容：fallback 是只补 workflow 需要的 build args，不整文件恢复旧 Dockerfile。
+- DeepGEMM fork wheel 无可复现源码 ref：fallback 是使用 chart 中明确出现且本线程已授权的 release wheel URL；不退回社区 DeepGEMM。
+- Mooncake/KV connector 在服务路径失败：先记录 render、argv/env、package/source 和日志证据；不直接 pin chart 版本，除非用户再次确认改变策略。
+- Docker/GPU 环境不可用：本地完成静态和 workflow 验证，将 image build 转到 ByteIAAS workflow；GPU deployment/benchmark 等待 workspace-env permit 或报告 scheduler-visible blocker。
+- 本轮按用户要求跳过 Prometheus：最终 summary 只能报告 evalscope 结果、pod-local metrics heads 和日志证据，不能声称有完整 Prometheus measured-window 诊断。
+- cache-hit decode BS512 结果可能被 router dispatch、cache lookup、KV/bootstrap、decode admission 或 scheduler queue 限制；最终摘要必须区分 TTFT、TPOT/ITL、output throughput 和 queue/admission 现象。
+- final gate 允许人工接受的 blocker 必须是外部环境或资源类；代码正确性、镜像内容、部署模板表达、真实请求路径、KV/Mooncake/DeepEP/DeepGEMM runtime 失败都必须阻止远端 `iaas_main` 更新。
+- benchmark 性能未达阈值也必须阻止远端 `iaas_main` 更新；本计划性能 gate 看 Avg，不看 P50/P95/P99；阈值为 64k/1 Avg TTFT < 10s，`1P1D` router-path BS512/1.5k evalscope overall output token throughput >= 14000 tokens/s。
+
+## Current Status
+
+- 执行 preflight 已开始；计划文档本身在 write scope 内且当前为未跟踪文件，C1 clean check 允许仅存在这些计划文档，除此之外不得有其它未提交改动。
+- subagent-driven-development 决策：暂不用于并行实现；M1-M5 操作同一 Git 分支、远端分支和 workflow/Dockerfile，顺序依赖强。可在后续完成主要实现后使用子代理做只读 review 或 final review。
+- M1 已完成：`origin/iaas_main` 当前备份为远端 `backup/iaas_main-20260629`，SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`；GitHub ruleset `Protect backup iaas_main branches` 已 active。
+- 尚未创建 fork-base integration 分支、未替换 `iaas_main`、未触发镜像发布、未创建部署模板、未部署 dev-cluster、未运行 benchmark。
+
+## Next Action
+
+执行阶段第一步使用 `superpowers:executing-plans`，在干净 `bytedance-iaas/vllm` 工作区运行命令引用 `C1`，确认 `origin/iaas_main` 和 `wangyicong52/dev/dsv4-mooncake-pp-megamoe` 的当前 SHA，然后直接执行已授权的 `C2` 和 `C2A`。

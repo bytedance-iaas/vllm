@@ -1,0 +1,194 @@
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  image: ""
+  imagePullPolicy: IfNotPresent
+  gpuCount: 8
+
+model:
+  basePath: /data01
+  name: DeepSeek-V4-Flash
+  servedName: deepseek-v4-flash
+
+onion:
+  enabled: true
+  model: DeepSeek-V4-Flash
+  dir: /data01
+
+stormService:
+  replicas: 1
+
+vllm:
+  trustRemoteCode: true
+  kvCacheDtype: fp8
+  blockSize: 256
+  maxModelLen: 66000
+  enableExpertParallel: true
+  tokenizerMode: deepseek_v4
+  toolCallParser: deepseek_v4
+  enableAutoToolChoice: true
+  reasoningParser: deepseek_v4
+  enableSleepMode: true
+  disableUvicornAccessLog: true
+  noDisableHybridKvCacheManager: true
+  transferBackend: mooncake
+  ibDevice: mlx5_1,mlx5_2,mlx5_3,mlx5_4
+  kvTransfer:
+    kv_connector: MooncakeConnector
+    kv_role: kv_both
+    kv_load_failure_policy: fail
+    kv_buffer_device: cuda
+    kv_connector_extra_config:
+      enforce_handshake_compat: false
+      mooncake_protocol: rdma
+
+prefill:
+  replicas: 1
+  podGroupSize: 1
+  port: 8000
+  hostNetwork: true
+  bootstrapPort: 8998
+  nodeAffinity:
+    enabled: true
+    key: kubernetes.io/hostname
+    operator: In
+    values: []
+  args:
+    all2allBackend: deepep_high_throughput
+    dataParallelSize: 8
+    dataParallelSizeLocal: 8
+    dataParallelStartRank: 0
+    dataParallelRpcPort: 16001
+    maxNumBatchedTokens: 66000
+    maxNumSeqs: 2
+    enforceEager: true
+    noAsyncScheduling: true
+  extraArgs:
+    - --gpu-memory-utilization
+    - "0.70"
+  extraEnv: {}
+
+decode:
+  replicas: 1
+  podGroupSize: 1
+  port: 8000
+  hostNetwork: true
+  bootstrapPort: 9889
+  nodeAffinity:
+    enabled: true
+    key: kubernetes.io/hostname
+    operator: In
+    values: []
+  args:
+    all2allBackend: deepep_low_latency
+    dataParallelSize: 8
+    dataParallelSizeLocal: 8
+    dataParallelStartRank: 0
+    dataParallelRpcPort: 16002
+    maxNumBatchedTokens: 512
+    maxNumSeqs: 512
+    compilationConfig: '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512,"compile_ranges_endpoints":[512]}'
+  extraArgs:
+    - --gpu-memory-utilization
+    - "0.70"
+  extraEnv: {}
+
+router:
+  enabled: true
+  replicas: 1
+  image: ""
+  imagePullPolicy: IfNotPresent
+  policy: round_robin
+  kvConnector: mooncake
+  host: 0.0.0.0
+  port: 30000
+  hostNetwork: true
+  intraNodeDataParallelSize: 8
+  serviceDiscovery:
+    enabled: true
+    port: 8000
+  nodeAffinity:
+    enabled: true
+    key: kubernetes.io/hostname
+    operator: In
+    values: []
+  service:
+    type: ClusterIP
+    port: 30000
+    nodePort: null
+  extraArgs: []
+  extraEnv: {}
+
+service:
+  prefill:
+    enabled: true
+    type: ClusterIP
+    port: 8000
+    targetPort: http
+  decode:
+    enabled: true
+    type: ClusterIP
+    port: 8000
+    targetPort: http
+
+volumes:
+  models:
+    hostPath: /data01
+  logs:
+    hostPath: /data/model_deploy/logs
+  sharedMem:
+    medium: Memory
+  infiniband:
+    hostPath: /dev/infiniband
+  nvidiaTopologyd:
+    hostPath: /var/run/nvidia-topologyd
+
+security:
+  hostIPC: true
+  hostPID: false
+  privileged: true
+  allowPrivilegeEscalation: true
+
+probes:
+  startup:
+    path: /health
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 180
+  readiness:
+    path: /health
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 10
+    failureThreshold: 4
+  liveness:
+    path: /health
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 15
+    failureThreshold: 4
+
+env:
+  common:
+    TILELANG_CLEANUP_TEMP_FILES: "1"
+    VLLM_DISABLE_COMPILE_CACHE: "1"
+    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    VLLM_RPC_TIMEOUT: "600000"
+    VLLM_LOG_STATS_INTERVAL: "1"
+    GLOO_SOCKET_IFNAME: eth0
+    NCCL_SOCKET_IFNAME: eth0
+    NCCL_DEBUG: INFO
+    NCCL_MIN_NCHANNELS: "24"
+    NCCL_IB_QPS_PER_CONNECTION: "8"
+    NCCL_IB_ECE_ENABLE: "0"
+    IB_DEVICE_LIST: mlx5_1,mlx5_2,mlx5_3,mlx5_4
+    NVSHMEM_DEBUG: ERROR
+    NVSHMEM_DEBUG_SUBSYS: INIT
+    TZ: Asia/Shanghai
+    PYTHONUNBUFFERED: "1"
+  prefill:
+    WITH_NVIDIA_PEERMEM: "true"
+  decode:
+    WITH_NVIDIA_PEERMEM: "true"
+  router: {}

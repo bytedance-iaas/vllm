@@ -1,0 +1,290 @@
+apiVersion: orchestration.aibrix.ai/v1alpha1
+kind: StormService
+metadata:
+  name: {{ include "deepseek-v4-flash-pd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "deepseek-v4-flash-pd.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.stormService.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "deepseek-v4-flash-pd.fullname" . }}
+  stateful: true
+  updateStrategy:
+    type: RollingUpdate
+    maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app: {{ include "deepseek-v4-flash-pd.fullname" . }}
+    spec:
+      roles:
+        - name: prefill
+          replicas: {{ .Values.prefill.replicas }}
+          stateful: true
+          podGroupSize: {{ .Values.prefill.podGroupSize }}
+          template:
+            spec:
+              {{- if .Values.prefill.hostNetwork }}
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              {{- end }}
+              hostIPC: {{ .Values.security.hostIPC }}
+              hostPID: {{ .Values.security.hostPID }}
+              {{- if .Values.prefill.nodeAffinity.enabled }}
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: {{ .Values.prefill.nodeAffinity.key }}
+                            operator: {{ .Values.prefill.nodeAffinity.operator }}
+                            values:
+{{ toYaml .Values.prefill.nodeAffinity.values | nindent 30 }}
+              {{- end }}
+              volumes:
+                - name: models
+                  hostPath:
+                    path: {{ .Values.volumes.models.hostPath }}
+                    type: DirectoryOrCreate
+                - name: logs
+                  hostPath:
+                    path: {{ .Values.volumes.logs.hostPath }}
+                    type: DirectoryOrCreate
+                - name: shared-mem
+                  emptyDir:
+                    medium: {{ .Values.volumes.sharedMem.medium | quote }}
+                - name: ib
+                  hostPath:
+                    path: {{ .Values.volumes.infiniband.hostPath }}
+                    type: Directory
+                - name: nvidia-topologyd
+                  hostPath:
+                    path: {{ .Values.volumes.nvidiaTopologyd.hostPath }}
+                    type: DirectoryOrCreate
+                - name: config-volume
+                  configMap:
+                    name: {{ include "deepseek-v4-flash-pd.configMapName" . }}
+                    defaultMode: 0755
+              {{- if .Values.onion.enabled }}
+              initContainers:
+                - name: onion-model-prepare
+                  image: {{ .Values.global.image }}
+                  imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+                  command: ["bash", "-lc"]
+                  args:
+                    - |-
+{{ include "deepseek-v4-flash-pd.prepareModel" . | nindent 22 }}
+                  volumeMounts:
+                    - name: models
+                      mountPath: {{ .Values.model.basePath }}
+              {{- end }}
+              containers:
+                - name: prefill
+                  image: {{ .Values.global.image }}
+                  imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+                  command: ["bash", "-lc"]
+                  args:
+                    - /opt/vllm-config/start-prefill.sh
+                  env:
+                    - name: VLLM_MOONCAKE_BOOTSTRAP_PORT
+                      value: {{ .Values.prefill.bootstrapPort | quote }}
+                    - name: HOST_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.hostIP
+{{- range $name, $value := .Values.env.common }}
+                    - name: {{ $name }}
+                      value: {{ $value | quote }}
+{{- end }}
+{{- range $name, $value := .Values.env.prefill }}
+                    - name: {{ $name }}
+                      value: {{ $value | quote }}
+{{- end }}
+{{- range $name, $value := .Values.prefill.extraEnv }}
+                    - name: {{ $name }}
+                      value: {{ $value | quote }}
+{{- end }}
+                  ports:
+                    - name: http
+                      containerPort: {{ .Values.prefill.port }}
+                      protocol: TCP
+                  startupProbe:
+                    httpGet:
+                      path: {{ .Values.probes.startup.path | quote }}
+                      port: http
+                    periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+                    timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+                    failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+                  readinessProbe:
+                    httpGet:
+                      path: {{ .Values.probes.readiness.path | quote }}
+                      port: http
+                    initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+                    periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+                    timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+                    failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+                  livenessProbe:
+                    httpGet:
+                      path: {{ .Values.probes.liveness.path | quote }}
+                      port: http
+                    initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+                    periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+                    timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+                    failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+                  resources:
+                    limits:
+                      nvidia.com/gpu: {{ .Values.global.gpuCount }}
+                    requests:
+                      nvidia.com/gpu: {{ .Values.global.gpuCount }}
+                  securityContext:
+                    privileged: {{ .Values.security.privileged }}
+                    allowPrivilegeEscalation: {{ .Values.security.allowPrivilegeEscalation }}
+                  volumeMounts:
+                    - name: models
+                      mountPath: {{ .Values.model.basePath }}
+                    - name: logs
+                      mountPath: /data/logs
+                    - name: shared-mem
+                      mountPath: /dev/shm
+                    - name: ib
+                      mountPath: /dev/infiniband
+                    - name: nvidia-topologyd
+                      mountPath: /var/run/nvidia-topologyd
+                    - name: config-volume
+                      mountPath: /opt/vllm-config
+        - name: decode
+          replicas: {{ .Values.decode.replicas }}
+          stateful: true
+          podGroupSize: {{ .Values.decode.podGroupSize }}
+          template:
+            spec:
+              {{- if .Values.decode.hostNetwork }}
+              hostNetwork: true
+              dnsPolicy: ClusterFirstWithHostNet
+              {{- end }}
+              hostIPC: {{ .Values.security.hostIPC }}
+              hostPID: {{ .Values.security.hostPID }}
+              {{- if .Values.decode.nodeAffinity.enabled }}
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: {{ .Values.decode.nodeAffinity.key }}
+                            operator: {{ .Values.decode.nodeAffinity.operator }}
+                            values:
+{{ toYaml .Values.decode.nodeAffinity.values | nindent 30 }}
+              {{- end }}
+              volumes:
+                - name: models
+                  hostPath:
+                    path: {{ .Values.volumes.models.hostPath }}
+                    type: DirectoryOrCreate
+                - name: logs
+                  hostPath:
+                    path: {{ .Values.volumes.logs.hostPath }}
+                    type: DirectoryOrCreate
+                - name: shared-mem
+                  emptyDir:
+                    medium: {{ .Values.volumes.sharedMem.medium | quote }}
+                - name: ib
+                  hostPath:
+                    path: {{ .Values.volumes.infiniband.hostPath }}
+                    type: Directory
+                - name: nvidia-topologyd
+                  hostPath:
+                    path: {{ .Values.volumes.nvidiaTopologyd.hostPath }}
+                    type: DirectoryOrCreate
+                - name: config-volume
+                  configMap:
+                    name: {{ include "deepseek-v4-flash-pd.configMapName" . }}
+                    defaultMode: 0755
+              {{- if .Values.onion.enabled }}
+              initContainers:
+                - name: onion-model-prepare
+                  image: {{ .Values.global.image }}
+                  imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+                  command: ["bash", "-lc"]
+                  args:
+                    - |-
+{{ include "deepseek-v4-flash-pd.prepareModel" . | nindent 22 }}
+                  volumeMounts:
+                    - name: models
+                      mountPath: {{ .Values.model.basePath }}
+              {{- end }}
+              containers:
+                - name: decode
+                  image: {{ .Values.global.image }}
+                  imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+                  command: ["bash", "-lc"]
+                  args:
+                    - /opt/vllm-config/start-decode.sh
+                  env:
+                    - name: VLLM_MOONCAKE_BOOTSTRAP_PORT
+                      value: {{ .Values.decode.bootstrapPort | quote }}
+                    - name: HOST_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.hostIP
+{{- range $name, $value := .Values.env.common }}
+                    - name: {{ $name }}
+                      value: {{ $value | quote }}
+{{- end }}
+{{- range $name, $value := .Values.env.decode }}
+                    - name: {{ $name }}
+                      value: {{ $value | quote }}
+{{- end }}
+{{- range $name, $value := .Values.decode.extraEnv }}
+                    - name: {{ $name }}
+                      value: {{ $value | quote }}
+{{- end }}
+                  ports:
+                    - name: http
+                      containerPort: {{ .Values.decode.port }}
+                      protocol: TCP
+                  startupProbe:
+                    httpGet:
+                      path: {{ .Values.probes.startup.path | quote }}
+                      port: http
+                    periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+                    timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+                    failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+                  readinessProbe:
+                    httpGet:
+                      path: {{ .Values.probes.readiness.path | quote }}
+                      port: http
+                    initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+                    periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+                    timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+                    failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+                  livenessProbe:
+                    httpGet:
+                      path: {{ .Values.probes.liveness.path | quote }}
+                      port: http
+                    initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+                    periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+                    timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+                    failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+                  resources:
+                    limits:
+                      nvidia.com/gpu: {{ .Values.global.gpuCount }}
+                    requests:
+                      nvidia.com/gpu: {{ .Values.global.gpuCount }}
+                  securityContext:
+                    privileged: {{ .Values.security.privileged }}
+                    allowPrivilegeEscalation: {{ .Values.security.allowPrivilegeEscalation }}
+                  volumeMounts:
+                    - name: models
+                      mountPath: {{ .Values.model.basePath }}
+                    - name: logs
+                      mountPath: /data/logs
+                    - name: shared-mem
+                      mountPath: /dev/shm
+                    - name: ib
+                      mountPath: /dev/infiniband
+                    - name: nvidia-topologyd
+                      mountPath: /var/run/nvidia-topologyd
+                    - name: config-volume
+                      mountPath: /opt/vllm-config
