@@ -678,7 +678,12 @@ RUN apt-get update -y \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
     && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
     && rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED \
-    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
+    && curl --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 5 \
+        --connect-timeout 20 --max-time 300 \
+        -o /tmp/get-pip.py ${GET_PIP_URL} \
+    && python${PYTHON_VERSION} /tmp/get-pip.py \
+    && rm -f /tmp/get-pip.py \
     && python3 --version && python3 -m pip --version
 
 # Install CUDA development tools for runtime JIT compilation

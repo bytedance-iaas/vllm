@@ -44,6 +44,8 @@ install_rustup() {
         --retry 5 \
         --retry-all-errors \
         --retry-delay 2 \
+        --connect-timeout 20 \
+        --max-time 300 \
         -o "$installer" \
         "$rustup_url"
     sh "$installer" -y --default-toolchain none

@@ -262,3 +262,22 @@
   - `helm lint examples/deployment/deepseek-v4-flash-pd ...` 通过，`1 chart(s) linted, 0 chart(s) failed`。
   - 正常 `helm template` 输出包含 `kind: StormService`、`node-prefill-8gpu`、`node-decode-8gpu`、`oniond download model`、prefill/decode `nvidia.com/gpu: 8` request/limit。
   - 同节点负例 `helm template ... prefill.nodeAffinity.values[0]=same-node decode.nodeAffinity.values[0]=same-node` 失败，错误为 `prefill and decode nodeAffinity values must be disjoint because each role requests 8 GPUs; overlapping node: same-node`。
+
+### P17: Second ByteIAAS workflow passed wheel and failed image on get-pip proxy 504
+
+- Summary: 第二次 ByteIAAS workflow run `28361351639` 越过 rustup bootstrap；`build-wheel / build-wheel` 成功，但 `build-image / build-and-publish-image` 在 `vllm-base` 阶段下载 `GET_PIP_URL` 时遇到 proxy 504，未产出可部署镜像。
+- Evidence:
+  - Run id: `28361351639`。
+  - Wheel job id `84016509746` conclusion: `success`。
+  - Image job id `84016509717` conclusion: `failure`。
+  - Image job API log path: `/tmp/byteiaas-vllm-84016509717-api.log`。
+  - 关键日志：`curl: (56) Received HTTP code 504 from proxy after CONNECT`，失败命令为 `curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION}`，Docker build 返回 `exit code: 1`。
+
+### P18: Hardened get-pip download for image build retry
+
+- Summary: 将 `docker/Dockerfile` 中 `GET_PIP_URL` 下载改为有 retry/timeout 的临时文件执行，避免 proxy 504 或半开连接直接导致 image build 失败；同时给 rustup installer 下载补 `connect-timeout` 和 `max-time`。
+- Evidence:
+  - `docker/Dockerfile` 将 `curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION}` 改为 `curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300 -o /tmp/get-pip.py ${GET_PIP_URL}`，随后 `python${PYTHON_VERSION} /tmp/get-pip.py` 并删除临时文件。
+  - `build_rust.sh` 的 rustup installer curl 追加 `--connect-timeout 20 --max-time 300`。
+  - `bash -n build_rust.sh` 通过。
+  - `git diff --check` 通过。
