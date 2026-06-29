@@ -447,9 +447,23 @@ rg -n "kind: StormService|replicas: 1|hostNetwork: true|oniond download model|${
   "${ARTIFACT_DIR}/rendered-${RELEASE}.yaml"
 rg -n "nvidia.com/gpu: 8|kubernetes.io/hostname|${PREFILL_NODE}|${DECODE_NODE}" \
   "${ARTIFACT_DIR}/rendered-${RELEASE}.yaml"
+
+if helm template "${RELEASE}" examples/deployment/deepseek-v4-flash-pd \
+  --namespace "${NAMESPACE}" \
+  --set global.image="${IMAGE}" \
+  --set global.gpuCount="${GLOBAL_GPU_COUNT}" \
+  --set "prefill.nodeAffinity.values[0]=same-node" \
+  --set "decode.nodeAffinity.values[0]=same-node" \
+  > "${ARTIFACT_DIR}/rendered-invalid-same-node.yaml" \
+  2> "${ARTIFACT_DIR}/rendered-invalid-same-node.err"; then
+  echo "expected Helm validation to reject same prefill/decode node" >&2
+  exit 1
+fi
+rg -n "prefill and decode nodeAffinity values must be disjoint" \
+  "${ARTIFACT_DIR}/rendered-invalid-same-node.err"
 ```
 
-**Expected result:** render 成功；prefill/decode workload 继续使用 `kind: StormService`；replica shape 为 `1P1D`，即 `stormService.replicas=1`、`prefill.replicas=1`、`decode.replicas=1`、`router.replicas=1`；`global.gpuCount=8` 渲染为 prefill 和 decode 的 `nvidia.com/gpu: 8` request/limit；`PREFILL_NODE` 与 `DECODE_NODE` 必须非空且不同，并分别出现在 prefill/decode required nodeAffinity；router 默认使用 `ROUTER_NODE=${DECODE_NODE}`；prefill、decode、router 默认保留 `hostNetwork: true`；serving container 和 Onion model prepare initContainer 都使用同一个新镜像 `global.image`；Onion 模型准备路径存在；没有 runtime hotfix、`git clone`、`pip install`、`apt install`、wheel download/install 或 runtime router install。
+**Expected result:** render 成功；prefill/decode workload 继续使用 `kind: StormService`；replica shape 为 `1P1D`，即 `stormService.replicas=1`、`prefill.replicas=1`、`decode.replicas=1`、`router.replicas=1`；`global.gpuCount=8` 渲染为 prefill 和 decode 的 `nvidia.com/gpu: 8` request/limit；`PREFILL_NODE` 与 `DECODE_NODE` 必须非空且不同，并分别出现在 prefill/decode required nodeAffinity；router 默认使用 `ROUTER_NODE=${DECODE_NODE}`；prefill、decode、router 默认保留 `hostNetwork: true`；serving container 和 Onion model prepare initContainer 都使用同一个新镜像 `global.image`；Onion 模型准备路径存在；没有 runtime hotfix、`git clone`、`pip install`、`apt install`、wheel download/install 或 runtime router install；同一节点负例必须被 Helm validation 拒绝。
 
 ## C14: dev-cluster preflight, registry, and GPU permit
 

@@ -219,6 +219,46 @@
   - 命令引用 `C15` deploy 默认打开 Onion 模型准备，且传入同一个 `global.image`。
   - 命令引用 `C16` 收集 `onion-model-prepare` 或 `init-model` 日志，并对非 router pod 硬检查模型目录中的 `config.json`、tokenizer 和 safetensors index/shards。
 
-## Final Summary
+## Initial Plan Summary
 
 当前仅完成计划编写，尚未实施迁移。执行建议使用 `superpowers:executing-plans`，第一步从命令引用 `C1` 开始；`C2`、`C2A`、计划内发布动作、dev-cluster 部署和 benchmark 已获本线程授权。`C10` 也已获授权，但只能作为最后发布门执行；若目标、参数、验证门槛或执行顺序偏离计划必须重新确认。
+
+### P13: ByteIAAS workflow first run failed on rustup bootstrap
+
+- Summary: 第一次 ByteIAAS workflow 构建未产出可部署镜像；失败点是 wheel image build 阶段 `build_rust.sh` 下载 rustup installer 时 `https://sh.rustup.rs` 返回 HTTP 504。该 run 已取消以释放构建资源。
+- Evidence:
+  - Workflow run id: `28360410848`。
+  - Wheel job id: `84013412316`。
+  - API log path: `/tmp/byteiaas-vllm-84013412316-api.log`。
+  - 关键日志：`rustup not found, installing...` 后 `curl: (22) The requested URL returned error: 504`，随后 `bash build_rust.sh` 退出 `22`。
+  - 本机 `docker info` 无法连接 `/var/run/docker.sock`，因此按计划使用 workflow 构建。
+
+### P14: Hardened Rust bootstrap for workflow retry
+
+- Summary: 将 `build_rust.sh` 的 rustup installer 下载和 `rustup toolchain install` 改为重试执行，避免 transient 504 直接使 ByteIAAS workflow 失败；未引入新镜像源或新依赖。
+- Evidence:
+  - `build_rust.sh` 新增 `retry_command` 和 `install_rustup`。
+  - rustup installer 使用 `curl --retry 5 --retry-all-errors --retry-delay 2 -o /tmp/rustup-init.sh` 下载后执行。
+  - `rustup toolchain install "$TOOLCHAIN"` 通过 `retry_command` 执行。
+  - `bash -n build_rust.sh` 通过。
+
+### P15: Enforced P/D different-node constraint in Helm chart
+
+- Summary: 用户指出 servingkit 模板中 prefill/decode 各请求 8 GPU，因此必须分布到不同节点；迁移 chart 已新增 Helm validation，从模板层拒绝空节点、非 8 GPU 形态和 P/D 节点交集。
+- Evidence:
+  - 新增 `examples/deployment/deepseek-v4-flash-pd/templates/validations.yaml`。
+  - validation 强制 `global.gpuCount == 8`、`prefill.nodeAffinity.enabled == true`、`decode.nodeAffinity.enabled == true`、两侧 nodeAffinity values 非空。
+  - validation 遍历 prefill node list，若任一节点也在 decode node list 中则 `fail`，错误包含 `prefill and decode nodeAffinity values must be disjoint`。
+  - 命令引用 `C13` 增加同节点负例渲染，要求 Helm validation 必须拒绝。
+
+### P16: Static validation after rustup and placement fixes
+
+- Summary: 当前修正通过静态验证、tag script 验证、Helm lint、正常渲染和同节点负例渲染。
+- Evidence:
+  - `bash -n build_rust.sh` 通过。
+  - `git diff --check` 通过。
+  - `python3 scripts/ci/get_byteiaas_image_tag.py --mode dev --image-flavor openai --cuda-suffix cu130 --timestamp 202606291700` 输出 `v0.10.1.1.iaas.dev.202606291700-cu130`。
+  - `python3 scripts/ci/get_byteiaas_image_tag.py --mode dev --image-flavor openai-devel --cuda-suffix cu130 --timestamp 202606291700` 输出 `v0.10.1.1.iaas.dev.202606291700-openai-devel-cu130`。
+  - `helm lint examples/deployment/deepseek-v4-flash-pd ...` 通过，`1 chart(s) linted, 0 chart(s) failed`。
+  - 正常 `helm template` 输出包含 `kind: StormService`、`node-prefill-8gpu`、`node-decode-8gpu`、`oniond download model`、prefill/decode `nvidia.com/gpu: 8` request/limit。
+  - 同节点负例 `helm template ... prefill.nodeAffinity.values[0]=same-node decode.nodeAffinity.values[0]=same-node` 失败，错误为 `prefill and decode nodeAffinity values must be disjoint because each role requests 8 GPUs; overlapping node: same-node`。

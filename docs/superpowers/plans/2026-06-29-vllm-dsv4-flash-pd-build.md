@@ -184,11 +184,12 @@
 
 ## Current Status
 
-- 执行 preflight 已开始；计划文档本身在 write scope 内且当前为未跟踪文件，C1 clean check 允许仅存在这些计划文档，除此之外不得有其它未提交改动。
-- subagent-driven-development 决策：暂不用于并行实现；M1-M5 操作同一 Git 分支、远端分支和 workflow/Dockerfile，顺序依赖强。可在后续完成主要实现后使用子代理做只读 review 或 final review。
-- M1 已完成：`origin/iaas_main` 当前备份为远端 `backup/iaas_main-20260629`，SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`；GitHub ruleset `Protect backup iaas_main branches` 已 active。
-- 尚未创建 fork-base integration 分支、未替换 `iaas_main`、未触发镜像发布、未创建部署模板、未部署 dev-cluster、未运行 benchmark。
+- 当前分支：`codex/vllm-dsv4-fork-base-byteiaas-build`，基于 fork SHA `cde7799cc66c5a4cb349156a3ca3228f9798dbc9`。
+- M1-M4 已完成：远端备份分支 `backup/iaas_main-20260629` 指向原 `origin/iaas_main` SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`，GitHub ruleset `Protect backup iaas_main branches` 已 active；ByteIAAS workflow、tag 脚本、`byteiaas-openai-devel` Dockerfile、Dockerfile 中 `vllm-router` 与 Onion CLI 构建能力已落到 fork-base 分支。
+- M5 进行中：本地 Docker daemon 不可访问，已改用 ByteIAAS workflow。第一次 workflow run `28360410848` 在 wheel image build 阶段失败并已取消，根因是 `build_rust.sh` 安装 rustup 时 `https://sh.rustup.rs` 返回 HTTP 504；当前已把 rustup 下载与 toolchain install 改为重试后准备重新提交并重跑 workflow。
+- M7 部署模板已创建：`examples/deployment/deepseek-v4-flash-pd/` 使用 `StormService` 表达 `1P1D`，同一新镜像负责 vLLM、`vllm-router` 和 Onion 模型准备；chart 新增 Helm validation，强制 `global.gpuCount=8`、prefill/decode nodeAffinity 非空且 disjoint。
+- M8/M9/M10 尚未执行：未部署 `dev-cluster`，未运行 benchmark，未更新远端 `iaas_main`。性能不达标时不得更新 `iaas_main`。
 
 ## Next Action
 
-执行阶段第一步使用 `superpowers:executing-plans`，在干净 `bytedance-iaas/vllm` 工作区运行命令引用 `C1`，确认 `origin/iaas_main` 和 `wangyicong52/dev/dsv4-mooncake-pp-megamoe` 的当前 SHA，然后直接执行已授权的 `C2` 和 `C2A`。
+提交当前 rustup 重试和 Helm validation 修正，推送 `codex/vllm-dsv4-fork-base-byteiaas-build`，重新运行命令引用 `C9` 的 ByteIAAS workflow；workflow 产出镜像后再执行 `C13`、`C14`、`C15` 进入 `dev-cluster` 部署与 benchmark。
