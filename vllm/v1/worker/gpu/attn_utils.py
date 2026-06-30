@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -396,6 +397,9 @@ def build_attn_metadata(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
+    req_state_indices: torch.Tensor | None = None,
+    req_state_indices_cpu: np.ndarray | None = None,
+    num_draft_tokens_per_req_cpu: np.ndarray | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool = True,
@@ -405,6 +409,12 @@ def build_attn_metadata(
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
     if seq_lens_cpu_upper_bound is not None:
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+    if req_state_indices is not None:
+        req_state_indices = req_state_indices[:num_reqs]
+    if req_state_indices_cpu is not None:
+        req_state_indices_cpu = req_state_indices_cpu[:num_reqs]
+    if num_draft_tokens_per_req_cpu is not None:
+        num_draft_tokens_per_req_cpu = num_draft_tokens_per_req_cpu[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -431,6 +441,9 @@ def build_attn_metadata(
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
+            req_state_indices=req_state_indices,
+            req_state_indices_cpu=req_state_indices_cpu,
+            num_draft_tokens_per_req_cpu=num_draft_tokens_per_req_cpu,
             **common_attn_metadata_extra_kwargs,
         )
 

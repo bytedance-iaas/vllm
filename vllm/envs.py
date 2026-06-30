@@ -148,6 +148,10 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_DSV4_C128_ONLINE_COMPRESS: bool = False
+    VLLM_DSV4_C128_ONLINE_MTP: bool = False
+    VLLM_DSV4_C128_ONLINE_DEBUG: bool = False
+    VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1301,6 +1305,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Enable DeepSeek-V4 C128 online (running-state) KV compression. Restricted
+    # to CUDA SM90, head_dim==512 and compress_ratio==128; gates the dedicated
+    # online recurrence state and kernel path.
+    "VLLM_DSV4_C128_ONLINE_COMPRESS": lambda: bool(
+        int(os.getenv("VLLM_DSV4_C128_ONLINE_COMPRESS", "0"))
+    ),
+    # Enable MTP (multi-token prediction) support for DeepSeek-V4 C128 online
+    # compression via transactional candidate banks. Only effective when
+    # VLLM_DSV4_C128_ONLINE_COMPRESS is also enabled.
+    "VLLM_DSV4_C128_ONLINE_MTP": lambda: bool(
+        int(os.getenv("VLLM_DSV4_C128_ONLINE_MTP", "0"))
+    ),
+    # Enable verbose debug logging / extra assertions for the DeepSeek-V4 C128
+    # online compression path.
+    "VLLM_DSV4_C128_ONLINE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DSV4_C128_ONLINE_DEBUG", "0"))
+    ),
+    # Enable the Mooncake PD auxiliary transfer of the C128 committed bank0
+    # partial state. Only effective with VLLM_DSV4_C128_ONLINE_COMPRESS and a PD
+    # disaggregated (producer/consumer) role. When disabled, PD remote prefill
+    # is fail-closed to 128-aligned resumes and no export/import pool is
+    # allocated.
+    "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER": lambda: bool(
+        int(os.getenv("VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER", "0"))
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
