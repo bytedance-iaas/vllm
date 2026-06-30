@@ -44,6 +44,8 @@ jobs:
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
+      BYTEIAAS_BUILD_NVCC_THREADS: "1"
     steps:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
@@ -102,11 +104,14 @@ jobs:
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
         with:
+          name: byteiaas-vllm-image-builder
           driver-opts: |
             network=host
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
+          keep-state: true
+          cleanup: false
 
       - name: Login to Volcengine CR
         run: |
@@ -121,11 +126,53 @@ jobs:
           final_base_image="nvidia/cuda:${{ inputs.cuda_version }}-base-ubuntu${ubuntu_version}"
           openai_metadata_file="/tmp/byteiaas-vllm-openai-image.json"
           openai_devel_metadata_file="/tmp/byteiaas-vllm-openai-devel-image.json"
+          build_cpus="$(nproc)"
+          build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
+          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-1}"
+          cache_root="${BYTEIAAS_BUILDX_CACHE_ROOT}"
+
+          echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}"
+          echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
+          df -h /data /data/docker /data/buildkit || true
+          mkdir -p "${cache_root}"
+
+          buildx_with_local_cache() {
+            local cache_name="$1"
+            shift
+            local cache_dir="${cache_root}/${cache_name}"
+            local cache_new="${cache_dir}.new"
+            local cache_old="${cache_dir}.old"
+            local cache_args=(
+              --cache-to "type=local,dest=${cache_new},mode=max"
+            )
+            if [ -d "${cache_dir}" ]; then
+              cache_args=(
+                --cache-from "type=local,src=${cache_dir}"
+                "${cache_args[@]}"
+              )
+              echo "Using local BuildKit cache: ${cache_dir}"
+            else
+              echo "No local BuildKit cache yet: ${cache_dir}"
+            fi
+
+            rm -rf "${cache_new}"
+            docker buildx build "${cache_args[@]}" "$@"
+
+            if [ -d "${cache_new}" ]; then
+              rm -rf "${cache_old}"
+              if [ -d "${cache_dir}" ]; then
+                mv "${cache_dir}" "${cache_old}"
+              fi
+              mv "${cache_new}" "${cache_dir}"
+              rm -rf "${cache_old}"
+              echo "Updated local BuildKit cache: ${cache_dir}"
+            fi
+          }
 
           build_vllm_openai() {
             local output_name="$1"
             local metadata_path="$2"
-            docker buildx build \
+            buildx_with_local_cache openai \
               --target vllm-openai \
               --platform linux/amd64 \
               --output "type=image,name=${output_name},push-by-digest=true,name-canonical=true,push=true" \
@@ -133,6 +180,8 @@ jobs:
               --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
               --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
               --build-arg INSTALL_KV_CONNECTORS=true \
+              --build-arg max_jobs="${build_max_jobs}" \
+              --build-arg nvcc_threads="${build_nvcc_threads}" \
               --build-arg HTTP_PROXY="${HTTP_PROXY}" \
               --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
               --build-arg ALL_PROXY="${ALL_PROXY}" \
@@ -150,12 +199,14 @@ jobs:
           openai_digest="$(python3 -c "import json; print(json.load(open('${openai_metadata_file}'))['containerimage.digest'])")"
           echo "Pushed openai digest: ${openai_digest}"
 
-          docker buildx build \
+          buildx_with_local_cache openai-devel \
             --platform linux/amd64 \
             --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
             -f docker/byteiaas-openai-devel.Dockerfile \
             --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${openai_digest}" \
             --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg max_jobs="${build_max_jobs}" \
+            --build-arg nvcc_threads="${build_nvcc_threads}" \
             --build-arg HTTP_PROXY="${HTTP_PROXY}" \
             --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
             --build-arg ALL_PROXY="${ALL_PROXY}" \
