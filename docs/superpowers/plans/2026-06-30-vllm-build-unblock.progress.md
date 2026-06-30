@@ -174,6 +174,26 @@
 - Fix: 将两个 workflow 的默认 `BYTEIAAS_BUILD_NVCC_THREADS` 改为 `min(4,nproc)`，保留 `MAX_JOBS=nproc`，使 vLLM `setup.py` 计算出的 CMake jobs 接近 `nproc/4`，总 CUDA 编译并发接近机器核数。
 - Next: 重新静态验证、提交、push，取消 run `28437275387` 并触发下一轮构建。
 
+### P7: Parallelism fix pushed and next run started
+
+- Summary: 完成并推送第二个修复提交，取消低效 run，并触发下一轮 ByteIAAS dev build。
+- Commit:
+  - `d3ad4172dc840748fa3b070544e58a974873d0c8 ci: tune vllm cuda build parallelism`
+- Validation:
+  - `bash -n tools/setup_deepgemm_pythons.sh`: pass。
+  - Python YAML parse `_byteiaas-build-wheel.yml` 和 `_byteiaas-build-and-publish-image.yml`: pass。
+  - `git diff --check`: pass。
+- Previous run:
+  - `28437275387` 已提交取消请求；取消原因是 CUDA 编译阶段实际 `ninja -j1`、单核低负载。
+- New run:
+  - URL: `https://github.com/bytedance-iaas/vllm/actions/runs/28438518376`
+  - run id: `28438518376`
+  - head SHA: `d3ad4172dc840748fa3b070544e58a974873d0c8`
+- Expected next evidence:
+  - build-01 日志或进程应显示 `max_jobs=144, nvcc_threads=4, effective_cuda_jobs=36`。
+  - build-02 日志或进程应显示 `max_jobs=120, nvcc_threads=4, effective_cuda_jobs=30`。
+  - CUDA 编译阶段应看到多个并发 `nvcc`/`cc1plus`/`ptxas` 进程，而不是 `ninja -j1` 单核低负载。
+
 ## Approval Notes
 
 - 本次 `/plan` 只写计划，不执行审批敏感动作。
@@ -197,3 +217,90 @@
 ## Final Summary
 
 - 暂无；执行完成后填写。
+
+## P8: 最新 run 并发修复后的首次现场检查
+
+时间：2026-06-30 18:45 +0800
+
+证据：
+- GitHub run：`28438518376`
+- head SHA：`d3ad4172dc840748fa3b070544e58a974873d0c8`
+- job `84270302392`：`build-wheel / build-wheel`，当前 step `Build wheel stage image`
+- job `84270302408`：`build-image / build-and-publish-image`，当前 step `Build and push AMD64 image by digest`
+- build-01 现场命令包含 `--build-arg max_jobs=144 --build-arg nvcc_threads=4`
+- build-02 现场命令包含 `--build-arg max_jobs=120 --build-arg nvcc_threads=4`
+- 两侧当前处于早期 `apt-get update/install` 阶段，没有看到 `uv venv --python 3.10 /opt/dgenv/3.10 --python-preference only-managed --seed`
+
+结论：
+- 上一轮发现的 CUDA/C++ 编译并发退化为 `ninja -j1` 的问题，已在新 run 参数层面修正为社区模式 `NVCC_THREADS=4`。
+- 当前暂未出现原始 `uv` managed Python 低速卡点，继续监控后续 DeepGEMM Python setup 和 CMake/Ninja 编译阶段。
+
+## P9: 最新 run 进入 CMake/CUDA 编译阶段
+
+时间：2026-06-30 19:12 +0800
+
+证据：
+- GitHub run：`28438518376` 仍在进行中。
+- build-01/wheel 现场曾显示：`python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38`，CMake configure 参数包含 `-DNVCC_THREADS=4` 和 `-DCMAKE_JOB_POOLS:STRING=compile=36`。
+- build-02/image 现场显示多条 `ccache /usr/local/cuda/bin/nvcc` 与 `nvcc` 进程，编译 `vllm-flash-attn`，每条命令包含 `--threads=4`。
+- 没有看到原始卡点 `uv venv --python 3.10 /opt/dgenv/3.10 --python-preference only-managed --seed`。
+
+结论：
+- 早期 `uv pip install requirements/cuda.txt` 没有形成无界卡死，build 已推进到 CMake/CUDA 编译。
+- `NVCC_THREADS=4` 与 `MAX_JOBS/NVCC_THREADS` 的设计已在现场生效；当前不是单线程 `ninja -j1`。
+- 继续监控完整构建是否成功；如后续失败，等 GitHub 完整日志出来后按失败点做最小修复。
+
+## P10: 19:23 现场 I/O 与编译推进检查
+
+时间：2026-06-30 19:23 +0800
+
+证据：
+- build-01/wheel：`python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38` 重新进入运行态，现场 CPU 约 `107%`，该进程 `write_bytes` 约 `6.4GB`；BuildKit 总写入约 `150GB`。
+- build-01 磁盘：`/dev/vda2` 约 `2.0T`，已用约 `413G`，可用约 `1.5T`。
+- build-02/image：BuildKit 总写入约 `182GB`，有新的 `buildkit-runc` step；磁盘 `/dev/vda2` 约 `2.0T`，已用约 `147G`，可用约 `1.8T`。
+- 两台机器均使用 `/data/buildkit/byteiaas-vllm-*-cache`，底层落在大空间 `/dev/vda2`，不是小系统盘瓶颈。
+
+结论：
+- 当前不是低 CPU、低 IO、无日志推进的空转；构建仍在推进，主要耗时来自首次 CUDA wheel/image 构建和 BuildKit 写层。
+- 不需要此刻打断 run；继续等待终态并在失败时拉完整日志定位。
+
+## P11: wheel 成功，image 仍在 BuildKit 本地阶段
+
+时间：2026-06-30 19:50 +0800
+
+证据：
+- run `28438518376` 中 `build-wheel / build-wheel` 已成功完成：`2026-06-30T10:43:52Z` -> `2026-06-30T11:38:45Z`，约 `55m`。
+- `build-image / build-and-publish-image` 仍在 `Build and push AMD64 image by digest`。
+- build-02/image 现场：`buildkitd` 仍有约 `15.9%` CPU，`docker-buildx build` 仍在；磁盘 `/dev/vda2` 约 `2.0T`，已用约 `162G`，可用约 `1.8T`。
+- 采样时没有看到到 CR 的活跃推送连接，判断还在本地 BuildKit layer/export/cache 阶段，而不是 CR 网络推送卡住。
+
+结论：
+- wheel 路径已完成；如果 image 后续失败，只需要针对 image target/publish 阶段继续最小修复。
+- image 当前仍有 BuildKit 活动，不满足“低 CPU、低 IO、无推进空转”的中断条件，继续等待终态。
+
+## P12: FlashInfer cubin 下载慢点定位与修复
+
+时间：2026-06-30 20:00 +0800
+
+触发：
+- 用户从 GitHub Actions 网页日志观察到 image job 长时间停在 `Downloading cubins`，例如 `1886/15602`，日志源为 `flashinfer.jit` 从 `edge.urm.nvidia.com` 下载 cubin 到 `site-packages/flashinfer_cubin/cubins/...`。
+
+原因：
+- `docker/Dockerfile` 的 `vllm-base` 阶段在所有 pip install 之后执行 `RUN flashinfer show-config && flashinfer download-cubin`。
+- 该命令会预下载约 `15602` 个 FlashInfer cubin 小文件；首次构建或该 layer cache 失效时，需要从 NVIDIA edge 全量拉取。
+- 该 layer 位于 vLLM wheel 和 EP kernels 安装之后，源码/wheel 变化容易让它失效，所以即使 FlashInfer 版本没有变化，dev image 也可能重新下载 cubins。
+- 不能直接删除该步骤，因为目标镜像不应依赖运行时 hotfix/install/download。
+
+修复：
+- 在 `RUN flashinfer show-config && flashinfer download-cubin` 周围加入 BuildKit cache mount：`id=flashinfer-cubins-${FLASHINFER_VERSION}-cuda-${CUDA_VERSION}`。
+- 构建开始时把 cache 中已有 cubins 拷回 `flashinfer_cubin/cubins`，再执行 `flashinfer download-cubin` 补齐缺失文件，最后把完整目录同步回 cache。
+- 最终镜像仍然包含 cubins；后续同 FlashInfer/CUDA 版本的 dev build 可复用本机构建 cache，避免每次因 vLLM wheel 改动重新从 NVIDIA edge 拉 15602 个文件。
+
+验证：
+- `bash -n tools/setup_deepgemm_pythons.sh`：pass。
+- Python YAML parse `_byteiaas-build-wheel.yml` 和 `_byteiaas-build-and-publish-image.yml`：pass。
+- `git diff --check`：pass。
+
+Next：
+- 提交并 push 当前修复。
+- 取消旧 run `28438518376`，触发新 run；第一轮新 cache 可能仍需下载一次，后续 rerun 应通过 cache 明显加速 cubin 步骤。

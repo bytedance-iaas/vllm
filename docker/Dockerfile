@@ -960,7 +960,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # those can reinstall/touch flashinfer packages. Downloading cubins earlier
 # (in the flashinfer-jit-cache layer) causes ~2.5 GB of layer duplication
 # when a later pip install overwrites flashinfer package files.
-RUN flashinfer show-config && flashinfer download-cubin
+RUN --mount=type=cache,id=flashinfer-cubins-${FLASHINFER_VERSION}-cuda-${CUDA_VERSION},target=/opt/flashinfer-cubin-cache,sharing=locked \
+    set -eux; \
+    FLASHINFER_CUBIN_DIR="$(python3 -c 'import importlib.util; from pathlib import Path; spec = importlib.util.find_spec("flashinfer_cubin"); assert spec is not None and spec.origin is not None, "flashinfer_cubin package not found"; print(Path(spec.origin).resolve().parent / "cubins")')"; \
+    mkdir -p "${FLASHINFER_CUBIN_DIR}" /opt/flashinfer-cubin-cache; \
+    if [ "$(find /opt/flashinfer-cubin-cache -mindepth 1 -print -quit)" ]; then \
+        cp -a /opt/flashinfer-cubin-cache/. "${FLASHINFER_CUBIN_DIR}/"; \
+    fi; \
+    flashinfer show-config; \
+    flashinfer download-cubin; \
+    rm -rf /opt/flashinfer-cubin-cache/*; \
+    cp -a "${FLASHINFER_CUBIN_DIR}/." /opt/flashinfer-cubin-cache/
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
