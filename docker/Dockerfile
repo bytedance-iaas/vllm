@@ -78,6 +78,7 @@ ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_INDEX_URL=${PIP_INDEX_URL}
 ARG UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ARG UV_VERSION=0.11.25
 
 # PyTorch provides its own indexes for standard and nightly builds
 ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
@@ -102,6 +103,7 @@ FROM ${BUILD_BASE_IMAGE} AS base
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG BUILD_OS
+ARG UV_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -163,10 +165,19 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
     fi
 
 # Install uv and bootstrap /opt/venv. Both paths converge on /opt/venv so all
-# downstream stages stay distro-agnostic.
+# downstream stages stay distro-agnostic. Install uv through pip instead of the
+# astral installer so CI does not depend on downloading release tarballs.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && if [ "${BUILD_OS}" = "manylinux" ]; then \
+           PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
+           && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
+           && "$MANYLINUX_PY" -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+           && ln -sf "/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/uv" "${UV_INSTALL_DIR}/uv"; \
+       else \
+           python3 -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+           && ln -sf "$(command -v uv)" "${UV_INSTALL_DIR}/uv"; \
+       fi \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
