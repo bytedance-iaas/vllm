@@ -850,6 +850,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
 ARG FLASHINFER_VERSION=0.6.12
+ARG FLASHINFER_CUBIN_CACHE_MIN_FILES=15000
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
         --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
@@ -963,14 +964,36 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 RUN --mount=type=cache,id=flashinfer-cubins-${FLASHINFER_VERSION}-cuda-${CUDA_VERSION},target=/opt/flashinfer-cubin-cache,sharing=locked \
     set -eux; \
     FLASHINFER_CUBIN_DIR="$(python3 -c 'import importlib.util; from pathlib import Path; spec = importlib.util.find_spec("flashinfer_cubin"); assert spec is not None and spec.origin is not None, "flashinfer_cubin package not found"; print(Path(spec.origin).resolve().parent / "cubins")')"; \
-    mkdir -p "${FLASHINFER_CUBIN_DIR}" /opt/flashinfer-cubin-cache; \
-    if [ "$(find /opt/flashinfer-cubin-cache -mindepth 1 -print -quit)" ]; then \
-        cp -a /opt/flashinfer-cubin-cache/. "${FLASHINFER_CUBIN_DIR}/"; \
+    FLASHINFER_CUBIN_CACHE_ROOT=/opt/flashinfer-cubin-cache; \
+    FLASHINFER_CUBIN_CACHE_DIR="${FLASHINFER_CUBIN_CACHE_ROOT}/cubins"; \
+    FLASHINFER_CUBIN_CACHE_DONE="${FLASHINFER_CUBIN_CACHE_ROOT}/.complete"; \
+    mkdir -p "${FLASHINFER_CUBIN_DIR}" "${FLASHINFER_CUBIN_CACHE_DIR}"; \
+    if [ -z "$(find "${FLASHINFER_CUBIN_CACHE_DIR}" -mindepth 1 -print -quit)" ] \
+        && [ "$(find "${FLASHINFER_CUBIN_CACHE_ROOT}" -mindepth 1 -maxdepth 1 ! -name cubins ! -name .complete -print -quit)" ]; then \
+        find "${FLASHINFER_CUBIN_CACHE_ROOT}" -mindepth 1 -maxdepth 1 ! -name cubins ! -name .complete -exec mv -t "${FLASHINFER_CUBIN_CACHE_DIR}" {} +; \
     fi; \
-    flashinfer show-config; \
-    flashinfer download-cubin; \
-    rm -rf /opt/flashinfer-cubin-cache/*; \
-    cp -a "${FLASHINFER_CUBIN_DIR}/." /opt/flashinfer-cubin-cache/
+    cached_cubins="$(find "${FLASHINFER_CUBIN_CACHE_DIR}" -type f -name '*.cubin' | wc -l)"; \
+    if [ -f "${FLASHINFER_CUBIN_CACHE_DONE}" ] || [ "${cached_cubins}" -ge "${FLASHINFER_CUBIN_CACHE_MIN_FILES}" ]; then \
+        echo "Using cached FlashInfer cubins: ${cached_cubins} files"; \
+        cp -a "${FLASHINFER_CUBIN_CACHE_DIR}/." "${FLASHINFER_CUBIN_DIR}/"; \
+        touch "${FLASHINFER_CUBIN_CACHE_DONE}"; \
+    else \
+        echo "Cached FlashInfer cubins incomplete: ${cached_cubins} files; downloading"; \
+        if [ "${cached_cubins}" -gt 0 ]; then \
+            cp -a "${FLASHINFER_CUBIN_CACHE_DIR}/." "${FLASHINFER_CUBIN_DIR}/"; \
+        fi; \
+        flashinfer show-config; \
+        flashinfer download-cubin; \
+        rm -rf "${FLASHINFER_CUBIN_CACHE_DIR}"; \
+        mkdir -p "${FLASHINFER_CUBIN_CACHE_DIR}"; \
+        cp -a "${FLASHINFER_CUBIN_DIR}/." "${FLASHINFER_CUBIN_CACHE_DIR}/"; \
+        final_cubins="$(find "${FLASHINFER_CUBIN_CACHE_DIR}" -type f -name '*.cubin' | wc -l)"; \
+        if [ "${final_cubins}" -lt "${FLASHINFER_CUBIN_CACHE_MIN_FILES}" ]; then \
+            echo "FlashInfer cubin cache incomplete after download: ${final_cubins} files" >&2; \
+            exit 1; \
+        fi; \
+        touch "${FLASHINFER_CUBIN_CACHE_DONE}"; \
+    fi
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers

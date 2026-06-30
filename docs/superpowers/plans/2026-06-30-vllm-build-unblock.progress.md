@@ -304,3 +304,110 @@
 Next：
 - 提交并 push 当前修复。
 - 取消旧 run `28438518376`，触发新 run；第一轮新 cache 可能仍需下载一次，后续 rerun 应通过 cache 明显加速 cubin 步骤。
+
+## P13: FlashInfer cache 修复已推送并重启构建
+
+时间：2026-06-30 20:05 +0800
+
+提交：
+- `7186cf328963d12daabe8ee47087a29111c0cb75 ci: cache flashinfer cubin downloads`
+
+动作：
+- 取消旧 run `28438518376`；该 run 已完成取消。
+- 触发新 ByteIAAS dev build run：`28442949331`
+- 新 run head SHA：`7186cf328963d12daabe8ee47087a29111c0cb75`
+
+预期：
+- 第一轮带新 cache mount 的 run 可能仍需要从 NVIDIA edge 下载一次 cubins，用来填充 BuildKit cache。
+- 后续同 FlashInfer/CUDA 版本 rerun 应从 `flashinfer-cubins-${FLASHINFER_VERSION}-cuda-${CUDA_VERSION}` cache 预填充 cubins，`flashinfer download-cubin` 不应再长时间重新下载 15602 个文件。
+
+## P14: FlashInfer cubin 首次 cache 填充确认
+
+时间：2026-06-30 20:19 +0800
+
+证据：
+- 新 run：`28442949331`，head SHA `7186cf328963d12daabe8ee47087a29111c0cb75`。
+- `build-wheel / build-wheel` 已成功，约 `8m37s`，说明 wheel local BuildKit cache 已明显生效。
+- `build-image / build-and-publish-image` 当前位于 `flashinfer download-cubin`，进程命令确认正在执行新增 wrapper：先检查 `/opt/flashinfer-cubin-cache`，再执行 `flashinfer download-cubin`，最后同步回 cache。
+- 当前运行目录约 `7511` 个 `.cubin`；构建机旧 snapshot 中存在多个完整目录，约 `15558` 个 `.cubin`、`1.8G`，但这些旧目录没有自动进入新 `flashinfer-cubins-${FLASHINFER_VERSION}-cuda-${CUDA_VERSION}` cache mount。
+
+结论：
+- 当前慢点是新增 cache mount 的首次填充，不代表修复失效。
+- 继续让本轮 image 跑完，以便将 cubins 写入新 BuildKit cache；随后必须同 SHA rerun 验证 `flashinfer download-cubin` 是否明显加速或跳过下载。
+
+## P15: GitHub live log 延迟与 image 后续阶段确认
+
+时间：2026-06-30 20:36 +0800
+
+证据：
+- 用户从 GitHub 网页看到 `Downloading cubins` 仍停在较旧进度，但构建机现场显示 `.cubin` 文件数已经从 `11710` 推进到 `15558`。
+- 20:36 现场：`flashinfer download-cubin` 进程已不在进程列表，说明 cubin 下载阶段已结束或已进入后续步骤。
+- 20:36 现场：`buildkitd` 仍约 `21.3%` CPU，`docker-buildx` 仍运行，image job 的 GitHub step 仍为 `Build and push AMD64 image by digest`。
+- build-02 磁盘：`/dev/vda2` 约 `2.0T`，已用约 `225G`，可用约 `1.7T`。
+- image local BuildKit cache 目录：`/data/buildkit/byteiaas-vllm-image-cache` 约 `37G`。
+
+结论：
+- GitHub Actions 网页 live log 在 BuildKit + `tqdm` 长输出场景下存在明显刷新滞后，不能用网页停在旧进度直接判断卡死。
+- 当前不是 FlashInfer 下载卡住；已进入 BuildKit 后续处理、cache export 或 image push 相关阶段。
+- 后续监控以 GitHub job 状态 + 构建机进程/文件数/BuildKit 活动为准。
+
+## P16: run 28442949331 完整成功
+
+时间：2026-06-30 20:46 +0800
+
+结果：
+- run `28442949331` 成功，head SHA `7186cf328963d12daabe8ee47087a29111c0cb75`。
+- `build-wheel / build-wheel`：`2026-06-30T12:05:26Z` -> `2026-06-30T12:14:03Z`，约 `8m37s`，成功。
+- `build-image / build-and-publish-image`：`2026-06-30T12:05:26Z` -> `2026-06-30T12:46:16Z`，约 `40m50s`，成功。
+
+观察：
+- 本轮 image 包含新增 FlashInfer cubin cache mount 的首次填充；下载阶段现场确认 `.cubin` 达到 `15558` 后进入 BuildKit 后续处理。
+- GitHub live log 对 `Downloading cubins` 进度存在滞后，应以构建机现场和最终日志为准。
+
+Next：
+- 检查 build-01/build-02 local cache 目录。
+- 触发同 SHA rerun，验证 wheel/image BuildKit cache 与 FlashInfer cubin cache 是否实际命中，尤其确认 image 不再长时间重新下载 cubins。
+
+## P17: cache 检查与同 SHA 验收 run 启动
+
+时间：2026-06-30 20:48 +0800
+
+cache 现状：
+- build-01：`/data/buildkit/byteiaas-vllm-wheel-cache` 约 `16G`；Buildx wheel builder state 约 `69G`；磁盘 `/dev/vda2` 约 `2.0T`，可用约 `1.5T`。
+- build-02：`/data/buildkit/byteiaas-vllm-image-cache` 约 `35G`；Buildx image builder state 约 `93G`；磁盘 `/dev/vda2` 约 `2.0T`，可用约 `1.7T`。
+
+同 SHA 验收 run：
+- run `28445477710`
+- head SHA：`7186cf328963d12daabe8ee47087a29111c0cb75`
+- 目的：验证 wheel/image local BuildKit cache 与新增 FlashInfer cubin cache。尤其确认 image 不再长时间重新下载 `15558` 个 cubins。
+
+注意：
+- GitHub live log 对 `Downloading cubins` 可能滞后；验收以完整日志、job 时长和构建机现场为准。
+
+## P18: 第二轮 cache 验收发现 `download-cubin` 仍会重下，改为 sentinel 跳过
+
+时间：2026-06-30 21:02 +0800
+
+证据：
+- 第二轮 run `28445477710`，head SHA `7186cf328963d12daabe8ee47087a29111c0cb75`。
+- wheel job 已成功，约 `8m15s`，说明 wheel local BuildKit cache 生效。
+- image job 进入 FlashInfer wrapper 后，当前容器中已有 `15558` 个 `.cubin`、约 `1.8G`，但 `flashinfer download-cubin` 仍运行约 `10m`，保持到代理 `100.68.162.211:3128` 的连接，并写入约 `993MB`。
+
+结论：
+- 单纯预拷贝 cubin cache 到 `flashinfer_cubin/cubins` 不足以达到效率门；FlashInfer CLI 仍会遍历并发起网络下载/覆盖。
+- 需要在 Dockerfile 层加 sentinel：当 cache 中已有足够 cubins 或 `.complete` 标记时，直接复制 cache 到镜像并跳过 `flashinfer download-cubin`。
+
+修复：
+- 新增 `ARG FLASHINFER_CUBIN_CACHE_MIN_FILES=15000`。
+- cache mount 改为含 `cubins/` 子目录与 `.complete` sentinel。
+- 兼容迁移上一版 cache mount 根目录直接存 cubins 的布局。
+- 当 cached cubin 数量达到阈值或 `.complete` 存在时，直接使用 cache，跳过 `flashinfer download-cubin`。
+- 只有 cache 不完整时才执行 `flashinfer download-cubin`，成功后写入 `cubins/` 与 `.complete`。
+
+动作：
+- 已请求取消低效验收 run `28445477710`。
+- 静态验证通过：`bash -n tools/setup_deepgemm_pythons.sh`、两个 workflow YAML parse、`git diff --check`。
+
+Next：
+- 提交并 push sentinel 修复。
+- 触发下一轮 dev build，验证 image 在 FlashInfer cubin step 输出 `Using cached FlashInfer cubins`，且没有长时间 `download-cubin` 网络下载。
