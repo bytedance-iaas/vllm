@@ -131,6 +131,49 @@
   - 本地 helper 校验：`tools/setup_deepgemm_pythons.sh 3.11` 输出 `/usr/bin/python3.11`，stderr 显示 `DeepGEMM Python 3.11: using system interpreter /usr/bin/python3.11`。
 - Risk carried forward: Docker build 仍需验证 deadsnakes/apt 是否提供 `python3.13` 和 `python3.14` packages；若新 run 失败，按 C15 分类后继续最小修复。
 
+### P4: Commit pushed and new build started
+
+- Summary: 完成 M6/C8 和 M7/C9-C10。旧 run 已取消，新 ByteIAAS dev build 已触发。
+- Commit:
+  - `207612ca3b6aa30cf1ed623ca647df0dcb70cfad ci: unblock vllm docker builds`
+  - Pushed branch: `codex/vllm-dsv4-fork-base-byteiaas-build`
+- Old run:
+  - `28434471432` 已进入 `completed/cancelled`。
+  - image job `84256928677` 和 wheel job `84256928772` 均在旧 Docker build step 被取消。
+- New run:
+  - URL: `https://github.com/bytedance-iaas/vllm/actions/runs/28437275387`
+  - run id: `28437275387`
+  - head SHA: `207612ca3b6aa30cf1ed623ca647df0dcb70cfad`
+  - initial jobs:
+    - `84266201333 build-wheel / build-wheel`
+    - `84266201334 build-image / build-and-publish-image`
+- Next: 按 C11 持续监控新 run，若出现新失败或低速卡点则执行 C15 分类并继续最小修复。
+
+### P5: First live monitoring after new run
+
+- Summary: 新 run 已越过旧的 DeepGEMM `/opt/dgenv/3.10` managed Python 卡点。image 和 wheel build 参数均显示 `nvcc_threads` 默认跟随 `nproc`，wheel workflow 已使用 Buildx local cache 路径。
+- Evidence:
+  - build-01 image process: `--build-arg max_jobs=144 --build-arg nvcc_threads=144`。
+  - build-01 compile process: `nvcc ... --threads=144`，并进入 `cmake --build` / `ninja` 阶段。
+  - build-02 wheel process: `docker buildx build --cache-to type=local,dest=/data/buildkit/byteiaas-vllm-wheel-cache/build.new,mode=max --load ... --build-arg max_jobs=120 --build-arg nvcc_threads=120`。
+  - No process matching `uv venv --python 3.10 /opt/dgenv/3.10 --python-preference only-managed --seed` in current probes.
+- Evidence files:
+  - `artifacts/2026-06-30-vllm-build-unblock/monitor/C11-build02-182440.txt`
+  - `artifacts/2026-06-30-vllm-build-unblock/monitor/C11-ivk-yepkqh1022lbds39tq1b-182923.txt`
+  - `artifacts/2026-06-30-vllm-build-unblock/monitor/C11-ivk-yepkqh2emslbds65uvb0-182924.txt`
+  - `artifacts/2026-06-30-vllm-build-unblock/monitor/C11-ivk-yepkqusytplbdsrn6sit-183501.txt`
+- Watch item: build-01 currently shows `cmake --build . -j=1` because `nvcc_threads=144` consumes the parallelism budget in vLLM's build logic. This may still be acceptable if `nvcc --threads=144` uses CPU effectively; if CPU remains low for the low-speed window, classify as a CUDA build parallelism efficiency issue and adjust.
+
+### P6: CUDA build parallelism adjusted after live efficiency issue
+
+- Summary: 新 run `28437275387` 越过旧 uv 卡点后暴露新效率问题：workflow 将 `nvcc_threads` 直接设为 `nproc`，vLLM `setup.py::compute_num_jobs` 会把 CMake jobs 降为 `MAX_JOBS/NVCC_THREADS=1`；现场只看到单个 `cc1plus` 约 1 核运行，不符合“CUDA/C++ 编译阶段不是单线程低负载”的验收门。
+- Evidence:
+  - build-01: `cmake --build . -j=1`，`ninja -j 1`，`nvcc --threads=144`。
+  - build-02: `cmake --build . -j=1`，`ninja -j 1`，`nvcc --threads=120`，单个 `cc1plus` 约 109% CPU。
+  - repo reference: `tools/generate_cmake_presets.py` 使用社区模式 `nvcc_threads = min(4, cpu_cores)`，`cmake_jobs = cpu_cores // nvcc_threads`。
+- Fix: 将两个 workflow 的默认 `BYTEIAAS_BUILD_NVCC_THREADS` 改为 `min(4,nproc)`，保留 `MAX_JOBS=nproc`，使 vLLM `setup.py` 计算出的 CMake jobs 接近 `nproc/4`，总 CUDA 编译并发接近机器核数。
+- Next: 重新静态验证、提交、push，取消 run `28437275387` 并触发下一轮构建。
+
 ## Approval Notes
 
 - 本次 `/plan` 只写计划，不执行审批敏感动作。

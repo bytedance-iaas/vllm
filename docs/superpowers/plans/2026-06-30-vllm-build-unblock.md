@@ -4,7 +4,7 @@
 
 **Goal:** 解决当前 ByteIAAS vLLM 构建卡在 DeepGEMM Python bootstrap、代理下载过慢、wheel 构建不复用稳定 BuildKit cache、CUDA/C++ 构建线程数过低的问题，并在当前分支完成一次完整构建和一次 cache 验证构建后停下来讨论是否合入 `iaas_main`。
 
-**Architecture:** 先把 DeepGEMM 多 Python 准备从 `uv` managed Python 下载路径改为优先使用镜像内本地 `/usr/bin/python3.x` 或 manylinux `/opt/python/cpXY-cpXY/bin/python3.x`，只在缺失时带超时重试 fallback 到 `uv`。然后把 wheel workflow 切到与 image workflow 同类的 local BuildKit cache，并把 image/wheel 默认 `nvcc_threads` 从 `1` 提升到机器核数。最后用 GitHub Actions 和构建机现场进程做闭环验证：每次出现失败或明显低速卡点，都先定位新的具体卡点，再做最小修复、重启构建并继续监控，直到当前分支完成完整构建，且同 SHA 复跑证明 cache 被读取、无明显低速空转卡点。
+**Architecture:** 先把 DeepGEMM 多 Python 准备从 `uv` managed Python 下载路径改为优先使用镜像内本地 `/usr/bin/python3.x` 或 manylinux `/opt/python/cpXY-cpXY/bin/python3.x`，只在缺失时带超时重试 fallback 到 `uv`。然后把 wheel workflow 切到与 image workflow 同类的 local BuildKit cache，并让 image/wheel 的 CUDA/C++ 默认总并发接近机器核数：`MAX_JOBS=nproc`，`NVCC_THREADS=min(4,nproc)`，由 vLLM `setup.py` 计算 CMake jobs 为 `MAX_JOBS/NVCC_THREADS`。最后用 GitHub Actions 和构建机现场进程做闭环验证：每次出现失败或明显低速卡点，都先定位新的具体卡点，再做最小修复、重启构建并继续监控，直到当前分支完成完整构建，且同 SHA 复跑证明 cache 被读取、无明显低速空转卡点。
 
 **Tech Stack:** `bytedance-iaas/vllm`, GitHub Actions self-hosted runners, Docker Buildx, BuildKit local cache, CUDA 13.0.2, Ubuntu 22.04, manylinux2_28, `uv`, DeepGEMM, `ve ecs RunCommand`, `/home/hanhan.hank/.local/bin/gh-github`.
 
@@ -97,11 +97,11 @@
 
 ### M5: 提升 CUDA/C++ 构建线程默认值
 
-- [ ] 修改 `.github/workflows/_byteiaas-build-and-publish-image.yml`：把 `BYTEIAAS_BUILD_NVCC_THREADS` 默认从 `"1"` 改成空默认或移除固定 env，使 step 内默认取 `nproc`。
-- [ ] 修改 `.github/workflows/_byteiaas-build-wheel.yml`：同样把 `BYTEIAAS_BUILD_NVCC_THREADS` 默认从 `"1"` 改成空默认或移除固定 env。
-- [ ] 修改两个 workflow 的 shell：`build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${build_cpus}}"`，继续允许手工 env 覆盖。
+- [ ] 修改 `.github/workflows/_byteiaas-build-and-publish-image.yml`：把 `BYTEIAAS_BUILD_NVCC_THREADS` 默认从 `"1"` 改成社区模式 `min(4,nproc)`。
+- [ ] 修改 `.github/workflows/_byteiaas-build-wheel.yml`：同样把 `BYTEIAAS_BUILD_NVCC_THREADS` 默认从 `"1"` 改成社区模式 `min(4,nproc)`。
+- [ ] 修改两个 workflow 的 shell：`build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${default_nvcc_threads}}"`，继续允许手工 env 覆盖；`build_max_jobs` 仍默认 `nproc`，由 vLLM `setup.py` 把 CMake jobs 算为 `MAX_JOBS/NVCC_THREADS`，使总 CUDA 编译并发接近核数。
 - [ ] 保持 `build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"`。
-- Acceptance: 新 workflow 日志打印的 `max_jobs`、`nvcc_threads` 和 `cpus` 三者默认等于实际 `nproc`；build-01 预期为 `144`，build-02 预期为 `120`，除非 runner 实际 `nproc` 不同。
+- Acceptance: 新 workflow 日志打印 `max_jobs=<nproc>`、`nvcc_threads=4`、`effective_cuda_jobs=<nproc/4>`；build-01 预期约 `max_jobs=144, nvcc_threads=4, effective_cuda_jobs=36`，build-02 预期约 `max_jobs=120, nvcc_threads=4, effective_cuda_jobs=30`，除非 runner 实际 `nproc` 不同。
 - References: commands `C4-C7`，progress entries `P6-P8`。
 
 ### M6: 静态验证、提交和推送修复分支
@@ -146,7 +146,7 @@
 - fallback `uv` managed Python 有明确 timeout、重试和清理，不会无界卡住。
 - wheel workflow 使用 fixed Buildx builder 和 local BuildKit cache，保留后续 `docker create` / `docker cp` wheel 提取路径。
 - image workflow 继续使用 local BuildKit cache，并保留现有 Volcengine CR publish 行为。
-- image/wheel workflow 默认 `max_jobs` 和 `nvcc_threads` 都跟随 `nproc`，同时保留 env override。
+- image/wheel workflow 默认 `max_jobs=nproc`、`nvcc_threads=min(4,nproc)`，总 CUDA 编译并发接近核数，同时保留 env override。
 - 新 run 不再卡在 `uv venv --python 3.10 /opt/dgenv/3.10 --python-preference only-managed --seed`。
 - 至少一次 wheel 构建成功并上传 wheel artifact。
 - 至少一次 image 构建成功并发布 openai/openai-devel image tag 或 digest。

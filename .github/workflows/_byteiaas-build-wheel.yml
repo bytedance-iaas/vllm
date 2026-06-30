@@ -58,10 +58,14 @@ jobs:
           set -euo pipefail
           build_cpus="$(nproc)"
           build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
-          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${build_cpus}}"
+          default_nvcc_threads=4
+          if [ "${build_cpus}" -lt "${default_nvcc_threads}" ]; then
+            default_nvcc_threads="${build_cpus}"
+          fi
+          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${default_nvcc_threads}}"
           cache_root="${BYTEIAAS_BUILDX_CACHE_ROOT}"
 
-          echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}"
+          echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}, effective_cuda_jobs=$((build_max_jobs / build_nvcc_threads))"
           echo "DeepGEMM Python versions: ${DEEPGEMM_PYTHON_VERSIONS:-default}"
           echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
           df -h /data /data/docker /data/buildkit || true

@@ -130,10 +130,10 @@ done
   - 添加与 image workflow 同风格的 `buildx_with_local_cache build ...` wrapper。
 - `.github/workflows/_byteiaas-build-and-publish-image.yml`
   - 移除或置空 `BYTEIAAS_BUILD_NVCC_THREADS: "1"`。
-  - 修改 `build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${build_cpus}}"`。
-  - 打印 `max_jobs`、`nvcc_threads`、`cpus` 和 cache source。
+  - 修改默认值为 `default_nvcc_threads=min(4, build_cpus)` 和 `build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${default_nvcc_threads}}"`。
+  - 打印 `max_jobs`、`nvcc_threads`、`cpus`、`effective_cuda_jobs` 和 cache source。
 
-**Expected result:** `git diff -- .github/workflows/_byteiaas-build-wheel.yml .github/workflows/_byteiaas-build-and-publish-image.yml` 显示 wheel workflow 使用 local BuildKit cache，两个 workflow 默认 `nvcc_threads=nproc`。
+**Expected result:** `git diff -- .github/workflows/_byteiaas-build-wheel.yml .github/workflows/_byteiaas-build-and-publish-image.yml` 显示 wheel workflow 使用 local BuildKit cache，两个 workflow 默认 `max_jobs=nproc`、`nvcc_threads=min(4,nproc)`，并打印 `effective_cuda_jobs`。
 
 ## C5: 静态检查
 
