@@ -22,6 +22,7 @@
 - Mooncake 保持当前 vLLM Dockerfile 中已有 KV connector/Mooncake 处理方式，不强制改为 Helm chart 中的 `mooncake-transfer-engine-cuda13==0.3.11`。
 - servingkit Helm chart 不直接迁入本仓库；本任务在 vLLM 仓库新建一份参考其 P/D 形态的部署模板，但必须移除 runtime hotfix 和运行时安装逻辑。模型准备例外：部署模板应通过同一个新构建 vLLM 镜像中的 `oniond download model ... --turbo --dir ...` 做幂等模型下载，不能在 Pod 启动时安装 Onion 或其他代码库。
 - 不新增、不恢复 `scripts/ci/check_byteiaas_dsv4_runtime.py`，也不在镜像构建流程补充 import/CLI smoke；构建后只做镜像构建结果、部署渲染、真实服务路径和 benchmark 验证。
+- vLLM runtime 源码逻辑保持 fork 基线；本任务不得用 `vllm/` Python runtime fallback、模型逻辑、算子调用逻辑或调度逻辑修改来绕过部署失败。明确禁止在 `vllm/_custom_ops.py` 或其它 `vllm/**` runtime Python 文件中加入 `_moe_C` 到 `_moe_C_stable_libtorch` 的 `ImportError` fallback。vLLM 源码相关改动只允许解决构建过程暴露的问题，例如 Dockerfile、workflow、`setup.py`/CMake/package-data、wheel extraction 或扩展产物命名/打包问题；如需触碰 `csrc`，范围只能是扩展构建入口、目标导出或 package artifact 生成，不能改变算子语义。
 - Kubernetes 目标环境固定为 `dev-cluster`，通过 `/data00/home/hanhan.hank/workspace/env/bin/envctl` 访问；当前只读验证 `envctl validate dev-cluster` 通过。
 - dev-cluster GPU 工作必须先通过 workspace-env GPU Permit Queue 获取 permit；本计划默认 namespace 为 `vllm-dsv4-flash-pd`，release 为 `dsv4-flash-pd`。servingkit 模板中 `global.gpuCount=8` 会同时用于 prefill 和 decode 的 `nvidia.com/gpu` request/limit，因此本计划 GPU 总量默认 `16`，且必须选择两台不同的 8-GPU 节点分别承载 prefill 和 decode。
 - benchmark 默认使用 evalscope；若 evalscope 不可安装或不能满足该请求，执行者必须停止并报告 blocker，不得擅自切换自定义 harness。
@@ -48,10 +49,12 @@
   - `scripts/ci/get_byteiaas_image_tag.py`
   - `docker/byteiaas-openai-devel.Dockerfile`
   - `docker/Dockerfile` 中 ByteIAAS image build 必需的最小构建参数
+  - `setup.py`、`CMakeLists.txt`、`cmake/**` 中与 wheel/build/package artifact 直接相关的最小修正
   - `examples/deployment/deepseek-v4-flash-pd/**`
   - `docs/superpowers/plans/2026-06-29-vllm-dsv4-flash-pd-build*.md`
 - Explicitly out of write scope：
   - vLLM 旧 `iaas_main` 业务逻辑回拷
+  - `vllm/**` Python runtime 逻辑修改，例如 import fallback、模型/调度/算子调用路径修改
   - `infcp/servingkit` 仓库中的 Helm chart
   - production deployment config
   - unrelated GitHub Actions and Buildkite cleanup
@@ -93,11 +96,12 @@
 
 ### M5: 验证 workflow 并构建镜像
 
+- [x] 按命令引用 `C9A` 撤销 runtime 源码 fallback 路线：取消或忽略 run `28414886195`，并从待发布分支中移除 `vllm/_custom_ops.py` fallback 修改；后续只允许 build/package 层修复 `_moe_C` artifact 问题。
 - [ ] 按命令引用 `C7` 做 YAML/actionlint 和 tag script 验证。
 - [ ] 按命令引用 `C8` 做本地或 build-node Docker build；不做镜像内 import/CLI smoke。
 - [ ] 按命令引用 `C9` 或 ByteIAAS workflow 构建并发布 openai/openai-devel 镜像，记录实际 image tag/digest。
 - [ ] 更新主计划 current status 和进展日志。
-- Acceptance: 至少产出一个可用于 deployment values 的 image tag/digest；若本地 Docker 不可用，则 ByteIAAS workflow 成功并输出 tag/digest。
+- Acceptance: 待发布分支不包含 `vllm/_custom_ops.py` 或其它 vLLM runtime Python fallback 修改；至少产出一个可用于 deployment values 的 image tag/digest；若本地 Docker 不可用，则 ByteIAAS workflow 成功并输出 tag/digest。
 
 ### M7: 编写无 runtime hotfix/install 的 DSV4 P/D 部署模板
 
@@ -176,6 +180,7 @@
 - fork Dockerfile 与旧 ByteIAAS workflow 参数不完全兼容：fallback 是只补 workflow 需要的 build args，不整文件恢复旧 Dockerfile。
 - DeepGEMM fork wheel 无可复现源码 ref：fallback 是使用 chart 中明确出现且本线程已授权的 release wheel URL；不退回社区 DeepGEMM。
 - Mooncake/KV connector 在服务路径失败：先记录 render、argv/env、package/source 和日志证据；不直接 pin chart 版本，除非用户再次确认改变策略。
+- `_moe_C` import 类问题不得通过 `vllm/` runtime Python fallback 解决；后续只能从 build/package artifact 角度处理，例如确认 wheel 应包含哪个扩展模块、CMake/setup 是否生成/抽取正确 artifact、Dockerfile 是否安装了正确 wheel。若 build/package 层无法解决，应停止并报告 blocker，而不是改 vLLM runtime 逻辑。
 - Docker/GPU 环境不可用：本地完成静态和 workflow 验证，将 image build 转到 ByteIAAS workflow；GPU deployment/benchmark 等待 workspace-env permit 或报告 scheduler-visible blocker。
 - 本轮按用户要求跳过 Prometheus：最终 summary 只能报告 evalscope 结果、pod-local metrics heads 和日志证据，不能声称有完整 Prometheus measured-window 诊断。
 - cache-hit decode BS512 结果可能被 router dispatch、cache lookup、KV/bootstrap、decode admission 或 scheduler queue 限制；最终摘要必须区分 TTFT、TPOT/ITL、output throughput 和 queue/admission 现象。
@@ -186,12 +191,13 @@
 
 - 当前分支：`codex/vllm-dsv4-fork-base-byteiaas-build`，基于 fork SHA `cde7799cc66c5a4cb349156a3ca3228f9798dbc9`。
 - M1-M4 已完成：远端备份分支 `backup/iaas_main-20260629` 指向原 `origin/iaas_main` SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`，GitHub ruleset `Protect backup iaas_main branches` 已 active；ByteIAAS workflow、tag 脚本、`byteiaas-openai-devel` Dockerfile、Dockerfile 中 `vllm-router` 与 Onion CLI 构建能力已落到 fork-base 分支。
-- M5 已完成：本地 Docker daemon 不可访问，已改用 ByteIAAS workflow；第三次 run `28389076984` 成功，产出 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606300110-cu130`，digest `sha256:574c3dc2023be9300df8e699994798f76e3f048bff81f3e6719e8726197de113`。
+- M5 需重新打开：本地 Docker daemon 不可访问，已改用 ByteIAAS workflow；第三次 run `28389076984` 成功产出镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606300110-cu130`，digest `sha256:574c3dc2023be9300df8e699994798f76e3f048bff81f3e6719e8726197de113`，但该镜像在 M8 启动失败于缺少 `vllm._moe_C`，因此不能进入 M9/M10。后续只允许用 build/package artifact 层修复该问题，并重新构建新镜像。
 - M7 部署模板已创建：`examples/deployment/deepseek-v4-flash-pd/` 使用 `StormService` 表达 `1P1D`，同一新镜像负责 vLLM、`vllm-router` 和 Onion 模型准备；chart 新增 Helm validation，强制 `global.gpuCount=8`、prefill/decode nodeAffinity 非空且 disjoint。
 - M8 首轮部署已清理：`dev-cluster` preflight 通过，StormService CRD 存在；首轮 16 GPU permit `3813ef32-5e13-42b7-9a1c-a36aa463dd5b` 已释放。首轮部署确认 prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；P/D 不同节点约束成立。该镜像启动失败于 `No module named 'vllm._moe_C'`，不得进入 M9 或 M10。
-- 当前修复：wheel 产物只包含 `vllm/_moe_C_stable_libtorch.abi3.so`，源码中 `topk_hash_softplus_sqrt` 已改为 `_moe_C` 不存在时导入 `_moe_C_stable_libtorch`；`python3 -m py_compile vllm/_custom_ops.py` 通过。
+- 用户在 2026-06-30 明确收窄范围：不接受 `vllm/_custom_ops.py` 中 `_moe_C` 到 `_moe_C_stable_libtorch` 的 runtime fallback；vLLM 源码修改只允许构建过程中遇到的问题。此前提交 `51b135cef854e6d72cb704068644c52d047706e5` 和 workflow run `28414886195` 被标记为无效路线，不得作为后续部署/benchmark/更新 `iaas_main` 的依据。详见进展日志 `P26`。
+- C9A 已完成：workflow run `28414886195` 已取消，`vllm/_custom_ops.py` 已恢复为 fork baseline hard import `vllm._moe_C`，且 `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过。详见进展日志 `P28`。
 - M9/M10 尚未执行；性能不达标或服务路径未跑通时不得更新 `iaas_main`。
 
 ## Next Action
 
-提交并推送 `_moe_C_stable_libtorch` fallback 修复，重新运行命令引用 `C9` 的 ByteIAAS workflow；workflow 产出新镜像后重新执行 `C13`、`C14`、`C15`，再进入 router smoke 和 benchmark。
+重新评估 `_moe_C` 缺失是否能在 build/package artifact 层解决；若能，按 `C7`/`C9` 重新构建镜像，之后再进入 `C13`、`C14`、`C15` 和 benchmark。调查和修复不得触碰 `vllm/**` runtime Python 逻辑。

@@ -299,6 +299,56 @@ rg "Published openai image:|Published openai-devel image:" "/tmp/byteiaas-vllm-$
 
 **Expected result:** workflow 成功；日志中出现 `Published openai image:` 和 `Published openai-devel image:`，将 image tag/digest 记录到进展日志。不要在构建流程中补充镜像内 import/CLI smoke。
 
+## C9A: 撤销 runtime fallback 路线并回到 build-only 修复
+
+**When:** 用户明确不接受 `vllm/_custom_ops.py` 这类 runtime Python fallback，且要求 vLLM 源码修改只包含构建过程中遇到的问题时。必须在再次构建、部署、benchmark 或更新 `iaas_main` 前执行。
+
+**Working directory:** fork-base integration 分支。
+
+```bash
+set -euo pipefail
+
+INVALID_RUN_ID="28414886195"
+INVALID_COMMIT="51b135cef854e6d72cb704068644c52d047706e5"
+
+gh run view "${INVALID_RUN_ID}" \
+  --repo bytedance-iaas/vllm \
+  --json status,conclusion,headSha,url \
+  --jq '{status, conclusion, headSha, url}'
+
+# 如果该 run 仍 queued/in_progress，取消以避免发布包含 runtime fallback 的镜像。
+RUN_STATUS="$(gh run view "${INVALID_RUN_ID}" \
+  --repo bytedance-iaas/vllm \
+  --json status \
+  --jq '.status')"
+if [ "${RUN_STATUS}" = "queued" ] || [ "${RUN_STATUS}" = "in_progress" ]; then
+  gh run cancel "${INVALID_RUN_ID}" --repo bytedance-iaas/vllm
+fi
+
+# 只回滚 runtime fallback 文件，保留计划文档中对该失败路线的历史记录和后续约束。
+# 不使用整提交 revert，因为该提交同时包含需要保留的计划/进展日志内容。
+git restore --source="${INVALID_COMMIT}^" -- vllm/_custom_ops.py
+
+git diff -- vllm/_custom_ops.py
+uv run --no-project python -m py_compile vllm/_custom_ops.py
+
+# 确认不再包含 `_moe_C` 到 stable libtorch extension 的 runtime fallback。
+if rg -n "_moe_C_stable_libtorch" vllm/_custom_ops.py; then
+  echo "vllm/_custom_ops.py still contains runtime fallback" >&2
+  exit 1
+fi
+if awk '/def topk_hash_softplus_sqrt/,/^def / { print }' vllm/_custom_ops.py | \
+  rg -n "try:|except ImportError|_moe_C_stable_libtorch"; then
+  echo "topk_hash_softplus_sqrt still contains runtime fallback" >&2
+  exit 1
+fi
+
+git add vllm/_custom_ops.py docs/superpowers/plans/2026-06-29-vllm-dsv4-flash-pd-build*.md
+git commit -s -m "Constrain DSV4 migration to build-only source changes"
+```
+
+**Expected result:** run `28414886195` 不再继续发布 runtime fallback 镜像；当前 HEAD 仅撤销 `vllm/_custom_ops.py` fallback 修改并保留计划日志。后续若继续处理 `No module named 'vllm._moe_C'`，只能从 build/package artifact 层修复，例如 `setup.py`、CMake、wheel extraction/package data 或 Dockerfile wheel 安装路径；不得再修改 `vllm/` runtime Python 逻辑。
+
 ## C10: Final gate 后更新远端 `iaas_main`
 
 **When:** C9 image build/publish 成功，C13 render 通过，C16 real router smoke 通过，C20/C21 measured runs 完成或对应 blocker 已在进展日志中被明确接受，并且 C22 summary 写入 artifacts 后。可接受 blocker 仅限外部环境或资源问题，例如 GPU permit 长时间排队、`dev-cluster` 临时资源不足、CR/image pull 临时失败、Onion 模型源临时不可用；render/config、镜像缺依赖、Onion init、模型完整性、vLLM 启动、router real request、KV transfer、DeepGEMM/DeepEP/Mooncake import 或 runtime 错误都必须阻止本步骤。benchmark 跑通但性能未达阈值也必须阻止本步骤；本计划性能 gate 看 Avg，不看 P50/P95/P99；阈值为 64k/1 Avg TTFT < 10s，BS512/1.5k evalscope overall output token throughput >= 14000 tokens/s。远端备份分支和保护规则必须仍存在。用户已在 2026-06-29 本线程授权本步骤；只要目标仓库、源 SHA、备份分支、验证门槛和更新方式符合本计划，不需要再次停下来审批。

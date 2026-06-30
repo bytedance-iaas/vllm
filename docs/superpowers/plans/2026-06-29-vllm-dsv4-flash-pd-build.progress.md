@@ -335,13 +335,72 @@
   - 按 workspace-env 规则，已执行 `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd` 并删除 namespace；`namespace-after-cleanup.txt` 记录 namespace 不存在。
   - Permit `3813ef32-5e13-42b7-9a1c-a36aa463dd5b` 已释放，release artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/permit-release.json`。
 
-### P23: Fixed `_moe_C` hard import for stable libtorch wheel layout
+### P23: Superseded runtime fallback attempt for `_moe_C`
 
-- Summary: ByteIAAS workflow 产出的 wheel 只包含 `vllm/_moe_C_stable_libtorch.abi3.so`，与 `setup.py` 和 `current_platform.import_kernels()` 中稳定 libtorch 扩展路径一致；启动失败来自 `vllm/_custom_ops.py::topk_hash_softplus_sqrt` 内部仍硬导入 `vllm._moe_C`。已将该点改为先导入 `_moe_C`，不存在时 fallback 到 `_moe_C_stable_libtorch`。
+- Summary: ByteIAAS workflow 产出的 wheel 只包含 `vllm/_moe_C_stable_libtorch.abi3.so`，与 `setup.py` 和 `current_platform.import_kernels()` 中稳定 libtorch 扩展路径一致；当时曾尝试在 `vllm/_custom_ops.py::topk_hash_softplus_sqrt` 中加入 `_moe_C` 到 `_moe_C_stable_libtorch` 的 runtime fallback。该路线已在 P26 被用户明确拒绝，不得作为后续实现依据，必须从待发布分支移除。
 - Evidence:
   - Wheel artifact downloaded from workflow run `28389076984` under `/tmp/vllm-wheel-28389076984/`。
   - Wheel content includes `vllm/_moe_C_stable_libtorch.abi3.so` and does not include `vllm/_moe_C.abi3.so`。
   - `setup.py` 的 package extraction list 和 extension list 均包含 `vllm._moe_C_stable_libtorch`。
   - `vllm/platforms/interface.py::import_kernels` 已用 `contextlib.suppress(ImportError)` 同时尝试 `vllm._moe_C` 和 `vllm._moe_C_stable_libtorch`。
   - 修改文件：`vllm/_custom_ops.py`。
-  - Validation: `python3 -m py_compile vllm/_custom_ops.py` 通过。
+  - Historical validation: `python3 -m py_compile vllm/_custom_ops.py` 当时通过，但该验证不再构成可接受依据。
+
+### P24: ByteIAAS workflow rerun queued without runner after 30 minutes
+
+- Summary: `_moe_C_stable_libtorch` fallback 修复提交后，已触发新的 ByteIAAS dev image workflow，但 30 分钟内仍未分配 runner；本地 `gh run watch` 已停止，GitHub run 未取消，等待外部 runner 队列恢复。
+- Evidence:
+  - Fix commit: `51b135cef854e6d72cb704068644c52d047706e5`。
+  - Branch pushed: `codex/vllm-dsv4-fork-base-byteiaas-build`。
+  - Workflow run id: `28414886195`。
+  - Run URL: `https://github.com/bytedance-iaas/vllm/actions/runs/28414886195`。
+  - `build-image / build-and-publish-image` job id `84195572689` status `queued`。
+  - `build-wheel / build-wheel` job id `84195572744` status `queued`。
+  - 结构化状态保存到 `artifacts/2026-06-29-vllm-dsv4-flash-pd/workflow/run-28414886195-queued-after-30m.json`。
+  - 同 workflow 另有 scheduled `iaas_main` run `28397967919` 也处于 `queued`，看起来是 ByteIAAS runner 队列容量问题，不是本分支 concurrency 阻塞。
+  - 当前未占用 `dev-cluster` GPU；首轮 permit 已释放，namespace 已删除。
+
+### P25: Resume check confirmed ByteIAAS runner is still externally blocked
+
+- Summary: 2026-06-30 resume 后重新检查 run `28414886195`，仍为 `queued`，且 `updatedAt` 仍停留在创建时间；当前没有进入 wheel/image build，因此不能提取新镜像、不能重新部署、不能 benchmark，也不能更新 `iaas_main`。
+- Evidence:
+  - `gh run view 28414886195 --repo bytedance-iaas/vllm` 返回 status `queued`，headSha `51b135cef854e6d72cb704068644c52d047706e5`。
+  - Job `84195572689` (`build-image / build-and-publish-image`) status `queued`。
+  - Job `84195572744` (`build-wheel / build-wheel`) status `queued`。
+  - `gh api repos/bytedance-iaas/vllm/actions/runners` 显示仓库只有 1 台 runner `vllm-byteiaas-build-01`，status `online`，busy `true`，labels 包含 `x64-vllm-wheel-build-node` 和 `x64-vllm-docker-build-node`。
+  - `gh api --method GET repos/bytedance-iaas/vllm/actions/runs -f per_page=30` 过滤 `queued/in_progress` 后，仅看到 run `28414886195` 和 scheduled `iaas_main` run `28397967919` 处于 `queued`，没有当前仓库内 `in_progress` run。
+  - 本次尝试 `gh run list --status ...` 失败，因为本机 `gh` 版本不支持 `--status`；随后改用 REST API 查询成功。
+  - 当前 `dev-cluster` namespace `vllm-dsv4-flash-pd` 不存在，首轮 permit 已释放，没有 GPU 占用。
+
+### P26: User rejected runtime fallback source modification; plan switched back to build-only changes
+
+- Summary: 用户在 2026-06-30 明确要求计划修改：不希望在 vLLM runtime Python 源码中加入 `import vllm._moe_C` / fallback 到 `vllm._moe_C_stable_libtorch`；vLLM 源码修改应只包含构建过程中遇到的问题。因此此前 `vllm/_custom_ops.py` fallback 提交和基于该提交触发的 workflow run 被标记为无效路线。
+- Evidence:
+  - 被拒绝的 runtime 修改提交：`51b135cef854e6d72cb704068644c52d047706e5`。
+  - 被拒绝路线触发的 workflow run：`28414886195`，headSha `51b135cef854e6d72cb704068644c52d047706e5`。
+  - 主计划新增全局约束：不得用 `vllm/` Python runtime fallback、模型逻辑、算子调用逻辑或调度逻辑修改来绕过部署失败。
+  - 主计划更新 M5：下一步必须执行 `C9A`，取消或忽略 run `28414886195`，并从待发布分支移除 `vllm/_custom_ops.py` fallback 修改。
+  - 命令引用新增 `C9A`：撤销 runtime fallback 路线并回到 build-only 修复。
+  - 后续 `_moe_C` import 类问题只能从 build/package artifact 层处理，例如 `setup.py`、CMake、wheel extraction/package data 或 Dockerfile wheel 安装路径；如果这些路径不能解决，应停止并报告 blocker，而不是改 vLLM runtime 逻辑。
+- Prevention note: 后续执行前必须先检查 `git diff <fork_sha>...HEAD -- vllm/`，确认没有 runtime Python fallback 修改；新镜像不能来自 run `28414886195` 或任何包含 `51b135cef` runtime fallback 的 ref。
+
+### P27: Tightened plan to prohibit `_moe_C` runtime fallback
+
+- Summary: 按用户最新要求再次收紧计划：不允许在 `vllm/_custom_ops.py` 或其它 `vllm/**` runtime Python 文件中加入 `_moe_C` 到 `_moe_C_stable_libtorch` 的 `ImportError` fallback；vLLM 源码修改只允许解决构建过程中暴露的问题。
+- Evidence:
+  - 主计划 `Global Constraints` 明确禁止 runtime fallback，并把 M5 从“已完成”改为“需重新打开”：成功构建的旧镜像只作为历史事实，不能进入 benchmark 或更新 `iaas_main`。
+  - 命令引用 `C9A` 从整提交 `git revert` 改为 `git restore --source="${INVALID_COMMIT}^" -- vllm/_custom_ops.py`，只回滚 runtime source 文件，保留计划日志和约束记录。
+  - `C9A` 验证改为禁止 `_moe_C_stable_libtorch` 和 `except ImportError` 出现在 `vllm/_custom_ops.py` 中；fork baseline 原有的 hard import `vllm._moe_C` 不被视为违规。
+  - 后续处理 `No module named 'vllm._moe_C'` 只能进入 build/package artifact 调查：`setup.py`、CMake、wheel extraction/package data、扩展产物命名或 Dockerfile wheel 安装路径。
+
+### P28: C9A completed; runtime fallback removed from pending branch
+
+- Summary: 按 `C9A` 执行撤销 runtime fallback 路线：取消无效 workflow run，恢复 `vllm/_custom_ops.py` 到 fork baseline 的 hard import，并把后续方向固定为 build/package artifact 修复。当前不使用 `superpowers:subagent-driven-development`；C9A 和接下来的 `_moe_C` package 修复都集中在同一分支、同一 build/runtime failure chain 和同一组计划文件，主线程串行执行能减少并发写冲突。后续如只读调查范围扩大，可再把 review lane 分给 subagent。
+- Evidence:
+  - `gh run view 28414886195 --repo bytedance-iaas/vllm --json status,conclusion,headSha,url` 初始返回 status `queued`、headSha `51b135cef854e6d72cb704068644c52d047706e5`。
+  - 已执行 `gh run cancel 28414886195 --repo bytedance-iaas/vllm`；复查返回 status `completed`、conclusion `cancelled`。
+  - 已执行 `git restore --source="51b135cef854e6d72cb704068644c52d047706e5^" -- vllm/_custom_ops.py`。
+  - `topk_hash_softplus_sqrt` 当前只包含 `import vllm._moe_C  # noqa: F401`，不包含 `_moe_C_stable_libtorch` fallback。
+  - `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过，遵守本仓库 AGENTS.md 中禁止 bare `python3` 的要求。
+  - 首次本地验证使用 `rg "_moe_C_stable_libtorch|except ImportError" vllm/_custom_ops.py`，误伤文件顶部既有 `torch.library.register_fake` 兼容 fallback；已修正命令引用，只检查 `_moe_C_stable_libtorch` 和 `topk_hash_softplus_sqrt` 函数范围内的 `try`/`except ImportError`。
+- Prevention note: 后续验证不能用全文件 `except ImportError` 判断 runtime fallback；必须限定到 `_moe_C`/`_moe_C_stable_libtorch` 目标或具体函数范围。

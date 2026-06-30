@@ -2354,10 +2354,7 @@ def topk_hash_softplus_sqrt(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
 ) -> None:
-    try:
-        import vllm._moe_C  # noqa: F401
-    except ImportError:
-        import vllm._moe_C_stable_libtorch  # noqa: F401
+    import vllm._moe_C  # noqa: F401
 
     if hash_indices_table is not None:
         assert input_tokens is not None
