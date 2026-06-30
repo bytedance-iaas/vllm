@@ -104,6 +104,8 @@ ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG BUILD_OS
 ARG UV_VERSION
+ARG DEADSNAKES_MIRROR_URL
+ARG DEADSNAKES_GPGKEY_URL
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -126,7 +128,7 @@ ENV PATH="/opt/venv/bin:/opt/uv/bin:$PATH"
 ENV VIRTUAL_ENV="/opt/venv"
 
 # Install system dependencies including build tools.
-# The Ubuntu path uses apt + deadsnakes-via-uv for Python; the manylinux path
+# The Ubuntu path installs Python locally via apt/deadsnakes; the manylinux path
 # (AlmaLinux 8, e.g. pytorch/manylinux2_28-builder) uses dnf and the Python
 # interpreters pre-installed at /opt/python/cpXY-cpXY/.
 RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
@@ -158,10 +160,26 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             gcc-11 \
             g++-11 \
         && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
-        # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
-        # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
-        # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
-        && (apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
+        && if ! apt-cache show "python${PYTHON_VERSION}" >/dev/null 2>&1; then \
+            if [ -n "${DEADSNAKES_MIRROR_URL:-}" ]; then \
+                if [ -n "${DEADSNAKES_GPGKEY_URL:-}" ]; then \
+                    mkdir -p -m 0755 /etc/apt/keyrings \
+                    && curl -L "${DEADSNAKES_GPGKEY_URL}" | gpg --dearmor > /etc/apt/keyrings/deadsnakes.gpg \
+                    && chmod 644 /etc/apt/keyrings/deadsnakes.gpg \
+                    && echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list; \
+                fi; \
+            else \
+                for i in 1 2 3; do \
+                    add-apt-repository -y ppa:deadsnakes/ppa && break || \
+                    { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+                done; \
+            fi \
+            && apt-get update -y; \
+        fi \
+        && apt-get install -y --no-install-recommends \
+            python${PYTHON_VERSION} \
+            python${PYTHON_VERSION}-dev \
+            python${PYTHON_VERSION}-venv \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -190,7 +208,7 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
            && venv_python="$MANYLINUX_PY"; \
        else \
-           venv_python="${PYTHON_VERSION}"; \
+           venv_python="/usr/bin/python${PYTHON_VERSION}"; \
        fi \
     && for attempt in 1 2 3 4 5; do \
            timeout 600s uv venv --seed /opt/venv --python "${venv_python}" && break; \
