@@ -117,6 +117,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # See #15174, #15359, #31959. Child stages inherit these via Dockerfile
 # `ENV` unless they override them explicitly.
 ENV UV_HTTP_TIMEOUT=500
+ENV UV_NATIVE_TLS=true
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/uv/cache
