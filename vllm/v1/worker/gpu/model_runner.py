@@ -202,6 +202,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         "is not supported."
                     )
 
+        # Online C128 MTP uses transactional candidate banks.
+        import vllm.envs as envs
+        from vllm.models.deepseek_v4.online_c128 import online_c128_mtp_enabled
+
+        self._online_c128_mtp = online_c128_mtp_enabled()
+        self._online_c128_verify_ctx: tuple | None = None
+        # Runner hooks for Mooncake C128 snapshot/restore; connector gates by role.
+        self._online_c128_pd_aux = bool(
+            envs.VLLM_DSV4_C128_ONLINE_COMPRESS
+        ) and bool(envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER)
+        if self._online_c128_mtp:
+            if self.speculative_config is None or (
+                self.speculative_config.method != "mtp"
+            ):
+                raise ValueError(
+                    "VLLM_DSV4_C128_ONLINE_MTP requires the MTP speculative "
+                    "method."
+                )
+            if getattr(self.speculative_config, "num_speculative_tokens", 1) < 1:
+                raise ValueError("C128 online MTP requires num_speculative_tokens >= 1.")
+            if self.use_pp:
+                raise ValueError("C128 online MTP does not support pipeline parallel.")
+
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
@@ -275,6 +298,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
+        # DeepSeek-V4 C128 online: clear the module-level state registry +
+        # shared scratch before (re)loading so a reload / multi-model worker
+        # does not accumulate stale per-layer states from a prior model. The new
+        # model's compressors re-register during construction below.
+        from vllm.models.deepseek_v4.online_c128 import clear_online_c128_states
+
+        clear_online_c128_states()
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
@@ -464,6 +494,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config,
             self.max_num_reqs,
         )
+        # Online C128 keeps FULL graphs for uniform decode; mixed/prefill need PW.
+        from vllm.models.deepseek_v4.online_c128 import online_c128_compress_enabled
+
+        self._online_c128_compress = online_c128_compress_enabled()
+        if self._online_c128_compress and cudagraph_mode == CUDAGraphMode.FULL:
+            logger.warning(
+                "VLLM_DSV4_C128_ONLINE_COMPRESS supports FULL cudagraphs only "
+                "for uniform decode batches; degrading cudagraph_mode FULL -> "
+                "FULL_AND_PIECEWISE so decode keeps FULL and mixed/prefill runs "
+                "PIECEWISE."
+            )
+            cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -731,10 +773,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return cuda_graph_size
 
-    def _remove_request(self, req_id: str) -> bool:
+    def _remove_request(self, req_id: str, *, snapshot_c128_state: bool = True) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
+        # Snapshot terminal producer state before the request slot is recycled.
+        if self._online_c128_pd_aux and snapshot_c128_state:
+            req_idx_for_snapshot = self.req_states.req_id_to_index.get(req_id)
+            if req_idx_for_snapshot is not None:
+                self.kv_connector.snapshot_c128_state(req_id, req_idx_for_snapshot)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -750,10 +797,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
         preempted_req_ids = scheduler_output.preempted_req_ids
-        if preempted_req_ids:
-            finished_req_ids = finished_req_ids.union(preempted_req_ids)
         for req_id in finished_req_ids:
-            self._remove_request(req_id)
+            self._remove_request(req_id, snapshot_c128_state=True)
+        for req_id in preempted_req_ids or ():
+            self._remove_request(req_id, snapshot_c128_state=False)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -777,7 +824,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Streaming input update: request already exists from a prior
             # chunk. Remove old state so it can be cleanly re-added below
             # with the updated prompt_token_ids and mm_features.
-            self._remove_request(req_id)
+            self._remove_request(req_id, snapshot_c128_state=False)
 
             prompt_len = len(new_req_data.prompt_token_ids)
             sampling_params = new_req_data.sampling_params
@@ -789,6 +836,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+
+            # Materialize D-side bank0 once the request slot is known.
+            if self._online_c128_pd_aux:
+                self.kv_connector.restore_c128_state(req_id, req_index)
 
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
@@ -899,6 +950,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
+        # Fixed-address request-state indices for online C128 graph replay.
+        req_state_indices_np = np.full(num_reqs_padded, -1, dtype=np.int32)
+        req_state_indices_np[:num_reqs] = idx_mapping_np
+        async_copy_to_gpu(
+            req_state_indices_np,
+            out=self.input_buffers.req_state_indices[:num_reqs_padded],
+        )
+        req_state_indices = self.input_buffers.req_state_indices[:num_reqs_padded]
         query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
@@ -983,6 +1042,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs_after_padding=num_reqs_padded,
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
+            req_state_indices=req_state_indices,
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1125,6 +1185,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        has_online_c128_mtp_verify = (
+            not dummy_run
+            and self._online_c128_mtp
+            and any(scheduled_spec_decode_tokens.values())
+        )
+        if has_online_c128_mtp_verify:
+            for req_id, draft_ids in scheduled_spec_decode_tokens.items():
+                if (
+                    draft_ids
+                    and scheduler_output.num_scheduled_tokens[req_id]
+                    > self.decode_query_len
+                ):
+                    raise ValueError(
+                        "C128 online MTP verify query_len exceeds allocated "
+                        "candidate banks for request "
+                        f"{req_id}: query_len="
+                        f"{scheduler_output.num_scheduled_tokens[req_id]}, "
+                        f"decode_query_len={self.decode_query_len}."
+                    )
+            if any(
+                not scheduled_spec_decode_tokens.get(req_id)
+                for req_id in scheduler_output.num_scheduled_tokens
+            ):
+                # Mixed batches need per-row planned semantics.
+                uniform_tok_count = None
+
+        # Non-verify uniform batches must not replay the MTP candidate-chain graph.
+        if (
+            self._online_c128_mtp
+            and uniform_tok_count == self.decode_query_len
+            and not has_online_c128_mtp_verify
+        ):
+            uniform_tok_count = None
 
         num_active_loras = 0
         if self.lora_config:
@@ -1252,6 +1346,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
+
+        # Mark MTP verify rows and record base seq lens for post-sample commit.
+        self._online_c128_verify_ctx = None
+        if self._online_c128_mtp and input_batch.num_draft_tokens > 0:
+            from vllm.models.deepseek_v4.online_c128 import begin_online_c128_verify
+
+            num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+            assert num_draft_tokens_per_req is not None
+            verify_req_mask_np = num_draft_tokens_per_req[: input_batch.num_reqs] > 0
+            verify_req_indices_np = np.nonzero(verify_req_mask_np)[0].astype(
+                np.int64
+            )
+            query_lens_all_np = (
+                input_batch.query_start_loc_np[1:]
+                - input_batch.query_start_loc_np[:-1]
+            )[: input_batch.num_reqs]
+            query_lens_np = query_lens_all_np[verify_req_indices_np]
+            base_seq_len_np = (
+                input_batch.seq_lens_cpu_upper_bound[: input_batch.num_reqs]
+                .cpu()
+                .numpy()
+                - query_lens_all_np
+            )[verify_req_indices_np]
+            if verify_req_indices_np.size:
+                begin_online_c128_verify()
+                verify_req_indices = torch.from_numpy(verify_req_indices_np).to(
+                    input_batch.req_state_indices.device
+                )
+                self._online_c128_verify_ctx = (
+                    input_batch.req_state_indices[: input_batch.num_reqs][
+                        verify_req_indices
+                    ],
+                    verify_req_indices,
+                    query_lens_np,
+                    base_seq_len_np,
+                )
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -1426,6 +1556,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+
+        # Commit accepted candidate banks before the next draft proposal.
+        if self._online_c128_verify_ctx is not None:
+            from vllm.models.deepseek_v4.online_c128 import (
+                commit_all_online_c128_verify,
+                end_online_c128_verify,
+            )
+
+            req_state_indices, verify_req_indices, query_lens_np, base_seq_len_np = (
+                self._online_c128_verify_ctx
+            )
+            device = req_state_indices.device
+            query_lens_t = torch.from_numpy(query_lens_np).to(
+                device, dtype=torch.int32
+            )
+            base_seq_len_t = torch.from_numpy(base_seq_len_np).to(
+                device, dtype=torch.int32
+            )
+            accepted_len = query_lens_t - num_rejected[verify_req_indices].to(
+                torch.int32
+            )
+            final_seq_len = base_seq_len_t + accepted_len
+            commit_all_online_c128_verify(
+                req_state_indices=req_state_indices,
+                accepted_len=accepted_len,
+                final_seq_len=final_seq_len,
+            )
+            end_online_c128_verify()
+            self._online_c128_verify_ctx = None
 
         if self.speculator is not None:
             assert self.sampler is not None
