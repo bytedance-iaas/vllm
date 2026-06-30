@@ -187,10 +187,20 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            # at the matching interpreter rather than letting it fetch one.
            PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
            && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
-           && uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
+           && venv_python="$MANYLINUX_PY"; \
        else \
-           uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
+           venv_python="${PYTHON_VERSION}"; \
        fi \
+    && for attempt in 1 2 3 4 5; do \
+           uv venv --seed /opt/venv --python "${venv_python}" && break; \
+           rc=$?; \
+           if [ "${attempt}" = "5" ]; then \
+               exit "${rc}"; \
+           fi; \
+           echo "uv venv failed on attempt ${attempt}/5; cleaning partial state and retrying..." >&2; \
+           rm -rf /opt/venv "${UV_PYTHON_INSTALL_DIR}/.temp" "${UV_CACHE_DIR:?}"/*; \
+           sleep $((attempt * 30)); \
+       done \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
