@@ -573,3 +573,91 @@
 - Decision:
   - 镜像 `v0.10.0.iaas.dev.202606302152-openai-devel-cu130` 不得继续用于 benchmark 或更新 `iaas_main`。
   - 下一步提交并推送 DeepGEMM fork wheel 修复，按 C9 重新触发 ByteIAAS workflow，等待新镜像产出后重新执行 C13-C16。
+
+### P38: DeepGEMM fork wheel image rebuild succeeded
+
+- Summary: 已提交并推送 DeepGEMM fork wheel 的 image build-time 安装修复，重新触发 ByteIAAS dev image workflow。新 workflow 成功产出 openai/openai-devel 镜像，且 image job log 确认安装了 `deep-gemm==2.5.0` 并完成 MegaMoE 符号检查。后续部署验证固定使用新的 `openai-devel` 镜像，不再使用 P35/P37 中失败的旧镜像。
+- Code and workflow evidence:
+  - Fix commit: `d6fe62d15643d5619e6c5ac95201a060938a839f`。
+  - Commit message: `Install DeepGEMM fork wheel in ByteIAAS image`。
+  - Pushed branch: `codex/vllm-dsv4-fork-base-byteiaas-build`。
+  - Workflow run id: `28452612809`。
+  - Workflow URL: `https://github.com/bytedance-iaas/vllm/actions/runs/28452612809`。
+  - `gh run view 28452612809 --repo bytedance-iaas/vllm --json status,conclusion,headSha,url,createdAt,updatedAt,jobs` 返回 `status=completed`、`conclusion=success`、`headSha=d6fe62d15643d5619e6c5ac95201a060938a839f`。
+  - Jobs: `build-image / build-and-publish-image` success；`build-wheel / build-wheel` success。
+- Published images:
+  - `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-cu130`，digest `sha256:fedbbdac93f15356b2a9afea25f8ad671c719c37f7343424b32c99cdd1fd9cfa`。
+  - `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`，digest `sha256:57cb7a44de57b09bb8a45d214210dc8c4e76cd601c0ea0a8c78fc81f05e2d32a`。
+  - Job log evidence saved at `artifacts/2026-06-29-vllm-dsv4-flash-pd/workflow/job-84318680934-logs-api.txt`，其中包含 `DeepGEMM MegaMoE symbols verified`、`+ deep-gemm==2.5.0`、`Published openai-devel image: iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`。
+  - `docker buildx imagetools inspect` 通过：openai-devel image index digest 为 `sha256:57cb7a44de57b09bb8a45d214210dc8c4e76cd601c0ea0a8c78fc81f05e2d32a`，包含 `linux/amd64` manifest `sha256:fb00b955042689ed001658ede9ff15e8678ac8b6cec7f250d986b0c5bcf6b182`。
+- Static validation before push:
+  - `git diff --check` 通过。
+  - ByteIAAS workflow YAML 通过 `yaml.safe_load` 解析。
+  - `uv pip install --python <temporary-py312-venv> --dry-run <DeepGEMM wheel URL>` 可解析 `deep-gemm` wheel。
+  - `helm template` 使用 `decode.args.maxNumSeqs=512`、不同 P/D 节点和测试 image 做 render 通过；render 中无 `--max-model-len`、`66000`、runtime hotfix/install forbidden pattern。
+- Decision:
+  - 新部署候选固定为 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`。
+  - 下一步重新执行 C13-C16；如果该新镜像仍失败，需要按新的日志证据重新定位，不得回退到运行时安装或 runtime fallback。
+
+### P39: Fourth deployment and router smoke passed with new image
+
+- Summary: 使用 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130` 重新执行 C13-C16，部署方式继续对齐 servingkit `perf/vllm_dsv4` SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69`：StormService、1P1D、prefill/decode 各 8 GPU、router 静态 P/D URL、同一镜像执行 Onion 模型准备，无 runtime hotfix/install。
+- Deployment evidence:
+  - C14 session: `codex-vllm-dsv4-flash-pd-20260630-225852-738107`。
+  - GPU permit: `7db945db-d65b-4d55-8f10-7c1ea453dfdd`，请求 16 GPU。
+  - 选定节点：prefill `192.168.1.148`，decode `192.168.1.186`，router `192.168.1.186`。
+  - Namespace: `vllm-dsv4-flash-pd`；Helm release: `dsv4-flash-pd`。
+  - Render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd.yaml`。
+  - Render scan 无 `--max-model-len`、`66000`、runtime hotfix/install forbidden pattern；prefill/decode nodeAffinity 非空且不同，`global.gpuCount=8`。
+  - Prefill pod `dsv4-flash-pd-roleset-pb4l6-prefill-86b499d88b-0` 调度到 `192.168.1.148`，container `prefill` 请求 8 GPU。
+  - Decode pod `dsv4-flash-pd-roleset-pb4l6-decode-57748944b9-0` 调度到 `192.168.1.186`，container `decode` 请求 8 GPU。
+  - Router pod `dsv4-flash-pd-router-59894c4b86-tkq6b` 调度到 `192.168.1.186`，不请求 GPU；启动早期因 servingkit-aligned TCP liveness probe 在 backend warmup 期间重启 2 次，最终 Ready。
+- Readiness and smoke evidence:
+  - `kubectl wait` 后 prefill、decode、router 均 Ready。
+  - Onion init 在 P/D 侧均完成并幂等跳过已存在模型目录：`Model directory /data01/DeepSeek-V4-Flash is already complete, skip Onion download.`。
+  - 模型完整性检查确认存在 `config.json`、tokenizer 文件和 safetensors index/shards。
+  - Router `/v1/models` 返回 HTTP 200，模型 `max_model_len=1048576`，说明没有通过 CLI 强设 `vllm.maxModelLen=66000`。
+  - Router `/v1/completions` 返回 HTTP 200 且非空输出；completion id 显示实际路由到 `prefill_addr_192.168.1.148:8000` 与 `decode_addr_192.168.1.186:8001`。
+  - C16 原 label selector 只覆盖 router，已补采 StormService-managed P/D pod 的 describe、logs、init status、argv/env、model files、package evidence。
+  - Package evidence 显示 `vllm 0.10.1.dev9890+gd6fe62d15`、`deep-gemm 2.5.0`、`mooncake-transfer-engine-cuda13 0.3.11.post1`、`vllm-router 0.1.14`、`oniond /usr/bin/oniond`；DeepGEMM 三个 MegaMoE 符号检查为 `True`。
+  - Bad-log scan for `Mooncake found no common KV transfer regions|KV group count mismatch|KV load failed|handshake compatibility failure|request timeout during KV pull` 为 0；runtime install/hotfix scan 为 0。
+- Artifacts:
+  - `pods-ready.txt`、`pods-ready-all-labels.txt`、`services.txt`、`router-models.json`、`router-completion-smoke.json`。
+  - `*-argv-env.txt`、`*-package-evidence.txt`、`*-model-files.txt`、`*-logs-tail5000.txt`。
+  - `bad-log-scan.txt`、`runtime-install-scan.txt`、`c16-scan-summary.txt`。
+- Decision:
+  - M8 acceptance 已满足，可以进入 M9 benchmark。
+
+### P40: Benchmark completed; TTFT passed but decode throughput gate failed
+
+- Summary: M9 已完成，evalscope raw artifacts、timestamps、pod-local metrics heads、serving logs 和 summary 已保存。64k/1 Avg TTFT 通过用户阈值，但 BS512/1536 decode Avg output throughput 未达到 14000 tokens/s，因此不得更新远端 `iaas_main`。
+- Harness adjustments:
+  - C17 初始 `evalscope` 安装后 `perf` 子命令缺 `uvicorn`，错误要求 `pip install 'evalscope[perf]'`；已在本地 `.venv-evalscope` 中安装 `evalscope[perf]`，`evalscope --version` 为 `1.8.1`。
+  - 本机没有 `/data01/DeepSeek-V4-Flash` tokenizer；已从运行中的 prefill pod 只复制 `config.json`、`generation_config.json`、`tokenizer.json`、`tokenizer_config.json` 到 artifact `tokenizer/`，未复制模型权重，未修改 serving pod。
+  - evalscope base URL 会自动拼 `/chat/completions` 并得到 404；实际 benchmark 使用显式 `http://127.0.0.1:30000/v1/completions`。
+  - C20 使用 `--dataset-offset 1`，避免复用 C19 cache seed 的同一 64k token 序列污染 TTFT。
+  - C20 wrapper 原先在 zsh 中使用 bash-only `PIPESTATUS`，evalscope 已成功但脚本尾部失败；已补写 timestamps end 和 exit code，并在 C21 改用 `bash -lc`。
+- Warmup and seed evidence:
+  - evalscope connection smoke 16 input / 1 output 成功。
+  - C19 warmup 1024 input / 1 output 成功，Avg TTFT `2658.39 ms`。
+  - C19 64k prefix cache seed 成功，Avg TTFT `6776.92 ms`，Avg Input Tokens `65536.00`。
+- Measured results:
+  - C20 64k input / 1 output: exit `0`，Avg TTFT `6590.02 ms`，Avg Input Tokens `65536.00`，Avg Output Tokens `1.00`；通过 `< 10s` gate。
+  - C21 BS512 / 1536 output: exit `0`，Total / Success / Failed `512 / 512 / 0`，Avg Output Tokens `1536.00`，Avg Latency `74.59 s`，Avg TTFT `38948.52 ms`，Avg TPOT `23.22 ms`，Avg ITL `103.78 ms`，Avg Output Throughput `8361.71 tok/s`；低于 `>= 14000 tok/s` gate。
+  - C21 Workload Completion tok/s: Overall `8361.71`，Last 30s `28671.27`，Steady `28671.27`；gate 按用户要求看 Avg/Overall，不看 Last 30s/Steady 或 percentiles。
+  - 该 throughput 是 1P1D router path 结果，output 来自单个 decode 节点，不是多 decode 聚合。
+- Cleanup evidence:
+  - 已保存 `summary.md`，明确 Prometheus skipped by user，不声称完整服务侧 monitoring 诊断。
+  - 已保存 `final-pods.txt`、`final-events.txt`、`post-benchmark/*`、`bad-log-scan-after-benchmark.txt`。
+  - `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd` 已执行；namespace 删除后复查为 `NotFound`。
+  - Router port-forward pid `749095` 已 kill 且进程不存在。
+  - Permit `7db945db-d65b-4d55-8f10-7c1ea453dfdd` 已释放，artifact `permit-release-after-benchmark.json` 状态为 `released`。
+  - workspace-env registry 中本任务 HelmRelease 记录已更新为 `released`；按本任务 namespace/session 过滤 active 结果为 `[]`。
+- Artifacts:
+  - Summary: `artifacts/2026-06-29-vllm-dsv4-flash-pd/summary.md`。
+  - TTFT: `evalscope-ttft-64k-1out.log`、`ttft-64k-1out.timestamps`。
+  - Decode: `evalscope-decode-bs512-cache-hit-1p5kout.log`、`decode-bs512-cache-hit-1p5kout.timestamps`。
+  - Cleanup: `cleanup-verification.txt`、`registry-helmrelease-released-after-benchmark.json`、`registry-active-after-benchmark-cleanup.json`。
+- Decision:
+  - M10 不执行。性能未达标是用户明确 stop rule：`性能过差不更新iaas_main`。
+  - 下一步若继续推进，应先诊断 BS512/1536 Avg throughput 低于目标的原因，而不是更新远端 `iaas_main`。

@@ -833,13 +833,16 @@ MODEL_PATH="${MODEL_PATH:-/data01/DeepSeek-V4-Flash}"
 eval "$("${ENV_ROOT}/bin/envctl" use "${ENVIRONMENT}")"
 
 kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod \
+  -l storm-service-name="${RELEASE}" \
+  --timeout=60m
+kubectl wait -n "${NAMESPACE}" --for=condition=Ready pod \
   -l app.kubernetes.io/instance="${RELEASE}" \
   --timeout=60m
 
 kubectl get pods -n "${NAMESPACE}" -o wide | tee "${ARTIFACT_DIR}/pods-ready.txt"
 kubectl get svc -n "${NAMESPACE}" -o wide | tee "${ARTIFACT_DIR}/services.txt"
 
-for pod in $(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/instance="${RELEASE}" -o name); do
+for pod in $(kubectl get pods -n "${NAMESPACE}" -o name | rg "${RELEASE}"); do
   kubectl describe -n "${NAMESPACE}" "${pod}" > "${ARTIFACT_DIR}/$(basename "${pod}")-describe.txt"
   kubectl logs -n "${NAMESPACE}" "${pod}" --all-containers --tail=300 > "${ARTIFACT_DIR}/$(basename "${pod}")-logs-tail.txt" || true
   kubectl get -n "${NAMESPACE}" "${pod}" -o jsonpath='{range .status.initContainerStatuses[*]}{.name}{" ready="}{.ready}{" exit="}{.state.terminated.exitCode}{" reason="}{.state.terminated.reason}{"\n"}{end}' \
@@ -885,11 +888,40 @@ ARTIFACT_DIR="$PWD/artifacts/2026-06-29-vllm-dsv4-flash-pd"
 EVAL_VENV="$PWD/.venv-evalscope"
 
 uv venv --python 3.12 "${EVAL_VENV}"
-uv pip install --python "${EVAL_VENV}/bin/python" evalscope
+uv pip install --python "${EVAL_VENV}/bin/python" 'evalscope[perf]'
 "${EVAL_VENV}/bin/evalscope" --version | tee "${ARTIFACT_DIR}/evalscope-version.txt"
 ```
 
-**Expected result:** evalscope 可执行。若 `uv`、Python、network、package index 或权限阻塞安装，停止并记录 blocker，不切换自定义 harness。
+**Expected result:** evalscope `perf` 子命令可执行。若 `uv`、Python、network、package index 或权限阻塞安装，停止并记录 blocker，不切换自定义 harness。
+
+## C17A: Copy tokenizer files for local evalscope
+
+**When:** C17 evalscope ready and C16 service ready；本机没有目标模型 tokenizer 路径时执行。
+
+**Working directory:** fork-base integration 分支。
+
+```bash
+set -euo pipefail
+
+ENV_ROOT="/data00/home/hanhan.hank/workspace/env"
+ENVIRONMENT="dev-cluster"
+NAMESPACE="vllm-dsv4-flash-pd"
+RELEASE="dsv4-flash-pd"
+ARTIFACT_DIR="$PWD/artifacts/2026-06-29-vllm-dsv4-flash-pd"
+TOKENIZER_DIR="${ARTIFACT_DIR}/tokenizer"
+MODEL_PATH="/data01/DeepSeek-V4-Flash"
+
+mkdir -p "${TOKENIZER_DIR}"
+eval "$("${ENV_ROOT}/bin/envctl" use "${ENVIRONMENT}")"
+prefill_pod="$(kubectl get pods -n "${NAMESPACE}" -l storm-service-name="${RELEASE}",role-name=prefill -o jsonpath='{.items[0].metadata.name}')"
+
+for f in config.json generation_config.json tokenizer.json tokenizer_config.json; do
+  kubectl cp -n "${NAMESPACE}" -c prefill "${prefill_pod}:${MODEL_PATH}/${f}" "${TOKENIZER_DIR}/${f}"
+done
+find "${TOKENIZER_DIR}" -maxdepth 1 -type f -printf '%f %s bytes\n' | sort | tee "${ARTIFACT_DIR}/tokenizer-files-local.txt"
+```
+
+**Expected result:** 只复制 tokenizer/config 小文件到 artifact 目录供 evalscope 生成固定 token 长度请求；不复制模型权重，不修改 serving pod。
 
 ## C18: Skip Prometheus and capture lightweight pod metrics
 
@@ -921,7 +953,7 @@ MD
 kubectl get svc -A | rg -i 'prometheus|grafana' | tee "${METRICS_DIR}/existing-monitoring-services.txt" || true
 kubectl get pods -A | rg -i 'prometheus|grafana' | tee "${METRICS_DIR}/existing-monitoring-pods.txt" || true
 
-for pod in $(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/instance="${RELEASE}" -o name); do
+for pod in $(kubectl get pods -n "${NAMESPACE}" -o name | rg "${RELEASE}"); do
   kubectl logs -n "${NAMESPACE}" "${pod}" --all-containers --tail=300 \
     > "${METRICS_DIR}/$(basename "${pod}")-logs-tail-before-benchmark.txt" || true
   kubectl exec -n "${NAMESPACE}" "${pod}" -- sh -lc 'curl -sf http://127.0.0.1:${PORT:-8000}/metrics | head -n 40' \
@@ -944,7 +976,7 @@ ARTIFACT_DIR="$PWD/artifacts/2026-06-29-vllm-dsv4-flash-pd"
 EVALSCOPE="$PWD/.venv-evalscope/bin/evalscope"
 URL="http://127.0.0.1:30000/v1/completions"
 MODEL="deepseek-v4-flash"
-TOKENIZER_PATH="/data01/DeepSeek-V4-Flash"
+TOKENIZER_PATH="${ARTIFACT_DIR}/tokenizer"
 
 "${EVALSCOPE}" perf \
   --parallel 1 \
@@ -998,7 +1030,7 @@ ARTIFACT_DIR="$PWD/artifacts/2026-06-29-vllm-dsv4-flash-pd"
 EVALSCOPE="$PWD/.venv-evalscope/bin/evalscope"
 URL="http://127.0.0.1:30000/v1/completions"
 MODEL="deepseek-v4-flash"
-TOKENIZER_PATH="/data01/DeepSeek-V4-Flash"
+TOKENIZER_PATH="${ARTIFACT_DIR}/tokenizer"
 
 run_start="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 echo "MEASURED_RUN_START=${run_start}" | tee "${ARTIFACT_DIR}/ttft-64k-1out.timestamps"
@@ -1010,6 +1042,7 @@ echo "MEASURED_RUN_START=${run_start}" | tee "${ARTIFACT_DIR}/ttft-64k-1out.time
   --url "${URL}" \
   --api openai \
   --dataset random \
+  --dataset-offset 1 \
   --prefix-length 0 \
   --min-prompt-length 65536 \
   --max-prompt-length 65536 \
@@ -1030,7 +1063,7 @@ run_end="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 exit "${run_status}"
 ```
 
-**Expected result:** evalscope measured run completes with exit code 0；raw log and outputs are preserved；TTFT metric is reported from streaming request path；64k/1 Avg TTFT 必须小于 10s，否则不得进入 C10 更新远端 `iaas_main`；P50/P95/P99 归档但不作为 gate。
+**Expected result:** evalscope measured run completes with exit code 0；raw log and outputs are preserved；TTFT metric is reported from streaming request path；`--dataset-offset 1` 避免该请求复用 C19 cache seed 的同一 token 序列；64k/1 Avg TTFT 必须小于 10s，否则不得进入 C10 更新远端 `iaas_main`；P50/P95/P99 归档但不作为 gate。
 
 ## C21: Measured cache-hit decode BS512 / 1.5k output throughput
 
@@ -1045,7 +1078,7 @@ ARTIFACT_DIR="$PWD/artifacts/2026-06-29-vllm-dsv4-flash-pd"
 EVALSCOPE="$PWD/.venv-evalscope/bin/evalscope"
 URL="http://127.0.0.1:30000/v1/completions"
 MODEL="deepseek-v4-flash"
-TOKENIZER_PATH="/data01/DeepSeek-V4-Flash"
+TOKENIZER_PATH="${ARTIFACT_DIR}/tokenizer"
 DECODE_OUTPUT_TOKENS=1536
 
 run_start="$(date '+%Y-%m-%dT%H:%M:%S%z')"
@@ -1153,6 +1186,22 @@ PY
 if [ -n "${PERMIT_ID}" ]; then
   python3 "${SKILL_DIR}/scripts/resource_registry.py" --env-root "${ENV_ROOT}" \
     permit-release --permit-id "${PERMIT_ID}"
+fi
+
+SESSION_ID="$(grep '^SESSION_ID=' "${ARTIFACT_DIR}/c14-session.env" | cut -d= -f2- || true)"
+if [ -n "${SESSION_ID}" ]; then
+  python3 "${SKILL_DIR}/scripts/resource_registry.py" --env-root "${ENV_ROOT}" \
+    resource-upsert \
+    --session-id "${SESSION_ID}" \
+    --environment "${ENVIRONMENT}" \
+    --namespace "${NAMESPACE}" \
+    --kind HelmRelease \
+    --name "${RELEASE}" \
+    --gpu 16 \
+    --status released \
+    --purpose vllm-dsv4-flash-pd \
+    --release-condition "released after benchmark artifacts and cleanup completed" \
+    --cleanup-command "eval \"\$(${ENV_ROOT}/bin/envctl use ${ENVIRONMENT})\"; helm uninstall ${RELEASE} -n ${NAMESPACE} || true; kubectl delete namespace ${NAMESPACE} --ignore-not-found"
 fi
 ```
 

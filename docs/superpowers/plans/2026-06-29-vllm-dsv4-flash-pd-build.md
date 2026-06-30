@@ -121,21 +121,21 @@
 
 ### M8: 在 `dev-cluster` 部署
 
-- [ ] 按命令引用 `C14` 解析 env root、验证 `dev-cluster`、注册 workspace-env session、申请 16 GPU permit，并确认执行者选定的 `PREFILL_NODE` 与 `DECODE_NODE` 是两个不同且各自 allocatable GPU 至少为 8 的节点。
-- [ ] 在 `C14` 中确认 `dev-cluster` 已存在 `stormservices.orchestration.aibrix.ai` CRD；如不存在，停止并记录 blocker，不在本任务中安装 Aibrix/StormService 控制面。
-- [ ] 按命令引用 `C15` 创建 namespace、注册 Helm release、`helm upgrade --install`。
-- [ ] 按命令引用 `C16` 收集 evidence ladder：render、Onion 模型准备日志、模型完整性检查、实际 argv/env、pod-local package/source evidence、稳定 readiness、router `/v1/models` 和一次真实 completion。
-- [ ] 如果资源 Pending 或 readiness/real request 失败，按 workspace-env 规则清理本任务创建的资源，记录 blocker。
+- [x] 按命令引用 `C14` 解析 env root、验证 `dev-cluster`、注册 workspace-env session、申请 16 GPU permit，并确认执行者选定的 `PREFILL_NODE` 与 `DECODE_NODE` 是两个不同且各自 allocatable GPU 至少为 8 的节点。
+- [x] 在 `C14` 中确认 `dev-cluster` 已存在 `stormservices.orchestration.aibrix.ai` CRD；如不存在，停止并记录 blocker，不在本任务中安装 Aibrix/StormService 控制面。
+- [x] 按命令引用 `C15` 创建 namespace、注册 Helm release、`helm upgrade --install`。
+- [x] 按命令引用 `C16` 收集 evidence ladder：render、Onion 模型准备日志、模型完整性检查、实际 argv/env、pod-local package/source evidence、稳定 readiness、router `/v1/models` 和一次真实 completion。
+- [x] 如果资源 Pending 或 readiness/real request 失败，按 workspace-env 规则清理本任务创建的资源，记录 blocker。
 - Acceptance: Onion 模型准备成功或幂等跳过且模型完整性检查通过；prefill pod 和 decode pod 分别落在 `PREFILL_NODE` 与 `DECODE_NODE` 两个不同节点，且各自请求 8 张 GPU；prefill/decode/router 通过真实 router path 可生成非空输出，且没有 runtime hotfix/install 证据。
 
 ### M9: 使用 evalscope benchmark 64k/1 TTFT 和 cache-hit decode BS512/1.5k output
 
-- [ ] 按命令引用 `C17` 准备 evalscope 环境；如果 evalscope 不可用或安装受阻，停止并记录 blocker。
-- [ ] 按命令引用 `C18` 跳过 Prometheus 部署，仅采集 pod-local `/metrics` 头部、日志和 skipped note；最终 summary 必须明确 Prometheus skipped by user。
-- [ ] 按命令引用 `C19` 先运行真实服务路径 smoke 和 warmup。
-- [ ] 按命令引用 `C20` 运行 64k input / 1 output TTFT measured run。
-- [ ] 按命令引用 `C21` 用固定 `--seed 42` 预热 prefix cache，再运行全命中 cache 的 decode BS512 output throughput measured run；固定 output length 为 1.5k，即 1536 tokens。
-- [ ] 保存 raw evalscope output、timestamps、serving logs、pod-local metrics heads、rendered manifests 和 Markdown summary 到 artifact path。
+- [x] 按命令引用 `C17` 准备 evalscope 环境；如果 evalscope 不可用或安装受阻，停止并记录 blocker。
+- [x] 按命令引用 `C18` 跳过 Prometheus 部署，仅采集 pod-local `/metrics` 头部、日志和 skipped note；最终 summary 必须明确 Prometheus skipped by user。
+- [x] 按命令引用 `C19` 先运行真实服务路径 smoke 和 warmup。
+- [x] 按命令引用 `C20` 运行 64k input / 1 output TTFT measured run。
+- [x] 按命令引用 `C21` 用固定 `--seed 42` 预热 prefix cache，再运行全命中 cache 的 decode BS512 output throughput measured run；固定 output length 为 1.5k，即 1536 tokens。
+- [x] 保存 raw evalscope output、timestamps、serving logs、pod-local metrics heads、rendered manifests 和 Markdown summary 到 artifact path。
 - Acceptance: 两个 measured run 均有开始/结束时间、exit code、raw output、artifact 路径、TTFT/throughput 摘要；性能 gate 看 Avg，不看 P50/P95/P99；64k/1 Avg TTFT 必须小于 10s；BS512/1.5k evalscope overall output token throughput 必须达到 14000 tokens/s 以上；该 throughput 口径为 `1P1D` router-path，总 output 来自单个 decode 节点；summary 明确 Prometheus skipped by user，不能声称有完整服务侧 monitoring 诊断；若 run invalid 或性能未达阈值，必须明确 invalid/blocker 原因。
 
 ### M10: 使用已授权审批更新远端 `iaas_main`
@@ -193,16 +193,17 @@
 
 - 当前分支：`codex/vllm-dsv4-fork-base-byteiaas-build`，基于 fork SHA `cde7799cc66c5a4cb349156a3ca3228f9798dbc9`。
 - M1-M4 已完成：远端备份分支 `backup/iaas_main-20260629` 指向原 `origin/iaas_main` SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`，GitHub ruleset `Protect backup iaas_main branches` 已 active；ByteIAAS workflow、tag 脚本、`byteiaas-openai-devel` Dockerfile、Dockerfile 中 `vllm-router` 与 Onion CLI 构建能力已落到 fork-base 分支。
-- M5 需再次构建：旧候选镜像 `v0.10.0.iaas.dev.202606302005-openai-devel-cu130` 在 M8 失败于 `mooncake.engine` 导入 `libcudart.so.12` 缺失后，已提交 `aaa5f958a4e8b156d789963174b445cae239fa53` 并由 ByteIAAS run `28449545514` 成功发布新候选镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302152-openai-devel-cu130`。该新镜像在 M8 第三轮部署中继续推进到 DeepGEMM 初始化，但 decode 失败于 vendored DeepGEMM 缺少 MegaMoE SM90 FP4 API `transform_weights_for_mega_moe_sm90_fp4`。已确认 `wangyicong52/DeepGEMM` release wheel 包含所需符号，而同名 tag 源码不包含该符号；因此当前按 Helm chart 已出现的 release wheel URL 做 image build-time 安装，不做 runtime hotfix/install。详见进展日志 `P37`。
+- M5 已第三次重新构建成功：旧候选镜像 `v0.10.0.iaas.dev.202606302152-openai-devel-cu130` 在 M8 第三轮部署中推进到 DeepGEMM 初始化后，decode 失败于 vendored DeepGEMM 缺少 MegaMoE SM90 FP4 API `transform_weights_for_mega_moe_sm90_fp4`。已提交 `d6fe62d15643d5619e6c5ac95201a060938a839f`，在 ByteIAAS image build 中安装 Helm chart 已出现的 `wangyicong52/DeepGEMM` release wheel，并做 build-time MegaMoE 符号检查。ByteIAAS run `28452612809` 成功，发布新候选镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`，digest `sha256:57cb7a44de57b09bb8a45d214210dc8c4e76cd601c0ea0a8c78fc81f05e2d32a`，包含 `linux/amd64` manifest；后续 C13-C16 必须使用该新镜像。详见进展日志 `P38`。
 - M7 部署模板已创建并在 2026-06-30 重新收敛到 servingkit `perf/vllm_dsv4` SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 的 P/D/router 语义：`examples/deployment/deepseek-v4-flash-pd/` 使用 `StormService` 表达 `1P1D`，同一新镜像负责 vLLM、`vllm-router` 和 Onion 模型准备；chart 新增 Helm validation，强制 `global.gpuCount=8`、prefill/decode nodeAffinity 非空且 disjoint。默认 values 不再保留调试残留 `NVSHMEM_QP_DEPTH=2048` 或 prefill `maxNumBatchedTokens=2048`，且不使用 `vllm.maxModelLen=66000`。
-- M8 第三轮部署已清理：`dev-cluster` preflight 通过，StormService CRD 存在；16 GPU permit `bf793b14-0583-4840-80f0-0741b4a99fa4` 已释放。部署确认 prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；Onion init 已完成并幂等跳过；router 以静态 P/D URL 模式启动；prefill 已推进到 API server startup，decode 失败于 DeepGEMM fork API 缺失，证据在进展日志 `P37`，不得进入 M9 或 M10。
+- M8 第四轮部署已完成并清理：使用新镜像 `v0.10.0.iaas.dev.202606302238-openai-devel-cu130`，16 GPU permit `7db945db-d65b-4d55-8f10-7c1ea453dfdd` 已释放；prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；Onion init 幂等跳过，模型完整性检查通过，真实 router `/v1/models` 与 `/v1/completions` 均成功；bad-log scan 和 runtime install/hotfix scan 均为 0。详见进展日志 `P39`。
 - 用户在 2026-06-30 明确收窄范围：不接受 `vllm/_custom_ops.py` 中 `_moe_C` 到 `_moe_C_stable_libtorch` 的 runtime fallback；vLLM 源码修改只允许构建过程中遇到的问题。此前提交 `51b135cef854e6d72cb704068644c52d047706e5` 和 workflow run `28414886195` 被标记为无效路线，不得作为后续部署/benchmark/更新 `iaas_main` 的依据。详见进展日志 `P26`。
 - C9A 已完成：workflow run `28414886195` 已取消，`vllm/_custom_ops.py` 已恢复为 fork baseline hard import `vllm._moe_C`，且 `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过。详见进展日志 `P28`。
 - C9B 已完成：用户指出 build-side `_moe_C` rename 路线异常后，已取消 workflow run `28418542564`，并将 `CMakeLists.txt`、`setup.py`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 恢复为 upstream main/fork baseline 的 `_moe_C_stable_libtorch` build artifact 命名。上游对比证明 upstream main 的自洽路径是：构建/import `vllm._moe_C_stable_libtorch`，但注册 `torch.ops._moe_C` namespace，且 `topk_hash_softplus_sqrt` 不再 hard import `vllm._moe_C`。详见进展日志 `P30`。
 - 用户已批准按 upstream main 对齐 `topk_hash_softplus_sqrt`：删除 `f7c4c621d` 引入的 hard import，不做 fallback、不改 build artifact。详见进展日志 `P31`。
 - C9D 已完成：run `28442949331` 和候选 `openai-devel` 镜像静态检查通过；当前不需要再触发一次 C9 重构建。详见进展日志 `P32`。
-- M9/M10 尚未执行；性能不达标或服务路径未跑通时不得更新 `iaas_main`。
+- M9 已完成但性能 gate 失败：64k/1 Avg TTFT 为 `6590.02 ms`，通过 `<10s` gate；BS512/1536 decode Avg output throughput 为 `8361.71 tok/s`，低于 `14000 tok/s` gate。所有临时 Helm release、namespace、port-forward 和本任务 GPU permit 已清理。详见进展日志 `P40`。
+- M10 不执行：性能未达标，按用户要求不得更新远端 `iaas_main`。
 
 ## Next Action
 
-提交并推送 DeepGEMM fork wheel 的 image build-time 安装修复，按 C9 重新触发 ByteIAAS workflow；新镜像产出后重新执行 C13-C16。旧 `202606302005-openai-devel-cu130` 和 `202606302152-openai-devel-cu130` 不得继续作为 benchmark 或 `iaas_main` 更新候选。
+停止本计划的远端 `iaas_main` 更新；若继续推进，需要先诊断为什么 BS512/1536 Avg output throughput 只有 `8361.71 tok/s`，并在新的镜像/部署/性能修复后重新执行 M8-M9 gate。旧 `202606302005-openai-devel-cu130` 和 `202606302152-openai-devel-cu130` 不得作为 benchmark 或 `iaas_main` 更新候选。
