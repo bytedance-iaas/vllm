@@ -192,7 +192,7 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            venv_python="${PYTHON_VERSION}"; \
        fi \
     && for attempt in 1 2 3 4 5; do \
-           uv venv --seed /opt/venv --python "${venv_python}" && break; \
+           timeout 600s uv venv --seed /opt/venv --python "${venv_python}" && break; \
            rc=$?; \
            if [ "${attempt}" = "5" ]; then \
                exit "${rc}"; \
