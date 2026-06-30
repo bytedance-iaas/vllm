@@ -29,7 +29,7 @@ jobs:
       HTTPS_PROXY: http://100.68.162.211:3128
       ALL_PROXY: http://100.68.162.211:3128
       NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
-      BYTEIAAS_BUILD_NVCC_THREADS: "1"
+      BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-wheel-cache
     steps:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
@@ -41,16 +41,67 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: byteiaas-vllm-wheel-builder
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+          keep-state: true
+          cleanup: false
+
       - name: Build wheel stage image
         run: |
           set -euo pipefail
           build_cpus="$(nproc)"
           build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
-          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-1}"
+          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${build_cpus}}"
+          cache_root="${BYTEIAAS_BUILDX_CACHE_ROOT}"
+
           echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}"
+          echo "DeepGEMM Python versions: ${DEEPGEMM_PYTHON_VERSIONS:-default}"
           echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
           df -h /data /data/docker /data/buildkit || true
-          DOCKER_BUILDKIT=1 docker build \
+          mkdir -p "${cache_root}"
+
+          buildx_with_local_cache() {
+            local cache_name="$1"
+            shift
+            local cache_dir="${cache_root}/${cache_name}"
+            local cache_new="${cache_dir}.new"
+            local cache_old="${cache_dir}.old"
+            local cache_args=(
+              --cache-to "type=local,dest=${cache_new},mode=max"
+            )
+            if [ -d "${cache_dir}" ]; then
+              cache_args=(
+                --cache-from "type=local,src=${cache_dir}"
+                "${cache_args[@]}"
+              )
+              echo "Using local BuildKit cache: ${cache_dir}"
+            else
+              echo "No local BuildKit cache yet: ${cache_dir}"
+            fi
+
+            rm -rf "${cache_new}"
+            docker buildx build "${cache_args[@]}" "$@"
+
+            if [ -d "${cache_new}" ]; then
+              rm -rf "${cache_old}"
+              if [ -d "${cache_dir}" ]; then
+                mv "${cache_dir}" "${cache_old}"
+              fi
+              mv "${cache_new}" "${cache_dir}"
+              rm -rf "${cache_old}"
+              echo "Updated local BuildKit cache: ${cache_dir}"
+            fi
+          }
+
+          buildx_with_local_cache build \
+            --load \
             --target build \
             --network=host \
             -f docker/Dockerfile \

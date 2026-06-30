@@ -106,6 +106,7 @@ ARG BUILD_OS
 ARG UV_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
+ARG DEEPGEMM_PYTHON_VERSIONS=3.10,3.11,3.12,3.13,3.14
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -160,7 +161,15 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             gcc-11 \
             g++-11 \
         && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
-        && if ! apt-cache show "python${PYTHON_VERSION}" >/dev/null 2>&1; then \
+        && deepgemm_python_versions="$(printf '%s' "${DEEPGEMM_PYTHON_VERSIONS}" | tr ',' ' ')" \
+        && python_versions="$(printf '%s\n' ${PYTHON_VERSION} ${deepgemm_python_versions} | awk '!seen[$0]++')" \
+        && needs_deadsnakes=0 \
+        && for py_version in ${python_versions}; do \
+            if ! apt-cache show "python${py_version}-dev" >/dev/null 2>&1; then \
+                needs_deadsnakes=1; \
+            fi; \
+        done \
+        && if [ "${needs_deadsnakes}" = "1" ]; then \
             if [ -n "${DEADSNAKES_MIRROR_URL:-}" ]; then \
                 if [ -n "${DEADSNAKES_GPGKEY_URL:-}" ]; then \
                     mkdir -p -m 0755 /etc/apt/keyrings \
@@ -176,10 +185,11 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             fi \
             && apt-get update -y; \
         fi \
-        && apt-get install -y --no-install-recommends \
-            python${PYTHON_VERSION} \
-            python${PYTHON_VERSION}-dev \
-            python${PYTHON_VERSION}-venv \
+        && python_packages="" \
+        && for py_version in ${python_versions}; do \
+            python_packages="${python_packages} python${py_version} python${py_version}-dev python${py_version}-venv"; \
+        done \
+        && apt-get install -y --no-install-recommends ${python_packages} \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -434,9 +444,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # DEEPGEMM_PYTHON_INTERPRETERS to build DeepGEMM `_C` for each. See
 # cmake/external_projects/deepgemm.cmake for the full picture.
 COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+ENV DEEPGEMM_PYTHON_VERSIONS=${DEEPGEMM_PYTHON_VERSIONS}
 ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
 RUN --mount=type=cache,target=/root/.cache/uv \
-    tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
+    tools/setup_deepgemm_pythons.sh $(printf '%s' "${DEEPGEMM_PYTHON_VERSIONS}" | tr ',' ' ') > /tmp/dg_pythons.txt \
+    && echo "DeepGEMM Python interpreters: $(cat /tmp/dg_pythons.txt)"
 
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
