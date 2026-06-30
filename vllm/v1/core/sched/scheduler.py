@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -166,6 +167,24 @@ class Scheduler(SchedulerInterface):
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        # Online C128 needs aligned local hits; Mooncake aux handles PD partials.
+        self._dsv4_c128_online = bool(
+            envs.VLLM_DSV4_C128_ONLINE_COMPRESS
+        )
+        # Mirror worker gating: aux is only defined for pure P/D roles.
+        _c128_pure_pd_role = kv_transfer_config is not None and (
+            kv_transfer_config.kv_role in ("kv_producer", "kv_consumer")
+        )
+        _c128_mooncake_connector = (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "MooncakeConnector"
+        )
+        self._dsv4_c128_pd_aux = (
+            self._dsv4_c128_online
+            and bool(envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER)
+            and _c128_pure_pd_role
+            and _c128_mooncake_connector
+        )
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -780,6 +799,27 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+
+                    # Online C128 requires either an aligned resume or Mooncake aux.
+                    if self._dsv4_c128_online:
+                        if num_new_local_computed_tokens % 128 != 0:
+                            raise ValueError(
+                                "C128 online compression requires 128-aligned "
+                                "local prefix-cache hits, got "
+                                f"{num_new_local_computed_tokens}."
+                            )
+                        if (
+                            not self._dsv4_c128_pd_aux
+                            and num_external_computed_tokens > 0
+                            and num_computed_tokens % 128 != 0
+                        ):
+                            raise ValueError(
+                                "C128 online compression PD remote prefill with a "
+                                "non-128-aligned resume requires "
+                                "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER=1 (committed "
+                                "bank0 partial-state transfer); got "
+                                f"num_computed_tokens={num_computed_tokens}."
+                            )
 
                     # Skip request with pending mm encoding prefetches
                     if (
