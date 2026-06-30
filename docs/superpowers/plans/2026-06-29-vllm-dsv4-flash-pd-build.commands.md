@@ -395,6 +395,7 @@ ONION_MODEL="${ONION_MODEL:-DeepSeek-V4-Flash}"
 ONION_DIR="${ONION_DIR:-/data01}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash}"
 MODEL_BASE_PATH="${MODEL_BASE_PATH:-/data01}"
+WORKSPACE_ENV_SESSION_ID="${WORKSPACE_ENV_SESSION_ID:-render-only}"
 
 if [ "${GLOBAL_GPU_COUNT}" != "8" ]; then
   echo "GLOBAL_GPU_COUNT must remain 8 for the servingkit-equivalent 1P1D shape" >&2
@@ -435,6 +436,9 @@ helm template "${RELEASE}" examples/deployment/deepseek-v4-flash-pd \
   --set onion.dir="${ONION_DIR}" \
   --set model.name="${MODEL_NAME}" \
   --set model.basePath="${MODEL_BASE_PATH}" \
+  --set workspaceEnv.sessionId="${WORKSPACE_ENV_SESSION_ID}" \
+  --set workspaceEnv.owner=codex \
+  --set workspaceEnv.purpose=vllm-dsv4-flash-pd \
   > "${ARTIFACT_DIR}/rendered-${RELEASE}.yaml"
 
 forbidden='runtimePatch|git clone|pip install|apt(-get)?[[:space:]]+(update|install)|install_deepgemm|ensure_pip_package|wheelURL|wheelPath|/tmp/vllm-runtime-patch|vllm-router.*pip'
@@ -574,6 +578,7 @@ ONION_MODEL="${ONION_MODEL:-DeepSeek-V4-Flash}"
 ONION_DIR="${ONION_DIR:-/data01}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash}"
 MODEL_BASE_PATH="${MODEL_BASE_PATH:-/data01}"
+WORKSPACE_ENV_SESSION_ID="${WORKSPACE_ENV_SESSION_ID:?set WORKSPACE_ENV_SESSION_ID to the granted workspace-env session id from C14}"
 
 if [ "${GLOBAL_GPU_COUNT}" != "8" ]; then
   echo "GLOBAL_GPU_COUNT must remain 8 for the servingkit-equivalent 1P1D shape" >&2
@@ -622,6 +627,9 @@ helm upgrade --install "${RELEASE}" examples/deployment/deepseek-v4-flash-pd \
   --set onion.dir="${ONION_DIR}" \
   --set model.name="${MODEL_NAME}" \
   --set model.basePath="${MODEL_BASE_PATH}" \
+  --set workspaceEnv.sessionId="${WORKSPACE_ENV_SESSION_ID}" \
+  --set workspaceEnv.owner=codex \
+  --set workspaceEnv.purpose=vllm-dsv4-flash-pd \
   --wait \
   --timeout 60m \
   2>&1 | tee "${ARTIFACT_DIR}/helm-upgrade-${RELEASE}.log"

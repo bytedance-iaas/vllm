@@ -6,6 +6,11 @@ global:
   imagePullPolicy: IfNotPresent
   gpuCount: 8
 
+workspaceEnv:
+  sessionId: ""
+  owner: codex
+  purpose: vllm-dsv4-flash-pd
+
 model:
   basePath: /data01
   name: DeepSeek-V4-Flash

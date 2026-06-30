@@ -19,6 +19,9 @@ spec:
       labels:
         {{- include "deepseek-v4-flash-pd.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: router
+        workspace-env/session-id: {{ .Values.workspaceEnv.sessionId | quote }}
+        workspace-env/owner: {{ .Values.workspaceEnv.owner | quote }}
+        workspace-env/purpose: {{ .Values.workspaceEnv.purpose | quote }}
     spec:
       serviceAccountName: {{ include "deepseek-v4-flash-pd.routerName" . }}
       {{- if .Values.router.hostNetwork }}

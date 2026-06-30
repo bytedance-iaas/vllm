@@ -25,6 +25,11 @@ spec:
           stateful: true
           podGroupSize: {{ .Values.prefill.podGroupSize }}
           template:
+            metadata:
+              labels:
+                workspace-env/session-id: {{ .Values.workspaceEnv.sessionId | quote }}
+                workspace-env/owner: {{ .Values.workspaceEnv.owner | quote }}
+                workspace-env/purpose: {{ .Values.workspaceEnv.purpose | quote }}
             spec:
               {{- if .Values.prefill.hostNetwork }}
               hostNetwork: true
@@ -159,6 +164,11 @@ spec:
           stateful: true
           podGroupSize: {{ .Values.decode.podGroupSize }}
           template:
+            metadata:
+              labels:
+                workspace-env/session-id: {{ .Values.workspaceEnv.sessionId | quote }}
+                workspace-env/owner: {{ .Values.workspaceEnv.owner | quote }}
+                workspace-env/purpose: {{ .Values.workspaceEnv.purpose | quote }}
             spec:
               {{- if .Values.decode.hostNetwork }}
               hostNetwork: true

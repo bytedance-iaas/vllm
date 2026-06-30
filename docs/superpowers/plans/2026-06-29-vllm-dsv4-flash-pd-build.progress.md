@@ -281,3 +281,39 @@
   - `build_rust.sh` 的 rustup installer curl 追加 `--connect-timeout 20 --max-time 300`。
   - `bash -n build_rust.sh` 通过。
   - `git diff --check` 通过。
+
+### P19: ByteIAAS workflow succeeded and deployment render passed with real image
+
+- Summary: 第三次 ByteIAAS workflow run `28389076984` 成功，产出可部署 `openai` 和 `openai-devel` 镜像；随后使用真实 `openai` 镜像完成 Helm render/lint、runtime install forbidden pattern 检查和同节点负例检查。
+- Evidence:
+  - Run id: `28389076984`，workflow conclusion: `success`。
+  - Image job id `84111193573` conclusion: `success`；wheel job id `84111193610` conclusion: `success`。
+  - Image job API log path: `/tmp/byteiaas-vllm-84111193573-api.log`。
+  - Published openai image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606300110-cu130`。
+  - Openai digest: `sha256:574c3dc2023be9300df8e699994798f76e3f048bff81f3e6719e8726197de113`。
+  - Published openai-devel image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606300110-openai-devel-cu130`。
+  - Openai-devel digest: `sha256:93e3326c6ca055a7e6986305ceb77a8b77d611bc2f9c4f92c52d1d2305bc6fd4`。
+  - `helm lint examples/deployment/deepseek-v4-flash-pd ...` 通过。
+  - Render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd.yaml`。
+  - Render 使用同一 `global.image`，包含 `kind: StormService`、`oniond download model`、prefill/decode `nvidia.com/gpu: 8`，并且同节点负例被 Helm validation 拒绝。
+
+### P20: dev-cluster preflight and GPU permit granted
+
+- Summary: `dev-cluster` preflight 通过，StormService CRD 存在，选择两个不同 8-GPU 节点并成功获取 16 GPU permit。
+- Evidence:
+  - `envctl info dev-cluster` 显示 kubeconfig 存在；`envctl validate dev-cluster` 返回 `OK dev-cluster`。
+  - CRD `stormservices.orchestration.aibrix.ai` 存在，created at `2026-04-07T11:59:19Z`。
+  - 当前 Running 8-GPU workloads 占用节点：`192.168.1.143`、`192.168.1.146`、`192.168.1.149`、`192.168.1.154`、`192.168.1.220`。
+  - 选择 `PREFILL_NODE=192.168.1.148`、`DECODE_NODE=192.168.1.186`、`ROUTER_NODE=192.168.1.186`；两节点 allocatable GPU 均为 8，且 `UNSCHEDULABLE=false`。
+  - Workspace-env session id: `codex-vllm-dsv4-flash-pd-20260630-093559-214441`。
+  - Permit id: `3813ef32-5e13-42b7-9a1c-a36aa463dd5b`，status `granted`，requested GPUs `16`。
+
+### P21: Added workspace-env labels to deployment template
+
+- Summary: 为满足 workspace-env GPU resource tracking 要求，chart 增加 `workspaceEnv.sessionId/owner/purpose` values，并把对应 labels 注入 prefill/decode StormService pod template 和 router Deployment pod template。
+- Evidence:
+  - 修改 `examples/deployment/deepseek-v4-flash-pd/values.yaml`，新增 `workspaceEnv`。
+  - 修改 `templates/stormservice.yaml`，在 prefill/decode `template.metadata.labels` 添加 `workspace-env/session-id`、`workspace-env/owner`、`workspace-env/purpose`。
+  - 修改 `templates/router.yaml`，在 router pod template labels 添加同样标签。
+  - Actual-node render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd-actual-nodes.yaml`。
+  - Render 验证包含 workspace-env labels、`PREFILL_NODE=192.168.1.148`、`DECODE_NODE=192.168.1.186`、prefill/decode `nvidia.com/gpu: 8`，且无 runtime install forbidden pattern。
