@@ -1094,6 +1094,7 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG DEEPGEMM_WHEEL_X86_64
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1153,6 +1154,15 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
                 ln -s "libcudart.so.${CUDA_MAJOR}" /usr/local/cuda/lib64/libcudart.so; \
             fi; \
         fi; \
+    fi
+
+# Install the DeepGEMM fork wheel at image build time when the deployment
+# requires fork-only MegaMoE SM90 APIs. vLLM prefers site-packages deep_gemm
+# over its vendored fallback, so this keeps runtime manifests free of hotfixes.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ -n "${DEEPGEMM_WHEEL_X86_64}" ]; then \
+        uv pip install --system "${DEEPGEMM_WHEEL_X86_64}" && \
+        python3 -c 'import deep_gemm; required = ["transform_weights_for_mega_moe_sm90", "transform_weights_for_mega_moe_sm90_fp4", "fp8_fp4_mega_moe"]; missing = [name for name in required if not hasattr(deep_gemm, name)]; assert not missing, f"DeepGEMM wheel missing required MegaMoE symbols: {missing}"; print("DeepGEMM MegaMoE symbols verified")'; \
     fi
 
 # Install the community router package in the image so deployment manifests do

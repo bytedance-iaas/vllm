@@ -512,3 +512,64 @@
 - Decision:
   - 旧镜像 `v0.10.0.iaas.dev.202606302005-openai-devel-cu130` 不得继续用于 benchmark 或更新 `iaas_main`。
   - 下一步必须提交并推送 Dockerfile 修复，按 C9 重新触发 ByteIAAS workflow，等待新镜像产出后重新执行 C13-C16。
+
+### P36: CUDA 13 Mooncake package fix rebuilt successfully
+
+- Summary: 已提交并推送 Dockerfile 修复，重新触发 ByteIAAS dev image workflow。新 workflow 成功产出 openai/openai-devel 镜像；后续部署验证固定使用新的 `openai-devel` 镜像，不再使用 P35 中失败的旧镜像。
+- Code and workflow evidence:
+  - Fix commit: `aaa5f958a4e8b156d789963174b445cae239fa53`。
+  - Commit message: `Fix CUDA13 Mooncake package for ByteIAAS image`。
+  - Pushed branch: `codex/vllm-dsv4-fork-base-byteiaas-build`。
+  - Workflow run id: `28449545514`。
+  - Workflow URL: `https://github.com/bytedance-iaas/vllm/actions/runs/28449545514`。
+  - `gh run view 28449545514 --repo bytedance-iaas/vllm --json status,conclusion,headSha,url,createdAt,updatedAt,jobs` 返回 `status=completed`、`conclusion=success`、`headSha=aaa5f958a4e8b156d789963174b445cae239fa53`。
+  - Jobs: `build-image / build-and-publish-image` success；`build-wheel / build-wheel` success。
+- Published images:
+  - `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302152-cu130`，digest `sha256:ae9c4b999fac0c7e14ba10730d7963a0a7db648841003e8881370541ca82d8fd`。
+  - `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302152-openai-devel-cu130`，digest `sha256:aaf3098637aa709286668aa380c74e6540c24b15ea14c3bc806530c56f7e6e2a`。
+  - Job log evidence saved at `artifacts/2026-06-29-vllm-dsv4-flash-pd/workflow/job-84307773674-logs-api.txt`，其中包含 `Resolved openai-devel image tag v0.10.0.iaas.dev.202606302152-openai-devel-cu130` 和 `Published openai-devel image: iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302152-openai-devel-cu130`。
+  - `docker buildx imagetools inspect` 通过：openai-devel image index digest 为 `sha256:aaf3098637aa709286668aa380c74e6540c24b15ea14c3bc806530c56f7e6e2a`，包含 `linux/amd64` manifest `sha256:16392b32883e2e4766b3f39d9dc7343af916913aea30222952cdb11a05b96a14`。
+- Static validation before push:
+  - `git diff --check` 通过。
+  - `uv pip install --system --dry-run 'mooncake-transfer-engine-cuda13>=0.3.8'` 可解析到 `mooncake-transfer-engine-cuda13==0.3.11.post1`。
+  - `helm template` 使用 `decode.args.maxNumSeqs=512`、不同 P/D 节点和旧候选 image 做 precommit render 通过；render 中无 `--max-model-len`、`66000`、runtime hotfix/install forbidden pattern。
+  - `helm lint examples/deployment/deepseek-v4-flash-pd ...` 通过，仅有 `Chart.yaml: icon is recommended` informational message。
+- Decision:
+  - 新部署候选固定为 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302152-openai-devel-cu130`。
+  - 下一步重新执行 C13-C16；如果该新镜像仍失败，需要按新的日志证据重新定位，不得回退到运行时安装或 runtime fallback。
+
+### P37: Third deployment failed on missing DeepGEMM fork MegaMoE SM90 symbols
+
+- Summary: 使用 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302152-openai-devel-cu130` 执行第三轮 `dev-cluster` 部署验证。Mooncake CUDA 13 包问题已越过，prefill 推进到 API server startup，router 以静态 P/D URL 模式启动并看到 prefill healthy；decode 在加载 DSV4 MegaMoE 权重时失败。根因是镜像内没有安装 servingkit chart 指向的 `wangyicong52/DeepGEMM` fork wheel，vLLM 回落到 vendored DeepGEMM 后缺少 `transform_weights_for_mega_moe_sm90_fp4`。
+- Deployment evidence:
+  - C14 session: `codex-vllm-dsv4-flash-pd-20260630-221836-711763`。
+  - GPU permit: `bf793b14-0583-4840-80f0-0741b4a99fa4`，请求 16 GPU，部署失败后已释放。
+  - 选定节点：prefill `192.168.1.148`，decode `192.168.1.186`，router `192.168.1.186`。
+  - Namespace: `vllm-dsv4-flash-pd`；Helm release: `dsv4-flash-pd`。
+  - Prefill pod `dsv4-flash-pd-roleset-jwnnx-prefill-548567f887-0` 调度到 `192.168.1.148`，container `prefill` 请求 8 GPU。
+  - Decode pod `dsv4-flash-pd-roleset-jwnnx-decode-c46c79c8b-0` 调度到 `192.168.1.186`，container `decode` 请求 8 GPU。
+  - Router pod `dsv4-flash-pd-router-7dbc4d6c5d-vxvg6` 调度到 `192.168.1.186`，不请求 GPU。
+  - Onion init 已完成并因已有模型目录幂等跳过：`Model directory /data01/DeepSeek-V4-Flash is already complete, skip Onion download.`
+  - Router static mode evidence: `prefill_urls: [("http://192.168.1.148:8000", Some(8998))]`，`decode_urls: ["http://192.168.1.186:8001"]`，`discovery: None`。
+- Failure evidence:
+  - Failure artifact directory: `artifacts/2026-06-29-vllm-dsv4-flash-pd/failure-deepgemm-20260630-222819/`。
+  - Full previous decode log: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-debug-new-image/decode-previous-main-full.log`。
+  - Decode log root cause: `NotImplementedError: The resolved DeepGEMM build is missing required MegaMoE symbols for SM90: ['transform_weights_for_mega_moe_sm90_fp4']. Update the DeepGEMM wheel/image.`
+  - Stack path: `vllm/models/deepseek_v4/nvidia/model.py::finalize_mega_moe_weights -> DeepseekV4MegaMoEExperts._check_runtime_supported`。
+  - Log also shows `deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm`，说明当前镜像没有外部 fork `deep_gemm`，只使用了 vLLM wheel 内的 vendored DeepGEMM。
+- Cleanup evidence:
+  - 已中断等待中的 Helm 命令并执行 `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd`。
+  - 已删除 namespace `vllm-dsv4-flash-pd` 并复查不存在。
+  - Permit `bf793b14-0583-4840-80f0-0741b4a99fa4` 已释放，release artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/permit-release-after-deepgemm-failure.json`。
+  - Workspace-env registry active after cleanup 为 `[]`；未保留 GPU pod。
+- DeepGEMM fork evidence:
+  - `git ls-remote --tags https://github.com/wangyicong52/DeepGEMM.git refs/tags/deep_gemm-2.5.0-1wyc-vllm-mega-moe196439b72` 返回 `88965b078186ee7510ab9fc4f1d5ebc19adfa8d1`。
+  - 同名 tag 源码中的 `deep_gemm/mega/__init__.py` 只有 `transform_weights_for_mega_moe`，不包含 `transform_weights_for_mega_moe_sm90` 或 `transform_weights_for_mega_moe_sm90_fp4`。
+  - servingkit chart 已出现的 release wheel URL 可访问，wheel `deep_gemm-2.5.0-1wyc_vllm_mega_moe196439b72-cp312-cp312-linux_x86_64.whl` 包含 `deep_gemm/_C.cpython-312-x86_64-linux-gnu.so`，且 `deep_gemm/__init__.py` 导出 `transform_weights_for_mega_moe_sm90`、`transform_weights_for_mega_moe_sm90_fp4` 和 `fp8_fp4_mega_moe`。
+- Fix:
+  - 已在 `docker/Dockerfile` 的 `vllm-openai-base` 阶段新增可选 `DEEPGEMM_WHEEL_X86_64` build arg；当 `TARGETPLATFORM=linux/amd64` 且参数非空时，image build-time 执行 `uv pip install --system "${DEEPGEMM_WHEEL_X86_64}"`，并用 Python 检查 `transform_weights_for_mega_moe_sm90`、`transform_weights_for_mega_moe_sm90_fp4`、`fp8_fp4_mega_moe` 三个符号。
+  - 已在 `.github/workflows/_byteiaas-build-and-publish-image.yml` 中为 ByteIAAS openai image build 传入 chart 已出现的 `wangyicong52/DeepGEMM` release wheel URL。
+  - 该修复位于镜像构建阶段，不修改 `vllm/**` runtime Python 逻辑，不在部署模板中添加 wheel 下载或安装，也不引入运行时 hotfix。
+- Decision:
+  - 镜像 `v0.10.0.iaas.dev.202606302152-openai-devel-cu130` 不得继续用于 benchmark 或更新 `iaas_main`。
+  - 下一步提交并推送 DeepGEMM fork wheel 修复，按 C9 重新触发 ByteIAAS workflow，等待新镜像产出后重新执行 C13-C16。

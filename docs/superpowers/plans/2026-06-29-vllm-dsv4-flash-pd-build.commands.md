@@ -174,17 +174,43 @@ set -euo pipefail
 git ls-remote --tags https://github.com/wangyicong52/DeepGEMM.git \
   "refs/tags/deep_gemm-2.5.0-1wyc-vllm-mega-moe196439b72" || true
 
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "${tmpdir}"' EXIT
+git clone --depth 1 --branch deep_gemm-2.5.0-1wyc-vllm-mega-moe196439b72 \
+  --recurse-submodules --shallow-submodules \
+  https://github.com/wangyicong52/DeepGEMM.git "${tmpdir}/DeepGEMM"
+rg -n "transform_weights_for_mega_moe_sm90|transform_weights_for_mega_moe_sm90_fp4" \
+  "${tmpdir}/DeepGEMM/deep_gemm" || true
+
 python3 - <<'PY'
 from urllib.parse import urlparse
+import tempfile
+import urllib.request
+import zipfile
 
 url = "https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-1wyc-vllm-mega-moe196439b72/deep_gemm-2.5.0-1wyc_vllm_mega_moe196439b72-cp312-cp312-linux_x86_64.whl"
 parsed = urlparse(url)
 print(parsed.netloc)
 print(parsed.path)
+
+with tempfile.NamedTemporaryFile(suffix=".whl") as f:
+    with urllib.request.urlopen(url, timeout=60) as r:
+        f.write(r.read())
+    f.flush()
+    with zipfile.ZipFile(f.name) as zf:
+        init_py = zf.read("deep_gemm/__init__.py").decode()
+        mega_py = zf.read("deep_gemm/mega/__init__.py").decode()
+        for symbol in [
+            "transform_weights_for_mega_moe_sm90",
+            "transform_weights_for_mega_moe_sm90_fp4",
+            "fp8_fp4_mega_moe",
+        ]:
+            assert symbol in init_py or symbol in mega_py, symbol
+        print("release wheel exports required MegaMoE symbols")
 PY
 ```
 
-**Expected result:** 如果 tag 存在，优先在 Docker build 中从该 tag 构建；如果 tag 不存在，记录 blocker，并使用本线程已授权的 Helm chart 中已出现 release wheel URL。
+**Expected result:** 确认 tag 是否存在，以及 tag 源码是否包含 `transform_weights_for_mega_moe_sm90_fp4`。如果 tag 源码包含所需符号，优先在 Docker build 中从该 tag 构建；如果 tag 源码缺少该符号但 chart 已出现的 release wheel 包含所需符号，则记录证据并使用本线程已授权的 Helm chart release wheel URL 做 image build-time 安装；不得在部署模板或 Pod 启动时下载/安装 wheel。
 
 ## C7: Workflow 和 tag 脚本验证
 
