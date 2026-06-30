@@ -411,6 +411,39 @@ git diff --check
 
 **Expected result:** `topk_hash_softplus_sqrt` 只调用 `torch.ops._moe_C.topk_softplus_sqrt`，不再 import `vllm._moe_C`，也不包含 fallback；build/package artifact 仍为 `vllm._moe_C_stable_libtorch`。该状态与 upstream main 的 `_moe_C_stable_libtorch` Python module + `torch.ops._moe_C` namespace 设计一致。
 
+## C9D: 检查已成功构建的 openai-devel 镜像
+
+**When:** 用户已在同一 integration branch 上完成 ByteIAAS workflow 成功构建，且希望复用现有镜像继续部署验证而不是重新构建。本次固定 run id 为 `28442949331`，固定候选镜像为 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130`。
+
+**Working directory:** fork-base integration 分支。
+
+```bash
+set -euo pipefail
+
+RUN_ID="28442949331"
+EXPECTED_SHA="7186cf328963d12daabe8ee47087a29111c0cb75"
+IMAGE="iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130"
+
+test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
+git merge-base --is-ancestor d3f23315c "${EXPECTED_SHA}"
+
+gh run view "${RUN_ID}" \
+  --repo bytedance-iaas/vllm \
+  --json status,conclusion,headSha,url,createdAt,updatedAt,jobs \
+  --jq '{status, conclusion, headSha, url, createdAt, updatedAt, jobs: [.jobs[] | {name, status, conclusion, url}]}'
+
+docker buildx imagetools inspect "${IMAGE}"
+
+# 本机 Docker/containerd socket 不可访问时，不把镜像内 import/CLI smoke 作为本步骤要求；
+# runtime 内容由 C13-C16 的 dev-cluster 部署和真实 router request 验证。
+docker info >/tmp/vllm-docker-info.txt 2>&1 || true
+ctr version >/tmp/vllm-ctr-version.txt 2>&1 || true
+cat /tmp/vllm-docker-info.txt
+cat /tmp/vllm-ctr-version.txt
+```
+
+**Expected result:** workflow `28442949331` 为 `completed/success`，headSha 等于 `7186cf328963d12daabe8ee47087a29111c0cb75`；候选镜像 registry manifest 可读，包含 `linux/amd64` manifest。若本机 Docker/containerd socket 因权限不可访问，记录该限制即可，不重新构建，不补充构建流程 smoke；下一步使用该 `openai-devel` image 执行 C13-C16。
+
 ## C10: Final gate 后更新远端 `iaas_main`
 
 **When:** C9 image build/publish 成功，C13 render 通过，C16 real router smoke 通过，C20/C21 measured runs 完成或对应 blocker 已在进展日志中被明确接受，并且 C22 summary 写入 artifacts 后。可接受 blocker 仅限外部环境或资源问题，例如 GPU permit 长时间排队、`dev-cluster` 临时资源不足、CR/image pull 临时失败、Onion 模型源临时不可用；render/config、镜像缺依赖、Onion init、模型完整性、vLLM 启动、router real request、KV transfer、DeepGEMM/DeepEP/Mooncake import 或 runtime 错误都必须阻止本步骤。benchmark 跑通但性能未达阈值也必须阻止本步骤；本计划性能 gate 看 Avg，不看 P50/P95/P99；阈值为 64k/1 Avg TTFT < 10s，BS512/1.5k evalscope overall output token throughput >= 14000 tokens/s。远端备份分支和保护规则必须仍存在。用户已在 2026-06-29 本线程授权本步骤；只要目标仓库、源 SHA、备份分支、验证门槛和更新方式符合本计划，不需要再次停下来审批。
@@ -507,6 +540,7 @@ ONION_MODEL="${ONION_MODEL:-DeepSeek-V4-Flash}"
 ONION_DIR="${ONION_DIR:-/data01}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash}"
 MODEL_BASE_PATH="${MODEL_BASE_PATH:-/data01}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-512}"
 WORKSPACE_ENV_SESSION_ID="${WORKSPACE_ENV_SESSION_ID:-render-only}"
 
 if [ "${GLOBAL_GPU_COUNT}" != "8" ]; then
@@ -548,6 +582,7 @@ helm template "${RELEASE}" examples/deployment/deepseek-v4-flash-pd \
   --set onion.dir="${ONION_DIR}" \
   --set model.name="${MODEL_NAME}" \
   --set model.basePath="${MODEL_BASE_PATH}" \
+  --set decode.args.maxNumSeqs="${DECODE_MAX_NUM_SEQS}" \
   --set workspaceEnv.sessionId="${WORKSPACE_ENV_SESSION_ID}" \
   --set workspaceEnv.owner=codex \
   --set workspaceEnv.purpose=vllm-dsv4-flash-pd \
@@ -559,7 +594,7 @@ if rg -n "${forbidden}" "${ARTIFACT_DIR}/rendered-${RELEASE}.yaml"; then
   exit 1
 fi
 
-rg -n "kind: StormService|replicas: 1|hostNetwork: true|oniond download model|${ONION_MODEL}|${ONION_DIR}|image: ${IMAGE}|vllm serve|vllm-router|MooncakeConnector|deep_gemm_mega_moe|deepep_low_latency" \
+rg -n "kind: StormService|replicas: 1|hostNetwork: true|oniond download model|${ONION_MODEL}|${ONION_DIR}|image: ${IMAGE}|vllm serve|vllm-router|MooncakeConnector|kv_producer|kv_consumer|deep_gemm_mega_moe|deepep_low_latency|--tensor-parallel-size|--pipeline-parallel-size|--cp-kv-cache-interleave-size|--speculative-config|--prefill|--decode|--intra-node-data-parallel-size" \
   "${ARTIFACT_DIR}/rendered-${RELEASE}.yaml"
 rg -n "nvidia.com/gpu: 8|kubernetes.io/hostname|${PREFILL_NODE}|${DECODE_NODE}" \
   "${ARTIFACT_DIR}/rendered-${RELEASE}.yaml"
@@ -579,7 +614,7 @@ rg -n "prefill and decode nodeAffinity values must be disjoint" \
   "${ARTIFACT_DIR}/rendered-invalid-same-node.err"
 ```
 
-**Expected result:** render 成功；prefill/decode workload 继续使用 `kind: StormService`；replica shape 为 `1P1D`，即 `stormService.replicas=1`、`prefill.replicas=1`、`decode.replicas=1`、`router.replicas=1`；`global.gpuCount=8` 渲染为 prefill 和 decode 的 `nvidia.com/gpu: 8` request/limit；`PREFILL_NODE` 与 `DECODE_NODE` 必须非空且不同，并分别出现在 prefill/decode required nodeAffinity；router 默认使用 `ROUTER_NODE=${DECODE_NODE}`；prefill、decode、router 默认保留 `hostNetwork: true`；serving container 和 Onion model prepare initContainer 都使用同一个新镜像 `global.image`；Onion 模型准备路径存在；没有 runtime hotfix、`git clone`、`pip install`、`apt install`、wheel download/install 或 runtime router install；同一节点负例必须被 Helm validation 拒绝。
+**Expected result:** render 成功；prefill/decode workload 继续使用 `kind: StormService`；replica shape 为 `1P1D`，即 `stormService.replicas=1`、`prefill.replicas=1`、`decode.replicas=1`、`router.replicas=1`；`global.gpuCount=8` 渲染为 prefill 和 decode 的 `nvidia.com/gpu: 8` request/limit；`PREFILL_NODE` 与 `DECODE_NODE` 必须非空且不同，并分别出现在 prefill/decode required nodeAffinity；router 默认使用 `ROUTER_NODE=${DECODE_NODE}`；prefill、decode、router 默认保留 `hostNetwork: true`；serving container 和 Onion model prepare initContainer 都使用同一个新镜像 `global.image`；Onion 模型准备路径存在；prefill/decode KV roles 分别为 `kv_producer`/`kv_consumer`；prefill 渲染 servingkit 对齐的 `dataParallelSize=1`、`tensorParallelSize=4`、`pipelineParallelSize=2`；decode 渲染 servingkit 对齐的 `dataParallelSize=8`、`port=8001`、`cpKvCacheInterleaveSize=256`、`deep_gemm_mega_moe`、MTP speculative config；router 默认关闭 service discovery 并渲染静态 `--prefill http://${PREFILL_NODE}:8000 8998` 与 `--decode http://${DECODE_NODE}:8001`，`intra-node-data-parallel-size=1`；`--max-model-len` 不应出现在 rendered command 中；只有 `decode.args.maxNumSeqs=512` 是为 BS512/1.5k benchmark 做的显式执行期覆盖；没有 runtime hotfix、`git clone`、`pip install`、`apt install`、wheel download/install 或 runtime router install；同一节点负例必须被 Helm validation 拒绝。
 
 ## C14: dev-cluster preflight, registry, and GPU permit
 
@@ -690,6 +725,7 @@ ONION_MODEL="${ONION_MODEL:-DeepSeek-V4-Flash}"
 ONION_DIR="${ONION_DIR:-/data01}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash}"
 MODEL_BASE_PATH="${MODEL_BASE_PATH:-/data01}"
+DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-512}"
 WORKSPACE_ENV_SESSION_ID="${WORKSPACE_ENV_SESSION_ID:?set WORKSPACE_ENV_SESSION_ID to the granted workspace-env session id from C14}"
 
 if [ "${GLOBAL_GPU_COUNT}" != "8" ]; then
@@ -739,6 +775,7 @@ helm upgrade --install "${RELEASE}" examples/deployment/deepseek-v4-flash-pd \
   --set onion.dir="${ONION_DIR}" \
   --set model.name="${MODEL_NAME}" \
   --set model.basePath="${MODEL_BASE_PATH}" \
+  --set decode.args.maxNumSeqs="${DECODE_MAX_NUM_SEQS}" \
   --set workspaceEnv.sessionId="${WORKSPACE_ENV_SESSION_ID}" \
   --set workspaceEnv.owner=codex \
   --set workspaceEnv.purpose=vllm-dsv4-flash-pd \
@@ -749,7 +786,7 @@ helm upgrade --install "${RELEASE}" examples/deployment/deepseek-v4-flash-pd \
 kubectl get all -n "${NAMESPACE}" -o wide | tee "${ARTIFACT_DIR}/kubectl-get-all-after-deploy.txt"
 ```
 
-**Expected result:** Helm release 安装成功，`1P1D` prefill/decode/router workloads 开始创建；prefill 和 decode 分别带不同节点的 required nodeAffinity，并各自请求 8 张 GPU；router 默认跟随 decode 节点。若 release 已存在且不是本任务创建，停止，不接管未知 owner。
+**Expected result:** Helm release 安装成功，`1P1D` prefill/decode/router workloads 开始创建；prefill 和 decode 分别带不同节点的 required nodeAffinity，并各自请求 8 张 GPU；P/D/router 运行参数与 servingkit `perf/vllm_dsv4` SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 保持语义一致，只有 image、Onion 模型准备、节点参数化、删除 runtime install/hotfix 和 `decode.args.maxNumSeqs=512` 是本计划允许的显式差异；`--max-model-len` 不应出现在 rendered command 中；router 默认跟随 decode 节点。若 release 已存在且不是本任务创建，停止，不接管未知 owner。
 
 ## C16: Deployment readiness and real router smoke
 

@@ -93,32 +93,17 @@ data:
 
     ulimit -l unlimited || true
     ulimit -s 67108864 || true
-    export ROLE_ALL2ALL_BACKEND={{ .Values.prefill.args.all2allBackend | quote }}
+    export ROLE_ALL2ALL_BACKEND={{ ternary .Values.prefill.args.all2allBackend "" (eq (int .Values.vllm.deepEPEnabled) 1) | quote }}
     export VLLM_KV_CONNECTOR={{ .Values.vllm.kvTransfer.kv_connector | quote }}
     source /opt/vllm-config/nccl_env.sh || true
 
     args=(
       {{ include "deepseek-v4-flash-pd.modelPath" . | quote }}
+      "--host" {{ .Values.vllm.host | quote }}
+      "--port" {{ .Values.prefill.port | quote }}
       "--served-model-name" {{ .Values.model.servedName | quote }}
       {{- if .Values.vllm.trustRemoteCode }}
       "--trust-remote-code"
-      {{- end }}
-      "--kv-cache-dtype" {{ .Values.vllm.kvCacheDtype | quote }}
-      "--block-size" {{ .Values.vllm.blockSize | quote }}
-      "--port" {{ .Values.prefill.port | quote }}
-      "--data-parallel-size" {{ .Values.prefill.args.dataParallelSize | quote }}
-      "--data-parallel-size-local" {{ .Values.prefill.args.dataParallelSizeLocal | quote }}
-      "--data-parallel-start-rank" {{ .Values.prefill.args.dataParallelStartRank | quote }}
-      "--data-parallel-address" "${HOST_IP}"
-      "--data-parallel-rpc-port" {{ .Values.prefill.args.dataParallelRpcPort | quote }}
-      {{- if .Values.vllm.enableExpertParallel }}
-      "--enable-expert-parallel"
-      {{- end }}
-      {{- if .Values.prefill.args.all2allBackend }}
-      "--all2all-backend" {{ .Values.prefill.args.all2allBackend | quote }}
-      {{- end }}
-      {{- if .Values.prefill.args.noAsyncScheduling }}
-      "--no-async-scheduling"
       {{- end }}
       "--tokenizer-mode" {{ .Values.vllm.tokenizerMode | quote }}
       "--tool-call-parser" {{ .Values.vllm.toolCallParser | quote }}
@@ -126,14 +111,52 @@ data:
       "--enable-auto-tool-choice"
       {{- end }}
       "--reasoning-parser" {{ .Values.vllm.reasoningParser | quote }}
+      "--kv-cache-dtype" {{ .Values.vllm.kvCacheDtype | quote }}
+      "--block-size" {{ .Values.vllm.blockSize | quote }}
+      "--data-parallel-size" {{ .Values.prefill.args.dataParallelSize | quote }}
+      {{- if .Values.prefill.args.dataParallelSizeLocal }}
+      "--data-parallel-size-local" {{ .Values.prefill.args.dataParallelSizeLocal | quote }}
+      "--data-parallel-start-rank" {{ default 0 .Values.prefill.args.dataParallelStartRank | quote }}
+      "--data-parallel-address" {{ default "${HOST_IP}" .Values.prefill.args.dataParallelAddress | quote }}
+      {{- if .Values.prefill.args.dataParallelRpcPort }}
+      "--data-parallel-rpc-port" {{ .Values.prefill.args.dataParallelRpcPort | quote }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.prefill.args.tensorParallelSize }}
+      "--tensor-parallel-size" {{ .Values.prefill.args.tensorParallelSize | quote }}
+      {{- end }}
+      {{- if .Values.prefill.args.pipelineParallelSize }}
+      "--pipeline-parallel-size" {{ .Values.prefill.args.pipelineParallelSize | quote }}
+      {{- end }}
+      {{- if .Values.prefill.args.cpKvCacheInterleaveSize }}
+      "--cp-kv-cache-interleave-size" {{ .Values.prefill.args.cpKvCacheInterleaveSize | quote }}
+      {{- end }}
+      {{- if .Values.prefill.args.enableExpertParallel }}
+      "--enable-expert-parallel"
+      {{- end }}
+      {{- if and (eq (int .Values.vllm.deepEPEnabled) 1) .Values.prefill.args.all2allBackend }}
+      "--all2all-backend" {{ .Values.prefill.args.all2allBackend | quote }}
+      {{- end }}
+      {{- if .Values.prefill.args.enablePrefixCaching }}
+      "--enable-prefix-caching"
+      {{- end }}
+      {{- if .Values.prefill.args.noAsyncScheduling }}
+      "--no-async-scheduling"
+      {{- end }}
+      {{- if .Values.vllm.maxModelLen }}
       "--max-model-len" {{ .Values.vllm.maxModelLen | quote }}
+      {{- end }}
       "--max-num-batched-tokens" {{ .Values.prefill.args.maxNumBatchedTokens | quote }}
       "--max-num-seqs" {{ .Values.prefill.args.maxNumSeqs | quote }}
+      {{- if and (eq (int .Values.vllm.deepEPEnabled) 1) .Values.prefill.args.enableDbo }}
+      "--enable-dbo"
+      "--dbo-prefill-token-threshold" {{ .Values.prefill.args.dboPrefillTokenThreshold | quote }}
+      {{- end }}
       {{- if .Values.prefill.args.enforceEager }}
       "--enforce-eager"
       {{- end }}
-      {{- if .Values.vllm.enableSleepMode }}
-      "--enable-sleep-mode"
+      {{- if .Values.prefill.args.compilationConfig }}
+      "--compilation-config" {{ .Values.prefill.args.compilationConfig | quote }}
       {{- end }}
       {{- if .Values.vllm.noDisableHybridKvCacheManager }}
       "--no-disable-hybrid-kv-cache-manager"
@@ -141,12 +164,14 @@ data:
       {{- if .Values.vllm.disableUvicornAccessLog }}
       "--disable-uvicorn-access-log"
       {{- end }}
-      "--kv-transfer-config" '{{ include "deepseek-v4-flash-pd.kvTransferConfigJson" . }}'
+      "--kv-transfer-config" '{{ include "deepseek-v4-flash-pd.kvTransferConfigJsonForRole" (dict "root" . "role" .Values.prefill.kvTransfer.role) }}'
       {{- range .Values.prefill.extraArgs }}
       {{ . | quote }}
       {{- end }}
     )
 
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+    unset NO_PROXY no_proxy
     exec vllm serve "${args[@]}"
   start-decode.sh: |
     #!/usr/bin/env bash
@@ -154,29 +179,17 @@ data:
 
     ulimit -l unlimited || true
     ulimit -s 67108864 || true
-    export ROLE_ALL2ALL_BACKEND={{ .Values.decode.args.all2allBackend | quote }}
+    export ROLE_ALL2ALL_BACKEND={{ ternary .Values.decode.args.all2allBackend "" (eq (int .Values.vllm.deepEPEnabled) 1) | quote }}
     export VLLM_KV_CONNECTOR={{ .Values.vllm.kvTransfer.kv_connector | quote }}
     source /opt/vllm-config/nccl_env.sh || true
 
     args=(
       {{ include "deepseek-v4-flash-pd.modelPath" . | quote }}
+      "--host" {{ .Values.vllm.host | quote }}
+      "--port" {{ .Values.decode.port | quote }}
       "--served-model-name" {{ .Values.model.servedName | quote }}
       {{- if .Values.vllm.trustRemoteCode }}
       "--trust-remote-code"
-      {{- end }}
-      "--kv-cache-dtype" {{ .Values.vllm.kvCacheDtype | quote }}
-      "--block-size" {{ .Values.vllm.blockSize | quote }}
-      "--port" {{ .Values.decode.port | quote }}
-      "--data-parallel-size" {{ .Values.decode.args.dataParallelSize | quote }}
-      "--data-parallel-size-local" {{ .Values.decode.args.dataParallelSizeLocal | quote }}
-      "--data-parallel-start-rank" {{ .Values.decode.args.dataParallelStartRank | quote }}
-      "--data-parallel-address" "${HOST_IP}"
-      "--data-parallel-rpc-port" {{ .Values.decode.args.dataParallelRpcPort | quote }}
-      {{- if .Values.vllm.enableExpertParallel }}
-      "--enable-expert-parallel"
-      {{- end }}
-      {{- if .Values.decode.args.all2allBackend }}
-      "--all2all-backend" {{ .Values.decode.args.all2allBackend | quote }}
       {{- end }}
       "--tokenizer-mode" {{ .Values.vllm.tokenizerMode | quote }}
       "--tool-call-parser" {{ .Values.vllm.toolCallParser | quote }}
@@ -184,12 +197,51 @@ data:
       "--enable-auto-tool-choice"
       {{- end }}
       "--reasoning-parser" {{ .Values.vllm.reasoningParser | quote }}
+      "--kv-cache-dtype" {{ .Values.vllm.kvCacheDtype | quote }}
+      "--block-size" {{ .Values.vllm.blockSize | quote }}
+      "--data-parallel-size" {{ .Values.decode.args.dataParallelSize | quote }}
+      {{- if .Values.decode.args.dataParallelSizeLocal }}
+      "--data-parallel-size-local" {{ .Values.decode.args.dataParallelSizeLocal | quote }}
+      "--data-parallel-start-rank" {{ default 0 .Values.decode.args.dataParallelStartRank | quote }}
+      "--data-parallel-address" {{ default "${HOST_IP}" .Values.decode.args.dataParallelAddress | quote }}
+      {{- if .Values.decode.args.dataParallelRpcPort }}
+      "--data-parallel-rpc-port" {{ .Values.decode.args.dataParallelRpcPort | quote }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.decode.args.tensorParallelSize }}
+      "--tensor-parallel-size" {{ .Values.decode.args.tensorParallelSize | quote }}
+      {{- end }}
+      {{- if .Values.decode.args.pipelineParallelSize }}
+      "--pipeline-parallel-size" {{ .Values.decode.args.pipelineParallelSize | quote }}
+      {{- end }}
+      {{- if .Values.decode.args.cpKvCacheInterleaveSize }}
+      "--cp-kv-cache-interleave-size" {{ .Values.decode.args.cpKvCacheInterleaveSize | quote }}
+      {{- end }}
+      {{- if .Values.decode.args.enableExpertParallel }}
+      "--enable-expert-parallel"
+      {{- end }}
+      {{- if and (eq (int .Values.vllm.deepEPEnabled) 1) .Values.decode.args.all2allBackend }}
+      "--all2all-backend" {{ .Values.decode.args.all2allBackend | quote }}
+      {{- end }}
+      {{- if .Values.decode.args.moeBackend }}
+      "--moe-backend" {{ .Values.decode.args.moeBackend | quote }}
+      {{- end }}
+      {{- if .Values.decode.args.enablePrefixCaching }}
+      "--enable-prefix-caching"
+      {{- end }}
+      {{- if .Values.vllm.maxModelLen }}
       "--max-model-len" {{ .Values.vllm.maxModelLen | quote }}
+      {{- end }}
       "--max-num-seqs" {{ .Values.decode.args.maxNumSeqs | quote }}
       "--max-num-batched-tokens" {{ .Values.decode.args.maxNumBatchedTokens | quote }}
+      {{- if .Values.decode.args.compilationConfig }}
       "--compilation-config" {{ .Values.decode.args.compilationConfig | quote }}
-      {{- if .Values.vllm.enableSleepMode }}
-      "--enable-sleep-mode"
+      {{- end }}
+      {{- if .Values.decode.args.speculativeConfig }}
+      "--speculative-config" {{ .Values.decode.args.speculativeConfig | quote }}
+      {{- end }}
+      {{- if .Values.decode.args.enforceEager }}
+      "--enforce-eager"
       {{- end }}
       {{- if .Values.vllm.noDisableHybridKvCacheManager }}
       "--no-disable-hybrid-kv-cache-manager"
@@ -197,12 +249,14 @@ data:
       {{- if .Values.vllm.disableUvicornAccessLog }}
       "--disable-uvicorn-access-log"
       {{- end }}
-      "--kv-transfer-config" '{{ include "deepseek-v4-flash-pd.kvTransferConfigJson" . }}'
+      "--kv-transfer-config" '{{ include "deepseek-v4-flash-pd.kvTransferConfigJsonForRole" (dict "root" . "role" .Values.decode.kvTransfer.role) }}'
       {{- range .Values.decode.extraArgs }}
       {{ . | quote }}
       {{- end }}
     )
 
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+    unset NO_PROXY no_proxy
     exec vllm serve "${args[@]}"
   start-router.sh: |
     #!/usr/bin/env bash
@@ -219,6 +273,13 @@ data:
       "--service-discovery-namespace" {{ .Release.Namespace | quote }}
       "--prefill-selector" {{ printf "storm-service-name=%s" (include "deepseek-v4-flash-pd.fullname" .) | quote }} "role-name=prefill"
       "--decode-selector" {{ printf "storm-service-name=%s" (include "deepseek-v4-flash-pd.fullname" .) | quote }} "role-name=decode"
+      {{- else }}
+      {{- range .Values.prefill.nodeAffinity.values }}
+      "--prefill" {{ printf "http://%s:%v" . $.Values.prefill.port | quote }} {{ $.Values.prefill.bootstrapPort | quote }}
+      {{- end }}
+      {{- range .Values.decode.nodeAffinity.values }}
+      "--decode" {{ printf "http://%s:%v" . $.Values.decode.port | quote }}
+      {{- end }}
       {{- end }}
       "--host" {{ .Values.router.host | quote }}
       "--port" {{ .Values.router.port | quote }}
@@ -229,4 +290,6 @@ data:
       {{- end }}
     )
 
+    unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+    unset NO_PROXY no_proxy
     exec vllm-router "${args[@]}"

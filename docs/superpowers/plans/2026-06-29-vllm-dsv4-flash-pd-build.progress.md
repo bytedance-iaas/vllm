@@ -443,3 +443,72 @@
   - `git show 103f86c7b -- vllm/platforms/interface.py` 显示新增 suppress 的 legacy `vllm._moe_C` import；该点不会直接失败，因为 `ImportError` 被 suppress。
   - 当前修改删除 `vllm/_custom_ops.py::topk_hash_softplus_sqrt` 内的 hard import，保留 `hash_indices_table` dtype 兼容逻辑和 `torch.ops._moe_C.topk_softplus_sqrt` 调用。
 - Validation plan: 执行命令引用 `C9C`；若通过，提交并按 `C9` 重启 ByteIAAS workflow。
+
+### P32: Successful user build image accepted for next deployment validation
+
+- Summary: 用户已在 `codex/vllm-dsv4-fork-base-byteiaas-build` 上继续修正构建并完成成功 ByteIAAS workflow run `28442949331`。该 run 的 headSha 是当前分支 HEAD `7186cf328963d12daabe8ee47087a29111c0cb75`，且包含此前批准的 upstream-main alignment 提交 `d3f23315c`；候选 `openai-devel` 镜像 registry/static 检查通过。当前不需要重新构建，后续直接使用该镜像进入 C13-C16 部署验证。
+- Evidence:
+  - `git rev-parse HEAD` 返回 `7186cf328963d12daabe8ee47087a29111c0cb75`，当前分支为 `codex/vllm-dsv4-fork-base-byteiaas-build`。
+  - `git merge-base --is-ancestor d3f23315c 7186cf328963d12daabe8ee47087a29111c0cb75` 成功，说明删除 `topk_hash_softplus_sqrt` hard import 的 upstream-main alignment 已包含在当前构建 SHA 中。
+  - `rg -n "import vllm\\._moe_C|_moe_C_stable_libtorch|topk_hash_softplus_sqrt" vllm/_custom_ops.py setup.py CMakeLists.txt cmake -S` 显示 `vllm/_custom_ops.py::topk_hash_softplus_sqrt` 不再 hard import `vllm._moe_C`；build/package artifact 仍为 `_moe_C_stable_libtorch`。
+  - `gh run view 28442949331 --repo bytedance-iaas/vllm --json status,conclusion,headSha,url,createdAt,updatedAt,jobs` 返回 `status=completed`、`conclusion=success`、`headSha=7186cf328963d12daabe8ee47087a29111c0cb75`；`build-wheel / build-wheel` 和 `build-image / build-and-publish-image` 两个 job 均为 success。
+  - Workflow image job logs 记录发布 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-cu130` 和 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130`；其中 `openai-devel` digest 为 `sha256:f38ccbf3f1b126e1aaf5621ed6abf51b590424ac48fad74d03e3f24b73a153a7`。
+  - `docker buildx imagetools inspect iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130` 返回 OCI image index digest `sha256:f38ccbf3f1b126e1aaf5621ed6abf51b590424ac48fad74d03e3f24b73a153a7`，包含 `linux/amd64` manifest `sha256:429013e1edb16888a0a0ad3776b5ae6366eb2cbea733b6107dff88021cfe65f0`。
+  - 本机 `docker info` 无法访问 `/var/run/docker.sock`，`ctr version` 无法访问 `/run/containerd/containerd.sock`；因此本步骤只做 registry/static image check，不做本地容器运行、镜像内 import/CLI smoke，也不向构建流程补充 smoke。
+- Decision: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130` 可作为下一轮 `dev-cluster` 部署验证候选镜像；runtime 内容是否满足要求由 C13 render、C14 preflight、C15 deploy 和 C16 真实 router smoke 验证。
+
+### P33: Re-aligned deployment template with current servingkit chart semantics
+
+- Summary: 用户指出计划要求部署方式不应与 servingkit `perf/vllm_dsv4/vllm/deepseek/deepseek-v4-flash-pd` 严重不对齐。已重新 fetch servingkit `perf/vllm_dsv4` 并以 SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 为当前参考基准，收敛 vLLM 仓库中的部署模板和计划说明。
+- Evidence:
+  - `git fetch origin perf/vllm_dsv4:refs/tmp/perf-vllm-dsv4` 成功，`git rev-parse refs/tmp/perf-vllm-dsv4` 返回 `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69`。
+  - servingkit 当前参考 values 的关键语义：prefill `kvTransfer.role=kv_producer`、`port=8000`、`dataParallelSize=1`、`tensorParallelSize=4`、`pipelineParallelSize=2`、`all2allBackend=""`、`enableExpertParallel=false`、`maxNumBatchedTokens=32768`、`maxNumSeqs=16`；decode `kvTransfer.role=kv_consumer`、`port=8001`、`dataParallelSize=8`、`cpKvCacheInterleaveSize=256`、`enableExpertParallel=true`、`moeBackend=deep_gemm_mega_moe`、`enablePrefixCaching=true`、MTP speculative config；router `serviceDiscovery.enabled=false`、静态 `--prefill/--decode`、`intraNodeDataParallelSize=1`。
+  - 已更新 `examples/deployment/deepseek-v4-flash-pd/values.yaml`：移除调试残留 `prefill.args.maxNumBatchedTokens=2048` 和 `env.decode.NVSHMEM_QP_DEPTH=2048`；默认 P/D/router 参数回到 servingkit 当前语义；保留计划允许的差异：`global.image` 由执行时填入、Onion 替代 TOS、节点参数化、删除 runtime install/hotfix。
+  - 已更新 `_helpers.tpl` 和 `configmap.yaml`：新增 `kvTransferConfigJsonForRole`，prefill/decode 分别渲染 `kv_producer`/`kv_consumer`；支持 servingkit 当前 TP/PP/CP/MegaMoE/MTP/静态 router 参数；保留 `command -v vllm-router` 检查但不做 runtime install。
+  - 已更新主计划 M7 和命令引用 C13/C15：chart 默认值跟随 servingkit 当前语义；当时曾把 `vllm.maxModelLen=66000` 和 `decode.args.maxNumSeqs=512` 作为执行期覆盖，该点已在 P34 被用户要求撤销，后续只保留 `decode.args.maxNumSeqs=512`。
+  - `helm template dsv4-flash-pd examples/deployment/deepseek-v4-flash-pd ... --set vllm.maxModelLen=66000 --set decode.args.maxNumSeqs=512` 曾通过，并保存到 `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd.yaml`；该 render 已被 P34 supersede，后续不得使用带 `vllm.maxModelLen=66000` 的 manifest。forbidden pattern `runtimePatch|git clone|pip install|apt install|install_deepgemm|ensure_pip_package|wheelURL|wheelPath|/tmp/vllm-runtime-patch|vllm-router.*pip` 无命中。
+  - rendered manifest 关键参数检查通过：`kv_producer`、`kv_consumer`、prefill `--tensor-parallel-size "4"`、`--pipeline-parallel-size "2"`、decode `--port "8001"`、`--data-parallel-size "8"`、`--cp-kv-cache-interleave-size "256"`、`--moe-backend "deep_gemm_mega_moe"`、`--speculative-config`、router `--prefill http://192.168.1.148:8000 8998`、`--decode http://192.168.1.186:8001`、`--intra-node-data-parallel-size "1"` 均存在。
+  - 同节点负例 `prefill.nodeAffinity.values[0]=same-node` 与 `decode.nodeAffinity.values[0]=same-node` 被 Helm validation 拒绝，错误包含 `prefill and decode nodeAffinity values must be disjoint`。
+  - `helm lint examples/deployment/deepseek-v4-flash-pd ...` 通过，只有 `Chart.yaml: icon is recommended` informational message；`git diff --check` 通过。
+- Decision: 后续部署验证不得继续使用之前发散的 DP8 prefill/high_throughput、decode 8000、router service discovery、router intra-node DP8 或调试注入的 `NVSHMEM_QP_DEPTH=2048` 路线，除非用户再次明确要求偏离 servingkit 当前 chart。
+
+### P34: Removed explicit vllm.maxModelLen override
+
+- Summary: 用户明确要求不使用 `vllm.maxModelLen=66000`。已更新主计划和命令引用，C13/C15 不再设置 `vllm.maxModelLen`，部署沿用 servingkit 当前 `maxModelLen: null` 行为；rendered command 中不应出现 `--max-model-len`。
+- Evidence:
+  - 从 C13/C15 命令引用删除 `MAX_MODEL_LEN="${MAX_MODEL_LEN:-66000}"` 和 `--set vllm.maxModelLen="${MAX_MODEL_LEN}"`。
+  - 主计划 M7 的允许差异改为只保留 `decode.args.maxNumSeqs=512` 作为 BS512/1.5k benchmark 显式覆盖，并新增禁止使用 `vllm.maxModelLen=66000` 的说明。
+  - `examples/deployment/deepseek-v4-flash-pd/values.yaml` 保持 `vllm.maxModelLen: null`。
+  - 重新执行 `helm template dsv4-flash-pd examples/deployment/deepseek-v4-flash-pd ... --set decode.args.maxNumSeqs=512` 并覆盖 `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd.yaml`；`rg -- "--max-model-len|\"66000\"|vllm.maxModelLen"` 对 rendered manifest 无命中。
+  - 新 rendered manifest 仍保留 servingkit 对齐关键项：prefill `--tensor-parallel-size "4"`、`--pipeline-parallel-size "2"`、`kv_role":"kv_producer"`；decode `--cp-kv-cache-interleave-size "256"`、`--moe-backend "deep_gemm_mega_moe"`、`--max-num-seqs "512"`、`kv_role":"kv_consumer"`；router 静态 `--prefill http://192.168.1.148:8000 8998`、`--decode http://192.168.1.186:8001`、`--intra-node-data-parallel-size "1"`。
+- Decision: 后续 render/deploy/benchmark 不得通过 values、命令行或临时 patch 显式设置 `vllm.maxModelLen=66000`；如果 64k/1 请求因此受限，应记录为与 servingkit 对齐后的实际行为，而不是重新加 `--max-model-len`。
+
+### P35: Second deployment failed on CUDA 12 Mooncake wheel inside CUDA 13 image
+
+- Summary: 使用用户成功构建的候选镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130` 执行第二轮 `dev-cluster` 部署验证。部署模板、节点约束、Onion init 和 router 静态 P/D 模式均按预期生效，但 prefill/decode 在 vLLM 初始化阶段失败。根因是镜像内通用 `mooncake-transfer-engine` wheel 依赖 CUDA 12 runtime，在 CUDA 13.0.2 image 中导入 `mooncake.engine` 时报 `libcudart.so.12` 缺失；这是镜像构建依赖问题，不应通过 runtime hotfix/install 规避。
+- Deployment evidence:
+  - C14 session: `codex-vllm-dsv4-flash-pd-20260630-214036-660370`。
+  - GPU permit: `96a89e60-ddba-41a0-89a9-b06ecbc07379`，请求 16 GPU，部署失败后已释放。
+  - 选定节点：prefill `192.168.1.148`，decode `192.168.1.186`，router `192.168.1.186`。
+  - Namespace: `vllm-dsv4-flash-pd`；Helm release: `dsv4-flash-pd`。
+  - Prefill pod `dsv4-flash-pd-roleset-dncp6-prefill-7b899c7478-0` 调度到 `192.168.1.148`，container `prefill` 请求 8 GPU。
+  - Decode pod `dsv4-flash-pd-roleset-dncp6-decode-6497676765-0` 调度到 `192.168.1.186`，container `decode` 请求 8 GPU。
+  - Router pod `dsv4-flash-pd-router-5b9fb8f67b-2lssk` 调度到 `192.168.1.186`，不请求 GPU。
+  - Onion init 已完成并因已有模型目录幂等跳过；router 启动为静态 P/D URL 模式：`prefill_urls: [("http://192.168.1.148:8000", Some(8998))]`，`decode_urls: ["http://192.168.1.186:8001"]`，`discovery: None`。
+- Failure evidence:
+  - 失败证据保存于 `artifacts/2026-06-29-vllm-dsv4-flash-pd/failure-20260630-214421/` 和 `artifacts/2026-06-29-vllm-dsv4-flash-pd/failure-latest/`。
+  - Prefill previous log `failure-latest/dsv4-flash-pd-roleset-dncp6-prefill-7b899c7478-0-prefill-previous.log` 包含 `RuntimeError: Mooncake is not available`。
+  - 对应代码路径 `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` 在 `from mooncake.engine import TransferEngine` 导入失败后将 `TransferEngine=None`，随后抛出 `RuntimeError("Mooncake is not available")`。
+  - 在 router container 使用同一镜像检查：`mooncake-transfer-engine` 已安装，版本 `0.3.11.post1`；`import mooncake` 可找到 `/usr/local/lib/python3.12/dist-packages/mooncake/__init__.py`；但 `from mooncake.engine import TransferEngine` 失败，错误为 `ImportError: libcudart.so.12: cannot open shared object file: No such file or directory`。
+  - `uv pip install --system --dry-run 'mooncake-transfer-engine-cuda13==0.3.11'` 可解析到 CUDA 13 专用包，说明构建层可以改用 `mooncake-transfer-engine-cuda13`。
+- Cleanup evidence:
+  - 已中断等待中的 Helm 命令并执行 `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd`。
+  - 已执行 `kubectl delete namespace vllm-dsv4-flash-pd --ignore-not-found --wait=true --timeout=180s`，`namespace-after-delete.txt` 记录 namespace 已不存在。
+  - Permit `96a89e60-ddba-41a0-89a9-b06ecbc07379` 已释放，release artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/permit-release-after-mooncake-failure.json`。
+  - Workspace-env registry active after cleanup 为 `[]`。
+- Fix:
+  - 已在 `docker/Dockerfile` 的 `INSTALL_KV_CONNECTORS` 分支中加入 CUDA 13 特化构建逻辑：当 `CUDA_MAJOR=13` 时卸载通用 `mooncake-transfer-engine`，并安装 `mooncake-transfer-engine-cuda13>=0.3.8`。
+  - 该修复位于镜像构建阶段，不修改 `vllm/**` runtime Python 逻辑，不添加部署时安装，也不添加构建流程 import/CLI smoke。
+- Decision:
+  - 旧镜像 `v0.10.0.iaas.dev.202606302005-openai-devel-cu130` 不得继续用于 benchmark 或更新 `iaas_main`。
+  - 下一步必须提交并推送 Dockerfile 修复，按 C9 重新触发 ByteIAAS workflow，等待新镜像产出后重新执行 C13-C16。

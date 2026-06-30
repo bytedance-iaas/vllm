@@ -25,16 +25,16 @@ stormService:
   replicas: 1
 
 vllm:
+  host: 0.0.0.0
   trustRemoteCode: true
   kvCacheDtype: fp8
   blockSize: 256
-  maxModelLen: 66000
-  enableExpertParallel: true
+  maxModelLen: null
+  deepEPEnabled: 1
   tokenizerMode: deepseek_v4
   toolCallParser: deepseek_v4
   enableAutoToolChoice: true
   reasoningParser: deepseek_v4
-  enableSleepMode: true
   disableUvicornAccessLog: true
   noDisableHybridKvCacheManager: true
   transferBackend: mooncake
@@ -54,32 +54,49 @@ prefill:
   port: 8000
   hostNetwork: true
   bootstrapPort: 8998
+  kvTransfer:
+    role: kv_producer
   nodeAffinity:
     enabled: true
     key: kubernetes.io/hostname
     operator: In
     values: []
   args:
-    all2allBackend: deepep_high_throughput
-    dataParallelSize: 8
-    dataParallelSizeLocal: 8
-    dataParallelStartRank: 0
-    dataParallelRpcPort: 16001
-    maxNumBatchedTokens: 66000
-    maxNumSeqs: 2
+    all2allBackend: ""
+    dataParallelSize: 1
+    dataParallelSizeLocal: null
+    dataParallelStartRank: null
+    dataParallelRpcPort: null
+    tensorParallelSize: 4
+    pipelineParallelSize: 2
+    cpKvCacheInterleaveSize: null
+    enableExpertParallel: false
+    enablePrefixCaching: false
+    maxNumBatchedTokens: 32768
+    maxNumSeqs: 16
+    enableDbo: false
+    dboPrefillTokenThreshold: 256
     enforceEager: true
+    compilationConfig: ""
     noAsyncScheduling: true
   extraArgs:
     - --gpu-memory-utilization
-    - "0.70"
+    - "0.85"
+    - --aggregate-engine-logging
+    - --renderer-num-workers
+    - "8"
+    - --api-server-count
+    - "4"
   extraEnv: {}
 
 decode:
   replicas: 1
   podGroupSize: 1
-  port: 8000
+  port: 8001
   hostNetwork: true
   bootstrapPort: 9889
+  kvTransfer:
+    role: kv_consumer
   nodeAffinity:
     enabled: true
     key: kubernetes.io/hostname
@@ -88,15 +105,28 @@ decode:
   args:
     all2allBackend: deepep_low_latency
     dataParallelSize: 8
-    dataParallelSizeLocal: 8
-    dataParallelStartRank: 0
-    dataParallelRpcPort: 16002
+    dataParallelSizeLocal: null
+    dataParallelStartRank: null
+    dataParallelRpcPort: null
+    tensorParallelSize: 1
+    pipelineParallelSize: 1
+    cpKvCacheInterleaveSize: 256
+    enableExpertParallel: true
+    moeBackend: deep_gemm_mega_moe
+    enablePrefixCaching: true
     maxNumBatchedTokens: 512
-    maxNumSeqs: 512
-    compilationConfig: '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":512,"compile_ranges_endpoints":[512]}'
+    maxNumSeqs: 96
+    speculativeConfig: '{"method":"mtp","num_speculative_tokens":4}'
+    enforceEager: false
+    compilationConfig: '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
   extraArgs:
     - --gpu-memory-utilization
-    - "0.70"
+    - "0.85"
+    - --aggregate-engine-logging
+    - --renderer-num-workers
+    - "8"
+    - --api-server-count
+    - "4"
   extraEnv: {}
 
 router:
@@ -109,9 +139,9 @@ router:
   host: 0.0.0.0
   port: 30000
   hostNetwork: true
-  intraNodeDataParallelSize: 8
+  intraNodeDataParallelSize: 1
   serviceDiscovery:
-    enabled: true
+    enabled: false
     port: 8000
   nodeAffinity:
     enabled: true
@@ -134,7 +164,7 @@ service:
   decode:
     enabled: true
     type: ClusterIP
-    port: 8000
+    port: 8001
     targetPort: http
 
 volumes:
@@ -180,10 +210,8 @@ env:
     VLLM_DISABLE_COMPILE_CACHE: "1"
     VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     VLLM_RPC_TIMEOUT: "600000"
-    VLLM_LOG_STATS_INTERVAL: "1"
     GLOO_SOCKET_IFNAME: eth0
     NCCL_SOCKET_IFNAME: eth0
-    NCCL_DEBUG: INFO
     NCCL_MIN_NCHANNELS: "24"
     NCCL_IB_QPS_PER_CONNECTION: "8"
     NCCL_IB_ECE_ENABLE: "0"

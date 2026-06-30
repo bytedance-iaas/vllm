@@ -48,6 +48,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- toJson .Values.vllm.kvTransfer -}}
 {{- end -}}
 
+{{- define "deepseek-v4-flash-pd.kvTransferConfigJsonForRole" -}}
+{{- $cfg := deepCopy .root.Values.vllm.kvTransfer -}}
+{{- $_ := set $cfg "kv_role" .role -}}
+{{- toJson $cfg -}}
+{{- end -}}
+
 {{- define "deepseek-v4-flash-pd.modelPath" -}}
 {{- printf "%s/%s" .Values.model.basePath .Values.model.name -}}
 {{- end -}}

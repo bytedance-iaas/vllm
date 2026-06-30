@@ -1127,6 +1127,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         ); \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
+        if [ "${CUDA_MAJOR}" = "13" ]; then \
+            uv pip uninstall --system mooncake-transfer-engine || true; \
+            uv pip install --system --no-deps "mooncake-transfer-engine-cuda13>=0.3.8"; \
+        fi; \
     fi
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the

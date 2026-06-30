@@ -20,7 +20,7 @@
 - 新 `iaas_main` 起点必须是 `https://github.com/wangyicong52/vllm.git` 的 `dev/dsv4-mooncake-pp-megamoe`。
 - 只从旧 `iaas_main` 保留构建相关能力；旧 `iaas_main` 的模型、运行时、调度、kernel、connector、API 逻辑不保留。
 - Mooncake 保持当前 vLLM Dockerfile 中已有 KV connector/Mooncake 处理方式，不强制改为 Helm chart 中的 `mooncake-transfer-engine-cuda13==0.3.11`。
-- servingkit Helm chart 不直接迁入本仓库；本任务在 vLLM 仓库新建一份参考其 P/D 形态的部署模板，但必须移除 runtime hotfix 和运行时安装逻辑。模型准备例外：部署模板应通过同一个新构建 vLLM 镜像中的 `oniond download model ... --turbo --dir ...` 做幂等模型下载，不能在 Pod 启动时安装 Onion 或其他代码库。
+- servingkit Helm chart 不直接迁入本仓库；本任务在 vLLM 仓库新建一份参考其 P/D 形态的部署模板，但必须移除 runtime hotfix 和运行时安装逻辑。部署语义必须以当前已 fetch 的 servingkit `perf/vllm_dsv4` SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 为基准，覆盖 P/D role、router 参数、端口、TP/PP/DP、KV transfer role、DeepEP/MegaMoE/MTP 参数、Service/StormService/ConfigMap 结构和 values 命名；不得因为调试失败随意发散。模型准备例外：部署模板应通过同一个新构建 vLLM 镜像中的 `oniond download model ... --turbo --dir ...` 做幂等模型下载，不能在 Pod 启动时安装 Onion 或其他代码库。
 - 不新增、不恢复 `scripts/ci/check_byteiaas_dsv4_runtime.py`，也不在镜像构建流程补充 import/CLI smoke；构建后只做镜像构建结果、部署渲染、真实服务路径和 benchmark 验证。
 - vLLM runtime 源码逻辑保持 fork 基线；本任务不得用 `vllm/` Python runtime fallback、模型逻辑、算子调用逻辑或调度逻辑修改来绕过部署失败。明确禁止在 `vllm/_custom_ops.py` 或其它 `vllm/**` runtime Python 文件中加入 `_moe_C` 到 `_moe_C_stable_libtorch` 的 `ImportError` fallback。vLLM 源码相关改动只允许解决构建过程暴露的问题，例如 Dockerfile、workflow、`setup.py`/CMake/package-data、wheel extraction 或扩展产物命名/打包问题；如需触碰 `csrc`，范围只能是扩展构建入口、目标导出或 package artifact 生成，不能改变算子语义。例外：用户已在 2026-06-30 明确批准按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，仅删除 `wangyicong52` fork 提交 `f7c4c621d` 引入的 `import vllm._moe_C` hard import；不得扩展成其它 runtime 逻辑改动。
 - Kubernetes 目标环境固定为 `dev-cluster`，通过 `/data00/home/hanhan.hank/workspace/env/bin/envctl` 访问；当前只读验证 `envctl validate dev-cluster` 通过。
@@ -33,7 +33,7 @@
 ## Context Summary
 
 - servingkit Helm chart 使用 `wangyicong52/vllm.git` `dev/dsv4-mooncake-pp-megamoe` 作为 runtime overlay，因此新的源码基线应直接使用该 fork，而不是把 fork 源码拆 port 到旧 `iaas_main`。
-- servingkit `vllm/deepseek/deepseek-v4-flash-pd` 当前模板中 `global.gpuCount: 8`，prefill 和 decode 均通过 `nvidia.com/gpu: {{ .Values.global.gpuCount }}` 请求 8 张 GPU；现有 values 中 prefill/decode 都是 `replicas: 1`，prefill 使用 `dataParallelSize: 8`，decode 使用 `dataParallelSize: 8`，因此本迁移部署的 `1P1D` 必须跨两个不同节点，而不是同节点尝试调度 16 卡。
+- servingkit `vllm/deepseek/deepseek-v4-flash-pd` 当前参考 SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 中 `global.gpuCount: 8`，prefill 和 decode 均通过 `nvidia.com/gpu: {{ .Values.global.gpuCount }}` 请求 8 张 GPU；现有 values 中 prefill/decode 都是 `replicas: 1`，prefill 语义为 `kv_producer`、`port: 8000`、`dataParallelSize: 1`、`tensorParallelSize: 4`、`pipelineParallelSize: 2`、不启用 expert parallel，decode 语义为 `kv_consumer`、`port: 8001`、`dataParallelSize: 8`、`cpKvCacheInterleaveSize: 256`、`moeBackend: deep_gemm_mega_moe`、`enablePrefixCaching: true`、MTP speculative config，router 默认关闭 service discovery 并用静态 `--prefill/--decode` 指向 P/D 节点。因此本迁移部署的 `1P1D` 必须跨两个不同节点，而不是同节点尝试调度 16 卡。
 - 旧 `origin/iaas_main` 当前已知 SHA：`1ad5c27d4`，包含 ByteIAAS 日构建 workflow、Volcengine CR publish workflow、CUDA 13.0.2 image build、`INSTALL_KV_CONNECTORS=true`、`docker/byteiaas-openai-devel.Dockerfile` 和 image tag 脚本。
 - fork 当前已知 SHA：`cde7799cc`，包含 DSV4 Flash/Mooncake/PP/MegaMoE 相关源码变化；它缺少 ByteIAAS release workflow 和 `docker/byteiaas-openai-devel.Dockerfile`。
 - 关键迁移方向已经变更为：fork 源码是主线，旧 `iaas_main` 只作为构建能力来源。
@@ -99,23 +99,25 @@
 - [x] 按命令引用 `C9A` 撤销 runtime 源码 fallback 路线：取消或忽略 run `28414886195`，并从待发布分支中移除 `vllm/_custom_ops.py` fallback 修改；后续只允许 build/package 层修复 `_moe_C` artifact 问题。
 - [x] 按命令引用 `C7` 做 YAML/actionlint 和 tag script 验证。
 - [ ] 按命令引用 `C8` 做本地或 build-node Docker build；不做镜像内 import/CLI smoke。
-- [ ] 按命令引用 `C9` 或 ByteIAAS workflow 构建并发布 openai/openai-devel 镜像，记录实际 image tag/digest。
-- [ ] 更新主计划 current status 和进展日志。
+- [x] 按命令引用 `C9` 或 ByteIAAS workflow 构建并发布 openai/openai-devel 镜像，记录实际 image tag/digest；本次由用户在 run `28442949331` 完成，headSha `7186cf328963d12daabe8ee47087a29111c0cb75`。
+- [x] 按命令引用 `C9D` 检查候选 `openai-devel` 镜像 manifest：`iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130`。
+- [x] 更新主计划 current status 和进展日志。
 - Acceptance: 待发布分支不包含 `vllm/_custom_ops.py` 或其它 vLLM runtime Python fallback 修改；至少产出一个可用于 deployment values 的 image tag/digest；若本地 Docker 不可用，则 ByteIAAS workflow 成功并输出 tag/digest。
 
 ### M7: 编写无 runtime hotfix/install 的 DSV4 P/D 部署模板
 
 - [ ] 在 `examples/deployment/deepseek-v4-flash-pd/` 创建 vLLM-owned Helm/example deployment。
-- [ ] 参考 servingkit `vllm/deepseek/deepseek-v4-flash-pd` 的 P/D 形态、router 参数、StormService/Service/ConfigMap 结构和 values 命名。
+- [ ] 参考 servingkit `vllm/deepseek/deepseek-v4-flash-pd` 当前 SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 的 P/D 形态、router 参数、StormService/Service/ConfigMap 结构和 values 命名。
 - [ ] 继续使用 servingkit 现有实现中的 `StormService` 作为 prefill/decode workload 形态；不改写为 StatefulSet、Deployment 或自定义控制逻辑。
 - [ ] 删除或不引入所有 runtime hotfix/install 路径：`runtimePatch`、`git clone`、`pip install`、`install_deepgemm_wheel`、`ensure_pip_package`、wheel download、runtime DeepEP build、runtime Mooncake install、runtime `vllm-router` install。
 - [ ] values 只接受 image tag/digest、model path、参数化 node placement、P/D/router shape、env、resources、ports、hostPath/hostNetwork 等部署参数；执行部署时再填写实际节点，`prefill.hostNetwork`、`decode.hostNetwork`、`router.hostNetwork` 保留 servingkit 现状并默认开启。
 - [ ] 部署形态固定为 `1P1D`：`stormService.replicas=1`、`prefill.replicas=1`、`decode.replicas=1`、`router.replicas=1`，且 `global.gpuCount=8`。prefill 与 decode 各自请求 8 张 GPU，执行时必须填写非空且不同的 `prefill.nodeAffinity.values[0]` 和 `decode.nodeAffinity.values[0]`；router 默认跟随 decode 节点，除非执行时明确给出第三个节点。
+- [ ] chart 默认值必须与 servingkit 当前 SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 的 P/D/router 语义保持一致；只允许这些有意差异：`global.image` 留空并由执行时填入新 ByteIAAS 镜像；TOS 下载替换为 Onion initContainer；节点 IP 改为参数化；runtime hotfix/install 删除；执行 benchmark 时显式覆盖 `decode.args.maxNumSeqs=512` 以满足 BS512/1.5k 测试。不得显式设置 `vllm.maxModelLen=66000`，应沿用 servingkit 当前 `maxModelLen: null`，rendered command 中不出现 `--max-model-len`。
 - [ ] `C13` render 和 `C15` deploy 必须在 `PREFILL_NODE` 或 `DECODE_NODE` 缺失、两者相同、或 `GLOBAL_GPU_COUNT` 不是 `8` 时失败；`C14` 必须在部署前检查这两个节点均存在且 allocatable `nvidia.com/gpu` 至少为 8。
 - [ ] BS512/1.5k output throughput 是该 `1P1D` router-path 结果，全部 output 来自单个 decode 节点，不是多 decode 聚合吞吐。
 - [ ] values 增加 Onion 模型准备参数：`onion.enabled=true`、`onion.model=DeepSeek-V4-Flash`、`onion.dir=/data01`；模板用 initContainer 或等价启动前步骤执行 `oniond download model "${onion.model}" --turbo --dir "${onion.dir}"`，initContainer image 必须是同一个 `global.image`，已有模型时由 Onion 幂等跳过。
 - [ ] 按命令引用 `C13` render 并 grep forbidden patterns。
-- Acceptance: rendered manifest 使用新构建 image，prefill/decode 由 `StormService` 管理，`1P1D` replica 形态明确，prefill/decode 均渲染为 `nvidia.com/gpu: 8`，并带有不同节点的 required nodeAffinity；router 默认渲染到 decode 节点；模型数据由 Onion 准备；prefill/decode/router 命令没有运行时安装和 hotfix，P/D 形态与 servingkit chart 等价。
+- Acceptance: rendered manifest 使用新构建 image，prefill/decode 由 `StormService` 管理，`1P1D` replica 形态明确，prefill/decode 均渲染为 `nvidia.com/gpu: 8`，并带有不同节点的 required nodeAffinity；router 默认渲染到 decode 节点；模型数据由 Onion 准备；prefill/decode/router 命令没有运行时安装和 hotfix；除已列出的 image、Onion、节点参数化、删除 runtime install/hotfix、benchmark 覆盖外，P/D/router 运行参数不得与 servingkit SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 严重发散。
 
 ### M8: 在 `dev-cluster` 部署
 
@@ -191,15 +193,16 @@
 
 - 当前分支：`codex/vllm-dsv4-fork-base-byteiaas-build`，基于 fork SHA `cde7799cc66c5a4cb349156a3ca3228f9798dbc9`。
 - M1-M4 已完成：远端备份分支 `backup/iaas_main-20260629` 指向原 `origin/iaas_main` SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`，GitHub ruleset `Protect backup iaas_main branches` 已 active；ByteIAAS workflow、tag 脚本、`byteiaas-openai-devel` Dockerfile、Dockerfile 中 `vllm-router` 与 Onion CLI 构建能力已落到 fork-base 分支。
-- M5 需重新打开：本地 Docker daemon 不可访问，已改用 ByteIAAS workflow；第三次 run `28389076984` 成功产出镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606300110-cu130`，digest `sha256:574c3dc2023be9300df8e699994798f76e3f048bff81f3e6719e8726197de113`，但该镜像在 M8 启动失败于缺少 `vllm._moe_C`，因此不能进入 M9/M10。后续只允许用 build/package artifact 层修复该问题，并重新构建新镜像。
-- M7 部署模板已创建：`examples/deployment/deepseek-v4-flash-pd/` 使用 `StormService` 表达 `1P1D`，同一新镜像负责 vLLM、`vllm-router` 和 Onion 模型准备；chart 新增 Helm validation，强制 `global.gpuCount=8`、prefill/decode nodeAffinity 非空且 disjoint。
-- M8 首轮部署已清理：`dev-cluster` preflight 通过，StormService CRD 存在；首轮 16 GPU permit `3813ef32-5e13-42b7-9a1c-a36aa463dd5b` 已释放。首轮部署确认 prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；P/D 不同节点约束成立。该镜像启动失败于 `No module named 'vllm._moe_C'`，不得进入 M9 或 M10。
+- M5 需重新构建：用户构建的候选镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302005-openai-devel-cu130` registry/static 检查曾通过，但 M8 部署验证失败于 `mooncake.engine` 导入 `libcudart.so.12` 缺失。根因是 CUDA 13 镜像中通过通用 `mooncake-transfer-engine` 安装到了 CUDA 12 依赖 wheel。已在 `docker/Dockerfile` 中按构建层修复：`INSTALL_KV_CONNECTORS=true` 且 `CUDA_MAJOR=13` 时卸载通用 `mooncake-transfer-engine` 并安装 `mooncake-transfer-engine-cuda13>=0.3.8`。后续必须重新触发 ByteIAAS workflow 构建新镜像，旧 `202606302005-openai-devel-cu130` 不得继续用于 benchmark 或更新 `iaas_main`。
+- M7 部署模板已创建并在 2026-06-30 重新收敛到 servingkit `perf/vllm_dsv4` SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 的 P/D/router 语义：`examples/deployment/deepseek-v4-flash-pd/` 使用 `StormService` 表达 `1P1D`，同一新镜像负责 vLLM、`vllm-router` 和 Onion 模型准备；chart 新增 Helm validation，强制 `global.gpuCount=8`、prefill/decode nodeAffinity 非空且 disjoint。默认 values 不再保留调试残留 `NVSHMEM_QP_DEPTH=2048` 或 prefill `maxNumBatchedTokens=2048`，且不使用 `vllm.maxModelLen=66000`。
+- M8 第二轮部署已清理：`dev-cluster` preflight 通过，StormService CRD 存在；16 GPU permit `96a89e60-ddba-41a0-89a9-b06ecbc07379` 已释放。部署确认 prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；Onion init 已完成并幂等跳过；router 以静态 P/D URL 模式启动。该镜像启动失败于 `mooncake.engine` 导入 `libcudart.so.12` 缺失，证据在进展日志 `P35`，不得进入 M9 或 M10。
 - 用户在 2026-06-30 明确收窄范围：不接受 `vllm/_custom_ops.py` 中 `_moe_C` 到 `_moe_C_stable_libtorch` 的 runtime fallback；vLLM 源码修改只允许构建过程中遇到的问题。此前提交 `51b135cef854e6d72cb704068644c52d047706e5` 和 workflow run `28414886195` 被标记为无效路线，不得作为后续部署/benchmark/更新 `iaas_main` 的依据。详见进展日志 `P26`。
 - C9A 已完成：workflow run `28414886195` 已取消，`vllm/_custom_ops.py` 已恢复为 fork baseline hard import `vllm._moe_C`，且 `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过。详见进展日志 `P28`。
 - C9B 已完成：用户指出 build-side `_moe_C` rename 路线异常后，已取消 workflow run `28418542564`，并将 `CMakeLists.txt`、`setup.py`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 恢复为 upstream main/fork baseline 的 `_moe_C_stable_libtorch` build artifact 命名。上游对比证明 upstream main 的自洽路径是：构建/import `vllm._moe_C_stable_libtorch`，但注册 `torch.ops._moe_C` namespace，且 `topk_hash_softplus_sqrt` 不再 hard import `vllm._moe_C`。详见进展日志 `P30`。
 - 用户已批准按 upstream main 对齐 `topk_hash_softplus_sqrt`：删除 `f7c4c621d` 引入的 hard import，不做 fallback、不改 build artifact。详见进展日志 `P31`。
+- C9D 已完成：run `28442949331` 和候选 `openai-devel` 镜像静态检查通过；当前不需要再触发一次 C9 重构建。详见进展日志 `P32`。
 - M9/M10 尚未执行；性能不达标或服务路径未跑通时不得更新 `iaas_main`。
 
 ## Next Action
 
-按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，删除 fork 残留的 `import vllm._moe_C` hard import；静态验证、提交推送后，按命令引用 `C9` 重启 ByteIAAS workflow 构建新镜像。
+提交并推送 `docker/Dockerfile` 的 CUDA 13 Mooncake 包修复，按 C9 重新触发 ByteIAAS workflow 构建新 `openai-devel` 镜像。新镜像产出后重新执行 C13-C16；旧 `202606302005-openai-devel-cu130` 不再作为验证候选。
