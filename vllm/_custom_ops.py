@@ -2354,8 +2354,6 @@ def topk_hash_softplus_sqrt(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
 ) -> None:
-    import vllm._moe_C  # noqa: F401
-
     if hash_indices_table is not None:
         assert input_tokens is not None
         if input_tokens.dtype != topk_indices.dtype:

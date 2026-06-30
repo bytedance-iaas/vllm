@@ -432,3 +432,14 @@
   - 已按命令引用 `C9B` 恢复 `CMakeLists.txt`、`setup.py`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 到 `4fcea785fd66874046f9b828eb2fad7fbd527a63^`，即 upstream main/fork baseline 的 stable build artifact 命名。
 - Current blocker: 合理修复应是按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，删除 fork 残留的 `import vllm._moe_C` hard import，让 `current_platform.import_kernels()` 负责加载 `vllm._moe_C_stable_libtorch`。这不是 fallback，但属于 `vllm/**` runtime Python 逻辑修改；用户此前要求 vLLM 源码修改只包含构建过程中遇到的问题，因此执行前需要用户确认。
 - Prevention note: 不再尝试 build-side rename 或 runtime fallback。再次推进前必须改变假设：这是 fork 与 upstream main 的 runtime/source 对齐问题，不是 wheel artifact 缺文件问题。
+
+### P31: Approved upstream-main alignment for hash topk MoE import
+
+- Summary: 用户确认按 upstream main 对齐修复。该问题不是社区 fork base `a331589394d95d462f2993c32fe3c063146c74e8` 原有问题，而是 `wangyicong52/vllm.git` `dev/dsv4-mooncake-pp-megamoe` fork 后的提交 `f7c4c621d2595cba06a135306b7709b6d5af7804` 引入：它在 `topk_hash_softplus_sqrt` 中新增了非 suppress 的 `import vllm._moe_C`，但 build artifact 已经是 `_moe_C_stable_libtorch`。本次只删除该 hard import，不做 fallback，不改 build artifact，不改算子语义。
+- Evidence:
+  - `git merge-base refs/tmp/wang-dsv4-mooncake-pp-megamoe refs/tmp/upstream-vllm-main` 返回 `a331589394d95d462f2993c32fe3c063146c74e8`。
+  - 在 base `a331589394d95d462f2993c32fe3c063146c74e8` 上：build artifact 是 `_moe_C_stable_libtorch`，`import_kernels()` import `vllm._moe_C_stable_libtorch`，`topk_hash_softplus_sqrt` 不 hard import `vllm._moe_C`。
+  - `git show f7c4c621d -- vllm/_custom_ops.py` 显示新增 `import vllm._moe_C  # noqa: F401`。
+  - `git show 103f86c7b -- vllm/platforms/interface.py` 显示新增 suppress 的 legacy `vllm._moe_C` import；该点不会直接失败，因为 `ImportError` 被 suppress。
+  - 当前修改删除 `vllm/_custom_ops.py::topk_hash_softplus_sqrt` 内的 hard import，保留 `hash_indices_table` dtype 兼容逻辑和 `torch.ops._moe_C.topk_softplus_sqrt` 调用。
+- Validation plan: 执行命令引用 `C9C`；若通过，提交并按 `C9` 重启 ByteIAAS workflow。

@@ -22,7 +22,7 @@
 - Mooncake 保持当前 vLLM Dockerfile 中已有 KV connector/Mooncake 处理方式，不强制改为 Helm chart 中的 `mooncake-transfer-engine-cuda13==0.3.11`。
 - servingkit Helm chart 不直接迁入本仓库；本任务在 vLLM 仓库新建一份参考其 P/D 形态的部署模板，但必须移除 runtime hotfix 和运行时安装逻辑。模型准备例外：部署模板应通过同一个新构建 vLLM 镜像中的 `oniond download model ... --turbo --dir ...` 做幂等模型下载，不能在 Pod 启动时安装 Onion 或其他代码库。
 - 不新增、不恢复 `scripts/ci/check_byteiaas_dsv4_runtime.py`，也不在镜像构建流程补充 import/CLI smoke；构建后只做镜像构建结果、部署渲染、真实服务路径和 benchmark 验证。
-- vLLM runtime 源码逻辑保持 fork 基线；本任务不得用 `vllm/` Python runtime fallback、模型逻辑、算子调用逻辑或调度逻辑修改来绕过部署失败。明确禁止在 `vllm/_custom_ops.py` 或其它 `vllm/**` runtime Python 文件中加入 `_moe_C` 到 `_moe_C_stable_libtorch` 的 `ImportError` fallback。vLLM 源码相关改动只允许解决构建过程暴露的问题，例如 Dockerfile、workflow、`setup.py`/CMake/package-data、wheel extraction 或扩展产物命名/打包问题；如需触碰 `csrc`，范围只能是扩展构建入口、目标导出或 package artifact 生成，不能改变算子语义。
+- vLLM runtime 源码逻辑保持 fork 基线；本任务不得用 `vllm/` Python runtime fallback、模型逻辑、算子调用逻辑或调度逻辑修改来绕过部署失败。明确禁止在 `vllm/_custom_ops.py` 或其它 `vllm/**` runtime Python 文件中加入 `_moe_C` 到 `_moe_C_stable_libtorch` 的 `ImportError` fallback。vLLM 源码相关改动只允许解决构建过程暴露的问题，例如 Dockerfile、workflow、`setup.py`/CMake/package-data、wheel extraction 或扩展产物命名/打包问题；如需触碰 `csrc`，范围只能是扩展构建入口、目标导出或 package artifact 生成，不能改变算子语义。例外：用户已在 2026-06-30 明确批准按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，仅删除 `wangyicong52` fork 提交 `f7c4c621d` 引入的 `import vllm._moe_C` hard import；不得扩展成其它 runtime 逻辑改动。
 - Kubernetes 目标环境固定为 `dev-cluster`，通过 `/data00/home/hanhan.hank/workspace/env/bin/envctl` 访问；当前只读验证 `envctl validate dev-cluster` 通过。
 - dev-cluster GPU 工作必须先通过 workspace-env GPU Permit Queue 获取 permit；本计划默认 namespace 为 `vllm-dsv4-flash-pd`，release 为 `dsv4-flash-pd`。servingkit 模板中 `global.gpuCount=8` 会同时用于 prefill 和 decode 的 `nvidia.com/gpu` request/limit，因此本计划 GPU 总量默认 `16`，且必须选择两台不同的 8-GPU 节点分别承载 prefill 和 decode。
 - benchmark 默认使用 evalscope；若 evalscope 不可安装或不能满足该请求，执行者必须停止并报告 blocker，不得擅自切换自定义 harness。
@@ -197,8 +197,9 @@
 - 用户在 2026-06-30 明确收窄范围：不接受 `vllm/_custom_ops.py` 中 `_moe_C` 到 `_moe_C_stable_libtorch` 的 runtime fallback；vLLM 源码修改只允许构建过程中遇到的问题。此前提交 `51b135cef854e6d72cb704068644c52d047706e5` 和 workflow run `28414886195` 被标记为无效路线，不得作为后续部署/benchmark/更新 `iaas_main` 的依据。详见进展日志 `P26`。
 - C9A 已完成：workflow run `28414886195` 已取消，`vllm/_custom_ops.py` 已恢复为 fork baseline hard import `vllm._moe_C`，且 `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过。详见进展日志 `P28`。
 - C9B 已完成：用户指出 build-side `_moe_C` rename 路线异常后，已取消 workflow run `28418542564`，并将 `CMakeLists.txt`、`setup.py`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 恢复为 upstream main/fork baseline 的 `_moe_C_stable_libtorch` build artifact 命名。上游对比证明 upstream main 的自洽路径是：构建/import `vllm._moe_C_stable_libtorch`，但注册 `torch.ops._moe_C` namespace，且 `topk_hash_softplus_sqrt` 不再 hard import `vllm._moe_C`。详见进展日志 `P30`。
+- 用户已批准按 upstream main 对齐 `topk_hash_softplus_sqrt`：删除 `f7c4c621d` 引入的 hard import，不做 fallback、不改 build artifact。详见进展日志 `P31`。
 - M9/M10 尚未执行；性能不达标或服务路径未跑通时不得更新 `iaas_main`。
 
 ## Next Action
 
-等待用户确认是否允许按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，删除 fork 残留的 `import vllm._moe_C` hard import。该改动不是 fallback，但属于 `vllm/**` runtime Python 逻辑修改；在确认前不得继续构建镜像、部署、benchmark 或更新 `iaas_main`。
+按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，删除 fork 残留的 `import vllm._moe_C` hard import；静态验证、提交推送后，按命令引用 `C9` 重启 ByteIAAS workflow 构建新镜像。

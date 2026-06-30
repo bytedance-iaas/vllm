@@ -384,6 +384,33 @@ git diff --check
 
 **Expected result:** run `28418542564` 不再发布 build-side rename 镜像；`CMakeLists.txt`、`setup.py` 和 `csrc/libtorch_stable/moe/torch_bindings.cpp` 恢复 upstream main/fork baseline 的 `_moe_C_stable_libtorch` build artifact 命名。后续若要解决 `topk_hash_softplus_sqrt` 的 `import vllm._moe_C` 失败，必须先确认是否允许按 upstream main 对齐 runtime hard import，而不是再做 fallback 或 build-side rename。
 
+## C9C: 按 upstream main 对齐 `topk_hash_softplus_sqrt`
+
+**When:** 用户确认允许删除 `wangyicong52` fork 提交 `f7c4c621d` 引入的 `import vllm._moe_C` hard import，并明确该改动是 upstream main 对齐，不是 runtime fallback。必须在再次构建、部署、benchmark 或更新 `iaas_main` 前执行。
+
+**Working directory:** fork-base integration 分支。
+
+```bash
+set -euo pipefail
+
+uv run --no-project python -m py_compile vllm/_custom_ops.py
+
+# `topk_hash_softplus_sqrt` 不应再 hard import `vllm._moe_C`，
+# 也不得 fallback 到 `_moe_C_stable_libtorch`。
+if awk '/def topk_hash_softplus_sqrt/,/^def / { print }' vllm/_custom_ops.py | \
+  rg -n "import vllm\\._moe_C|_moe_C_stable_libtorch|try:|except ImportError"; then
+  echo "topk_hash_softplus_sqrt still contains forbidden import/fallback" >&2
+  exit 1
+fi
+
+# Build artifact 命名保持 upstream main/fork baseline 的 stable-libtorch 路线。
+rg -n "vllm\\._moe_C_stable_libtorch|_moe_C_stable_libtorch" \
+  setup.py CMakeLists.txt csrc/libtorch_stable/moe/torch_bindings.cpp
+git diff --check
+```
+
+**Expected result:** `topk_hash_softplus_sqrt` 只调用 `torch.ops._moe_C.topk_softplus_sqrt`，不再 import `vllm._moe_C`，也不包含 fallback；build/package artifact 仍为 `vllm._moe_C_stable_libtorch`。该状态与 upstream main 的 `_moe_C_stable_libtorch` Python module + `torch.ops._moe_C` namespace 设计一致。
+
 ## C10: Final gate 后更新远端 `iaas_main`
 
 **When:** C9 image build/publish 成功，C13 render 通过，C16 real router smoke 通过，C20/C21 measured runs 完成或对应 blocker 已在进展日志中被明确接受，并且 C22 summary 写入 artifacts 后。可接受 blocker 仅限外部环境或资源问题，例如 GPU permit 长时间排队、`dev-cluster` 临时资源不足、CR/image pull 临时失败、Onion 模型源临时不可用；render/config、镜像缺依赖、Onion init、模型完整性、vLLM 启动、router real request、KV transfer、DeepGEMM/DeepEP/Mooncake import 或 runtime 错误都必须阻止本步骤。benchmark 跑通但性能未达阈值也必须阻止本步骤；本计划性能 gate 看 Avg，不看 P50/P95/P99；阈值为 64k/1 Avg TTFT < 10s，BS512/1.5k evalscope overall output token throughput >= 14000 tokens/s。远端备份分支和保护规则必须仍存在。用户已在 2026-06-29 本线程授权本步骤；只要目标仓库、源 SHA、备份分支、验证门槛和更新方式符合本计划，不需要再次停下来审批。
