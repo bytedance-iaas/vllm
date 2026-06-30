@@ -404,3 +404,18 @@
   - `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过，遵守本仓库 AGENTS.md 中禁止 bare `python3` 的要求。
   - 首次本地验证使用 `rg "_moe_C_stable_libtorch|except ImportError" vllm/_custom_ops.py`，误伤文件顶部既有 `torch.library.register_fake` 兼容 fallback；已修正命令引用，只检查 `_moe_C_stable_libtorch` 和 `topk_hash_softplus_sqrt` 函数范围内的 `try`/`except ImportError`。
 - Prevention note: 后续验证不能用全文件 `except ImportError` 判断 runtime fallback；必须限定到 `_moe_C`/`_moe_C_stable_libtorch` 目标或具体函数范围。
+
+### P29: Fixed `_moe_C` as a build/package artifact issue
+
+- Summary: `_moe_C` 缺失已按用户约束从 build/package artifact 层修复，不修改 `vllm/**` runtime Python fallback。修复方式是继续使用 `csrc/libtorch_stable/moe/**` 的 stable ABI MoE extension 源码，但将 Python extension module 名导出为 fork runtime baseline 期望的 `vllm._moe_C`，并让 C++ init 入口跟随 CMake target 名。
+- Touched files:
+  - `CMakeLists.txt`：MoE stable ABI extension target 从 `_moe_C_stable_libtorch` 改为 `_moe_C`，对应 compile definitions/link target 同步改名。
+  - `csrc/libtorch_stable/moe/torch_bindings.cpp`：`REGISTER_EXTENSION(_moe_C_stable_libtorch)` 改为 `REGISTER_EXTENSION(TORCH_EXTENSION_NAME)`，使 build target 名决定 `PyInit_*`；torch library fragment/impl 仍是 `_moe_C`，算子 schema 和实现未改。
+  - `setup.py`：`ext_modules` 改为 `CMakeExtension(name="vllm._moe_C")`；precompiled exact member 从 `vllm/_moe_C_stable_libtorch.abi3.so` 改为 `vllm/_moe_C.abi3.so`，避免 wheel 同时携带两个会注册同一 torch library 的 module。
+- Evidence:
+  - `rg -n "_moe_C_stable_libtorch|_moe_C" setup.py CMakeLists.txt csrc/libtorch_stable/moe/torch_bindings.cpp vllm/platforms/interface.py vllm/_custom_ops.py` 显示构建/打包侧只导出 `vllm._moe_C`；仅 `vllm/platforms/interface.py` 保留 suppress 的 `vllm._moe_C_stable_libtorch` import，这是 fork baseline runtime 逻辑且本次未改。
+  - `uv run --no-project python -m py_compile setup.py vllm/_custom_ops.py` 通过。
+  - `git diff --check` 通过。
+  - C7 workflow/tag/Onion 静态验证通过：四个 ByteIAAS workflow YAML parsed；tag script 输出 `v0.10.1.1.iaas.dev.202606301136-cu130` 和 `v0.10.1.1.iaas.dev.202606301136-openai-devel-cu130`；Dockerfile 中存在 build-time `onion-ai-data`/`oniond` 安装和 `command -v oniond` 校验。
+  - 本机 `docker info` 仍失败：`permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`；因此不执行本地 C8，下一步走 C9 ByteIAAS workflow。
+- Prevention note: 不要通过复制或同时打包 `_moe_C_stable_libtorch` 与 `_moe_C` 解决该问题；两个 module 若都被 import，可能重复注册 `_moe_C` torch library。

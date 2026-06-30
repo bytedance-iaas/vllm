@@ -1113,7 +1113,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 #
-# _moe_C_stable_libtorch extension
+# Stable ABI MoE extension exported under the runtime baseline module name.
 #
 
 set(VLLM_MOE_EXT_SRC
@@ -1285,7 +1285,7 @@ endif()
 
 message(STATUS "Enabling MoE C_stable extension.")
 define_extension_target(
-  _moe_C_stable_libtorch
+  _moe_C
   DESTINATION vllm
   LANGUAGE ${VLLM_GPU_LANG}
   SOURCES ${VLLM_MOE_EXT_SRC}
@@ -1300,25 +1300,25 @@ define_extension_target(
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   # Set TORCH_TARGET_VERSION for stable ABI compatibility.
   # This ensures we only use C-shim APIs available in PyTorch 2.11.
-  # _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
+  # _moe_C is abi compatible with PyTorch >= TORCH_TARGET_VERSION
   # which is currently set to 2.11.
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE
+  target_compile_definitions(_moe_C PRIVATE
     TORCH_TARGET_VERSION=0x020B000000000000ULL)
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE USE_CUDA)
+  target_compile_definitions(_moe_C PRIVATE USE_CUDA)
   # Needed by CUTLASS kernels
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE
+  target_compile_definitions(_moe_C PRIVATE
     CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 elseif(VLLM_GPU_LANG STREQUAL "HIP")
   # Set TORCH_TARGET_VERSION for stable ABI compatibility.
   # This ensures we only use C-shim APIs available in PyTorch 2.10.
-  # _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
+  # _moe_C is abi compatible with PyTorch >= TORCH_TARGET_VERSION
   # which is currently set to 2.10.
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE
+  target_compile_definitions(_moe_C PRIVATE
     TORCH_TARGET_VERSION=0x020A000000000000ULL)
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE USE_ROCM)
+  target_compile_definitions(_moe_C PRIVATE USE_ROCM)
 endif()
 
-# On ROCm, _moe_C_stable_libtorch calls raw HIP APIs (e.g. hipGetDevice in
+# On ROCm, _moe_C calls raw HIP APIs (e.g. hipGetDevice in
 # get_device_prop()) which must resolve to the same libamdhip64.so that
 # PyTorch uses.  When PyTorch bundles its own copy (pip/conda wheels),
 # the raw HIP calls would otherwise resolve to the system ROCm copy,
@@ -1332,8 +1332,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   find_library(_MOE_STABLE_TORCH_AMDHIP64 amdhip64
     PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
   if(_MOE_STABLE_TORCH_AMDHIP64)
-    message(STATUS "Found PyTorch-bundled libamdhip64 for _moe_C_stable_libtorch at ${_MOE_STABLE_TORCH_AMDHIP64}")
-    target_link_libraries(_moe_C_stable_libtorch PRIVATE ${_MOE_STABLE_TORCH_AMDHIP64})
+    message(STATUS "Found PyTorch-bundled libamdhip64 for _moe_C at ${_MOE_STABLE_TORCH_AMDHIP64}")
+    target_link_libraries(_moe_C PRIVATE ${_MOE_STABLE_TORCH_AMDHIP64})
   endif()
 endif()
 

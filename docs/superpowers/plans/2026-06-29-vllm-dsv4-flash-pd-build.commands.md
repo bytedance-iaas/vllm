@@ -202,7 +202,7 @@ if command -v actionlint >/dev/null 2>&1; then
     .github/workflows/_byteiaas-build-and-publish-image.yml \
     .github/workflows/_byteiaas-build-wheel.yml
 else
-  python3 - <<'PY'
+  uv run --no-project --with pyyaml python - <<'PY'
 from pathlib import Path
 import yaml
 
@@ -217,12 +217,12 @@ for path in [
 PY
 fi
 
-python3 scripts/ci/get_byteiaas_image_tag.py \
+uv run --no-project python scripts/ci/get_byteiaas_image_tag.py \
   --mode dev \
   --image-flavor openai \
   --cuda-suffix cu130
 
-python3 scripts/ci/get_byteiaas_image_tag.py \
+uv run --no-project python scripts/ci/get_byteiaas_image_tag.py \
   --mode dev \
   --image-flavor openai-devel \
   --cuda-suffix cu130

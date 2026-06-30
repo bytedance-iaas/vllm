@@ -97,7 +97,7 @@
 ### M5: 验证 workflow 并构建镜像
 
 - [x] 按命令引用 `C9A` 撤销 runtime 源码 fallback 路线：取消或忽略 run `28414886195`，并从待发布分支中移除 `vllm/_custom_ops.py` fallback 修改；后续只允许 build/package 层修复 `_moe_C` artifact 问题。
-- [ ] 按命令引用 `C7` 做 YAML/actionlint 和 tag script 验证。
+- [x] 按命令引用 `C7` 做 YAML/actionlint 和 tag script 验证。
 - [ ] 按命令引用 `C8` 做本地或 build-node Docker build；不做镜像内 import/CLI smoke。
 - [ ] 按命令引用 `C9` 或 ByteIAAS workflow 构建并发布 openai/openai-devel 镜像，记录实际 image tag/digest。
 - [ ] 更新主计划 current status 和进展日志。
@@ -196,8 +196,9 @@
 - M8 首轮部署已清理：`dev-cluster` preflight 通过，StormService CRD 存在；首轮 16 GPU permit `3813ef32-5e13-42b7-9a1c-a36aa463dd5b` 已释放。首轮部署确认 prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；P/D 不同节点约束成立。该镜像启动失败于 `No module named 'vllm._moe_C'`，不得进入 M9 或 M10。
 - 用户在 2026-06-30 明确收窄范围：不接受 `vllm/_custom_ops.py` 中 `_moe_C` 到 `_moe_C_stable_libtorch` 的 runtime fallback；vLLM 源码修改只允许构建过程中遇到的问题。此前提交 `51b135cef854e6d72cb704068644c52d047706e5` 和 workflow run `28414886195` 被标记为无效路线，不得作为后续部署/benchmark/更新 `iaas_main` 的依据。详见进展日志 `P26`。
 - C9A 已完成：workflow run `28414886195` 已取消，`vllm/_custom_ops.py` 已恢复为 fork baseline hard import `vllm._moe_C`，且 `uv run --no-project python -m py_compile vllm/_custom_ops.py` 通过。详见进展日志 `P28`。
+- `_moe_C` build/package 修复已完成本地静态验证：stable ABI MoE extension 现在以 runtime baseline module 名 `vllm._moe_C` 导出；`setup.py`、`CMakeLists.txt`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 已更新，且 C7 通过。本机 Docker daemon 仍不可访问，跳过本地 C8，下一步使用 ByteIAAS workflow 构建新镜像。详见进展日志 `P29`。
 - M9/M10 尚未执行；性能不达标或服务路径未跑通时不得更新 `iaas_main`。
 
 ## Next Action
 
-重新评估 `_moe_C` 缺失是否能在 build/package artifact 层解决；若能，按 `C7`/`C9` 重新构建镜像，之后再进入 `C13`、`C14`、`C15` 和 benchmark。调查和修复不得触碰 `vllm/**` runtime Python 逻辑。
+提交并推送 `_moe_C` build/package 修复后，按命令引用 `C9` 触发 ByteIAAS workflow 构建新镜像；workflow 成功后再进入 `C13`、`C14`、`C15` 和 benchmark。

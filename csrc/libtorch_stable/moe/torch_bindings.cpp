@@ -154,4 +154,4 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CompositeExplicitAutograd, m) {
 }
 #endif
 
-REGISTER_EXTENSION(_moe_C_stable_libtorch)
+REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
