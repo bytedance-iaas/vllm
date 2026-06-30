@@ -173,7 +173,7 @@ class OnlineC128MergeKernel:
             stride=(cute.sym_int64(divisibility=16), 1),
             assumed_align=16,
         )
-        segments = make_fake_tensor(Int32, (num_segments, 5), divisibility=4)
+        segments = make_fake_tensor(Int32, (num_segments, 5), divisibility=1)
         compressed_kv = cute.runtime.make_fake_tensor(
             Float32,
             (num_tokens, head_size),
@@ -282,115 +282,139 @@ class OnlineC128DecodeKernel:
         col0 = tid * self.elems_per_lane
 
         rsi = req_state_indices[req]
-        if rsi < Int32(0):
-            # Padding request slot (FULL cudagraph pad): nothing to do.
-            return
+        if rsi >= Int32(0):
+            tok_start = query_start_loc[req]
+            tok_end = query_start_loc[req + Int32(1)]
+            query_len = tok_end - tok_start
 
-        tok_start = query_start_loc[req]
-        tok_end = query_start_loc[req + Int32(1)]
-        query_len = tok_end - tok_start
-        if query_len <= Int32(0):
-            return
+            if query_len > Int32(0):
+                max_off = Int64(0)
+                sum_off = Int64(self.head_dim)
+                wsum_off = Int64(2 * self.head_dim)
 
-        max_off = Int64(0)
-        sum_off = Int64(self.head_dim)
-        wsum_off = Int64(2 * self.head_dim)
+                run_state_w = run_state.stride[0]
+                kv_w = kv.stride[0]
+                score_w = score.stride[0]
+                ape_w = ape.stride[0]
+                compressed_w = compressed_kv.stride[0]
+                max_num_reqs64 = Int64(self.max_num_reqs)
 
-        run_state_w = run_state.stride[0]
-        kv_w = kv.stride[0]
-        score_w = score.stride[0]
-        ape_w = ape.stride[0]
-        compressed_w = compressed_kv.stride[0]
-        max_num_reqs64 = Int64(self.max_num_reqs)
-
-        local_max = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
-        local_sum = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
-        local_product = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
-
-        # Aligned starts seed from identity; bank0 may contain stale carry.
-        first_pos = positions[tok_start.to(Int64)]
-        carry_len = first_pos % Int64(self.compress_ratio)
-        bank0_base = rsi.to(Int64) * run_state_w + col0.to(Int64)
-        if carry_len != Int64(0):
-            for e in cutlass.range_constexpr(self.elems_per_lane):
-                local_max[e] = run_state.iterator[bank0_base + max_off + Int64(e)]
-                local_sum[e] = run_state.iterator[bank0_base + sum_off + Int64(e)]
-                local_product[e] = run_state.iterator[bank0_base + wsum_off + Int64(e)]
-        else:
-            for e in cutlass.range_constexpr(self.elems_per_lane):
-                local_max[e] = -Float32.inf
-                local_sum[e] = Float32(0.0)
-                local_product[e] = Float32(0.0)
-
-        rsi64 = rsi.to(Int64)
-        # Walk the request's query tokens sequentially (accumulator in regs).
-        for j in cutlass.range(query_len, unroll=1):
-            token = tok_start + j
-            tok64 = token.to(Int64)
-            position = positions[tok64]
-            ape_row = (position % Int64(self.compress_ratio)) * ape_w
-            kv_base = tok64 * kv_w + col0.to(Int64)
-            score_base = tok64 * score_w + col0.to(Int64)
-            ape_base = ape_row + col0.to(Int64)
-            for e in cutlass.range_constexpr(self.elems_per_lane):
-                kv_e = kv.iterator[kv_base + Int64(e)].to(Float32)
-                score_e = score.iterator[score_base + Int64(e)].to(Float32)
-                ape_e = ape.iterator[ape_base + Int64(e)]
-                score_e = score_e + ape_e
-                new_max = cute.arch.fmax(local_max[e], score_e)
-                old_scale = cute.math.exp2(
-                    (local_max[e] - new_max) * Float32(RCP_LN2), fastmath=True
+                local_max = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
+                local_sum = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
+                local_product = cute.make_rmem_tensor(
+                    (self.elems_per_lane,), Float32
                 )
-                new_scale = cute.math.exp2(
-                    (score_e - new_max) * Float32(RCP_LN2), fastmath=True
-                )
-                local_sum[e] = local_sum[e] * old_scale + new_scale
-                local_product[e] = local_product[e] * old_scale + kv_e * new_scale
-                local_max[e] = new_max
 
-            position_i = position + Int64(1)
-            boundary = (position_i % Int64(self.compress_ratio)) == Int64(0)
-            if boundary:
-                ebase = tok64 * compressed_w + col0.to(Int64)
-                for e in cutlass.range_constexpr(self.elems_per_lane):
-                    compressed_kv.iterator[ebase + Int64(e)] = (
-                        local_product[e] / local_sum[e]
-                    )
-
-            if cutlass.const_expr(self.candidate_chain):
-                # Verify writes candidate banks; post-sample commit advances bank0.
-                write_row = (j + Int32(1)).to(Int64) * max_num_reqs64 + rsi64
-                wbase = write_row * run_state_w + col0.to(Int64)
-                if boundary:
+                # Aligned starts seed from identity; bank0 may contain stale carry.
+                first_pos = positions[tok_start.to(Int64)]
+                carry_len = first_pos % Int64(self.compress_ratio)
+                bank0_base = rsi.to(Int64) * run_state_w + col0.to(Int64)
+                if carry_len != Int64(0):
                     for e in cutlass.range_constexpr(self.elems_per_lane):
-                        run_state.iterator[wbase + max_off + Int64(e)] = -Float32.inf
-                        run_state.iterator[wbase + sum_off + Int64(e)] = Float32(0.0)
-                        run_state.iterator[wbase + wsum_off + Int64(e)] = Float32(0.0)
-                        # Restart the running chunk for the next chain position.
-                        local_max[e] = -Float32.inf
-                        local_sum[e] = Float32(0.0)
-                        local_product[e] = Float32(0.0)
+                        local_max[e] = run_state.iterator[
+                            bank0_base + max_off + Int64(e)
+                        ]
+                        local_sum[e] = run_state.iterator[
+                            bank0_base + sum_off + Int64(e)
+                        ]
+                        local_product[e] = run_state.iterator[
+                            bank0_base + wsum_off + Int64(e)
+                        ]
                 else:
                     for e in cutlass.range_constexpr(self.elems_per_lane):
-                        run_state.iterator[wbase + max_off + Int64(e)] = local_max[e]
-                        run_state.iterator[wbase + sum_off + Int64(e)] = local_sum[e]
-                        run_state.iterator[wbase + wsum_off + Int64(e)] = (
-                            local_product[e]
-                        )
-            else:
-                if boundary:
-                    # Decode: chunk closed; restart accumulator from identity.
-                    for e in cutlass.range_constexpr(self.elems_per_lane):
                         local_max[e] = -Float32.inf
                         local_sum[e] = Float32(0.0)
                         local_product[e] = Float32(0.0)
 
-        if cutlass.const_expr(not self.candidate_chain):
-            # Decode: write the trailing carry back to committed bank0.
-            for e in cutlass.range_constexpr(self.elems_per_lane):
-                run_state.iterator[bank0_base + max_off + Int64(e)] = local_max[e]
-                run_state.iterator[bank0_base + sum_off + Int64(e)] = local_sum[e]
-                run_state.iterator[bank0_base + wsum_off + Int64(e)] = local_product[e]
+                rsi64 = rsi.to(Int64)
+                # Walk the request's query tokens sequentially.
+                for j in cutlass.range(query_len, unroll=1):
+                    token = tok_start + j
+                    tok64 = token.to(Int64)
+                    position = positions[tok64]
+                    ape_row = (position % Int64(self.compress_ratio)) * ape_w
+                    kv_base = tok64 * kv_w + col0.to(Int64)
+                    score_base = tok64 * score_w + col0.to(Int64)
+                    ape_base = ape_row + col0.to(Int64)
+                    for e in cutlass.range_constexpr(self.elems_per_lane):
+                        kv_e = kv.iterator[kv_base + Int64(e)].to(Float32)
+                        score_e = score.iterator[score_base + Int64(e)].to(Float32)
+                        ape_e = ape.iterator[ape_base + Int64(e)]
+                        score_e = score_e + ape_e
+                        new_max = cute.arch.fmax(local_max[e], score_e)
+                        old_scale = cute.math.exp2(
+                            (local_max[e] - new_max) * Float32(RCP_LN2),
+                            fastmath=True,
+                        )
+                        new_scale = cute.math.exp2(
+                            (score_e - new_max) * Float32(RCP_LN2), fastmath=True
+                        )
+                        local_sum[e] = local_sum[e] * old_scale + new_scale
+                        local_product[e] = (
+                            local_product[e] * old_scale + kv_e * new_scale
+                        )
+                        local_max[e] = new_max
+
+                    position_i = position + Int64(1)
+                    boundary = (position_i % Int64(self.compress_ratio)) == Int64(0)
+                    if boundary:
+                        ebase = tok64 * compressed_w + col0.to(Int64)
+                        for e in cutlass.range_constexpr(self.elems_per_lane):
+                            compressed_kv.iterator[ebase + Int64(e)] = (
+                                local_product[e] / local_sum[e]
+                            )
+
+                    if cutlass.const_expr(self.candidate_chain):
+                        # Verify writes candidate banks; commit advances bank0.
+                        write_row = (
+                            (j + Int32(1)).to(Int64) * max_num_reqs64 + rsi64
+                        )
+                        wbase = write_row * run_state_w + col0.to(Int64)
+                        if boundary:
+                            for e in cutlass.range_constexpr(self.elems_per_lane):
+                                run_state.iterator[
+                                    wbase + max_off + Int64(e)
+                                ] = -Float32.inf
+                                run_state.iterator[
+                                    wbase + sum_off + Int64(e)
+                                ] = Float32(0.0)
+                                run_state.iterator[
+                                    wbase + wsum_off + Int64(e)
+                                ] = Float32(0.0)
+                                local_max[e] = -Float32.inf
+                                local_sum[e] = Float32(0.0)
+                                local_product[e] = Float32(0.0)
+                        else:
+                            for e in cutlass.range_constexpr(self.elems_per_lane):
+                                run_state.iterator[
+                                    wbase + max_off + Int64(e)
+                                ] = local_max[e]
+                                run_state.iterator[
+                                    wbase + sum_off + Int64(e)
+                                ] = local_sum[e]
+                                run_state.iterator[
+                                    wbase + wsum_off + Int64(e)
+                                ] = local_product[e]
+                    else:
+                        if boundary:
+                            # Decode: chunk closed; restart from identity.
+                            for e in cutlass.range_constexpr(self.elems_per_lane):
+                                local_max[e] = -Float32.inf
+                                local_sum[e] = Float32(0.0)
+                                local_product[e] = Float32(0.0)
+
+                if cutlass.const_expr(not self.candidate_chain):
+                    # Decode: write trailing carry back to committed bank0.
+                    for e in cutlass.range_constexpr(self.elems_per_lane):
+                        run_state.iterator[
+                            bank0_base + max_off + Int64(e)
+                        ] = local_max[e]
+                        run_state.iterator[
+                            bank0_base + sum_off + Int64(e)
+                        ] = local_sum[e]
+                        run_state.iterator[
+                            bank0_base + wsum_off + Int64(e)
+                        ] = local_product[e]
 
     @cache
     @staticmethod
@@ -404,6 +428,7 @@ class OnlineC128DecodeKernel:
             raise ValueError("head_size must be even.")
         num_tokens = cute.sym_int()
         num_reqs = cute.sym_int()
+        num_query_locs = cute.sym_int()
         num_rows = cute.sym_int()
 
         kv = cute.runtime.make_fake_tensor(
@@ -425,7 +450,9 @@ class OnlineC128DecodeKernel:
             assumed_align=16,
         )
         positions = make_fake_tensor(Int64, (num_tokens,), divisibility=8)
-        query_start_loc = make_fake_tensor(Int32, (num_reqs + 1,), divisibility=1)
+        query_start_loc = make_fake_tensor(
+            Int32, (num_query_locs,), divisibility=1
+        )
         req_state_indices = make_fake_tensor(Int32, (num_reqs,), divisibility=1)
         run_state = cute.runtime.make_fake_tensor(
             Float32,

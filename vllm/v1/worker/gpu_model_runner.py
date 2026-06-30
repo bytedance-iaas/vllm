@@ -636,6 +636,8 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.req_id_to_state_index: dict[str, int] = {}
+        self.free_req_state_indices: list[int] = list(reversed(range(self.max_num_reqs)))
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -723,6 +725,9 @@ class GPUModelRunner(
         )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
+        )
+        self.req_state_indices = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
         )
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -1139,6 +1144,9 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            state_index = self.req_id_to_state_index.pop(req_id, None)
+            if state_index is not None:
+                self.free_req_state_indices.append(state_index)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1237,6 +1245,12 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            if not self.free_req_state_indices:
+                raise RuntimeError(
+                    "C128 request-state slots exhausted: "
+                    f"max_num_reqs={self.max_num_reqs}"
+                )
+            self.req_id_to_state_index[req_id] = self.free_req_state_indices.pop()
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -2431,6 +2445,14 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
         )
+
+        req_state_indices_cpu = self.req_state_indices.np[:num_reqs_padded]
+        req_state_indices_cpu.fill(-1)
+        for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            req_state_indices_cpu[req_index] = self.req_id_to_state_index[req_id]
+        self.req_state_indices.copy_to_gpu(num_reqs_padded)
+        cm_base.req_state_indices = self.req_state_indices.gpu[:num_reqs_padded]
+        cm_base.req_state_indices_cpu = req_state_indices_cpu
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
