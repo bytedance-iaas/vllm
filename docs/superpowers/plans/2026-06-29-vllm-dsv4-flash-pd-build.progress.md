@@ -405,9 +405,9 @@
   - 首次本地验证使用 `rg "_moe_C_stable_libtorch|except ImportError" vllm/_custom_ops.py`，误伤文件顶部既有 `torch.library.register_fake` 兼容 fallback；已修正命令引用，只检查 `_moe_C_stable_libtorch` 和 `topk_hash_softplus_sqrt` 函数范围内的 `try`/`except ImportError`。
 - Prevention note: 后续验证不能用全文件 `except ImportError` 判断 runtime fallback；必须限定到 `_moe_C`/`_moe_C_stable_libtorch` 目标或具体函数范围。
 
-### P29: Fixed `_moe_C` as a build/package artifact issue
+### P29: Superseded build-side `_moe_C` rename attempt
 
-- Summary: `_moe_C` 缺失已按用户约束从 build/package artifact 层修复，不修改 `vllm/**` runtime Python fallback。修复方式是继续使用 `csrc/libtorch_stable/moe/**` 的 stable ABI MoE extension 源码，但将 Python extension module 名导出为 fork runtime baseline 期望的 `vllm._moe_C`，并让 C++ init 入口跟随 CMake target 名。
+- Summary: `_moe_C` 缺失曾尝试按 build/package artifact 层修复，不修改 `vllm/**` runtime Python fallback。修复方式是继续使用 `csrc/libtorch_stable/moe/**` 的 stable ABI MoE extension 源码，但将 Python extension module 名导出为 fork runtime baseline 期望的 `vllm._moe_C`，并让 C++ init 入口跟随 CMake target 名。该路线在 P30 被上游对比推翻，已撤销，不得继续构建或发布。
 - Touched files:
   - `CMakeLists.txt`：MoE stable ABI extension target 从 `_moe_C_stable_libtorch` 改为 `_moe_C`，对应 compile definitions/link target 同步改名。
   - `csrc/libtorch_stable/moe/torch_bindings.cpp`：`REGISTER_EXTENSION(_moe_C_stable_libtorch)` 改为 `REGISTER_EXTENSION(TORCH_EXTENSION_NAME)`，使 build target 名决定 `PyInit_*`；torch library fragment/impl 仍是 `_moe_C`，算子 schema 和实现未改。
@@ -419,3 +419,16 @@
   - C7 workflow/tag/Onion 静态验证通过：四个 ByteIAAS workflow YAML parsed；tag script 输出 `v0.10.1.1.iaas.dev.202606301136-cu130` 和 `v0.10.1.1.iaas.dev.202606301136-openai-devel-cu130`；Dockerfile 中存在 build-time `onion-ai-data`/`oniond` 安装和 `command -v oniond` 校验。
   - 本机 `docker info` 仍失败：`permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`；因此不执行本地 C8，下一步走 C9 ByteIAAS workflow。
 - Prevention note: 不要通过复制或同时打包 `_moe_C_stable_libtorch` 与 `_moe_C` 解决该问题；两个 module 若都被 import，可能重复注册 `_moe_C` torch library。
+
+### P30: Upstream comparison invalidated build-side rename; waiting on runtime alignment approval
+
+- Summary: 用户指出 commit `4fcea785fd66874046f9b828eb2fad7fbd527a63` 比 runtime fallback 更异常后，已停止该路线。对比 `vllm-project/vllm` upstream main、`v0.10.1.1`、`v0.10.1`、`v0.10.0` 证明：上游不出问题是因为每条代码线内部自洽，而当前 fork base 混入了 stable build artifact 与残留 hard import。
+- Evidence:
+  - 已取消 workflow run `28418542564`；复查 `gh run view 28418542564 --repo bytedance-iaas/vllm --json status,conclusion,headSha,url` 返回 status `completed`、conclusion `cancelled`、headSha `4fcea785fd66874046f9b828eb2fad7fbd527a63`。
+  - `git fetch --no-tags https://github.com/vllm-project/vllm.git refs/heads/main:refs/tmp/upstream-vllm-main refs/tags/v0.10.0:refs/tmp/upstream-vllm-v0.10.0 refs/tags/v0.10.1:refs/tmp/upstream-vllm-v0.10.1 refs/tags/v0.10.1.1:refs/tmp/upstream-vllm-v0.10.1.1` 成功；`git fetch ... 4fcea785fd66874046f9b828eb2fad7fbd527a63` 也能取到对象，但该 SHA 仅由当前本地/远端 integration branch 包含。
+  - upstream main：`CMakeLists.txt`、`setup.py`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 仍构建/打包 `vllm._moe_C_stable_libtorch`；`vllm/platforms/interface.py::import_kernels()` import stable extension；`vllm/_custom_ops.py::topk_hash_softplus_sqrt` 不再 hard import `vllm._moe_C`，直接调用 `torch.ops._moe_C.topk_softplus_sqrt`。
+  - upstream `v0.10.0`/`v0.10.1`/`v0.10.1.1`：构建/打包 `vllm._moe_C`，且 runtime import `vllm._moe_C`；module 名和 import 名一致。
+  - fork base `cde7799cc66c5a4cb349156a3ca3228f9798dbc9`：构建/打包 `vllm._moe_C_stable_libtorch`，但 `topk_hash_softplus_sqrt` 仍 hard import `vllm._moe_C`，这是首轮部署 `No module named 'vllm._moe_C'` 的直接不一致点。
+  - 已按命令引用 `C9B` 恢复 `CMakeLists.txt`、`setup.py`、`csrc/libtorch_stable/moe/torch_bindings.cpp` 到 `4fcea785fd66874046f9b828eb2fad7fbd527a63^`，即 upstream main/fork baseline 的 stable build artifact 命名。
+- Current blocker: 合理修复应是按 upstream main 对齐 `vllm/_custom_ops.py::topk_hash_softplus_sqrt`，删除 fork 残留的 `import vllm._moe_C` hard import，让 `current_platform.import_kernels()` 负责加载 `vllm._moe_C_stable_libtorch`。这不是 fallback，但属于 `vllm/**` runtime Python 逻辑修改；用户此前要求 vLLM 源码修改只包含构建过程中遇到的问题，因此执行前需要用户确认。
+- Prevention note: 不再尝试 build-side rename 或 runtime fallback。再次推进前必须改变假设：这是 fork 与 upstream main 的 runtime/source 对齐问题，不是 wheel artifact 缺文件问题。

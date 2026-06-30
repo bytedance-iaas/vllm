@@ -349,6 +349,41 @@ git commit -s -m "Constrain DSV4 migration to build-only source changes"
 
 **Expected result:** run `28414886195` 不再继续发布 runtime fallback 镜像；当前 HEAD 仅撤销 `vllm/_custom_ops.py` fallback 修改并保留计划日志。后续若继续处理 `No module named 'vllm._moe_C'`，只能从 build/package artifact 层修复，例如 `setup.py`、CMake、wheel extraction/package data 或 Dockerfile wheel 安装路径；不得再修改 `vllm/` runtime Python 逻辑。
 
+## C9B: 撤销错误的 build-side `_moe_C` rename 路线
+
+**When:** 上游对比证明 `_moe_C_stable_libtorch` build artifact 与 `torch.ops._moe_C` namespace 是 upstream main 的自洽设计，而当前分支的 build-side rename 会偏离 upstream main 时。必须在再次构建、部署、benchmark 或更新 `iaas_main` 前执行。
+
+**Working directory:** fork-base integration 分支。
+
+```bash
+set -euo pipefail
+
+BAD_COMMIT="4fcea785fd66874046f9b828eb2fad7fbd527a63"
+BAD_RUN_ID="28418542564"
+
+RUN_STATUS="$(gh run view "${BAD_RUN_ID}" \
+  --repo bytedance-iaas/vllm \
+  --json status \
+  --jq '.status')"
+if [ "${RUN_STATUS}" = "queued" ] || [ "${RUN_STATUS}" = "in_progress" ]; then
+  gh run cancel "${BAD_RUN_ID}" --repo bytedance-iaas/vllm
+fi
+gh run view "${BAD_RUN_ID}" \
+  --repo bytedance-iaas/vllm \
+  --json status,conclusion,headSha,url \
+  --jq '{status, conclusion, headSha, url}'
+
+git restore --source="${BAD_COMMIT}^" -- \
+  CMakeLists.txt \
+  setup.py \
+  csrc/libtorch_stable/moe/torch_bindings.cpp
+
+uv run --no-project python -m py_compile setup.py
+git diff --check
+```
+
+**Expected result:** run `28418542564` 不再发布 build-side rename 镜像；`CMakeLists.txt`、`setup.py` 和 `csrc/libtorch_stable/moe/torch_bindings.cpp` 恢复 upstream main/fork baseline 的 `_moe_C_stable_libtorch` build artifact 命名。后续若要解决 `topk_hash_softplus_sqrt` 的 `import vllm._moe_C` 失败，必须先确认是否允许按 upstream main 对齐 runtime hard import，而不是再做 fallback 或 build-side rename。
+
 ## C10: Final gate 后更新远端 `iaas_main`
 
 **When:** C9 image build/publish 成功，C13 render 通过，C16 real router smoke 通过，C20/C21 measured runs 完成或对应 blocker 已在进展日志中被明确接受，并且 C22 summary 写入 artifacts 后。可接受 blocker 仅限外部环境或资源问题，例如 GPU permit 长时间排队、`dev-cluster` 临时资源不足、CR/image pull 临时失败、Onion 模型源临时不可用；render/config、镜像缺依赖、Onion init、模型完整性、vLLM 启动、router real request、KV transfer、DeepGEMM/DeepEP/Mooncake import 或 runtime 错误都必须阻止本步骤。benchmark 跑通但性能未达阈值也必须阻止本步骤；本计划性能 gate 看 Avg，不看 P50/P95/P99；阈值为 64k/1 Avg TTFT < 10s，BS512/1.5k evalscope overall output token throughput >= 14000 tokens/s。远端备份分支和保护规则必须仍存在。用户已在 2026-06-29 本线程授权本步骤；只要目标仓库、源 SHA、备份分支、验证门槛和更新方式符合本计划，不需要再次停下来审批。
