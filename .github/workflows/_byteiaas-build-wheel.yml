@@ -22,7 +22,10 @@ on:
 jobs:
   build-wheel:
     if: github.repository == 'bytedance-iaas/vllm'
-    runs-on: x64-vllm-wheel-build-node
+    runs-on:
+      - self-hosted
+      - x64-vllm-wheel-build-node
+      - vllm-byteiaas-build-01
     timeout-minutes: 1440
     env:
       HTTP_PROXY: http://100.68.162.211:3128

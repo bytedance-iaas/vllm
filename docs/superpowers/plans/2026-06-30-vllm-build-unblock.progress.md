@@ -411,3 +411,46 @@ cache 现状：
 Next：
 - 提交并 push sentinel 修复。
 - 触发下一轮 dev build，验证 image 在 FlashInfer cubin step 输出 `Using cached FlashInfer cubins`，且没有长时间 `download-cubin` 网络下载。
+
+## P19: sentinel 修复已推送并触发下一轮
+
+时间：2026-06-30 21:03 +0800
+
+提交：
+- `fdc19db075af31ec7bd947cf7e5f5d0662f02759 ci: skip cached flashinfer cubin download`
+
+动作：
+- 已取消低效 run `28445477710`，最终状态 `cancelled`。
+- 已触发新 run `28446403707`，head SHA `fdc19db075af31ec7bd947cf7e5f5d0662f02759`。
+
+验收重点：
+- image job 的 FlashInfer cubin step 应输出/体现 `Using cached FlashInfer cubins`。
+- 现场不应再出现长时间 `flashinfer download-cubin` 代理下载。
+- wheel job 应继续快速命中 local BuildKit cache。
+
+## P20: runner 调度随机性导致 node-local cache 失效，固定 runner 标签
+
+时间：2026-06-30 21:07 +0800
+
+问题：
+- run `28446403707` 中 image job 被调度到 build-01，而 build-01 的 image cache 之前基本为空；现场 `docker buildx build` 只有 `--cache-to`，没有 `--cache-from`。
+- 两台 runner 原本同时拥有 `x64-vllm-wheel-build-node` 和 `x64-vllm-docker-build-node` 标签，导致 wheel/image job 可被任意节点接走。
+- local BuildKit cache 是节点本地资源；不固定 runner 会让 cache 验收和后续效率不稳定。
+
+动作：
+- 已取消 run `28446403707`。
+- 通过 GitHub runner label API 添加唯一标签：
+  - build-01 runner id `3`：`vllm-byteiaas-build-01`
+  - build-02 runner id `23`：`vllm-byteiaas-build-02`
+- 修改 workflow：
+  - `.github/workflows/_byteiaas-build-wheel.yml` 固定 `runs-on: [self-hosted, x64-vllm-wheel-build-node, vllm-byteiaas-build-01]`
+  - `.github/workflows/_byteiaas-build-and-publish-image.yml` 固定 `runs-on: [self-hosted, x64-vllm-docker-build-node, vllm-byteiaas-build-02]`
+
+验证：
+- Python YAML parse 两个 workflow：pass。
+- `bash -n tools/setup_deepgemm_pythons.sh`：pass。
+- `git diff --check`：pass。
+
+Next：
+- 提交并 push runner pinning。
+- 触发下一轮 build，验证 wheel 固定 build-01、image 固定 build-02，并确认 image 使用 build-02 本地 cache 与 FlashInfer sentinel skip。

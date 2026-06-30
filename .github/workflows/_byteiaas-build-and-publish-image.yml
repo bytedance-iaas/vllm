@@ -32,7 +32,10 @@ jobs:
   build-and-publish-image:
     if: github.repository == 'bytedance-iaas/vllm'
     name: build-and-publish-image
-    runs-on: x64-vllm-docker-build-node
+    runs-on:
+      - self-hosted
+      - x64-vllm-docker-build-node
+      - vllm-byteiaas-build-02
     timeout-minutes: 1440
     env:
       HTTP_PROXY: http://100.68.162.211:3128
