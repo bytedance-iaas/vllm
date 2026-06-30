@@ -317,3 +317,31 @@
   - 修改 `templates/router.yaml`，在 router pod template labels 添加同样标签。
   - Actual-node render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd-actual-nodes.yaml`。
   - Render 验证包含 workspace-env labels、`PREFILL_NODE=192.168.1.148`、`DECODE_NODE=192.168.1.186`、prefill/decode `nvidia.com/gpu: 8`，且无 runtime install forbidden pattern。
+
+### P22: dev-cluster first deployment proved P/D different-node placement but image startup failed
+
+- Summary: 首轮 `dev-cluster` 部署使用新镜像和 `StormService` 成功创建 1P1D 形态；实际调度证明 prefill 和 decode 分别占用不同 8-GPU 节点。服务未进入 benchmark，因为 prefill/decode engine 初始化失败于镜像内缺少 `vllm._moe_C` 模块。
+- Evidence:
+  - Helm release `dsv4-flash-pd` 部署到 namespace `vllm-dsv4-flash-pd`。
+  - Render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd-actual-nodes.yaml`。
+  - Render 中 prefill nodeAffinity values 为 `192.168.1.148`，decode nodeAffinity values 为 `192.168.1.186`，router nodeAffinity values 为 `192.168.1.186`。
+  - Render 中 prefill/decode containers 均包含 `requests.nvidia.com/gpu: 8` 和 `limits.nvidia.com/gpu: 8`。
+  - Cluster evidence: `dsv4-flash-pd-roleset-4s2b6-prefill-7df8bb5fcd-0` 调度到 `192.168.1.148`，container `prefill` 请求 8 GPU。
+  - Cluster evidence: `dsv4-flash-pd-roleset-4s2b6-decode-5498c49684-0` 调度到 `192.168.1.186`，container `decode` 请求 8 GPU。
+  - Cluster evidence: router `dsv4-flash-pd-router-6c9f646bcf-l7cwz` 调度到 `192.168.1.186`，不请求 GPU。
+  - Onion init logs 显示 prefill/decode 均执行模型准备并因已有完整目录幂等跳过：`Model directory /data01/DeepSeek-V4-Flash is already complete, skip Onion download.`
+  - Failure evidence: prefill/decode previous logs 均包含 `RuntimeError: Worker failed with error 'No module named 'vllm._moe_C''` 和 `RuntimeError: Engine core initialization failed.`
+  - Latest evidence saved under `artifacts/2026-06-29-vllm-dsv4-flash-pd/logs/` and `artifacts/2026-06-29-vllm-dsv4-flash-pd/cluster/`.
+  - 按 workspace-env 规则，已执行 `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd` 并删除 namespace；`namespace-after-cleanup.txt` 记录 namespace 不存在。
+  - Permit `3813ef32-5e13-42b7-9a1c-a36aa463dd5b` 已释放，release artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/permit-release.json`。
+
+### P23: Fixed `_moe_C` hard import for stable libtorch wheel layout
+
+- Summary: ByteIAAS workflow 产出的 wheel 只包含 `vllm/_moe_C_stable_libtorch.abi3.so`，与 `setup.py` 和 `current_platform.import_kernels()` 中稳定 libtorch 扩展路径一致；启动失败来自 `vllm/_custom_ops.py::topk_hash_softplus_sqrt` 内部仍硬导入 `vllm._moe_C`。已将该点改为先导入 `_moe_C`，不存在时 fallback 到 `_moe_C_stable_libtorch`。
+- Evidence:
+  - Wheel artifact downloaded from workflow run `28389076984` under `/tmp/vllm-wheel-28389076984/`。
+  - Wheel content includes `vllm/_moe_C_stable_libtorch.abi3.so` and does not include `vllm/_moe_C.abi3.so`。
+  - `setup.py` 的 package extraction list 和 extension list 均包含 `vllm._moe_C_stable_libtorch`。
+  - `vllm/platforms/interface.py::import_kernels` 已用 `contextlib.suppress(ImportError)` 同时尝试 `vllm._moe_C` 和 `vllm._moe_C_stable_libtorch`。
+  - 修改文件：`vllm/_custom_ops.py`。
+  - Validation: `python3 -m py_compile vllm/_custom_ops.py` 通过。

@@ -188,8 +188,10 @@
 - M1-M4 已完成：远端备份分支 `backup/iaas_main-20260629` 指向原 `origin/iaas_main` SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`，GitHub ruleset `Protect backup iaas_main branches` 已 active；ByteIAAS workflow、tag 脚本、`byteiaas-openai-devel` Dockerfile、Dockerfile 中 `vllm-router` 与 Onion CLI 构建能力已落到 fork-base 分支。
 - M5 已完成：本地 Docker daemon 不可访问，已改用 ByteIAAS workflow；第三次 run `28389076984` 成功，产出 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606300110-cu130`，digest `sha256:574c3dc2023be9300df8e699994798f76e3f048bff81f3e6719e8726197de113`。
 - M7 部署模板已创建：`examples/deployment/deepseek-v4-flash-pd/` 使用 `StormService` 表达 `1P1D`，同一新镜像负责 vLLM、`vllm-router` 和 Onion 模型准备；chart 新增 Helm validation，强制 `global.gpuCount=8`、prefill/decode nodeAffinity 非空且 disjoint。
-- M8 进行中：`dev-cluster` preflight 通过，StormService CRD 存在，16 GPU permit 已 granted；选定 prefill 节点 `192.168.1.148`、decode/router 节点 `192.168.1.186`。M9/M10 尚未执行；性能不达标时不得更新 `iaas_main`。
+- M8 首轮部署已清理：`dev-cluster` preflight 通过，StormService CRD 存在；首轮 16 GPU permit `3813ef32-5e13-42b7-9a1c-a36aa463dd5b` 已释放。首轮部署确认 prefill 落到 `192.168.1.148` 且请求 8 GPU，decode 落到 `192.168.1.186` 且请求 8 GPU，router 跟随 decode 节点且不请求 GPU；P/D 不同节点约束成立。该镜像启动失败于 `No module named 'vllm._moe_C'`，不得进入 M9 或 M10。
+- 当前修复：wheel 产物只包含 `vllm/_moe_C_stable_libtorch.abi3.so`，源码中 `topk_hash_softplus_sqrt` 已改为 `_moe_C` 不存在时导入 `_moe_C_stable_libtorch`；`python3 -m py_compile vllm/_custom_ops.py` 通过。
+- M9/M10 尚未执行；性能不达标或服务路径未跑通时不得更新 `iaas_main`。
 
 ## Next Action
 
-提交当前 rustup 重试和 Helm validation 修正，推送 `codex/vllm-dsv4-fork-base-byteiaas-build`，重新运行命令引用 `C9` 的 ByteIAAS workflow；workflow 产出镜像后再执行 `C13`、`C14`、`C15` 进入 `dev-cluster` 部署与 benchmark。
+提交并推送 `_moe_C_stable_libtorch` fallback 修复，重新运行命令引用 `C9` 的 ByteIAAS workflow；workflow 产出新镜像后重新执行 `C13`、`C14`、`C15`，再进入 router smoke 和 benchmark。
