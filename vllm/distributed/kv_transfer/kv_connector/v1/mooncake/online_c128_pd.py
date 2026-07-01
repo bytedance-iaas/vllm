@@ -149,18 +149,26 @@ def build_c128_aux_descriptors(
     remote_import_slot: int,
     num_layers: int,
     row_width_bytes: int,
+    layer_pos_pairs: list[tuple[int, int]] | None = None,
 ) -> C128AuxXferPlan:
     """Build per-layer src/dst/len descriptors for one request's bank0 transfer.
 
     Source: the P export slot's per-layer rows.
     Destination: the D import slot's per-layer rows (NOT a live bank0 row; the
     runner copies the staged slot into bank0 after the request is admitted).
+    ``layer_pos_pairs`` maps producer-local layer positions to
+    consumer-local layer positions; identity mapping is used when omitted.
     """
     plan = C128AuxXferPlan()
     src_base = export_pool.base_addr + export_pool.slot_offset_bytes(export_slot)
     dst_base = remote_import_base_addr + remote_import_slot * remote_slot_bytes
-    for layer_pos in range(num_layers):
-        plan.src_ptrs.append(src_base + layer_pos * row_width_bytes)
-        plan.dst_ptrs.append(dst_base + layer_pos * row_width_bytes)
+    pairs = (
+        layer_pos_pairs
+        if layer_pos_pairs is not None
+        else [(layer_pos, layer_pos) for layer_pos in range(num_layers)]
+    )
+    for src_layer_pos, dst_layer_pos in pairs:
+        plan.src_ptrs.append(src_base + src_layer_pos * row_width_bytes)
+        plan.dst_ptrs.append(dst_base + dst_layer_pos * row_width_bytes)
         plan.lengths.append(row_width_bytes)
     return plan

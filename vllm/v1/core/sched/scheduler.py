@@ -2569,7 +2569,7 @@ class Scheduler(SchedulerInterface):
             marked_invalid_block = False
             req_id = request.request_id
             # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2579,13 +2579,23 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
+            for idx in range(req_num_computed_blocks):
+                invalid_at_idx = [
+                    block_ids[idx]
+                    for block_ids in req_block_id_groups
+                    if idx < len(block_ids) and block_ids[idx] in invalid_block_ids
+                ]
+                if not invalid_at_idx:
                     continue
 
                 is_affected = True
 
-                if block_id in marked_invalid_block_ids:
+                unmarked_invalid_at_idx = [
+                    block_id
+                    for block_id in invalid_at_idx
+                    if block_id not in marked_invalid_block_ids
+                ]
+                if not unmarked_invalid_at_idx:
                     # This invalid block is shared with a previous request
                     # and was already marked for recomputation.
                     # This means this request can still consider this block
@@ -2594,7 +2604,7 @@ class Scheduler(SchedulerInterface):
                     # loading does not yet support block sharing
                     continue
 
-                marked_invalid_block_ids.add(block_id)
+                marked_invalid_block_ids.update(unmarked_invalid_at_idx)
 
                 if marked_invalid_block:
                     # This request has already marked an invalid block for
@@ -2611,7 +2621,8 @@ class Scheduler(SchedulerInterface):
 
                 # collect invalid block and all downstream dependent blocks
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    for block_ids in req_block_id_groups:
+                        blocks_to_evict.update(block_ids[idx:])
 
             if is_affected:
                 if not marked_invalid_block:

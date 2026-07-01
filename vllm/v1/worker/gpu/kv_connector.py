@@ -47,6 +47,9 @@ class KVConnector:
     def snapshot_c128_state(self, req_id: str, req_state_idx: int) -> None:
         pass
 
+    def bind_c128_state_index(self, req_id: str, req_state_idx: int) -> None:
+        pass
+
     def restore_c128_state(self, req_id: str, req_state_idx: int) -> None:
         pass
 
@@ -118,6 +121,11 @@ class ActiveKVConnector(KVConnector):
 
     def snapshot_c128_state(self, req_id: str, req_state_idx: int) -> None:
         fn = getattr(self.kv_connector, "snapshot_c128_state", None)
+        if fn is not None:
+            fn(req_id, req_state_idx)
+
+    def bind_c128_state_index(self, req_id: str, req_state_idx: int) -> None:
+        fn = getattr(self.kv_connector, "bind_c128_state_index", None)
         if fn is not None:
             fn(req_id, req_state_idx)
 

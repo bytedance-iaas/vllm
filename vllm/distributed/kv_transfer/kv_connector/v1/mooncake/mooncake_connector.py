@@ -734,6 +734,7 @@ class MooncakeXferMetadata(
     c128_import_slot_bytes: int = 0
     c128_num_layers: int = 0
     c128_state_row_bytes: int = 0
+    c128_layer_indices: list[int] = msgspec.field(default_factory=list)
     # Per-request C128 import slot and partial-state flag.
     c128_req_import_slot: dict[ReqId, int] = msgspec.field(default_factory=dict)
     c128_req_needs_partial: dict[ReqId, bool] = msgspec.field(default_factory=dict)
@@ -926,6 +927,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """P side: snapshot committed bank0 before request-slot reuse."""
         if self.connector_worker is not None:
             self.connector_worker.snapshot_c128_state(req_id, p_req_state_idx)
+
+    def bind_c128_state_index(self, req_id: str, p_req_state_idx: int) -> None:
+        """P side: remember the live request-state slot for lazy snapshot."""
+        if self.connector_worker is not None:
+            self.connector_worker.bind_c128_state_index(req_id, p_req_state_idx)
 
     def restore_c128_state(self, req_id: str, d_req_state_idx: int) -> None:
         """D side: materialize bank0 after remote-prefill admission."""
@@ -1365,11 +1371,13 @@ class MooncakeConnectorWorker:
         self._c128_state_row_width: int = 0
         self._c128_state_row_bytes: int = 0
         self._c128_num_layers: int = 0
+        self._c128_layer_indices: list[int] = []
         # P side: export pool is keyed by req_id until transfer_id is known.
         self._c128_export_pool = None  # C128ExportSlotPool
         self._c128_export_slots: dict[ReqId, int] = {}
         # Sender thread waits on this event before RDMA-reading export slots.
         self._c128_export_events: dict[ReqId, torch.cuda.Event] = {}
+        self._c128_req_state_indices: dict[ReqId, int] = {}
         # D side: import pool (RDMA destination) + per-transfer staging info.
         self._c128_import_pool = None  # C128ImportSlotPool
         # transfer_id -> (import_slot, needs_partial); set when a pull is built.
@@ -1685,8 +1693,19 @@ class MooncakeConnectorWorker:
                 # Timeout, abort all pending requests.
                 for task in wait_tasks:
                     task.cancel()
+                pending_state = [
+                    (
+                        d_req_id,
+                        send_meta.transfer_id,
+                        send_meta.p_req_id,
+                        bool(send_meta.local_block_ids),
+                        send_meta.c128_export_slot,
+                        send_meta.ready.is_set(),
+                    )
+                    for d_req_id, send_meta in pending_reqs.items()
+                ]
                 logger.warning(
-                    "Timeout waiting for P side ready: %s", list(pending_reqs)
+                    "Timeout waiting for P side ready: %s", pending_state
                 )
                 response = MooncakeXferResponse(
                     status=MooncakeXferResponseStatus.FINISH,
@@ -2034,19 +2053,38 @@ class MooncakeConnectorWorker:
         if not sends_aux:
             return err_msg
 
-        expected_remote_slot_bytes = num_layers * row_bytes
+        remote_layer_indices = agent_meta.c128_layer_indices or list(
+            range(agent_meta.c128_num_layers)
+        )
+        remote_layer_pos = {
+            layer_index: layer_pos
+            for layer_pos, layer_index in enumerate(remote_layer_indices)
+        }
+        layer_pos_pairs: list[tuple[int, int]] = []
+        missing_layer_indices: list[int] = []
+        for src_layer_pos, layer_index in enumerate(self._c128_layer_indices):
+            dst_layer_pos = remote_layer_pos.get(layer_index)
+            if dst_layer_pos is None:
+                missing_layer_indices.append(layer_index)
+            else:
+                layer_pos_pairs.append((src_layer_pos, dst_layer_pos))
+
+        expected_remote_slot_bytes = agent_meta.c128_num_layers * row_bytes
         if (
-            agent_meta.c128_num_layers != num_layers
-            or agent_meta.c128_state_row_bytes != row_bytes
+            agent_meta.c128_state_row_bytes != row_bytes
             or agent_meta.c128_import_slot_bytes != expected_remote_slot_bytes
+            or missing_layer_indices
         ):
             err_msg = (
                 "C128 aux descriptor mismatch between producer and consumer: "
-                f"P(num_layers={num_layers}, row_bytes={row_bytes}, "
-                f"slot_bytes={expected_remote_slot_bytes}) vs "
+                f"P(num_layers={num_layers}, layer_indices="
+                f"{self._c128_layer_indices}, row_bytes={row_bytes}, "
+                f"slot_bytes={num_layers * row_bytes}) vs "
                 f"D(num_layers={agent_meta.c128_num_layers}, "
+                f"layer_indices={remote_layer_indices}, "
                 f"row_bytes={agent_meta.c128_state_row_bytes}, "
-                f"slot_bytes={agent_meta.c128_import_slot_bytes})."
+                f"slot_bytes={agent_meta.c128_import_slot_bytes}); "
+                f"missing_layer_indices={missing_layer_indices}."
             )
             for d_req_id, _ in ready_reqs:
                 if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
@@ -2081,6 +2119,7 @@ class MooncakeConnectorWorker:
                 remote_import_slot=import_slot,
                 num_layers=num_layers,
                 row_width_bytes=row_bytes,
+                layer_pos_pairs=layer_pos_pairs,
             )
             src_ptrs.extend(plan.src_ptrs)
             dst_ptrs.extend(plan.dst_ptrs)
@@ -2162,6 +2201,7 @@ class MooncakeConnectorWorker:
         self._c128_state_row_width = row_width
         self._c128_state_row_bytes = row_width * states[0].state.element_size()
         self._c128_num_layers = len(states)
+        self._c128_layer_indices = [state.layer_index for state in states]
         capacity = self.vllm_config.scheduler_config.max_num_seqs
         device = states[0].state.device
 
@@ -2439,6 +2479,8 @@ class MooncakeConnectorWorker:
             self._c128_export_pool.release(p_req_id)
             self._c128_export_slots.pop(p_req_id, None)
             self._c128_export_events.pop(p_req_id, None)
+        if p_req_id:
+            self._c128_req_state_indices.pop(p_req_id, None)
         send_meta.c128_export_slot = None
 
     def _release_c128_export_by_req(self, req_id: str) -> None:
@@ -2449,6 +2491,18 @@ class MooncakeConnectorWorker:
             self._c128_export_pool.release(req_id)
             self._c128_export_slots.pop(req_id, None)
             self._c128_export_events.pop(req_id, None)
+        self._c128_req_state_indices.pop(req_id, None)
+
+    def bind_c128_state_index(self, req_id: str, p_req_state_idx: int) -> None:
+        """P side: track live request-state slots for lazy aux snapshots."""
+        if not self._c128_aux_transfer_enabled:
+            return
+        self._c128_req_state_indices[req_id] = p_req_state_idx
+        logger.info(
+            "C128 aux bound live state index: req_id=%s req_state_idx=%d",
+            req_id,
+            p_req_state_idx,
+        )
 
     def snapshot_c128_state(self, req_id: str, p_req_state_idx: int) -> None:
         """P side: snapshot committed bank0 before the request slot is reused."""
@@ -2477,6 +2531,44 @@ class MooncakeConnectorWorker:
         event.record()
         self._c128_export_events[req_id] = event
         self._c128_export_slots[req_id] = slot
+        logger.info(
+            "C128 aux snapshotted export slot: req_id=%s req_state_idx=%d "
+            "slot=%d pending_sends=%s",
+            req_id,
+            p_req_state_idx,
+            slot,
+            [
+                (transfer_id, send_meta.p_req_id, bool(send_meta.local_block_ids))
+                for transfer_id, send_meta in self.reqs_need_send.items()
+                if send_meta.p_req_id == req_id
+            ],
+        )
+        self._attach_c128_export_slot_to_pending_sends(req_id, slot)
+
+    def _attach_c128_export_slot_to_pending_sends(
+        self, req_id: str, slot: int
+    ) -> None:
+        """Bind a freshly snapshotted C128 export slot to pending sends.
+
+        Scheduler-side ``request_finished`` can publish block IDs before the
+        worker has removed the request and snapshotted bank0.  When aux transfer
+        is enabled, defer sender readiness until this method attaches the slot.
+        """
+        if not self._c128_aux_transfer_enabled:
+            return
+        for send_meta in self.reqs_need_send.values():
+            if send_meta.p_req_id != req_id:
+                continue
+            send_meta.c128_export_slot = slot
+            if send_meta.local_block_ids:
+                logger.info(
+                    "C128 aux attached export slot to pending send: req_id=%s "
+                    "transfer_id=%s slot=%d",
+                    req_id,
+                    send_meta.transfer_id,
+                    slot,
+                )
+                send_meta.ready.set()
 
     def reserve_c128_import_slot(
         self, d_req_id: str, transfer_id: str, needs_partial: bool
@@ -2703,6 +2795,7 @@ class MooncakeConnectorWorker:
             ),
             c128_num_layers=self._c128_num_layers,
             c128_state_row_bytes=self._c128_state_row_bytes,
+            c128_layer_indices=list(self._c128_layer_indices),
             c128_req_import_slot={
                 req_id: pull_meta.c128_import_slot
                 for req_id, pull_meta in pull_metas.items()
@@ -2986,9 +3079,40 @@ class MooncakeConnectorWorker:
                 # Attach the req-keyed export slot to this transfer.
                 if self._c128_aux_transfer_enabled:
                     slot = self._c128_export_slots.get(p_req_id)
+                    if slot is None:
+                        req_state_idx = self._c128_req_state_indices.get(p_req_id)
+                        if req_state_idx is not None:
+                            self.snapshot_c128_state(p_req_id, req_state_idx)
+                            slot = self._c128_export_slots.get(p_req_id)
+                        else:
+                            logger.warning(
+                                "C128 aux no live state index for request %s "
+                                "transfer_id=%s known_state_indices=%s",
+                                p_req_id,
+                                transfer_id,
+                                list(self._c128_req_state_indices),
+                            )
                     if slot is not None:
                         send_meta.c128_export_slot = slot
-                send_meta.ready.set()
+                        logger.info(
+                            "C128 aux attached existing export slot: req_id=%s "
+                            "transfer_id=%s slot=%d",
+                            p_req_id,
+                            transfer_id,
+                            slot,
+                        )
+                        send_meta.ready.set()
+                    else:
+                        logger.warning(
+                            "Deferring Mooncake send readiness for request %s "
+                            "transfer_id=%s until C128 export slot is "
+                            "snapshotted. known_export_slots=%s",
+                            p_req_id,
+                            transfer_id,
+                            list(self._c128_export_slots),
+                        )
+                else:
+                    send_meta.ready.set()
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet

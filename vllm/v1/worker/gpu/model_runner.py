@@ -806,11 +806,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
-        # Snapshot terminal producer state before the request slot is recycled.
-        if self._online_c128_pd_aux and snapshot_c128_state:
-            req_idx_for_snapshot = self.req_states.req_id_to_index.get(req_id)
-            if req_idx_for_snapshot is not None:
-                self.kv_connector.snapshot_c128_state(req_id, req_idx_for_snapshot)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
@@ -835,6 +830,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.encoder_cache is not None:
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
+
+    def _snapshot_c128_pending_sends(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Snapshot producer C128 bank0 for sends advertised this step.
+
+        Scheduler-side ``request_finished`` can publish Mooncake block metadata
+        before this worker recycles the request state. Snapshot here, while the
+        request slot is still live, and before ``pre_forward`` starts sender
+        tasks.
+        """
+        metadata = scheduler_output.kv_connector_metadata
+        reqs_to_send = getattr(metadata, "reqs_to_send", None)
+        req_ids = set(reqs_to_send or ())
+        req_ids.update(scheduler_output.finished_req_ids)
+        if not req_ids:
+            return
+        logger.info(
+            "C128 aux snapshot pending sends: req_ids=%s live_req_ids=%s",
+            sorted(req_ids),
+            list(self.req_states.req_id_to_index),
+        )
+        for req_id in req_ids:
+            req_idx = self.req_states.req_id_to_index.get(req_id)
+            if req_idx is not None:
+                self.kv_connector.snapshot_c128_state(req_id, req_idx)
+            else:
+                logger.warning(
+                    "C128 aux snapshot skipped: request %s not found in "
+                    "live req_state slots.",
+                    req_id,
+                )
 
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
@@ -865,6 +892,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            self.kv_connector.bind_c128_state_index(req_id, req_index)
 
             # Materialize D-side bank0 once the request slot is known.
             if self._online_c128_pd_aux:
@@ -1199,6 +1227,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
+            self._snapshot_c128_pending_sends(scheduler_output)
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
@@ -1206,6 +1235,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
+                self._snapshot_c128_pending_sends(scheduler_output)
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
