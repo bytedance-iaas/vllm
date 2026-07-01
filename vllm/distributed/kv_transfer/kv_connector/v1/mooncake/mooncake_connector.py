@@ -2171,6 +2171,17 @@ class MooncakeConnectorWorker:
         )
         if device.type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(device)
+            if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+                logger.info(
+                    "C128 online debug: aux pool sizing role=%s capacity=%d "
+                    "num_layers=%d row_width=%d pool_bytes=%d free_bytes=%d",
+                    "consumer" if self.is_kv_consumer else "producer",
+                    capacity,
+                    self._c128_num_layers,
+                    row_width,
+                    pool_bytes,
+                    free_bytes,
+                )
             # Keep a 5% headroom so registration / fragmentation does not OOM.
             margin = int(free_bytes * 0.95)
             if pool_bytes > margin:
@@ -2451,6 +2462,16 @@ class MooncakeConnectorWorker:
         snapshot_bank0_to_slot(
             self._c128_states, self._c128_export_pool, slot, p_req_state_idx
         )
+        if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+            logger.info(
+                "C128 online debug: snapshotted P bank0 req_id=%s "
+                "req_state_idx=%d export_slot=%d layers=%d slot_bytes=%d",
+                req_id,
+                p_req_state_idx,
+                slot,
+                len(self._c128_states),
+                self._c128_export_pool.slot_bytes,
+            )
         # Sender waits on this event before RDMA-reading the export slot.
         event = torch.cuda.Event()
         event.record()
@@ -2466,6 +2487,16 @@ class MooncakeConnectorWorker:
         slot = self._c128_import_pool.acquire(transfer_id, timeout=0.0)
         self._c128_import_slots[transfer_id] = (slot, needs_partial)
         self._c128_req_to_transfer[d_req_id] = transfer_id
+        if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+            logger.info(
+                "C128 online debug: reserved D import slot req_id=%s "
+                "transfer_id=%s slot=%d needs_partial=%s slot_bytes=%d",
+                d_req_id,
+                transfer_id,
+                slot,
+                needs_partial,
+                self._c128_import_pool.slot_bytes,
+            )
         return slot
 
     def restore_c128_state(self, req_id: str, d_req_state_idx: int) -> None:
@@ -2489,14 +2520,34 @@ class MooncakeConnectorWorker:
         if entry is None:
             # No staging reserved for this request: reset bank0 to identity.
             reset_bank0(self._c128_states, d_req_state_idx)
+            if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+                logger.info(
+                    "C128 online debug: reset D bank0 without import slot "
+                    "req_id=%s req_state_idx=%d",
+                    req_id,
+                    d_req_state_idx,
+                )
             return
         slot, needs_partial = entry
         if needs_partial:
             restore_bank0_from_slot(
                 self._c128_states, self._c128_import_pool, slot, d_req_state_idx
             )
+            action = "restored"
         else:
             reset_bank0(self._c128_states, d_req_state_idx)
+            action = "reset"
+        if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+            logger.info(
+                "C128 online debug: %s D bank0 req_id=%s transfer_id=%s "
+                "req_state_idx=%d import_slot=%d needs_partial=%s",
+                action,
+                req_id,
+                transfer_id,
+                d_req_state_idx,
+                slot,
+                needs_partial,
+            )
         self._c128_import_pool.release(transfer_id)
 
     def _c128_release_import_slot(self, pull_meta: "PullReqMeta") -> None:
@@ -2858,6 +2909,17 @@ class MooncakeConnectorWorker:
                 and pull_meta.c128_import_slot is not None
             ):
                 self._c128_active_pulls[pull_meta.d_req_id] = pull_meta
+                if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+                    logger.info(
+                        "C128 online debug: tracking D import slot quiesce "
+                        "req_id=%s transfer_id=%s slot=%s pull_tasks=%d "
+                        "abort_pending=%s",
+                        pull_meta.d_req_id,
+                        pull_meta.transfer_id,
+                        pull_meta.c128_import_slot,
+                        pull_meta.c128_pull_pending,
+                        pull_meta.c128_abort_pending,
+                    )
         for worker_addr in worker_addrs:
             asyncio.create_task(
                 self.receive_kv_from_single_worker(worker_addr, pull_metas)

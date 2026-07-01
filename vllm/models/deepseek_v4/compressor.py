@@ -26,6 +26,7 @@ from vllm.models.deepseek_v4.online_c128 import (
     assert_online_c128_supported,
     ensure_online_c128_compressed_kv,
     online_c128_compress_enabled,
+    online_c128_debug_enabled,
     online_c128_mtp_enabled,
     register_online_c128_state,
 )
@@ -390,6 +391,23 @@ class DeepseekCompressor(nn.Module):
             )
             register_online_c128_state(self.online_c128_state)
             self.online_c128_mtp = online_c128_mtp_enabled()
+            if online_c128_debug_enabled() and self.online_c128_state.layer_index == 0:
+                state_bytes = (
+                    self.online_c128_state.state.numel()
+                    * self.online_c128_state.state.element_size()
+                )
+                logger.info(
+                    "C128 online debug: compressor enabled prefix=%s "
+                    "compress_ratio=%d head_dim=%d mtp=%s num_banks=%d "
+                    "max_num_reqs=%d state_bytes_per_layer=%d",
+                    self.prefix,
+                    self.compress_ratio,
+                    self.head_dim,
+                    self.online_c128_mtp,
+                    self.online_c128_state.num_banks,
+                    self.online_c128_state.max_num_reqs,
+                    state_bytes,
+                )
             # Fixed-address compressed-KV scratch for the FULL decode cudagraph
             # path (shared across layers; allocated before any capture).
             ensure_online_c128_compressed_kv(
@@ -589,6 +607,16 @@ class DeepseekCompressor(nn.Module):
         run_state = online_state.state
 
         cg_mode = get_forward_context().cudagraph_runtime_mode
+        if online_c128_debug_enabled() and online_state.layer_index == 0:
+            logger.info(
+                "C128 online debug: forward path cg_mode=%s num_actual=%d "
+                "mtp=%s store_full_kv=%s store_full_fp8=%s",
+                cg_mode.name,
+                num_actual,
+                self.online_c128_mtp,
+                store_full_kv,
+                store_full_fp8,
+            )
         if cg_mode == CUDAGraphMode.FULL:
             self._online_forward_graph_safe(
                 kv=kv,
@@ -770,6 +798,18 @@ class DeepseekCompressor(nn.Module):
                     req_mask=verify_req_mask,
                     max_query_len=online_state.num_banks - 1,
                 )
+                if online_c128_debug_enabled() and online_state.layer_index == 0:
+                    logger.info(
+                        "C128 online debug: planned MTP verify reqs=%d "
+                        "steps=%d segments_per_step=%s max_query_len=%d",
+                        int(np.count_nonzero(verify_req_mask)),
+                        len(verify_segments_by_step),
+                        [
+                            int(step_segments.shape[0])
+                            for step_segments in verify_segments_by_step
+                        ],
+                        online_state.num_banks - 1,
+                    )
                 for step_segments in verify_segments_by_step:
                     online_c128_merge(
                         kv=kv,
@@ -828,6 +868,15 @@ class DeepseekCompressor(nn.Module):
                 bank_id=0,
                 compress_ratio=self.compress_ratio,
             )
+            if online_c128_debug_enabled() and online_state.layer_index == 0:
+                logger.info(
+                    "C128 online debug: planned regular segments "
+                    "emit=%d update=%d reset=%d num_actual=%d",
+                    plan.emit_segments.shape[0],
+                    plan.update_segments.shape[0],
+                    plan.reset_rows.numel(),
+                    num_actual,
+                )
             # Phase 1 (emit): read committed carry read-only, write compressed_kv.
             online_c128_merge(
                 kv=kv,

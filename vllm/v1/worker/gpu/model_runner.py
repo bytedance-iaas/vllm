@@ -204,14 +204,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Online C128 MTP uses transactional candidate banks.
         import vllm.envs as envs
-        from vllm.models.deepseek_v4.online_c128 import online_c128_mtp_enabled
+        from vllm.models.deepseek_v4.online_c128 import (
+            online_c128_debug_enabled,
+            online_c128_mtp_enabled,
+        )
 
         self._online_c128_mtp = online_c128_mtp_enabled()
+        self._online_c128_debug = online_c128_debug_enabled()
         self._online_c128_verify_ctx: tuple | None = None
         # Runner hooks for Mooncake C128 snapshot/restore; connector gates by role.
         self._online_c128_pd_aux = bool(
             envs.VLLM_DSV4_C128_ONLINE_COMPRESS
         ) and bool(envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER)
+        if self._online_c128_debug:
+            logger.info(
+                "C128 online debug: runner flags compress=%s mtp=%s "
+                "pd_aux=%s spec=%s pp=%d dp=%d tp=%d max_num_reqs=%d "
+                "max_num_tokens=%d",
+                bool(envs.VLLM_DSV4_C128_ONLINE_COMPRESS),
+                self._online_c128_mtp,
+                self._online_c128_pd_aux,
+                getattr(self.speculative_config, "method", None)
+                if self.speculative_config is not None
+                else None,
+                self.parallel_config.pipeline_parallel_size,
+                self.parallel_config.data_parallel_size,
+                self.parallel_config.tensor_parallel_size,
+                self.max_num_reqs,
+                self.max_num_tokens,
+            )
         if self._online_c128_mtp:
             if self.speculative_config is None or (
                 self.speculative_config.method != "mtp"
@@ -506,6 +527,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "PIECEWISE."
             )
             cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+        if getattr(self, "_online_c128_debug", False):
+            logger.info(
+                "C128 online debug: resolved cudagraph_mode=%s "
+                "decode_query_len=%d online_compress=%s",
+                cudagraph_mode.name,
+                self.decode_query_len,
+                self._online_c128_compress,
+            )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -1374,6 +1403,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 verify_req_indices = torch.from_numpy(verify_req_indices_np).to(
                     input_batch.req_state_indices.device
                 )
+                if self._online_c128_debug:
+                    logger.info(
+                        "C128 online debug: begin MTP verify req_ids=%s "
+                        "req_state_indices=%s query_lens=%s base_seq_lens=%s",
+                        [
+                            input_batch.req_ids[i]
+                            for i in verify_req_indices_np.tolist()
+                        ],
+                        input_batch.req_state_indices[: input_batch.num_reqs][
+                            verify_req_indices
+                        ]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        query_lens_np.tolist(),
+                        base_seq_len_np.tolist(),
+                    )
                 self._online_c128_verify_ctx = (
                     input_batch.req_state_indices[: input_batch.num_reqs][
                         verify_req_indices
@@ -1578,6 +1624,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 torch.int32
             )
             final_seq_len = base_seq_len_t + accepted_len
+            if self._online_c128_debug:
+                logger.info(
+                    "C128 online debug: commit MTP verify req_state_indices=%s "
+                    "query_lens=%s rejected=%s accepted=%s final_seq_lens=%s",
+                    req_state_indices.detach().cpu().tolist(),
+                    query_lens_t.detach().cpu().tolist(),
+                    num_rejected[verify_req_indices].detach().cpu().tolist(),
+                    accepted_len.detach().cpu().tolist(),
+                    final_seq_len.detach().cpu().tolist(),
+                )
             commit_all_online_c128_verify(
                 req_state_indices=req_state_indices,
                 accepted_len=accepted_len,
