@@ -78,7 +78,7 @@ prefill:
     dboPrefillTokenThreshold: 256
     enforceEager: true
     compilationConfig: ""
-    noAsyncScheduling: true
+    noAsyncScheduling: false
   extraArgs:
     - --gpu-memory-utilization
     - "0.85"
