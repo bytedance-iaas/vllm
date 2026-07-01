@@ -285,7 +285,8 @@
 - 2026-07-02 用户接受 `vllm bench serve` 结果，认为总体通过；当前 M10 不再因历史 evalscope 波动阻塞。M10 仍必须先完成发布前核对：不得使用 C25/C28 诊断分支直接更新 `iaas_main`；需要切回非诊断集成/发布候选分支，确认候选 SHA 与已验证非诊断镜像的源码一致，或者在不一致时先重新构建非诊断镜像；同时重新核对远端备份分支、保护规则、diff scope、部署模板和 no-runtime-fallback 约束。
 - 2026-07-02 M10 发布前核对发现 blocker：非诊断候选分支 `origin/codex/vllm-dsv4-fork-base-byteiaas-build` 当前 SHA `72a6e5752256c2664107b5005c63d71006334807` 中 `examples/deployment/deepseek-v4-flash-pd/values.yaml` 仍为 `prefill.args.noAsyncScheduling: true`，会渲染 `--no-async-scheduling`，与用户要求和主计划 `prefill.args.noAsyncScheduling=false` 不一致。按执行规则停止发布，未更新远端 `iaas_main`。详见进展日志 `P98`。
 - 2026-07-02 M10 blocker 已在非诊断 release worktree 修复：`examples/deployment/deepseek-v4-flash-pd/values.yaml` 已改为 `prefill.args.noAsyncScheduling: false`，并同步当前计划 ledger 到 release 分支。后续必须完成 render 验证和 GitHub ref 更新。详见进展日志 `P99`。
+- 2026-07-02 M10 已完成：非诊断 release candidate 经 render/scope 验证后更新远端 `codex/vllm-dsv4-fork-base-byteiaas-build`，并用 `--force-with-lease` 将远端 `iaas_main` 从原始 SHA `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16` 更新到 release candidate。备份分支 `backup/iaas_main-20260629` 仍指向原始 SHA，保护 ruleset active。详见进展日志 `P100` 和 `P101`。
 
 ## Next Action
 
-当前 C28 TTFT 根因分析已完成，资源已清理；用户已在 2026-07-02 接受 vLLM benchmark 结果，认为总体通过。非诊断 release worktree 已修复 `prefill.args.noAsyncScheduling=false`，下一步是完成 render 验证、commit/push release candidate、重新核对远端备份分支和保护规则，然后按 C10 更新远端 `iaas_main` 或记录 branch protection fallback。
+当前计划的核心迁移、构建、部署、benchmark、差异分析和远端 `iaas_main` 更新均已完成。下一步只剩 completion audit：确认远端 refs、备份分支、保护规则、计划文件、render invariants 和本地临时 worktree 状态；若审计通过，可标记 goal complete。

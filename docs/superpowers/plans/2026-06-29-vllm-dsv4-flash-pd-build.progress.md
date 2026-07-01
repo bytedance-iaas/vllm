@@ -2163,3 +2163,25 @@
 - Decision:
   - Proceed to push `codex/vllm-dsv4-fork-base-byteiaas-build`.
   - Then run C10 remote `iaas_main` update with `--force-with-lease` against the current old `origin/iaas_main` SHA, unless branch protection rejects and requires C11 fallback.
+
+### P101: C10 remote iaas_main update completed
+
+- Date: 2026-07-02
+- Trigger: P100 validation passed and user had already authorized M10 remote update in this thread.
+- Release candidate:
+  - First pushed candidate branch from local HEAD `a1102a2013b90b4634ff2cff0f46760909a88d41`.
+  - `git push origin HEAD:refs/heads/codex/vllm-dsv4-fork-base-byteiaas-build` succeeded.
+- Backup and ruleset preflight:
+  - `origin/iaas_main` before C10: `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`.
+  - `backup/iaas_main-20260629`: `1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16`.
+  - Candidate branch before C10: `a1102a2013b90b4634ff2cff0f46760909a88d41`.
+  - Ruleset `Protect backup iaas_main branches` id `18250606` is `active`, target `branch`, include `refs/heads/backup/iaas_main-*`, rules `deletion` and `non_fast_forward`.
+- C10 update:
+  - Command shape: `git push --force-with-lease=refs/heads/iaas_main:1ad5c27d41aa2b04d61a13c2adfe8d3db6ae2b16 origin HEAD:refs/heads/iaas_main`.
+  - Result: success, forced update `1ad5c27d4...a1102a201`.
+  - `origin/iaas_main` after C10: `a1102a2013b90b4634ff2cff0f46760909a88d41`.
+- Final ledger note:
+  - This P101 entry is being committed after the successful C10 update so the branch records the remote update result.
+  - After committing P101, the release branch and `iaas_main` must be advanced one more time to the final ledger commit, with backup branch still unchanged.
+- Remaining validation:
+  - Run C12-style final status checks after final ledger commit is pushed.
