@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 ReqId = str  # Internal scheduler request ID
 TransferId = str  # KV transfer coordination ID (shared by P/D)
 BlockIds = list[list[int]]
+DiagContext = dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -1342,6 +1343,16 @@ class MooncakeConnectorWorker:
         self._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
 
+    @staticmethod
+    def _diag_enabled() -> bool:
+        return envs.VLLM_DSV4_MOONCAKE_DIAG
+
+    @staticmethod
+    def _diag_sample(values: list[str] | set[str], limit: int = 8) -> list[str]:
+        if isinstance(values, set):
+            return sorted(values)[:limit]
+        return values[:limit]
+
     def _sync_block_size_with_kernel(self) -> None:
         # When speculative decoding (e.g. Eagle) is enabled, the main model
         # and draft model may use different attention backends with different
@@ -1566,6 +1577,15 @@ class MooncakeConnectorWorker:
                 # Timeout, abort all pending requests.
                 for task in wait_tasks:
                     task.cancel()
+                if self._diag_enabled():
+                    logger.warning(
+                        "MooncakeDiag ready_timeout role=producer rank=%s "
+                        "pending_count=%d pending_req_sample=%s timeout_s=%d",
+                        self.tp_rank,
+                        len(pending_reqs),
+                        self._diag_sample(set(pending_reqs)),
+                        envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                    )
                 logger.warning(
                     "Timeout waiting for P side ready: %s", list(pending_reqs)
                 )
@@ -1621,6 +1641,20 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                diag_context: DiagContext | None = None
+                if self._diag_enabled():
+                    diag_context = {
+                        "role": "producer",
+                        "rank": self.tp_rank,
+                        "remote_session": remote_session,
+                        "request_count": len(ok_ready_reqs),
+                        "req_sample": self._diag_sample(
+                            [d_req_id for d_req_id, _ in ok_ready_reqs]
+                        ),
+                        "transfer_id_sample": self._diag_sample(
+                            [send_meta.transfer_id for _, send_meta in ok_ready_reqs]
+                        ),
+                    }
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
@@ -1628,6 +1662,7 @@ class MooncakeConnectorWorker:
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                    diag_context,
                 )
 
                 if ret_value != 0:
@@ -1868,17 +1903,20 @@ class MooncakeConnectorWorker:
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
+        diag_context: DiagContext | None = None,
     ) -> int:
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
+        total_bytes = sum(lengths)
+        num_descs = len(src_ptrs)
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
-                num_descs=len(src_ptrs),
+                total_bytes=total_bytes,
+                num_descs=num_descs,
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
@@ -1888,8 +1926,25 @@ class MooncakeConnectorWorker:
                 remote_session,
                 ret_value,
                 duration,
-                len(src_ptrs),
-                sum(lengths),
+                num_descs,
+                total_bytes,
+            )
+        if self._diag_enabled():
+            diag_context = diag_context or {}
+            logger.warning(
+                "MooncakeDiag transfer role=%s rank=%s remote_session=%s "
+                "request_count=%s req_sample=%s transfer_id_sample=%s "
+                "ret=%s elapsed_s=%.6f descriptor_count=%d total_bytes=%d",
+                diag_context.get("role", "producer"),
+                diag_context.get("rank", self.tp_rank),
+                diag_context.get("remote_session", remote_session),
+                diag_context.get("request_count"),
+                diag_context.get("req_sample"),
+                diag_context.get("transfer_id_sample"),
+                ret_value,
+                duration,
+                num_descs,
+                total_bytes,
             )
         return ret_value
 
@@ -2075,6 +2130,23 @@ class MooncakeConnectorWorker:
                     send_meta.p_req_id,
                     envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
                 )
+                if self._diag_enabled():
+                    logger.warning(
+                        "MooncakeDiag producer_expired_request rank=%s "
+                        "p_req_id=%s transfer_id=%s pending_total=%d "
+                        "expired_count_so_far=%d timeout_s=%d need_send=%d "
+                        "sent=%d sending=%d local_group_count=%d",
+                        self.tp_rank,
+                        send_meta.p_req_id,
+                        transfer_id,
+                        len(self.reqs_need_send),
+                        len(expired_transfer_id) + 1,
+                        envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                        send_meta.need_send,
+                        send_meta.sent,
+                        send_meta.sending,
+                        len(send_meta.local_block_ids),
+                    )
                 self.xfer_stats.record_kv_expired_req()
                 finished_sending_reqs.add(send_meta.p_req_id)
                 expired_transfer_id.append(transfer_id)
@@ -2170,6 +2242,19 @@ class MooncakeConnectorWorker:
                     ret_msg = await sock.recv()
                     response = self._xfer_resp_decoder.decode(ret_msg)
                     if response.status == MooncakeXferResponseStatus.ERROR:
+                        if self._diag_enabled():
+                            logger.error(
+                                "MooncakeDiag receive_error role=consumer rank=%s "
+                                "worker_addr=%s request_count=%d req_sample=%s "
+                                "err_reqs=%s err_msg=%s metadata_bytes=%d",
+                                self.tp_rank,
+                                worker_addr,
+                                len(req_ids),
+                                self._diag_sample(req_ids),
+                                response.err_reqs,
+                                response.err_msg,
+                                len(encoded_data),
+                            )
                         logger.error(
                             "Error happens during transferring kvcache for %s: %s",
                             req_ids,
@@ -2205,6 +2290,15 @@ class MooncakeConnectorWorker:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
 
         if response.err_reqs:
+            if self._diag_enabled():
+                logger.error(
+                    "MooncakeDiag pulling_error role=consumer rank=%s "
+                    "err_count=%d err_reqs=%s err_msg=%s",
+                    self.tp_rank,
+                    len(response.err_reqs),
+                    self._diag_sample(response.err_reqs),
+                    response.err_msg,
+                )
             logger.error(
                 "pulling kv_caches for %s failed: %s",
                 response.err_reqs,

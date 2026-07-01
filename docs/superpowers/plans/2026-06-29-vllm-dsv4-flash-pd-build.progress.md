@@ -83,7 +83,7 @@
 - `I4`: GitHub rulesets API 可能因权限或 GitHub Enterprise 版本不可用而失败；失败时记录 exact error，并要求仓库管理员在 UI 上为 `backup/iaas_main-*` 添加 deletion/non-fast-forward 保护。
 - `I5`: `dev-cluster` GPU workload 需要 workspace-env GPU permit；如果 permit queued/denied/blocked，不得创建 Pending workload 占位。
 - `I6`: 若 evalscope 不可安装或无法表达 full-cache decode BS512 场景，必须停止并记录 blocker，不得擅自改用自定义 harness。
-- `I7`: 用户已明确此处先跳过 Prometheus；summary 必须标记 Prometheus skipped by user，不得声称有完整服务侧 measured-window monitoring 诊断。
+- `I7`: P7 的 Prometheus skipped 决策已被 P51 supersede；后续必须部署 servingkit `origin/hanhan_dev:llm-serving-monitoring` 的最小 Prometheus 监控，并用 `vllm:num_requests_running` / `vllm:num_requests_waiting` 判断 running BS 和排队状态。
 
 ## Progress Entries
 
@@ -661,3 +661,943 @@
 - Decision:
   - M10 不执行。性能未达标是用户明确 stop rule：`性能过差不更新iaas_main`。
   - 下一步若继续推进，应先诊断 BS512/1536 Avg throughput 低于目标的原因，而不是更新远端 `iaas_main`。
+
+### P41: Align deployment semantics back to servingkit for scheduler and max-num-seqs
+
+- Summary: 用户确认 `prefill.args.noAsyncScheduling` 必须与 servingkit `perf/vllm_dsv4` SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 对齐为 `false`；`decode.args.maxNumSeqs` 是每个 worker 的值，不应为 BS512 benchmark 覆盖为 `512`，应保持 `96`。本条 supersede 之前 P33/P34/P38/P39 中关于 `decode.args.maxNumSeqs=512` 可作为允许差异的结论，但不改写历史已执行命令记录。
+- Evidence:
+  - `examples/deployment/deepseek-v4-flash-pd/values.yaml` 已将 `prefill.args.noAsyncScheduling` 从 `true` 改为 `false`。
+  - 命令引用 `C13` 与 `C15` 的 `DECODE_MAX_NUM_SEQS` 默认值已从 `512` 改为 `96`。
+  - 主计划 `M7` 已明确：`decode.args.maxNumSeqs` 必须保持 servingkit 当前语义 `96`，不得为了 BS512/1.5k benchmark 覆盖为 `512`。
+  - 当前状态已标记：此前 benchmark 使用的 `decode.args.maxNumSeqs=512` run 不能作为当前部署语义的有效 gate；后续需以 `prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96` 重新 render/deploy/benchmark。
+
+### P42: Resume execution decision and ownership
+
+- Summary: 继续按 `superpowers:executing-plans` 执行主计划；本轮不启用 `subagent-driven-development`。
+- Rationale: 当前剩余工作不是独立可并行实现流，而是同一 Helm release、同一 namespace、同一 GPU permit、同一 router port-forward 和同一 artifact 目录上的串行状态机。并行子代理会增加 Kubernetes ownership、permit、port-forward 和 artifact 覆盖冲突。
+- Ownership boundaries: 主线程独占 `dev-cluster` namespace `vllm-dsv4-flash-pd`、Helm release `dsv4-flash-pd`、workspace-env permit/session、`artifacts/2026-06-29-vllm-dsv4-flash-pd/` 以及计划三份文档的更新。
+- Validation strategy: 重新执行 `C13` render，确认 `prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96`、无 `--max-model-len`、无 runtime hotfix/install；随后执行 `C14` 获取 16 GPU permit，`C15/C16` 部署和真实 router smoke，最后执行 `C19-C21` benchmark 并由 `C22` 清理和更新 gate 结果。
+
+### P43: C13 rerender passed with maxNumSeqs=96
+
+- Summary: 使用当前新候选镜像和原 P/D 节点重新执行 C13 render，确认部署语义已回到 servingkit 对齐状态。
+- Evidence:
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`。
+  - Render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd.yaml`。
+  - Positive grep artifacts: `c13-render-positive-grep.txt`、`c13-render-shape-grep.txt`。
+  - Render 中 prefill 参数包含 `--max-num-seqs "16"`，没有 `--no-async-scheduling`。
+  - Render 中 decode 参数包含 `--max-num-seqs "96"`、`--all2all-backend "deepep_low_latency"`、`--moe-backend "deep_gemm_mega_moe"`、`--cp-kv-cache-interleave-size "256"` 和 MTP speculative config。
+  - Render 中没有 `--max-model-len`、`"66000"`、`runtimePatch`、`git clone`、`pip install`、`apt install`、wheel download/install 或 runtime router install。
+  - `helm template` 同节点负例被拒绝，`rendered-invalid-same-node.err` 包含 `prefill and decode nodeAffinity values must be disjoint`。
+
+### P44: C14 GPU permit granted; local env-file write bug repaired
+
+- Summary: C14 集群 preflight 与 GPU permit 申请已完成，permit 返回 `granted`；命令尾部用于写 `c14-current-env.sh` 的 Python snippet 错误引用了未定义变量，导致 shell exit `1`，但错误发生在 permit 已写入 artifact 后、任何 GPU workload 创建之前。已用 artifact 中的 JSON 修正本地状态文件。
+- Evidence:
+  - `envctl info dev-cluster` 和 `envctl validate dev-cluster` 通过，输出保存到 `c14-env-info.txt`、`c14-env-validate.txt`。
+  - `stormservices.orchestration.aibrix.ai` CRD 存在。
+  - 节点 `192.168.1.148` 与 `192.168.1.186` 均 `ALLOCATABLE_GPU=8` 且 `UNSCHEDULABLE=false`。
+  - `gpu-permit.json` 返回 `status=granted`、`permit_id=585fd741-c3a7-490b-935f-cb761b5652fc`、`session_id=codex-vllm-dsv4-flash-pd-20260630-234927-790782`、`requested_gpus=16.0`。
+  - `permit-list --active` 确认该 permit 仍 active 且状态为 `granted`。
+  - 已写入 `artifacts/2026-06-29-vllm-dsv4-flash-pd/c14-current-env.sh`，供 C15/C16 使用。
+- Prevention: 后续命令不再在 f-string 中引用未定义 JSON key 变量；需要写 permit 环境文件时直接从已保存的 JSON 字段取值。
+
+### P45: C15 deployed after node reselect
+
+- Summary: 初始 C15 使用旧节点 `192.168.1.148/192.168.1.186` 失败在调度阶段，原因是这些节点已有其它 hostNetwork P/D 服务占用 8000/8001 端口。已停止 Helm wait、卸载本任务刚创建的失败 release，改选当前空闲的 `192.168.1.149` 与 `192.168.1.154` 后重新 render/deploy；Helm release 已成功 deployed。
+- Failed old-node evidence:
+  - `c15-failed-old-node-events.txt` 中 prefill/decode Pending 原因：`1 node(s) didn't have free ports for the requested pod ports`。
+  - `c15-node-occupancy-before-reselect.txt` 显示 `192.168.1.148` 上已有 `hank/vllm-45112-ppcp...prefill` 占用 `8000,8998`，`192.168.1.186` 上已有 `hank/vllm-45112-ppcp...decode` 占用 `8001,8999`。
+  - 本任务旧 release 已通过 `c15-uninstall-old-node-release.log` 卸载，旧 router pod delete wait 成功。
+- Reselect evidence:
+  - `c15-node-occupancy-before-reselect.txt` 显示 `192.168.1.149` 与 `192.168.1.154` 当前 GPU request 为 `0`，hostNetwork 仅有系统/monitoring 端口，不占用 P/D/router 端口。
+  - `rendered-dsv4-flash-pd.yaml` 已重新渲染到 prefill `192.168.1.149:8000`、decode `192.168.1.154:8001`、router `192.168.1.154:30000`，且 `decode.args.maxNumSeqs=96`。
+  - `c15-reselected-nodes.txt` 记录 `192.168.1.149` 与 `192.168.1.154` 均 `ALLOCATABLE_GPU=8`、`UNSCHEDULABLE=false`。
+- Deploy evidence:
+  - `helm-upgrade-dsv4-flash-pd.log` 返回 `STATUS: deployed`。
+  - `kubectl-get-all-after-deploy.txt` 显示 prefill pod `dsv4-flash-pd-roleset-596xb-prefill-846b58fc57-0` Ready on `192.168.1.149`，decode pod `dsv4-flash-pd-roleset-596xb-decode-6598c55574-0` Ready on `192.168.1.154`，router pod `dsv4-flash-pd-router-6d8fb49b5f-tbfln` Ready on `192.168.1.154`。
+  - Permit `585fd741-c3a7-490b-935f-cb761b5652fc` 已通过 `c15-permit-running.json` 标记为 `running`。
+
+### P46: C16 readiness and real router smoke passed
+
+- Summary: C16 证据链通过。P/D/router 均 Ready，Onion init 幂等跳过已有模型目录，模型完整性检查通过，router `/v1/models` 与 `/v1/completions` 均通过真实 router path。
+- Evidence:
+  - `pods-ready.txt` 显示 prefill `1/1 Running` on `192.168.1.149`，decode `1/1 Running` on `192.168.1.154`，router `1/1 Running` on `192.168.1.154`。router 在后端未 ready 期间有 3 次 liveness restart，最终 Ready。
+  - `*-onion-model-prepare.log` 显示 `Model directory /data01/DeepSeek-V4-Flash is already complete, skip Onion download.`。
+  - `router-models.json` 返回 `deepseek-v4-flash`，`max_model_len=1048576`，确认没有通过 CLI 设置 `--max-model-len=66000`。
+  - `router-completion-smoke.json` 返回 HTTP 成功且文本为 `","`；completion id 包含 `prefill_addr_192.168.1.149:8000` 与 `decode_addr_192.168.1.154:8001`。
+  - `bad-log-scan.txt` 对 `Mooncake found no common KV transfer regions|KV group count mismatch|KV load failed|handshake compatibility failure|request timeout during KV pull` 无命中。
+  - `runtime-install-scan.txt` 对 runtime hotfix/install pattern 无命中。
+  - `*-package-evidence.txt`、`*-argv-env.txt`、`*-model-files.txt` 已保存到 artifact 目录。
+- Issue: 第一次 C16 shell 由于 nested zsh/bash quoting 失败，未执行到集群；随后改为 `shell=bash` 直接运行同一逻辑成功。后续长脚本优先用 bash shell 直接执行，避免把脚本嵌进 zsh 单引号。
+
+### P47: C19-C21 rerun with maxNumSeqs=96; C21 invalid due Mooncake KV transfer failures
+
+- Summary: 继续在 `prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96` 的当前部署上执行 M9。C19 warmup/cache seed 和 C20 64k/1 TTFT 成功；C21 BS512/1536 cache-hit decode run 未完成且无有效 throughput gate 结果。日志出现大量 Mooncake KV transfer 失败和 producer 侧 480s timeout，因此 M10 仍不得执行。
+- Access path issue:
+  - 继续使用 `envctl port-forward` 时，port-forward 进程在处理一次健康检查连接后退出，导致 C19 多次在 `curl http://127.0.0.1:30000/health` 处 exit `7`。
+  - 直接访问 router Node IP `http://192.168.1.154:30000/health` 从本机超时。
+  - 改用前台 PTY session 执行原生 `kubectl port-forward -n vllm-dsv4-flash-pd svc/dsv4-flash-pd-router 30000:30000` 后，连续健康检查通过，C19-C21 可继续执行。
+  - Prevention: 未来长 benchmark 不应在短生命周期 shell 中用后台 `envctl port-forward`；需要保持 port-forward 前台会话，或使用更稳定的 cluster-internal benchmark pod。
+- C19 evidence:
+  - Health check: `c19-router-health-before-warmup.txt` 返回 `All servers healthy`。
+  - Warmup artifact: `evalscope-warmup.log`，1024 input / 1 output 成功，`Total / Success / Failed = 1 / 1 / 0`，Avg TTFT `10578.51 ms`。
+  - Cache seed artifact: `evalscope-cache-seed.log`，64k prefix / 1 output 成功，`Total / Success / Failed = 1 / 1 / 0`，Avg TTFT `6804.19 ms`。
+- C20 evidence:
+  - Artifact: `evalscope-ttft-64k-1out.log`、`ttft-64k-1out.timestamps`。
+  - Measured run: start `2026-07-01T00:19:47+0800`，end `2026-07-01T00:19:59+0800`，exit `0`。
+  - Result: `Total / Success / Failed = 1 / 1 / 0`，Avg TTFT `6633.05 ms`，Avg Input Tokens `65536.00`，Avg Output Tokens `1.00`。
+  - Gate: 通过 `<10s` Avg TTFT gate。
+- C21 evidence:
+  - Artifact: `evalscope-decode-bs512-cache-hit-1p5kout.log`、`decode-bs512-cache-hit-1p5kout.timestamps`。
+  - Command shape: `--parallel 512 --number 512 --prefix-length 65536 --min-tokens 1536 --max-tokens 1536 --seed 42`，部署端仍为 `decode.args.maxNumSeqs=96`。
+  - Request generation completed after about 4m46s, then entered `Processing[parallel_512_number_512]`。
+  - Partial evalscope progress reached at least 300 successes, but then stalled; last raw progress in `evalscope-decode-bs512-cache-hit-1p5kout.log` stayed around `Processing ... 68%| 348/512` before no further progress.
+  - During the stall, decode pod logs captured many `mooncake_connector.py:2208 ... failed: Mooncake transfer engine returned -1` lines.
+  - Prefill pod logs captured many `mooncake_connector.py:2072 ... timed out after 480 seconds without being sent. Freeing its blocks on the producer side.` warnings.
+  - Evidence files: `c21-invalid-mooncake-evidence.txt`、`c21-*-logs-during-hang.txt`、`c21-*-logs-final.txt`、`c21-evalscope-log-tail-during-hang.txt`。
+  - Because this is a KV/Mooncake runtime failure and the run did not finish 512/512, it has no valid Avg/Overall output throughput for the `>=14000 tokens/s` gate.
+  - The run was interrupted after failure evidence was collected; timestamps record end `2026-07-01T00:35:19+0800` and `MEASURED_RUN_EXIT_CODE=130` with invalid reason.
+- Cleanup evidence:
+  - `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd` completed; artifact `cleanup-helm-uninstall-invalid-c21.txt`。
+  - Namespace `vllm-dsv4-flash-pd` deleted and subsequent lookup returned `NotFound`; artifacts `cleanup-namespace-delete-invalid-c21.txt`、`cleanup-namespace-after-invalid-c21.txt`。
+  - PTY port-forward session exited after local `kubectl port-forward` process was killed.
+  - Workspace-env permit `585fd741-c3a7-490b-935f-cb761b5652fc` released; artifact `permit-release-after-invalid-c21.json` shows `status=released`。
+  - Workspace-env active registry for `dev-cluster/vllm-dsv4-flash-pd` is empty; artifact `registry-active-after-invalid-c21-cleanup.json`。
+  - Updated benchmark summary: `artifacts/2026-06-29-vllm-dsv4-flash-pd/summary.md`。
+- Decision:
+  - M10 不执行。C20 TTFT gate 通过，但 C21 是不可接受的 KV/Mooncake runtime failure，不是外部资源 blocker，也没有满足 BS512/1.5k output throughput gate。
+  - 下一步必须先诊断 Mooncake transfer engine `-1` 与 producer-side timeout 的根因；当前分支不得更新到远端 `iaas_main`。
+
+### P48: Re-confirm servingkit-aligned scheduling values after user correction
+
+- Summary: 用户再次确认 `noAsyncScheduling` 必须对齐 servingkit 为 `false`，且 `maxNumSeqs` 是每个 worker 的值，所以 decode 侧应保持 `96`，不能为了 BS512 benchmark 改成 `512`。本条只收敛模板和计划口径，不改变 P/D 拓扑、镜像或 benchmark 阈值。
+- Evidence:
+  - `examples/deployment/deepseek-v4-flash-pd/values.yaml` 当前为 `prefill.args.noAsyncScheduling: false`、`decode.args.maxNumSeqs: 96`。
+  - 命令引用 `C13` 与 `C15` 当前默认 `DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-96}"`，并在 Helm render/deploy 时传入 `--set decode.args.maxNumSeqs="${DECODE_MAX_NUM_SEQS}"`。
+  - 主计划 `M7` 与 Current Status 已明确：`decode.args.maxNumSeqs` 按每 worker admission 值理解，必须保持 `96`，不得因 BS512/1.5k benchmark 覆盖为 `512`。
+  - 执行只读 render 校验生成 `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd-maxseqs96-check.yaml`，检查通过：prefill rendered command 不包含 `--no-async-scheduling`；decode `start-decode.sh` 包含 `"--max-num-seqs" "96"`；rendered manifest 不包含 `--max-model-len`、`runtimePatch`、`git clone`、`pip install`、`apt install`、runtime wheel/install 或 runtime router install pattern。
+- Outcome:
+  - 计划中历史 P40 的 `decode.args.maxNumSeqs=512` run 已明确标记为废弃历史结果，不再作为 M9 gate 依据。
+  - 当前有效后续执行入口仍是 P47 之后的 Mooncake transfer failure 诊断或在健康节点上按 `noAsyncScheduling=false`、`maxNumSeqs=96` 重新跑 C13-C21。
+- Prevention:
+  - 后续执行 C13/C15 时可显式留空 `DECODE_MAX_NUM_SEQS` 使用默认 `96`，或显式设置 `DECODE_MAX_NUM_SEQS=96`；不得设置为 `512`。
+
+### P49: Reverse-node C21 invalid and cleanup
+
+- Date: 2026-07-01
+- Summary: 在 `prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96` 的当前部署语义下，尝试将 P/D 节点对调为 prefill `192.168.1.154`、decode/router `192.168.1.149`。C16 smoke 和 C20 64k/1 TTFT 通过，但旧 C21 BS512/512 请求形态仍因 Mooncake KV transfer 错误无法形成有效 throughput gate。
+- Evidence:
+  - Reverse render artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd-reverse-154-149.yaml`。
+  - Reverse permit: `aaa9b695-2390-4e2f-ad21-2b52d0a27fd0`，session `codex-vllm-dsv4-flash-pd-20260701-reverse-149-154`。
+  - Reverse deployment: prefill pod on `192.168.1.154`，decode/router on `192.168.1.149`，均 Ready；Onion init 幂等跳过；router `/v1/models` 和 `/v1/completions` 成功。
+  - C20 artifact: `evalscope-ttft-64k-1out-reverse.log`；Avg TTFT `6636.64 ms`，通过 `<10s` gate；该结果是计算结果，不是 cache 命中结果，因为 measured run 使用 `prefix_length=0`，且 `Cached Prompt tok/s=0.00`。
+  - 旧 C21 artifact: `evalscope-decode-bs512-cache-hit-1p5kout-reverse.log`、`decode-bs512-cache-hit-1p5kout-reverse.timestamps`。请求生成完成 `512/512` 后进入 processing，阶段性统计到 `400` success，最后约停在 `487/512`，无有效最终 Avg/Overall throughput。
+  - Prefill bad-log evidence saved to `c21-reverse-prefill-tail-after-invalid.log`，包含 `Sending to 192.168.1.149:15927 failed (ret=-1)`。
+  - Decode bad-log evidence saved to `c21-reverse-decode-tail-after-invalid.log`，包含 `Mooncake transfer engine returned -1`。
+  - Evalscope 被中断并写入 `MEASURED_RUN_EXIT_CODE=120`。
+- Cleanup:
+  - Helm release `dsv4-flash-pd` 已卸载；namespace `vllm-dsv4-flash-pd` 已删除。
+  - Permit `aaa9b695-2390-4e2f-ad21-2b52d0a27fd0` 已释放；registry 资源已标记 `released`。
+  - 本地 evalscope 和 router port-forward 已退出；残留 `kubectl logs -f` 已停止。
+- Outcome:
+  - 反向节点只能说明旧 C21 BS512/512 请求口径下仍会触发 Mooncake KV transfer 失败；不能作为 BS512/1.5k throughput gate。
+  - M10 继续不执行。
+
+### P50: Decode throughput benchmark request count and fallback BS sweep
+
+- Date: 2026-07-01
+- Summary: 用户修改 benchmark 策略：压测时发送请求数应为 BS 的 4 倍，以达到更好的 decode 端吞吐；如果 BS512 跑不过，需要在 128-512 之间寻找能够完整通过压测的 BS。
+- Plan changes:
+  - 命令引用 `C21` 已从 `--parallel 512 --number 512` 改为 `DECODE_BS=512`、`DECODE_REQUESTS=$((DECODE_BS * 4))`，即 `--parallel 512 --number 2048`。
+  - `C21` artifact 命名改为包含总请求数：`evalscope-decode-bs512-cache-hit-1p5kout-n2048.log` 和 `decode-bs512-cache-hit-1p5kout-n2048.timestamps`。
+  - 新增命令引用 `C21A`：当 BS512/2048 请求 run invalid 或没有有效 throughput 结果时，按默认候选 `384 256 192 128` 降档尝试；每个候选都使用 `number = 4 * BS`，并写入 `decode-bs-sweep-cache-hit-1p5kout.summary.tsv`。
+  - 主计划 `M9` 已恢复为未完成状态：需要重新执行 C21；若 BS512 invalid，还必须执行 C21A。
+  - 主计划 `M10` 已明确：只有 BS512 本身的 `number=2048` run 达到 `>=14000 tokens/s` 且无不可接受 runtime 错误，才能更新远端 `iaas_main`；降档 BS 通过只能作为容量诊断，不替代 BS512 gate。
+- Next:
+  - 重新部署当前 image 和模板后，先执行 C21 BS512/2048 请求；若再次出现 KV/Mooncake 错误或未完成，再执行 C21A 降档 sweep，并同步保存 P/D/router bad-log scan。
+
+### P51: Monitoring, service restart isolation, and vLLM bench comparison
+
+- Date: 2026-07-01
+- Summary: 用户补充要求：失败后应重启服务，避免把坏状态带到下一轮；需要补充对比 vLLM 自带压测脚本是否和 evalscope 有差异；需要使用 servingkit `hanhan_dev/llm-serving-monitoring` 部署监控系统，并检查是否达到预期 running BS，达不到时不测试高于实际 BS 的情况。
+- Source inspection:
+  - servingkit URL 对应本地 repo `origin/hanhan_dev` 下路径 `llm-serving-monitoring/`，不是独立分支。
+  - 该 chart 包含 `Chart.yaml`、`values.yaml`、`templates/prometheus-*`、`templates/grafana-*`、`dashboards/vllm-v4-full-metrics.json` 和示例 `examples/dev-cluster-vllm-dsv4-fp8-pd-values.yaml`。
+  - README 说明该 chart 部署独立 Prometheus/Grafana，默认不依赖集群级 Prometheus/VMP；vLLM dashboard 中使用 `vllm:num_requests_running`、`vllm:num_requests_waiting`、`vllm:generation_tokens_total` 等指标。
+  - 当前 vLLM fork 中存在 `vllm/benchmarks/serve.py`，CLI 为 `vllm bench serve` / `python -m vllm.benchmarks.serve`，支持 `--request-rate inf`、`--max-concurrency`、`--num-prompts`、`--random-prefix-len`、`--random-input-len`、`--random-output-len`、`--ignore-eos`、`--extra-body`、`--save-result` 等参数，可与 evalscope C21/C21A 做口径对比。
+- Plan changes:
+  - 主计划全局约束新增：benchmark 必须部署 servingkit `origin/hanhan_dev:llm-serving-monitoring` 的最小 Prometheus 监控；对比 vLLM 自带压测脚本，但 gate 仍默认使用 evalscope，除非对比证明口径等价。
+  - 命令引用 `C18` 从“Skip Prometheus”改为部署 servingkit monitoring chart：归档 `llm-serving-monitoring/` 到 artifact 目录，使用本任务专属 namespace/release `vllm-dsv4-flash-pd-monitoring` / `dsv4-flash-pd-monitoring`，不得接管或清理已有共享 `vllm-monitoring`；生成本任务 values，scrape `${RELEASE}-prefill.${NAMESPACE}.svc.cluster.local:8000`、`${RELEASE}-decode.${NAMESPACE}.svc.cluster.local:8001`、`${RELEASE}-router.${NAMESPACE}.svc.cluster.local:30000`，并校验三类 target `up == 1`。
+  - 新增 `C21M`：每次 C21/C21A 候选结束、失败或中断后，用 Prometheus query_range 记录 `max_decode_running`、`max_decode_waiting` 和 `max_decode_output_tps_30s`。
+  - 新增 `C21R`：任何 C21/C21A 候选失败、被中断、出现 KV/Mooncake runtime 错误或队列/运行态异常后，继续下一轮前必须删除并重建 P/D/router pods，重新等待 Ready，并确认 router `/health` 和 `/v1/models` 成功。
+  - 新增 `C21V`：保存 vLLM 自带 benchmark help、对比说明，并在不高于 observed running BS 的候选上运行一次 `python -m vllm.benchmarks.serve` 对照；该结果只用于判断工具差异，不替代 C21 gate。
+  - `C22` summary/cleanup 增加 monitoring release/namespace 清理和 running BS evidence。
+- Supersedes:
+  - P7 的“此处先跳过 Prometheus”已被本条新要求覆盖。后续不得再把 Prometheus skipped 作为当前计划状态。
+  - P50 的降档 sweep 继续有效，但每次失败后必须先执行 C21R；若 C21M 显示 observed running BS 低于候选目标，下一轮不得测试高于 observed capacity 的候选。
+- Gate impact:
+  - 远端 `iaas_main` 更新仍必须由 BS512/1.5k gate 决定：`number=2048`、Avg/Overall output throughput `>=14000 tokens/s`、Prometheus 证明实际 running BS 达标、无 KV/Mooncake/DeepEP/DeepGEMM runtime 错误。
+  - 降档 BS 通过只能作为容量诊断；vLLM bench 对比通过也不能单独替代 evalscope gate，除非计划后续被明确修改。
+
+### P52: Redeploy current image and fix monitoring namespace creation
+
+- Date: 2026-07-01
+- Summary: 继续执行当前 plan，使用候选镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130` 重新部署当前模板，节点选择 prefill `192.168.1.149`、decode/router `192.168.1.154`。C13 render、C14 permit、C15 deploy、C16 real router smoke 已完成；C18 首次执行暴露出 monitoring chart namespace 创建命令 bug，已修正命令引用后准备重跑。
+- Evidence:
+  - C13 artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/rendered-dsv4-flash-pd.yaml`；检查通过：`prefill.args.noAsyncScheduling=false`，decode `--max-num-seqs "96"`，不包含 `--max-model-len`、`66000`、runtime hotfix/install，且同节点负例被 Helm validation 拒绝。
+  - C14 permit: session `codex-vllm-dsv4-flash-pd-20260701-014137-931102`，permit `1ee454b6-f76a-480c-8345-92b7fc6463f0`，状态 `granted`，节点 `192.168.1.149` 与 `192.168.1.154` 均 allocatable `nvidia.com/gpu=8`。
+  - C15 deploy: release `dsv4-flash-pd` deployed；prefill pod `dsv4-flash-pd-roleset-cpgck-prefill-64697d968-0` 在 `192.168.1.149`，decode pod `dsv4-flash-pd-roleset-cpgck-decode-775d4df7f-0` 在 `192.168.1.154`，router pod `dsv4-flash-pd-router-68d87564cb-pvr98` 在 `192.168.1.154`；三者均 Ready。decode 首次启动花约 8.5 分钟完成 TileLang/DeepGEMM 初始化，router 早期因等待 worker 健康重启 2 次，最终 Ready。
+  - C16 smoke: router `/v1/models` 返回 `max_model_len=1048576`；router `/v1/completions` 返回非空文本 `","`，completion id 显示 route 到 prefill `192.168.1.149:8000` 和 decode `192.168.1.154:8001`；bad-log scan 与 runtime install/hotfix scan 未命中。
+  - C17/C17A: evalscope `1.8.1` 可用；tokenizer 小文件已从当前 prefill pod 刷新到 `artifacts/2026-06-29-vllm-dsv4-flash-pd/tokenizer/`。
+  - C18 首次失败: `Error: namespaces "vllm-dsv4-flash-pd-monitoring" already exists`。原因是命令引用同时使用 Helm `--create-namespace` 和 chart values `namespace.create: true`，Helm 先创建 namespace 后 chart 再尝试创建同名 Namespace。
+- Plan fix:
+  - 命令引用 `C18` 已改为 `namespace.create: false`，由 Helm `--create-namespace` 负责创建本任务专属 namespace；scrape targets、Prometheus 配置、nodeAffinity 和 cleanup 语义不变。
+- Next:
+  - 重跑 C18；通过后继续 C19 warmup/cache seed、C20 64k/1 TTFT、C21 BS512/2048 decode throughput，并在每个候选后执行 C21M。
+
+### P53: Fix monitoring Prometheus service discovery
+
+- Date: 2026-07-01
+- Summary: C18 第二次执行成功部署过 Prometheus Pod，但随后 port-forward 失败，因为命令引用假设 Service 名称为 `${MONITORING_RELEASE}-prometheus`；servingkit chart 实际渲染名称为 `${MONITORING_RELEASE}-llm-serving-monitoring-prometheus`。执行失败后未保留 release/namespace，当前 `vllm-dsv4-flash-pd-monitoring` 不存在。
+- Evidence:
+  - C18 output: Prometheus Pod `dsv4-flash-pd-monitoring-llm-serving-monitoring-prometheus6qxzp` 曾 Ready，Service 名称显示为 `dsv4-flash-pd-monitoring-llm-serving-monitoring-prometheus`。
+  - 失败原因: `Error from server (NotFound): services "dsv4-flash-pd-monitoring-prometheus" not found`。
+  - 后续检查: `helm status dsv4-flash-pd-monitoring -n vllm-dsv4-flash-pd-monitoring` 返回 `release: not found`；`kubectl get ns vllm-dsv4-flash-pd-monitoring` 返回 `NotFound`。
+- Plan fix:
+  - 命令引用 `C18` 和 `C21M` 已改为通过 label `app.kubernetes.io/instance=${MONITORING_RELEASE},app.kubernetes.io/component=prometheus` 动态发现 Prometheus Service，并把实际名称写入 artifact。
+- Next:
+  - 重新执行 C18；若 scrape target `up == 1` 通过，再继续 benchmark。
+
+### P54: Treat router metrics as unavailable, keep worker metrics gate
+
+- Date: 2026-07-01
+- Summary: C18 第三次执行后，Prometheus 已能 scrape prefill/decode vLLM worker metrics，但 router target `up=0`。诊断确认 router `/metrics` 对 Prometheus GET 返回 `405 Method Not Allowed`；这不是 P/D worker running BS 指标缺失。计划已改为 C18 只要求 prefill/decode `up == 1`，并将 router 可用性保留在 C16 的 `/health`、`/v1/models` 和真实 completion smoke。
+- Evidence:
+  - Prometheus query `up{stack="vllm",release="dsv4-flash-pd"}` 返回 prefill `1`、decode `1`、router `0`。
+  - Prometheus target error for router: `server returned HTTP status 405 Method Not Allowed` on `http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000/metrics`。
+  - 从 Prometheus Pod 内直接访问 prefill/decode `/metrics` 返回 `vllm:*` 指标；访问 router `/metrics` 返回 `HTTP/1.1 405 Method Not Allowed`。
+  - 从 router Pod 内访问 `/health` 返回 `All servers healthy`；C16 已通过 router `/v1/models` 与真实 completion smoke。
+- Plan fix:
+  - 命令引用 `C18` 将 router scrape target 设为 `enabled: false`，required roles 改为 `prefill` 和 `decode`。
+  - 主计划全局约束和 M9 已明确：running BS gate 使用 decode worker metrics；router metrics 不可用时记录证据但不阻塞 benchmark。
+- Next:
+  - 重新执行 C18，确认 prefill/decode worker target `up == 1` 后继续 C19/C20/C21。
+
+### P55: C20/C21 latest measured results with monitoring
+
+- Date: 2026-07-01
+- Summary: 在当前有效部署语义 `prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96`、`1P1D`、P/D 不同 8-GPU 节点下，C20 TTFT 通过，但 C21 BS512/2048 请求 decode throughput run 无效。
+- C20 evidence:
+  - Artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/evalscope-ttft-64k-1out.log`、`ttft-64k-1out.timestamps`。
+  - Result: `Total / Success / Failed = 1 / 1 / 0`，Avg TTFT `6775.64 ms`，通过 `<10s` gate。
+  - Cache status: `prefix_length=0` 且 `Cached Prompt tok/s=0.00`，因此这是计算结果，不是 cache 命中结果。
+- C21 evidence:
+  - Artifact: `evalscope-decode-bs512-cache-hit-1p5kout-n2048.log`、`decode-bs512-cache-hit-1p5kout-n2048.timestamps`。
+  - Command shape: `--parallel 512 --number 2048 --prefix-length 65536 --min/max-prompt-length 0 --min/max-tokens 1536 --seed 42`，满足 `number = 4 * BS`。
+  - Timestamps: start `2026-07-01T02:02:49+0800`，end `2026-07-01T02:25:44+0800`，exit `120`。
+  - Runtime failure evidence: decode logs 出现 `Mooncake transfer engine returned -1`；prefill logs 出现 Mooncake transfer timeout，例如 `Sync batch data transfer timeout`。
+  - C21M monitoring: `monitoring/running-bs-bs512.summary.txt` 记录 `max_decode_running=231.0`、`max_decode_waiting=512.0`、`max_decode_output_tps_30s=8578.58620689655`。
+- Outcome: C21 BS512 无有效 Avg/Overall throughput，且属于不可接受的 KV/Mooncake runtime failure；不得更新远端 `iaas_main`。
+
+### P56: C21R restart isolated failed BS512 state
+
+- Date: 2026-07-01
+- Summary: 按用户要求，BS512 失败后先重启 P/D/router，再执行降档候选，避免把 Mooncake/KV、router 或队列坏状态带入下一轮。
+- Evidence:
+  - Restart artifact dir: `artifacts/2026-06-29-vllm-dsv4-flash-pd/service-restarts/20260701-022656/`。
+  - 第一次 wait 命令存在竞态：`kubectl wait` 命中了旧 pod ready 状态，已中断并改用 corrected wait。
+  - Corrected wait 后 prefill pod `dsv4-flash-pd-roleset-cpgck-prefill-64697d968-0` Ready on `192.168.1.149`，decode pod `dsv4-flash-pd-roleset-cpgck-decode-775d4df7f-0` Ready on `192.168.1.154`，router pod `dsv4-flash-pd-router-68d87564cb-gfbgm` Ready on `192.168.1.154`。
+  - Post-restart router `/health`、`/v1/models` 和真实 completion smoke 通过；completion artifact 为 `router-completion-after-c21r.json`。
+- Prevention: 后续 C21R 应等待被删除 pod 退出或等待新 pod UID/创建时间变化后再判断 Ready，避免旧 pod ready 竞态。
+
+### P57: C21A fallback BS192 completed but below gate
+
+- Date: 2026-07-01
+- Summary: 因 C21M 显示 BS512 observed max running 仅 `231`，没有继续测试 384 或 256，直接选择不高于 observed capacity 的 BS192。该降档候选完整通过，但吞吐显著低于 14000 tokens/s，且不能替代 BS512 gate。
+- Evidence:
+  - Artifact: `evalscope-decode-bs192-cache-hit-1p5kout-n768.log`、`decode-bs192-cache-hit-1p5kout-n768.timestamps`。
+  - Command shape: `--parallel 192 --number 768 --prefix-length 65536 --min/max-prompt-length 0 --min/max-tokens 1536 --seed 42`。
+  - Timestamps: start `2026-07-01T02:36:59+0800`，end `2026-07-01T02:47:32+0800`，exit `0`。
+  - Result: `Total / Success / Failed = 768 / 768 / 0`，`Avg Output Tokens=1536.00`，`Output Throughput=6354.03 tok/s`，workload `Completion tok/s` overall `6354.78`，Last30s `8283.68`，steady drop 20% `9042.32`。
+  - C21M monitoring: `monitoring/running-bs-bs192.summary.txt` 记录 `max_decode_running=192.0`、`max_decode_waiting=164.0`、`max_decode_output_tps_30s=10668.137931034482`。
+  - Bad-log scan: `log-scans/bad-log-scan-bs192.txt` 记录 `bad_log_scan=clean`。
+- Outcome: BS192 是当前部署下能完成的降档诊断点，但不足以发布；M10 继续不执行。
+
+### P58: C21V local vLLM benchmark comparison unavailable
+
+- Date: 2026-07-01
+- Summary: 按 C21V 尝试运行 vLLM 自带 benchmark help，当前本地客户端环境缺少 `torch`，因此无法执行 vLLM bench 对照 run。
+- Evidence:
+  - Artifact dir: `artifacts/2026-06-29-vllm-dsv4-flash-pd/vllm-bench-compare/`。
+  - `vllm-bench-serve-help.exitcode` 为 `1`。
+  - `vllm-bench-serve-help.err` 包含 `ModuleNotFoundError: No module named 'torch'`。
+  - 已写入 `vllm-bench-serve-unavailable.md`，明确该缺口不改变 evalscope gate。
+- Outcome: C21V 作为口径对比有验证缺口；没有证据支持切换 benchmark harness。最终 gate 仍使用 evalscope C20/C21/C21A。
+
+### P59: Current gate decision before cleanup
+
+- Date: 2026-07-01
+- Summary: 当前 image、部署模板和 benchmark 证据已足以做 gate 判断：不更新远端 `iaas_main`。
+- Decision:
+  - `64k/1` Avg TTFT `6775.64 ms`，通过 `<10s`。
+  - BS512/1.5k `number=2048` 无效，属于 Mooncake/KV runtime failure，且 Prometheus observed max running 只有 `231`。
+  - BS192/1.5k 完整通过但 evalscope Output Throughput `6354.03 tok/s`，低于 `14000 tok/s`，且只是降档容量诊断。
+  - vLLM built-in benchmark 本地对比不可用，不能替代 evalscope gate。
+- Artifact summary: `artifacts/2026-06-29-vllm-dsv4-flash-pd/summary.md` 已更新为最新结果。
+- Next: 执行 C22 清理 serving/monitoring Helm release、namespace、本地 port-forward 和 GPU permit `1ee454b6-f76a-480c-8345-92b7fc6463f0`。
+
+### P60: C22 cleanup completed
+
+- Date: 2026-07-01
+- Summary: 已清理本次 live benchmark 创建的 serving、monitoring、port-forward 和 GPU permit 资源。
+- Cleanup evidence:
+  - `cleanup/helm-uninstall-serving.txt`: `release "dsv4-flash-pd" uninstalled`。
+  - `cleanup/delete-serving-namespace.txt`: `namespace "vllm-dsv4-flash-pd" deleted`。
+  - `cleanup/helm-uninstall-monitoring.txt`: `release "dsv4-flash-pd-monitoring" uninstalled`。
+  - `cleanup/delete-monitoring-namespace.txt`: `namespace "vllm-dsv4-flash-pd-monitoring" deleted`。
+  - `cleanup/permit-release.json`: permit `1ee454b6-f76a-480c-8345-92b7fc6463f0` 状态为 `released`。
+  - `cleanup/namespaces-after-cleanup.txt`: 两个 namespace 均返回 `NotFound`。
+  - `cleanup/registry-active-after-cleanup-final.json` 和 `cleanup/permit-list-after-cleanup-final.json`: 均为 `[]`。
+  - `cleanup/local-processes-after-cleanup-final.txt`: 无本任务 `kubectl port-forward`、`evalscope` 或 `vllm.benchmarks.serve` 残留。
+- Final decision:
+  - 远端 `iaas_main` 未更新。
+  - 当前 goal 停止于不可接受的 BS512 KV/Mooncake runtime failure 和性能 gate 未达标；后续若要推进，需要先修复或重新定位 C21 BS512 failure，再重新构建/部署/benchmark。
+
+### P61: Plan update for containerized vLLM benchmark comparison
+
+- Date: 2026-07-01
+- Summary: 用户要求修改计划：vLLM 自带压测必须在 vLLM 容器中执行。此前 P58 的本地 `python3 -m vllm.benchmarks.serve --help` 缺 `torch` 只能保留为历史证据，不再满足 C21V 的计划要求。
+- Plan changes:
+  - 主计划 Global Constraints 已明确：`vllm bench serve` / `vllm.benchmarks.serve` 对比必须在同一个新构建 vLLM 镜像启动的容器内执行，不能使用本地工作站 Python 环境；该容器不请求 GPU，不做运行时安装、代码 clone 或 hotfix，通过集群内 router Service 发请求，结束后删除。
+  - M9 的 C21V checkbox 已重新置为未完成，要求后续保存容器内 help、对比说明、一个不高于 observed running BS 的对照运行或容器内无法运行原因。
+  - 命令引用 `C21V` 已改为创建临时 benchmark Pod `dsv4-flash-pd-vllm-bench`，使用同一 vLLM 镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`，挂载 `/data01` 只读作为 tokenizer/model path，通过 `http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000` 访问 router。
+  - C21V 不再使用本地 port-forward，也不在本地执行 `python3 -m vllm.benchmarks.serve`；help 和 benchmark 都通过 `kubectl exec` 在 benchmark Pod 内运行。
+  - 如果容器内 help 或 benchmark 失败，应归类为候选镜像/容器 runtime 对 vLLM bench 支持不足，而不是本地环境缺依赖。
+- Outcome:
+  - 当前 live 资源已在 P60 清理，未立即执行新的 C21V。
+  - 后续恢复执行时需要重新部署服务和 monitoring 后再运行新的容器内 C21V。
+
+### P62: C21V containerized vLLM benchmark comparison completed
+
+- Date: 2026-07-01
+- Summary: 按用户要求，C21V 已在同一个新构建 vLLM 镜像启动的临时 benchmark Pod 内执行，而不是本地 Python 环境。镜像内 `python3 -m vllm.benchmarks.serve` 是空入口，没有输出和结果目录；实际可用入口为 `vllm bench serve`。
+- Benchmark pod:
+  - Namespace: `vllm-dsv4-flash-pd`
+  - Pod: `dsv4-flash-pd-vllm-bench`
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - GPU request: none
+  - Target: `http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000/v1/completions`
+  - Tokenizer/model path: `/data01/DeepSeek-V4-Flash`
+- Command shape:
+  - `vllm bench serve --backend openai --base-url http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000 --endpoint /v1/completions --model deepseek-v4-flash --tokenizer /data01/DeepSeek-V4-Flash --dataset-name random --random-prefix-len 65536 --random-input-len 0 --random-output-len 1536 --request-rate inf --max-concurrency 128 --num-prompts 512 --ignore-eos --temperature 0 --seed 42 --save-result --save-detailed`
+- Result:
+  - Timestamps: start `2026-07-01T07:45:50+0800`, end `2026-07-01T07:50:36+0800`, exit `0`。
+  - Successful / Failed: `512 / 0`。
+  - Output token throughput: `5018.14 tok/s`。
+  - Mean TTFT: `18268.25 ms`。
+  - Mean TPOT: `11.17 ms`。
+  - Mean ITL: `46.78 ms`。
+  - vLLM-reported maximum request concurrency: `128`；vLLM-reported peak concurrent requests: `180`，该字段与 `max_concurrency` 的口径不同，不能直接作为服务端 running BS gate。
+- Monitoring:
+  - Prometheus window artifacts: `vllm-bench-compare-c21v-container/monitoring/window-summary.json`。
+  - Decode running: max `128.0`，avg `31.97`。
+  - Decode waiting: max `64.0`，avg `4.31`。
+  - Decode 30s output TPS: max `8772.66`，avg `2531.23`。
+  - Bad-log scan: `vllm-bench-compare-c21v-container/bad-log-scan-c21v.txt`，没有命中 Mooncake/KV 坏模式。
+- Outcome:
+  - C21V 证明 vLLM 镜像内置 CLI 可用，但该口径只是对照，不能替代 evalscope gate。
+  - C21V 的 BS128/1.5k output throughput 仍显著低于 `14000 tok/s`，且 Prometheus 显示 decode running 平均远低于 128；继续测试更高 BS 没有发布意义。
+  - 远端 `iaas_main` 仍不得更新。
+
+### P63: C22 cleanup after C21V completed
+
+- Date: 2026-07-01
+- Summary: 已清理本次为 C21V 容器内 benchmark 重新创建的 serving、monitoring、临时 benchmark Pod、namespace 和 workspace-env permit。
+- Cleanup evidence:
+  - Cleanup artifact dir: `artifacts/2026-06-29-vllm-dsv4-flash-pd/cleanup-c21v/`。
+  - `helm-uninstall-serving.txt`: `release "dsv4-flash-pd" uninstalled`。
+  - `delete-serving-namespace.txt`: `namespace "vllm-dsv4-flash-pd" deleted`。
+  - `helm-uninstall-monitoring.txt`: `release "dsv4-flash-pd-monitoring" uninstalled`。
+  - `delete-monitoring-namespace.txt`: `namespace "vllm-dsv4-flash-pd-monitoring" deleted`。
+  - `namespaces-after-cleanup-final.txt`: `vllm-dsv4-flash-pd` 与 `vllm-dsv4-flash-pd-monitoring` 均返回 `NotFound`。
+  - `permit-release-c21v.json` 和 `permit-status-after-cleanup-c21v.json`: permit `626cbb46-0c8f-4166-8ffc-c7737180a180` 状态为 `released`。
+  - `registry-active-after-cleanup-c21v.json`: `[]`。
+  - `permit-list-unreleased-after-cleanup-c21v.json`: `[]`。
+  - `local-processes-after-cleanup-c21v-final.txt`: 无本任务 `kubectl port-forward`、`kubectl wait/exec`、`evalscope`、`vllm bench` 或 `vllm.benchmarks` 残留。
+- Final decision:
+  - 远端 `iaas_main` 未更新。
+  - 当前 goal 停止于不可接受的 BS512 KV/Mooncake runtime failure 和性能 gate 未达标；后续需要先修复或重新定位 BS512 failure/throughput 问题，再重新构建、部署和 benchmark。
+
+### P64: Supplemental vLLM bench serve BS256/400/512 sweep completed
+
+- Date: 2026-07-01
+- Summary: 按用户要求补充 vLLM 自带压测方式下 BS256、BS400、BS512 三组结果。该 sweep 在同一个新构建 vLLM 镜像启动的 no-GPU benchmark Pod 内执行，通过 in-cluster router Service 发请求，固定 64K prefix、1536 output、`number = 4 * BS`，部署语义仍为 `prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96`、`1P1D`。
+- Benchmark pod:
+  - Namespace: `vllm-dsv4-flash-pd`
+  - Pod: `dsv4-flash-pd-vllm-bench-sweep`
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - GPU request: none
+  - Target: `http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000/v1/completions`
+  - Tokenizer/model path: `/data01/DeepSeek-V4-Flash`
+- Command shape:
+  - `vllm bench serve --backend openai --base-url http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000 --endpoint /v1/completions --model deepseek-v4-flash --tokenizer /data01/DeepSeek-V4-Flash --dataset-name random --random-prefix-len 65536 --random-input-len 0 --random-output-len 1536 --request-rate inf --max-concurrency <BS> --num-prompts <4*BS> --ignore-eos --temperature 0 --seed 42 --save-result --save-detailed --result-dir /tmp/vllm-bench-bs-sweep --result-filename vllm-bench-serve-bs<BS>-n<4*BS>.json --disable-tqdm`
+- Results:
+  - BS256: start `2026-07-01T08:28:58+08:00`，end `2026-07-01T08:36:22+08:00`，exit `0`，`Successful / Failed = 1024 / 0`，output throughput `8052.52 tok/s`，Mean TTFT `23914.05 ms`，Mean TPOT `14.90 ms`，Mean ITL `69.75 ms`。
+  - BS400: start `2026-07-01T08:36:24+08:00`，end `2026-07-01T08:46:20+08:00`，exit `0`，`Successful / Failed = 1600 / 0`，output throughput `11091.25 tok/s`，Mean TTFT `10276.96 ms`，Mean TPOT `26.36 ms`，Mean ITL `87.89 ms`。
+  - BS512: start `2026-07-01T08:46:22+08:00`，end `2026-07-01T08:58:13+08:00`，exit `0`，`Successful / Failed = 2048 / 0`，output throughput `15281.44 tok/s`，Mean TTFT `6876.14 ms`，Mean TPOT `26.39 ms`，Mean ITL `106.91 ms`。
+- Monitoring:
+  - BS256: Prometheus max decode running `256.0`，max decode 30s output TPS `13468.83`。
+  - BS400: Prometheus max decode running `400.0`，max decode 30s output TPS `14246.62`。
+  - BS512: Prometheus max decode running `510.0`，max decode 30s output TPS `18210.17`。
+  - 三组 bad-log scan 均未命中 Mooncake/KV 坏模式。
+- Artifacts:
+  - Summary: `artifacts/2026-06-29-vllm-dsv4-flash-pd/vllm-bench-bs-sweep-20260701/summary.md`。
+  - TSV: `artifacts/2026-06-29-vllm-dsv4-flash-pd/vllm-bench-bs-sweep-20260701/runs/summary.tsv`。
+  - Per-BS logs/results/Prometheus windows: `runs/bs256/`、`runs/bs400/`、`runs/bs512/`。
+- Outcome:
+  - vLLM bench BS512 口径下吞吐超过 `14000 tok/s`，且 Prometheus 显示 decode running 达到 `510`。
+  - 该结果仍是 vLLM harness 对照，不能自动替代此前 invalid 的 evalscope BS512 gate；远端 `iaas_main` 仍不更新，除非用户明确接受 vLLM bench 作为新的 gate 或后续 evalscope gate 重新跑通。
+
+### P65: Cleanup after supplemental vLLM BS sweep completed
+
+- Date: 2026-07-01
+- Summary: 已清理补充 vLLM BS sweep 创建或复用的 serving、monitoring、benchmark Pod、namespace 和 workspace-env permit。
+- Cleanup evidence:
+  - Cleanup artifact dir: `artifacts/2026-06-29-vllm-dsv4-flash-pd/vllm-bench-bs-sweep-20260701/cleanup/`。
+  - Namespace lookup after cleanup: `vllm-dsv4-flash-pd` 与 `vllm-dsv4-flash-pd-monitoring` 均返回 `NotFound`。
+  - Permit release: `b2a762f1-8271-4a9b-b544-7cd872237760` 状态为 `released`。
+  - `registry-active-after-cleanup-final.json`: `[]`。
+  - `permit-list-active-after-cleanup-final.json`: `[]`。
+  - `local-processes-after-cleanup.txt`: 无本任务相关本地残留进程。
+- Note:
+  - 第一次清理脚本中的本地 `pkill` pattern 误匹配自身导致 exit `143`，但当时 serving/monitoring namespace 已删除；随后使用不匹配自身的方式补完 permit release、registry 验证和本地进程检查。
+
+### P66: Plan update for evalscope vs vLLM bench divergence analysis
+
+- Date: 2026-07-01
+- Trigger: 用户要求修改计划，分析为什么 evalscope 的结果和 vLLM 自带 benchmark 的结果差异这么大。
+- Plan changes:
+  - 主计划 Global Constraints 新增差异分析 gate：evalscope 与 vLLM bench 结果显著不一致时，必须先执行 `C21W`，从请求构造、prefix cache 命中语义、client 网络路径、并发/限流模型、超时与失败处理、统计口径、Prometheus running/waiting/output TPS、Mooncake/KV 错误窗口和服务状态延续角度归因。
+  - M9 新增未完成项：`C21W` 先基于现有 artifacts 做离线分析，不创建 GPU workload、不更新 gate；如果证据不足，再执行 `C21X` 最小配对复现实验。
+  - M9 Acceptance 新增：`C21W` 必须产出 `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/summary.md`，并把结论分类为 `workload-mismatch`、`client-path`、`harness-timeout/statistics`、`service-state/kv-transfer`、`mixed` 或 `inconclusive`。
+  - 命令引用新增 `C21W`：读取 evalscope BS512/BS192、vLLM bench BS512、Prometheus window、bad-log scan 和 timestamps，生成 `summary.md`、`evalscope-excerpts.txt`、`vllm-bench-excerpts.txt`、`monitoring-comparison.txt`、`bad-log-comparison.txt`。
+  - 命令引用新增 `C21X`：仅当 `C21W` 无法解释差异时，重新部署相同 `1P1D` 服务并按 BS128/256/512 做配对复现实验；每个失败候选后必须 C21R 重启服务。
+- Current decision:
+  - vLLM bench BS512 成功结果仍只作为 supplemental/harness comparison。
+  - 在 `C21W` 完成且差异原因可审计前，不得用 vLLM bench BS512 替代 evalscope BS512 gate，不得进入 M10 更新远端 `iaas_main`。
+- Next:
+  - 执行 `C21W` 离线分析；只有 `C21W` 结论为 `inconclusive` 时才重新申请 GPU permit 执行 `C21X`。
+
+### P67: C21W execution strategy
+
+- Date: 2026-07-01
+- Summary: 开始按 `superpowers:executing-plans` 执行 `C21W`。本轮不启用 `subagent-driven-development`。
+- Rationale:
+  - `C21W` 是单一离线 artifact 分析，输入集中在 `artifacts/2026-06-29-vllm-dsv4-flash-pd/`，写入集中在 `harness-diff-analysis-20260701/summary.md` 和计划进展日志。
+  - 当前不创建 GPU workload、不访问 live cluster、不修改 vLLM 源码、不触碰远端分支或 `iaas_main`。
+  - 分派并行 subagent 会增加同一 summary 结论和计划文件的写入冲突，收益低于协调成本。
+- Ownership:
+  - 主线程负责读取 evidence、生成差异分析、更新主计划 compact status、更新 progress log，并决定是否需要进入 `C21X`。
+- Validation:
+  - `C21W` 产物必须包含 `summary.md`、`evalscope-excerpts.txt`、`vllm-bench-excerpts.txt`、`monitoring-comparison.txt`、`bad-log-comparison.txt`。
+  - 结论必须覆盖 workload、client path、concurrency/running BS、failure window、stats denominator 和 Mooncake/KV bad-log 证据。
+
+### P68: C21W divergence analysis completed
+
+- Date: 2026-07-01
+- Summary: C21W 离线差异分析已完成；本轮没有创建 GPU workload、没有访问 live cluster、没有重新部署、没有执行 C21X。
+- Artifacts:
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/summary.md`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/request-db-summary.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/evalscope-excerpts.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/vllm-bench-excerpts.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/monitoring-comparison.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/harness-diff-analysis-20260701/bad-log-comparison.txt`
+- Evidence:
+  - evalscope BS512 timestamps: start `2026-07-01T02:02:49+0800`，end `2026-07-01T02:25:44+0800`，exit `120`。
+  - evalscope BS512 request DB: `result_count=0`，因此没有完整请求结果，也没有可比较的 Avg/Overall throughput。
+  - evalscope BS512 Prometheus: `max_decode_running=231.0`，`max_decode_waiting=512.0`，`max_decode_output_tps_30s=8578.58620689655`。
+  - evalscope BS512 bad logs: prefill 侧有 `Sync batch data transfer timeout`、`Sending to ... failed (ret=-1)`，producer-side 有 `timed out after 480 seconds without being sent`。
+  - evalscope BS192 fallback request DB: `result_count=768`，`success_counts=[(1, 768)]`，sample row 为 `prompt_tokens=65536`、`completion_tokens=1536`，证明完成请求的 token 长度对齐；但 output throughput 只有 `6354.03 tok/s`。
+  - vLLM bench BS512: `completed=2048`，`failed=0`，`total_input_tokens=134217728`，`total_output_tokens=3145728`，`output_throughput=15281.439904082581`，Prometheus decode running max `510.0`，waiting max `16.0`，bad-log scan clean。
+- Conclusion:
+  - 分类为 `mixed`，主因是 `service-state/kv-transfer` 与 `harness-timeout/statistics` 叠加；`client-path` 是可信放大因素。
+  - evalscope BS512 不是低吞吐完整结果，而是 invalid run；vLLM bench BS512 是后续健康服务状态下的完整结果，两者不能直接互相替代。
+  - 现有 artifacts 已足以解释差异，因此当前不进入 `C21X`；若用户决定切换 gate 或要求 same-state harness 等价性证明，再修改计划并执行 C21X。
+- Gate:
+  - C21W 不改变 M10 决策。evalscope BS512 仍未通过，且 KV/Mooncake runtime failure 是不可接受 blocker；vLLM bench BS512 仍只作为 supplemental/harness comparison，不替代 evalscope gate。
+
+### P69: Plan update for evalscope Mooncake/KV failure diagnosis
+
+- Date: 2026-07-01
+- Trigger: 用户要求修改计划，分析 evalscope 结果为什么和 vLLM 结果差异这么大；C21W 已解释差异主要来自 evalscope BS512 invalid run 与 vLLM bench healthy run 的不可比，但还需要定位 evalscope BS512 触发的 Mooncake/KV transfer failure。
+- Plan changes:
+  - 主计划 Global Constraints 新增 C23 gate：在 C21W 解释差异但根因落在 Mooncake/KV transfer failure 时，必须先做离线根因初筛，不修改源码、不改变部署语义、不创建 GPU workload。
+  - M9 新增 C23 checkbox：分析 evalscope BS512 的失败是否属于部署语义发散、metadata/握手不一致、Mooncake/RDMA transfer timeout/descriptor pressure、client burst/服务状态污染，或证据不足。
+  - M9 Acceptance 新增 C23 artifact：`artifacts/2026-06-29-vllm-dsv4-flash-pd/mooncake-failure-diagnosis-20260701/summary.md`，并保存失败日志统计、MooncakeConnector 代码路径、servingkit SHA 对齐/差异、节点与 rendered command 对比。
+  - 命令引用新增 `C23: Offline Mooncake/KV failure root-cause triage`，只使用已有 artifacts、当前部署模板、servingkit reference SHA `53a6d6a27e59fe1cc620b85c5ee20f51d27e9b69` 和本仓库代码。
+- Execution strategy:
+  - 本轮继续不启用 `subagent-driven-development`；C23 是单一离线诊断链，写入集中在一个 artifact 目录和三份计划文件，并行分派会增加状态冲突。
+  - 当前不申请 workspace-env permit，不访问 live cluster，不修改 vLLM runtime 源码，不触碰远端 `iaas_main`。
+- Next:
+  - 执行 C23 离线命令并记录 summary；若 C23 仍无法解释 transfer failure，再规划 live diagnostic/repro。
+
+### P70: C23 offline Mooncake/KV failure diagnosis completed
+
+- Date: 2026-07-01
+- Summary: C23 离线根因初筛已完成；本轮没有申请 GPU permit、没有访问 live cluster、没有重新部署、没有修改 vLLM runtime 源码，也没有改变 evalscope gate。
+- Artifacts:
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/mooncake-failure-diagnosis-20260701/summary.md`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/mooncake-failure-diagnosis-20260701/failure-counts.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/mooncake-failure-diagnosis-20260701/code-path-excerpts.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/mooncake-failure-diagnosis-20260701/servingkit-values-diff.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/mooncake-failure-diagnosis-20260701/node-and-render-comparison.txt`
+- Evidence:
+  - 日志统计覆盖 9 个 C21 during/final log 文件。
+  - `sync_timeout=62`、`ret_failed=62`、`xfer_returned=93`、`producer_timeout=535`。
+  - `KV group count mismatch=0`、`handshake compatibility failure=0`、`Mooncake found no common KV transfer regions=0`。
+  - `ret_failed` 远端 session 都指向 decode 节点 `192.168.1.154` 的多个 Mooncake 端口：`16737`、`15047`、`16936`、`15365`、`16445`、`15763`、`15628`、`16078`。
+  - 失败 transfer 统计：`duration_s` min `30.1319`、p50 `31.4379`、max `32.0157`；descriptors min `7642`、p50 `82033`、max `115257`；bytes min `130947840`、p50 `1427616000`、max `1998662400`。
+  - MooncakeConnector 代码路径显示 `_send_blocks` 调用 `batch_transfer_sync_write`，ret 非 0 时记录 `Sending to ... failed (ret=...)`；consumer 侧随后记录 `Mooncake transfer engine returned -1`；producer 侧未发送请求按 `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` 默认 480s 超时释放。
+  - servingkit diff 的主要差异是计划内的 runtime hotfix/install 删除、`mooncakePackageVersion` pin 删除、节点参数化；当前没有看到足以解释 failure 的严重 P/D/router 语义发散。
+- Conclusion:
+  - 当前不是 evalscope “低吞吐完成结果”，而是 Mooncake transfer failure invalid run。
+  - 现有证据更支持 evalscope BS512 请求突发/客户端路径触发 Mooncake/RDMA transfer timeout 或 descriptor pressure；不像 metadata/握手不一致。
+  - vLLM bench BS512 后续健康 run 成功，不能证明 evalscope gate 通过，也不能消除该 transfer failure blocker。
+- Next:
+  - 如果继续推进 evalscope gate，应新增或执行 live diagnostic/repro：同一新部署、同一节点、同一 prefix/tokenizer、控制 harness 顺序，采集 Mooncake debug/RDMA/descriptor 证据；每次失败后必须 C21R 重启服务。
+  - 当前仍不得更新远端 `iaas_main`。
+
+### P71: Plan update for live repro, flakiness check, and debug-code authorization
+
+- Date: 2026-07-01
+- Trigger: 用户要求修改计划，继续部署并分析根因，同时考虑这可能是偶现问题、可能和压测方式无关；用户允许修改调试代码并推送。
+- Plan changes:
+  - 主计划新增 M11：Live 复现与 Mooncake/KV 根因诊断。
+  - 命令引用新增 `C24: Live Mooncake/KV repro, flakiness check, and harness cross-check`。
+  - 命令引用新增 `C25: Add gated Mooncake diagnostic logging, push branch, build debug image, and retest`。
+  - Global Constraints 明确：先用当前成功构建镜像做无代码改动 live 复现和偶现性判断；只有 C24 证据不足时，才加最小调试代码、推送诊断分支、触发 dev image 构建。
+  - Approval Forecast 记录追加授权：允许为根因诊断修改最小调试代码、推送诊断分支、触发 dev image 构建，并用调试镜像复测；该授权不包含更新远端 `iaas_main`。
+- Diagnostic policy:
+  - C24 必须至少跑 evalscope BS512/2048 两次 independent attempts；attempt 之间必须执行 C21R 重启 P/D/router。
+  - 如果第一次成功，仍需第二次判断是否只是偶现恢复；如果第一次失败，重启后第二次判断是否稳定复现。
+  - 同一 live 服务状态下还要跑 vLLM bench BS512 cross-check，避免仅凭历史 healthy run 推断压测方式差异。
+  - C24 summary 必须分类为 `stable-repro`、`intermittent`、`harness-specific`、`node/environment-specific`、`instrumentation-needed` 或 `resolved-by-successful-rerun`。
+  - C25 调试代码只允许加可开关日志/计数，例如 `VLLM_DSV4_MOONCAKE_DIAG=1`；不得改变 Mooncake transfer、调度、fallback、TP/PP/DP/EP、maxNumSeqs 或 benchmark 语义。
+- Current decision:
+  - 下一步执行 C24 前置环境、render 和 workspace-env permit 检查。
+  - 当前仍不得更新远端 `iaas_main`。
+
+### P72: C24 live deployment and first evalscope BS512 attempt
+
+- Date: 2026-07-01
+- Summary: C24 已重新申请 workspace-env permit 并部署当前成功构建镜像 `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`。第一次 deployment candidate 使用 prefill node `192.168.1.149` 时，该节点在 benchmark 前变为 `NodeNotReady`/unreachable，pod 被 evict 且 stuck terminating；该事件归类为 node/environment-specific，不纳入 evalscope/vLLM harness 对比。随后清理并改用 prefill `192.168.1.148`、decode/router `192.168.1.154`。
+- Permit:
+  - Session: `codex-vllm-dsv4-live-diag-20260701-095856`
+  - Thread: `codex-thread-vllm-dsv4-live-diag`
+  - Permit: `6751b814-3d8d-40f8-80f0-0fd8fe6bb4e2`
+  - Requested GPUs: `16`
+- Effective deployment semantics:
+  - `1P1D`，prefill 8 GPU，decode 8 GPU，P/D different nodes。
+  - `prefill.args.noAsyncScheduling=false`。
+  - `decode.args.maxNumSeqs=96`。
+  - Rendered command does not contain `--max-model-len`。
+  - No runtime hotfix/install path was observed.
+- Smoke and seed:
+  - Router `/v1/models` and `/v1/completions` succeeded.
+  - Evalscope seed for attempt 2 later confirmed seed prompt hash equals formal prompt hash.
+- Evalscope attempt 1:
+  - Directory: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/evalscope-bs512-attempt-1/`
+  - Command shape: `evalscope perf --parallel 512 --number 2048 --dataset random --prefix-length 65536 --min-prompt-length 0 --max-prompt-length 0 --min-tokens 1536 --max-tokens 1536 --seed 42 --extra-args '{"temperature":0,"ignore_eos":true}'`
+  - Processing stalled around `1762/2048` after several minutes without progress.
+  - Client interrupted and recorded exit `130`.
+  - Partial DB summary: `1000` success rows, avg latency `70.439972s`, avg TTFT `47.572388s`, avg output tokens `1536`, output tokens `1,536,000`.
+  - Stuck Prometheus snapshot: decode running `0`, decode waiting `286`, generation TPS `0`, prefill running/waiting `0`.
+  - Corrected log counts: producer-side `timed out after 480 seconds without being sent` count `2065`; `out-of-order step` count `732`; `KV group count mismatch`/`handshake compatibility failure`/`Mooncake found no common KV transfer regions` all `0`.
+- Decision:
+  - Attempt 1 is a real producer-side timeout/stall signal, but not yet stable repro because service was restarted and attempt 2 completed.
+
+### P73: C24 restart and second evalscope BS512 attempt
+
+- Date: 2026-07-01
+- Summary: Attempt 1 后按要求重启 P/D/router，修正了首次 restart 脚本中错误使用 `role-group` label 的问题，改为使用 `role-name=prefill` 和 `role-name=decode` 删除 P/D pods，并删除旧 router pod 释放 hostNetwork port `30000`。
+- Restart evidence:
+  - Directory: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/restart-after-attempt-1b/`
+  - Current pods after restart:
+    - Prefill: `dsv4-flash-pd-roleset-2dd5z-prefill-744499bdd7-0` on `192.168.1.148`
+    - Decode: `dsv4-flash-pd-roleset-2dd5z-decode-8cd55cb47-0` on `192.168.1.154`
+    - Router: `dsv4-flash-pd-router-6748845866-kjcxj` on `192.168.1.154`
+- Attempt 2 seed:
+  - Directory: `evalscope-bs512-attempt-2-seed/`
+  - Seed request succeeded with TTFT `14101.70 ms`.
+  - Seed prompt hash: `b88adb6042683505ee443673a4c578f643293ad60a126f0ada5cc27b2b1260d3`.
+  - Wrapper exited nonzero only because zsh did not support the bash `PIPESTATUS` collection expression after evalscope completion; actual evalscope request succeeded.
+- Attempt 2 formal run:
+  - Directory: `evalscope-bs512-attempt-2/`
+  - Exit: `0`
+  - Result: `2048/2048` success, `0` failed.
+  - Formal prompt hash: `b88adb6042683505ee443673a4c578f643293ad60a126f0ada5cc27b2b1260d3`; seed and formal run prompt match.
+  - First 10 formal prompts are identical; this rules out evalscope generating different prefixes per request for this run.
+  - Avg output throughput: `12291.66 tok/s`.
+  - Steady/drop20% completion throughput: `16963.67 tok/s`.
+  - Last 30s completion throughput: `18608.77 tok/s`.
+  - Avg TTFT: `20907.75 ms`; p50 TTFT `18604.52 ms`; p99 TTFT `52169.56 ms`.
+  - DB summary: `2048` rows, `2048` success, avg latency `57.61893s`, avg TTFT `20.90775s`, avg output tokens `1536`, total output tokens `3,145,728`.
+  - Corrected log counts in attempt-local artifacts: producer timeout `0`; `ret == TransferStatus::COMPLETED` `0`; `KV group count mismatch` `0`; `handshake compatibility failure` `0`; `Mooncake found no common KV transfer regions` `0`; `out-of-order step` `0`.
+  - Exact Prometheus window `2026-07-01T11:39:54+08:00` to `2026-07-01T11:44:11+08:00`: decode running min/avg/max `0/294.54/512`; decode waiting `0/18.44/187`; prefill running `0/3.33/16`; prefill waiting `0/63.33/479`; decode generation TPS 30s `0/11889.85/18978.79`.
+- Decision:
+  - Attempt 2 shows the producer-side timeout is not deterministic under the current deployment.
+  - However evalscope Avg gate still fails: output throughput `<14000 tok/s` and Avg TTFT `>10s`.
+  - Because user specified `看Avg`, steady/drop20% and last30s values are evidence only, not gate pass.
+
+### P74: C24 vLLM bench BS512 cross-check in the same vLLM image
+
+- Date: 2026-07-01
+- Summary: 在同一 live deployment 上，用同一个 vLLM image 启动 no-GPU benchmark Pod 执行 `vllm bench serve` BS512/2048 cross-check；该 Pod 挂载 `/data01` hostPath 读取 tokenizer/model，通过 in-cluster router Service 发请求，没有本地 Python 环境、运行时安装、代码 clone 或 hotfix。
+- Benchmark pod:
+  - Namespace: `vllm-dsv4-flash-pd`
+  - Pod: `vllm-bench-bs512-crosscheck`
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - Node: `192.168.1.148`
+  - GPU request: none
+  - Tokenizer/model path check: `/data01/DeepSeek-V4-Flash` exists with `tokenizer_config.json` and `tokenizer.json`.
+- Command:
+  - `vllm bench serve --backend openai --base-url http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000 --endpoint /v1/completions --model deepseek-v4-flash --tokenizer /data01/DeepSeek-V4-Flash --dataset-name random --random-prefix-len 65536 --random-input-len 0 --random-output-len 1536 --request-rate inf --max-concurrency 512 --num-prompts 2048 --ignore-eos --temperature 0 --seed 42 --save-result --save-detailed --result-dir /tmp/vllm-bench-bs512-crosscheck --result-filename vllm-bench-serve-bs512-n2048.json`
+- Result:
+  - Exit: `0`
+  - Successful / Failed: `2048 / 0`
+  - Output token throughput: `15152.89 tok/s`
+  - Mean TTFT: `7964.35 ms`
+  - Mean TPOT: `26.01 ms`
+  - Mean ITL: `105.79 ms`
+  - P99 TTFT: `33665.59 ms`
+  - Total input tokens: `134,217,728`
+  - Total generated tokens: `3,145,728`
+  - Max concurrency argument: `512`; reported peak concurrent requests: `539`
+- Log scan:
+  - Producer timeout `0`
+  - `KV group count mismatch` `0`
+  - `handshake compatibility failure` `0`
+  - `Mooncake found no common KV transfer regions` `0`
+  - `out-of-order step` `650`; because this run completed successfully, this pattern is not by itself fatal.
+- Exact Prometheus window `2026-07-01T11:55:26+08:00` to `2026-07-01T11:58:54+08:00`:
+  - decode running min/avg/max `0/391.93/512`
+  - decode waiting min/avg/max `0/4.31/16`
+  - prefill running min/avg/max `0/3.79/15`
+  - prefill waiting min/avg/max `0/28.48/288`
+  - decode generation TPS 30s min/avg/max `0/14365.81/18456.14`
+- Interpretation:
+  - vLLM bench meets both user Avg gates on the same image/deployment: Mean TTFT `<10s` and output throughput `>14000 tok/s`.
+  - Compared with evalscope attempt 2, vLLM bench kept higher average decode running and much lower decode waiting, which supports request arrival/admission shape as a major factor in the harness gap.
+  - This remains a cross-check, not a substitute for evalscope gate unless the plan gate is explicitly changed.
+
+### P75: C24 conclusion and cleanup
+
+- Date: 2026-07-01
+- C24 summary artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/summary.md`
+- Classification: `intermittent + harness-specific`
+- Root-cause assessment:
+  - The original evalscope BS512 producer timeout/stall is not a stable deterministic failure under the current deployment because attempt 2 completed after a full restart.
+  - It is not safe to call the issue resolved because evalscope attempt 2 still failed the required Avg gate and attempt 1 produced real producer-side timeout evidence.
+  - The live evalscope vs vLLM bench difference is reproducible and correlates with different admission/waiting behavior: evalscope exact window had decode running avg `294.54` and decode waiting max `187`; vLLM bench exact window had decode running avg `391.93` and decode waiting max `16`.
+  - Evalscope prefix-cache intent was aligned within evalscope: seed and formal prompt hashes matched, and formal requests were identical. Evalscope still reported `Cached Prompt tok/s 0.00`, so cache accounting/metric semantics remain unresolved.
+  - C25 debug code is not required to decide M10, because M10 is blocked by evalscope Avg gate failure and intermittent producer timeout. C25 should be used only if the next objective is to deeply root-cause attempt-1 Mooncake/RDMA descriptor timeout behavior.
+- Cleanup:
+  - Cleanup artifact dir: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/cleanup/`
+  - Serving namespace `vllm-dsv4-flash-pd`: `NotFound` after cleanup.
+  - Monitoring namespace `vllm-dsv4-flash-pd-monitoring`: `NotFound` after cleanup.
+  - Benchmark pod `vllm-bench-bs512-crosscheck`: deleted with namespace.
+  - Local task processes: no remaining `vllm-bench`, `evalscope`, or task-specific `kubectl wait/exec/port-forward`.
+  - Permit `6751b814-3d8d-40f8-80f0-0fd8fe6bb4e2`: status `released`.
+- Release decision:
+  - Remote `iaas_main` remains unchanged.
+  - Current plan still blocks M10 unless the user explicitly changes the performance gate from evalscope Avg to vLLM bench Avg and requests the corresponding plan update.
+
+### P76: C26 evalscope vs vLLM benchmark deep dive completed
+
+- Date: 2026-07-01
+- Trigger: 用户要求修改计划，分析 vLLM benchmark 和 evalscope benchmark 的差异，深挖 evalscope benchmark 无法达标的原因，并重点看 speculative decoding 接受率是否有区别。
+- Summary: C26 离线深挖已完成；本轮没有创建 GPU workload、没有访问 live cluster、没有修改源码、没有执行 C25 调试代码、没有更新远端 `iaas_main`。
+- Artifacts:
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/benchmark-diff-deep-dive-20260701/summary.md`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/benchmark-diff-deep-dive-20260701/metrics-comparison.txt`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/benchmark-diff-deep-dive-20260701/chunk-granularity.txt`
+- Evidence:
+  - evalscope attempt 2 与 vLLM bench cross-check 都完成 `2048/2048`，总 output tokens 均为 `3,145,728`。
+  - evalscope attempt 2: duration `255.9237s`，output throughput `12291.6638 tok/s`，Avg TTFT `20907.75 ms`，Avg TPOT `23.92 ms`，Avg ITL `101.84 ms`，Decoded Tok/Iter `4.3615`，Spec. Accept Rate `0.7707`。
+  - vLLM bench cross-check: duration `207.5992s`，output throughput `15152.8905 tok/s`，Mean TTFT `7964.35 ms`，Mean TPOT `26.01 ms`，Mean ITL `105.79 ms`；JSON 中没有 `spec`、`accept` 或 `draft` 字段。
+  - 首批 512 请求差异更明显：evalscope Avg TTFT `44907.21 ms`，vLLM bench Mean TTFT `21885.30 ms`。
+  - 末批 512 请求仍有差距：evalscope Avg TTFT `7535.16 ms`，vLLM bench Mean TTFT `2016.18 ms`。
+  - Prometheus exact window: evalscope decode running avg/max `294.54/512`、decode waiting avg/max `18.44/187`、prefill waiting avg/max `63.33/479`、decode gen TPS avg/max `11889.85/18978.79`；vLLM bench decode running avg/max `391.93/512`、decode waiting avg/max `4.31/16`、prefill waiting avg/max `28.48/288`、decode gen TPS avg/max `14365.81/18456.14`。
+  - evalscope seed prompt 与 formal prompt SHA 相同：`b88adb6042683505ee443673a4c578f643293ad60a126f0ada5cc27b2b1260d3`；first 10 formal prompts identical。
+  - evalscope prompt UTF-8 bytes `434688`；2048 请求约 `890 MB` prompt payload，首批 512 请求约 `223 MB`，不含 JSON/HTTP overhead；evalscope 通过本地 `127.0.0.1:30000` port-forward，vLLM bench 在集群内 no-GPU Pod 直连 router Service。
+  - chunk/ITL 代理：evalscope 约 `4.2610` output tokens / ITL event，vLLM bench 约 `4.0699` output tokens / ITL event；该代理不能替代 server-side spec metrics，但不支持 evalscope 接受率更差。
+- Conclusion:
+  - 分类为 `client-path + TTFT/admission dominated; speculative-acceptance-not-primary`。
+  - 当前证据不支持“evalscope 因投机解码接受率更差导致无法达标”。evalscope 的 per-output decode cadence 不差，直接报告的 `Spec. Accept Rate=0.7707` 也不是异常低值；主要差距来自 TTFT、admission/waiting、client path 和请求 payload 上传路径。
+  - 不能离线给出 vLLM bench 的真实 speculative accept rate，因为 vLLM bench JSON 没有 spec 字段，C24 Prometheus 也未抓 `vllm:spec_decode_*`。因此只能说“没有证据表明 evalscope 接受率更差”，不能宣称两者接受率完全相同。
+  - 若需要 definitive 结论，应执行新增 `C26B`：重新部署相同镜像/语义，分别跑 local port-forward evalscope、in-cluster evalscope no-GPU Pod 和 in-cluster vLLM bench，并在每个窗口抓 `vllm:spec_decode_num_draft_tokens_total`、`vllm:spec_decode_num_accepted_tokens_total`、`vllm:spec_decode_num_accepted_tokens_per_pos_total`、`vllm:spec_decode_num_drafts_total`。
+- Gate:
+  - C26 不改变 M10 决策。evalscope Avg gate 仍未通过；vLLM bench 通过仍只作为 harness cross-check；远端 `iaas_main` 仍不得更新。
+
+### P77: C26B follow-up for port-forward/client path and attempt-1 RDMA details
+
+- Date: 2026-07-01
+- Trigger: 用户要求定位 evalscope 不达标是否只是本地 port-forward/client path 导致，并定位 attempt 1 的 producer timeout、Mooncake descriptor 和 RDMA 细节。
+- Summary:
+  - 重新确认 `dev-cluster` 可用，并通过 idempotent workspace-env permit 继续使用 `c52190ad-8c5c-4fe7-a392-7e9a325edc25`。
+  - 当前部署语义保持 servingkit 对齐：prefill `192.168.1.148`、decode/router `192.168.1.154`、`prefill.args.noAsyncScheduling=false`、`decode.args.maxNumSeqs=96`、无 `--max-model-len`、无 runtime hotfix/install。
+  - smoke 成功后执行 local port-forward evalscope BS512/2048、尝试 in-cluster evalscope、执行 in-cluster `vllm bench serve` no-GPU Pod，并补充 attempt 1 RDMA/descriptor 统计。
+  - 本轮结束后已清理 Helm release、serving/monitoring namespaces、benchmark Pod、local port-forward，并释放 permit `c52190ad-8c5c-4fe7-a392-7e9a325edc25`。
+- Artifacts:
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/smoke-after-restart/`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/runs/local-portforward-evalscope-bs512-full/`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/runs/incluster-evalscope-bs512/`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/runs/incluster-evalscope-bs512-venv/`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/runs/incluster-vllm-bench-bs512-spec/summary.md`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/evalscope-bs512-attempt-1/evidence-summary/attempt1-rdma-descriptor-stats.txt`
+- Evidence:
+  - local port-forward evalscope BS512/2048：exit `0`，`2048/2048` success，request generation 耗时 `18:44`，Avg output throughput `11875.18 tok/s`，Avg TTFT `28649.67 ms`，Avg TPOT `21.54 ms`，Avg ITL `96.69 ms`，Decoded Tok/Iter `4.58`，Spec. Accept Rate `78.2%`。
+  - local evalscope processing window：post-generation decode running avg/max `262.02/512`，decode waiting avg/max `13.74/165`，prefill waiting avg/max `82.68/474`，decode generation TPS avg/max `11158.13/20730.45`，weighted spec accept rate `0.8263`。first-completion-to-end window decode generation TPS avg/max `13829.31/20730.45`，weighted spec accept rate `0.8266`。
+  - in-cluster evalscope blocked：同镜像 no-GPU Pod 内 `pip install evalscope==1.8.1` 卡在依赖下载；复用本地 `.venv-evalscope` 的 hostPath 失败，报 `/data00/.../.venv-evalscope/bin/evalscope: No such file or directory`，因为 Kubernetes 节点 `/data00` 不是本地工作站文件系统。
+  - in-cluster `vllm bench serve` no-GPU Pod：image 与 serving 相同，直连 `http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000`，`2048/2048` completed，0 failed，output throughput `10688.35 tok/s`，Mean TTFT `27152.21 ms`，Mean TPOT `25.34 ms`，Mean ITL `100.11 ms`，`MEASURED_RUN_START=2026-07-01T06:00:14+0000`，`MEASURED_RUN_END=2026-07-01T06:13:54+0000`，vLLM bench duration `294.31s`。
+  - in-cluster vLLM bench processing window：decode running avg/max `305.34/512`，decode waiting avg/max `20.06/308`，prefill waiting avg/max `89.76/496`，decode generation TPS avg/max `10568.30/17652.03`，weighted spec accept rate `0.7234`。
+  - in-cluster vLLM bench bad-log scan：0 行，无 `Sync batch data transfer timeout`、`Mooncake transfer engine returned -1`、producer 480s timeout、KV mismatch、handshake failure 或 no-common-region。
+  - C24 attempt 1 单独 RDMA/descriptor 统计：`Sync batch data transfer timeout=204`、producer 480s timeout `2063`、Mooncake `ret=-1` `212`、KV mismatch/handshake/no-common-region 均为 `0`。
+  - attempt 1 `Sending to ... failed (ret=-1)` records `204`；duration_s p50/p90/max `30.58/35.09/36.75`；descriptors p50/p90/max `33062/139169/173006`；bytes p50/p90/max `571046400/2426947200/2997993600`。
+- Conclusion:
+  - evalscope 不达标不是“只是本地 port-forward/client path”单因导致。port-forward 和本地 client path 会放大问题，但 in-cluster vLLM bench 绕开 port-forward 后仍未达 Avg gate。
+  - 当前更准确的分类是：大 prompt client 构造/上传、router admission/waiting、decode running 不持续贴满 512、以及 Mooncake/RDMA 偶发大批量 transfer timeout 共同影响。
+  - speculative decoding 不是 evalscope 独有劣化点：local evalscope 的 Prometheus weighted spec accept rate 约 `0.826`，in-cluster vLLM bench 约 `0.723`，没有证据支持 evalscope 因接受率更差而不达标。
+  - attempt 1 的失败路径更像 Mooncake/RDMA descriptor pressure 或 transfer timeout：大批量 transfer 在约 30-37s 超时，consumer 侧 `ret=-1`，producer 侧随后 480s unsent timeout；metadata/握手/region mismatch 证据为 0。
+- Cleanup:
+  - `helm uninstall dsv4-flash-pd -n vllm-dsv4-flash-pd` 完成，namespace `vllm-dsv4-flash-pd` deleted。
+  - `helm uninstall dsv4-flash-pd-monitoring -n vllm-dsv4-flash-pd-monitoring` 完成，namespace `vllm-dsv4-flash-pd-monitoring` deleted。
+  - 本地无残留 `port-forward`、`kubectl wait`、`evalscope` 或 `vllm bench` 进程。
+  - Permit `c52190ad-8c5c-4fe7-a392-7e9a325edc25` status `released`。
+- Gate:
+  - 远端 `iaas_main` 仍不得更新。evalscope BS512 Avg gate 未通过；本轮 in-cluster vLLM bench 也未达到 `>=14000 tok/s`。
+  - C25 暂不执行，除非下一步目标明确变为继续定位 attempt 1 的 Mooncake/RDMA timeout 并构建调试镜像。
+
+### P78: Proxy install path for in-cluster evalscope verified
+
+- Date: 2026-07-01
+- Trigger: 用户询问此前安装 evalscope 是否使用代理，并要求使用代理安装 evalscope。
+- Summary:
+  - 使用 `envctl info dev-cluster` 中的代理 `100.68.170.29:3128`，在 `dev-cluster` 创建临时 no-GPU Pod 验证同一 vLLM 镜像内安装 `evalscope[perf]==1.8.1`。
+  - 该步骤不创建 GPU workload，不占用 workspace-env GPU permit。
+  - 验证完成后已删除临时 namespace `vllm-dsv4-evalscope-install`，并确认查询为空。
+- Artifact:
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/evalscope-proxy-install-20260701/pod.yaml`
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/evalscope-proxy-install-20260701/pod.log`
+- Environment:
+  - Namespace: `vllm-dsv4-evalscope-install`
+  - Pod: `evalscope-proxy-install`
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - Node: `192.168.1.154`
+  - Proxy env: `HTTP_PROXY/HTTPS_PROXY/http_proxy/https_proxy=http://100.68.170.29:3128`
+- Command:
+  - `python3 -m pip install --proxy http://100.68.170.29:3128 -U 'evalscope[perf]==1.8.1'`
+  - `evalscope --version`
+  - Python import check for `evalscope.__version__`
+- Evidence:
+  - `evalscope 1.8.1`
+  - `evalscope_import_ok 1.8.1`
+  - `jieba-0.42.1.tar.gz` 等依赖通过代理正常下载；此前 C26B 无代理 Pod 卡在依赖下载。
+  - Pod runtime: `POD_START=2026-07-01T07:23:13+0000`，`POD_END=2026-07-01T07:24:40+0000`。
+- Plan update:
+  - C26B 的 in-cluster evalscope Pod scaffold 已更新为显式设置代理并安装 `evalscope[perf]==1.8.1`，不再使用无代理 `pip install evalscope==1.8.1`。
+  - 该更新只影响 benchmark client Pod 的依赖安装方式，不改变 serving 部署镜像、P/D/router 语义、Mooncake/DeepEP/DeepGEMM/vLLM runtime 行为或 M10 gate。
+- Next:
+  - 若继续补齐 definitive C26B 对照，应重新按 C14 获取 workspace-env GPU permit，部署相同镜像和 servingkit-aligned `1P1D` 服务，然后运行 in-cluster evalscope BS512/2048 并采集 Prometheus running/waiting/output TPS 与 `vllm:spec_decode_*` 指标。
+
+### P79: C26B proxy rerun blocked by prefill node NotReady before benchmark
+
+- Date: 2026-07-01
+- Trigger: 继续执行目标；C26B 的 Pod 内 evalscope 安装阻塞已通过 P78 的代理安装验证解除，因此尝试重新部署同镜像同语义 `1P1D` 服务以补跑 in-cluster evalscope。
+- Subagent decision:
+  - 不启用 `subagent-driven-development`。
+  - 原因：本轮工作是单一 live cluster mutation、permit 生命周期、Helm release 和 cleanup 的串行流程；并行子代理会增加同一 namespace/permit/artifact 的状态冲突风险。
+  - 主线程负责所有集群 mutation、artifact、计划更新和 gate 判断。
+- Issue log:
+  - `C14` 第一次前置检查在 `kubectl get pods -o custom-columns=...containers[*]...` 被 zsh glob 解析打断，错误为 `zsh: no matches found: custom-columns=...containers[*]...`。
+  - Outcome: 错误发生在 permit 申请之前，没有创建 GPU workload。
+  - Fix/prevention: C14 命令引用已改为给 `custom-columns=...` 参数加单引号，后续 zsh 环境不会再把 `[*]` 当 glob。
+- Permit:
+  - Session: `codex-vllm-dsv4-c26b-proxy-20260701-153108`
+  - Thread: `019f02ab-92f4-73f3-870b-5f981a254020`
+  - Permit: `f50acdc0-e818-43d2-bfa9-c88e5dab11a8`
+  - Requested GPUs: `16`
+  - Status: `granted` at `2026-07-01T07:31:09+00:00`; released at `2026-07-01T07:47:10+00:00`
+- Deployment attempt:
+  - Artifact root: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/proxy-rerun/`
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - Intended shape: `1P1D`，prefill `192.168.1.148`，decode/router `192.168.1.154`，`prefill.args.noAsyncScheduling=false`，`decode.args.maxNumSeqs=96`，无 `--max-model-len`。
+  - Render evidence: `deploy/rendered.yaml` and `deploy/render-grep.txt` show `StormService`、prefill/decode `nvidia.com/gpu: 8`、decode `--max-num-seqs "96"`、Onion model preparation；未出现 `--max-model-len`、runtime hotfix/install pattern。
+  - Helm install started and created the expected pods:
+    - decode `dsv4-flash-pd-roleset-p6nnt-decode-74586976c-0` on `192.168.1.154` reached `Ready=True`。
+    - router `dsv4-flash-pd-router-d596fd5bd-59kxk` started on `192.168.1.154` but restarted while waiting for workers。
+    - prefill `dsv4-flash-pd-roleset-p6nnt-prefill-74ddd7796c-0` started on `192.168.1.148` but never reached readiness before node eviction。
+- Blocker evidence:
+  - Event: `TaintManagerEviction` marked prefill pod for deletion.
+  - Node `192.168.1.148` status became `NotReady` / `Ready=Unknown` with reason `NodeStatusUnknown` and message `Kubelet stopped posting node status`。
+  - Node taints: `node.kubernetes.io/unreachable` with `NoSchedule` and `NoExecute`。
+  - This happened before router smoke, monitoring deploy, or in-cluster evalscope measured run; therefore no C26B benchmark result was produced in this attempt.
+- Cleanup:
+  - Helm release `dsv4-flash-pd` uninstalled.
+  - Namespace `vllm-dsv4-flash-pd` deleted after force-deleting the stuck task-owned prefill pod.
+  - Monitoring release was not created in this attempt; `dsv4-flash-pd-monitoring` was not present.
+  - Permit `f50acdc0-e818-43d2-bfa9-c88e5dab11a8` released.
+  - Independent checks after cleanup found no `vllm-dsv4-flash-pd` namespace, no task pods, and no task-specific `port-forward`/`evalscope`/`helm upgrade` processes.
+- Gate:
+  - C26B in-cluster evalscope remains incomplete due to external node failure before benchmark.
+  - M10 remains blocked because evalscope BS512 Avg gate has not passed.
+  - Next retry should not use `192.168.1.148` until it returns Ready; it should reacquire workspace-env permit and select two currently Ready/free 8-GPU nodes.
+
+### P80: C26B in-cluster evalscope proxy rerun completed on 186/154 and failed Avg gate
+
+- Date: 2026-07-01
+- Trigger: P79 的首个 proxy rerun 被 `192.168.1.148` 节点 NotReady 阻断后，按当前 Ready/free 节点重试，补齐用户要求的“使用代理安装 evalscope”并验证是否只是本地 port-forward/client path 导致。
+- Permit:
+  - Session: `codex-vllm-dsv4-c26b-proxy-186154-20260701-154948`
+  - Thread: `019f02ab-92f4-73f3-870b-5f981a254020`
+  - Permit: `a7389cb9-4e81-4a34-9c65-c8a4c27b22d0`
+  - Requested GPUs: `16`
+  - Status during benchmark: `running`
+- Deployment:
+  - Artifact root: `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/proxy-rerun-186-154/`
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - Shape: `1P1D`，prefill `192.168.1.186`，decode/router `192.168.1.154`，`prefill.args.noAsyncScheduling=false`，`decode.args.maxNumSeqs=96`，无 `--max-model-len`。
+  - Router smoke 成功，completion id 显示 prefill `192.168.1.186:8000`、decode `192.168.1.154:8001`。
+  - Monitoring `up{stack="vllm",release="dsv4-flash-pd"}` 对 prefill/decode 均为 `1`。
+- Benchmark command:
+  - Pod: `evalscope-bench-incluster-proxy`
+  - Client placement: no-GPU Pod on `192.168.1.186`。
+  - Proxy install: `python3 -m pip install --proxy http://100.68.170.29:3128 -U 'evalscope[perf]==1.8.1'`。
+  - Formal shape: `parallel=512`，`number=2048`，`prefix-length=65536`，`min/max-tokens=1536`，`temperature=0`，`ignore_eos=true`。
+- Results:
+  - Seed run completed; TTFT about `13976.75 ms`。
+  - Formal run completed with `MEASURED_RUN_EXIT_CODE=0` and Pod phase `Succeeded`。
+  - Total / success / failed: `2048 / 2047 / 1`。
+  - Avg TTFT: `20492.39 ms`，未通过 `< 10000 ms` gate。
+  - Evalscope Overall Avg output throughput: `12613.28 tok/s`，未通过 `>= 14000 tok/s` gate。
+  - Workload completion throughput: Overall `12630.03 tok/s`，Last 30s `21912.98 tok/s`，Steady drop 20% `16094.52 tok/s`；用户 gate 按 Avg/Overall，因此仍失败。
+  - Speculative decoding: `Decoded Tok/Iter=4.35`，evalscope `Spec. Accept Rate=0.77`。
+- Prometheus processing-window evidence:
+  - Window: approximately `2026-07-01T16:23:25+0800` to `2026-07-01T16:27:35+0800`。
+  - Decode running avg/max: `300.68 / 512.0`。
+  - Decode waiting avg/max: `45.30 / 398.0`。
+  - Decode generation tps 30s avg/max: `12047.57 / 18842.41`。
+  - Spec accepted/draft tps 30s avg: `9143.93 / 11623.09`，rate-derived acceptance `0.7867`。
+  - Interpretation: in-cluster evalscope 移除了本地 port-forward，但服务端仍未长期维持 512 running；Prometheus output TPS 与 evalscope Overall Avg 同向，因此不达标不能只归因于本地 port-forward。
+- Log scan:
+  - Prefill bad-log matches: `0`。
+  - Decode matches: `334`，样本均为 `Received stats for out-of-order step ...` warning；未见 Mooncake transfer-region/KV-load/producer timeout 类错误样本。
+  - Router matches: `4`，其中 benchmark 窗口内 1 条 `Two-stage processing failed ... Prefill request failed ... connection closed before message completed`，对应 evalscope 1 个 failed request。
+- Artifact:
+  - `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-spec-paired-20260701/proxy-rerun-186-154/runs/incluster-evalscope-bs512-proxy/summary.md`
+  - `.../pod.log` and `.../pod-final.log`
+  - `.../prometheus/range-summary.json`
+  - `.../logs/{prefill,decode,router}-since40m.log`
+- Artifact gap:
+  - `kubectl cp` 在 Pod `Succeeded` 后失败：`cannot exec into a container in a completed pod`。
+  - 文件级 evalscope outputs 未能复制出 `/tmp`；完整文本摘要已保存在 `pod.log`/`pod-final.log`。后续 benchmark Pod 若需 DB/HTML/JSON 文件，应在命令末尾 sleep 或把 output 写到可持久化卷。
+- Gate:
+  - 本轮仍阻止 M10，不得更新远端 `iaas_main`。
+  - 若继续按计划寻找 128-512 之间可完整通过的 evalscope batch，必须先重启 P/D/router，再按 monitoring 的实际 running capacity 决定候选。
+- Cleanup:
+  - Benchmark Pod `evalscope-bench-incluster-proxy` 已删除。
+  - Helm release `dsv4-flash-pd` 已卸载，namespace `vllm-dsv4-flash-pd` 已删除。
+  - Monitoring release `dsv4-flash-pd-monitoring` 已卸载，namespace `vllm-dsv4-flash-pd-monitoring` 已删除。
+  - Prometheus port-forward session 已停止。
+  - Permit `a7389cb9-4e81-4a34-9c65-c8a4c27b22d0` status `released` at `2026-07-01T08:32:42+00:00`。
+  - Final check: 查询两个任务 namespace 返回空；本地无本任务 `port-forward`/`evalscope` 残留。仍存在一个无关 `default svc/tmp-router 18080:8000` port-forward，未清理。
+
+### P81: C26C evalscope proxy BS 降档 sweep 已完成并清理
+
+- Date: 2026-07-01
+- Trigger: 用户要求 evalscope 安装必须使用代理，并在 BS512 不达标后继续检查 `128-512` 间是否存在能通过 Avg gate 的 BS；每个失败候选后必须重启服务，避免把坏状态带到下一轮。
+- Permit:
+  - Session: `codex-vllm-dsv4-evalscope-bs-sweep-20260701-163549`
+  - Thread: `019f02ab-92f4-73f3-870b-5f981a254020`
+  - Permit: `e927012a-ff9e-4626-a769-d80bc8cac77f`
+  - Requested GPUs: `16`
+  - Release status: `released` at `2026-07-01T10:09:45+00:00`
+- Deployment:
+  - Image: `iaas-gpu-cn-beijing.cr.volces.com/serving/vllm:v0.10.0.iaas.dev.202606302238-openai-devel-cu130`
+  - Shape: `1P1D`，prefill `192.168.1.186`，decode/router `192.168.1.154`，P/D 均 8 GPU 且不同节点；`prefill.args.noAsyncScheduling=false`，`decode.args.maxNumSeqs=96`，无 `--max-model-len`。
+  - Router smoke after final restart: `/v1/models` model count `1`，`/v1/completions` returned non-empty text `World`。
+- Evalscope install:
+  - All benchmark Pods used proxy env `HTTP_PROXY/HTTPS_PROXY=http://100.68.170.29:3128` with `NO_PROXY=localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`。
+  - Explicit install command in Pod YAML: `python3 -m pip install --proxy http://100.68.170.29:3128 -U 'evalscope[perf]==1.8.1'`。
+  - Pod output confirmed `evalscope 1.8.1`。
+- Benchmark commands:
+  - BS400: `evalscope perf --url http://dsv4-flash-pd-router.vllm-dsv4-flash-pd.svc.cluster.local:30000/v1/completions --model deepseek-v4-flash --tokenizer-path /data01/DeepSeek-V4-Flash --parallel 400 --number 1600 --dataset random --prefix-length 65536 --min-prompt-length 0 --max-prompt-length 0 --min-tokens 1536 --max-tokens 1536 --seed 42 --extra-args '{"temperature":0,"ignore_eos":true}' --outputs /tmp/evalscope-bs400/formal`
+  - BS256: same arguments with `--parallel 256 --number 1024 --outputs /tmp/evalscope-bs256/formal`
+  - BS128: same arguments with `--parallel 128 --number 512 --outputs /tmp/evalscope-bs128/formal`
+- Results:
+  - BS400 completed `1600 / 1600 / 0`，Avg TTFT `28498.44 ms`，Output Throughput `10525.87 tok/s`，TPOT `17.80 ms`，Decoded Tok/Iter `4.78`，Spec. Accept Rate `0.79`。未通过 `>= 14000 tok/s` Avg gate。
+  - BS256 completed `1024 / 1024 / 0`，Avg TTFT `24342.75 ms`，Output Throughput `8042.26 tok/s`，TPOT `14.84 ms`，Decoded Tok/Iter `4.56`，Spec. Accept Rate `0.78`。未通过 Avg gate。
+  - BS128 completed `512 / 512 / 0`，Avg TTFT `21165.30 ms`，Output Throughput `4920.15 tok/s`，TPOT `11.09 ms`，Decoded Tok/Iter `4.38`，Spec. Accept Rate `0.77`。未通过 Avg gate。
+  - 因用户要求 gate 看 Avg，BS400 的 steady/drop20% `14008.14 tok/s` 不作为通过依据。
+- Prometheus processing-window evidence:
+  - BS400: decode running avg/max `185.50/400.00`，waiting avg/max `18.85/245.00`，decode tps 30s avg/max `9581.17/18099.00`，rate-derived spec accept ratio avg `0.8642`。
+  - BS256: decode running avg/max `121.80/256.00`，waiting avg/max `10.28/131.00`，decode tps 30s avg/max `7042.59/13333.38`，rate-derived spec accept ratio avg `0.7674`。
+  - BS128: decode running avg/max `55.91/128.00`，waiting avg/max `7.70/36.00`，decode tps 30s avg/max `4220.63/6990.69`，rate-derived spec accept ratio avg `0.7616`。
+- Failure/restart hygiene:
+  - BS400 failed Avg gate 后删除 benchmark Pod，并重启 P/D/router 后再跑 BS256。
+  - BS256 failed Avg gate 后第一次删除 serving pods 命令把多个 Pod 名拼成单个参数，返回 `NotFound`；随后用 `xargs` 重试成功，等待 P/D/router Ready，并通过 router smoke 后再跑 BS128。
+  - BS128 failed Avg gate 后未再启动更小 BS，因为用户要求寻找 `128-512` 间候选；BS128 已是下界且仍远低于门槛。
+- Log scan:
+  - BS128 broad bad-log regex 命中 `55` 行，主要是 `VLLM_RPC_TIMEOUT` unknown env warning、decode coordinator `out-of-order step` warning 和 router startup timeout text。
+  - Mooncake/RDMA 关键词命中大量正常 RDMA 初始化日志；error-like 过滤命中 `8` 条 `Failed to open device mlx5_7 ... GID 3`，均发生在 startup 阶段。
+  - 未见本轮请求处理期间 `Mooncake found no common KV transfer regions`、`KV group count mismatch`、`KV load failed`、`handshake compatibility failure`、`request timeout during KV pull` 或 `Sync batch data transfer timeout` 这类 producer timeout/KV pull failure。
+- Artifacts:
+  - Root: `artifacts/2026-06-29-vllm-dsv4-flash-pd/evalscope-bs-downgrade-sweep-20260701/`
+  - Per-run: `runs/evalscope-bs400/`、`runs/evalscope-bs256/`、`runs/evalscope-bs128/`
+  - BS128 copied outputs: `runs/evalscope-bs128/pod-output/evalscope-bs128/`
+  - Monitoring summaries: `runs/evalscope-bs{400,256,128}/monitoring/range-summary.txt`
+  - Cleanup evidence: `final-cleanup/`
+- Cleanup:
+  - Benchmark Pod `evalscope-bs128-proxy` deleted with namespace cleanup.
+  - Helm release `dsv4-flash-pd` uninstalled.
+  - Namespace `vllm-dsv4-flash-pd` deleted.
+  - Monitoring release `dsv4-flash-pd-monitoring` uninstalled.
+  - Namespace `vllm-dsv4-flash-pd-monitoring` deleted.
+  - Local router port-forward `18082:30000` and Prometheus port-forward `19091:9090` stopped.
+  - Final checks: both namespaces return `NotFound`；local process scan found no task `port-forward` or `evalscope-bs*` process；permit `e927012a-ff9e-4626-a769-d80bc8cac77f` no longer appears in granted/running permits.
+- Gate:
+  - No evalscope candidate in the tested `128/256/400/512` set passed the Avg output throughput gate.
+  - M10 remains blocked; do not update remote `iaas_main` unless gate changes or a later run satisfies the original Avg thresholds.
+
+### P82: C25 gated Mooncake diagnostic logging started
+
+- Date: 2026-07-01
+- Trigger: 继续执行 goal；C26C 已证明 evalscope proxy 降档没有满足 Avg gate，M10 继续阻止；用户此前要求定位 attempt 1 producer timeout / Mooncake descriptor / RDMA 细节，且已授权为诊断修改最小调试代码并推送。
+- Subagent decision:
+  - 不启用 `superpowers:subagent-driven-development`。
+  - Rationale: C25 涉及同一个诊断分支、两个紧耦合文件 `vllm/envs.py` 与 `mooncake_connector.py`、同一 ByteIAAS workflow、同一后续 GPU deployment/permit 生命周期；并行子代理会增加 dirty worktree、branch、namespace、permit 和 artifact 冲突风险。
+  - Ownership: 主线程负责代码、验证、提交、推送、workflow 触发和后续复测；不分派并行写入。
+- Branch:
+  - Base branch before C25: `codex/vllm-dsv4-fork-base-byteiaas-build`
+  - Diagnostic branch: `codex/vllm-dsv4-mooncake-transfer-diagnostics`
+- Code changes:
+  - `vllm/envs.py`: added default-off env flag `VLLM_DSV4_MOONCAKE_DIAG`。
+  - `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py`: added gated `MooncakeDiag` logs for:
+    - producer ready timeout: rank, pending request count/sample, timeout seconds;
+    - producer batch transfer: remote session, request count/sample, transfer id sample, ret, elapsed seconds, descriptor count, total bytes;
+    - producer expired request: pending total, expired count, timeout, need/sent/sending counters, local group count;
+    - consumer receive/pulling error: worker address, request count/sample, err_reqs, err_msg, encoded metadata bytes.
+  - Behavior guard: all new diagnostic logs are behind `VLLM_DSV4_MOONCAKE_DIAG`; normal values do not enable it. No transfer behavior, timeout, scheduling, retry, fallback import, Mooncake/DeepEP/DeepGEMM config, or deployment semantic value changed.
+- Validation:
+  - `uv run --no-project python -m py_compile vllm/envs.py vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` passed.
+  - `git diff --check -- vllm/envs.py vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py` passed.
+  - Code diff archived at `artifacts/2026-06-29-vllm-dsv4-flash-pd/live-mooncake-diagnosis-20260701/c25-debug-code.diff`。
+- Issue log:
+  - CodeGraph was not initialized in this workspace, so codegraph context lookup failed before editing.
+  - Outcome: used narrow file reads and existing plan command references instead; no code was edited before the failed codegraph lookup.
+  - Prevention: if broader call graph review becomes necessary, initialize CodeGraph in a separate step or continue using narrow symbol/file reads for this two-file diagnostic change.
+- Next:
+  - Stage only `vllm/envs.py`、`mooncake_connector.py` and the three C25 plan files; do not stage artifacts, `outputs/`, unrelated `2026-06-30` plan progress, or pre-existing deployment-template edits unless explicitly needed.
+  - Commit, push diagnostic branch, trigger ByteIAAS dev image workflow for `openai-devel` / `cu130`。
