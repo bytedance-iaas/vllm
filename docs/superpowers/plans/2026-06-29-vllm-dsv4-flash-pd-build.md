@@ -270,4 +270,4 @@
 
 ## Next Action
 
-当前 C26C 已完成 128-512 范围内的 evalscope proxy 降档验证：BS400/256/128 均完整完成但 Avg output throughput 均低于 `14000 tok/s`，因此没有找到可通过 gate 的候选。所有本轮 serving release、monitoring release、benchmark Pod、port-forward 和 permit `e927012a-ff9e-4626-a769-d80bc8cac77f` 已清理/释放；两个任务 namespace 查询为空。M10 仍阻止更新远端 `iaas_main`。当前正在执行 C25：提交并推送诊断分支，触发 ByteIAAS dev image workflow，等待调试镜像；镜像成功后才能用同一部署语义、仅增加 `VLLM_DSV4_MOONCAKE_DIAG=1` 复测 attempt 1 类 workload。
+当前 C26C 已完成 128-512 范围内的 evalscope proxy 降档验证：BS400/256/128 均完整完成但 Avg output throughput 均低于 `14000 tok/s`，因此没有找到可通过 gate 的候选。所有本轮 serving release、monitoring release、benchmark Pod、port-forward 和 permit `e927012a-ff9e-4626-a769-d80bc8cac77f` 已清理/释放；两个任务 namespace 查询为空。M10 仍阻止更新远端 `iaas_main`。当前正在执行 C25：诊断分支 commit `66e76d57e2dd1cefb3b2122054cf0b907892eb61` 已推送；ByteIAAS dev workflow run `28510442949` 在 image job 早期失败于 buildx `docker` driver 不支持 `push-by-digest`，已取消该 run 并在 workflow 中改为 per-run `docker-container` builder。下一步推送该 CI 修复并重触发 dev workflow。镜像成功后才能用同一部署语义、仅增加 `VLLM_DSV4_MOONCAKE_DIAG=1` 复测 attempt 1 类 workload。

@@ -1599,5 +1599,56 @@
   - Outcome: used narrow file reads and existing plan command references instead; no code was edited before the failed codegraph lookup.
   - Prevention: if broader call graph review becomes necessary, initialize CodeGraph in a separate step or continue using narrow symbol/file reads for this two-file diagnostic change.
 - Next:
-  - Stage only `vllm/envs.py`、`mooncake_connector.py` and the three C25 plan files; do not stage artifacts, `outputs/`, unrelated `2026-06-30` plan progress, or pre-existing deployment-template edits unless explicitly needed.
   - Commit, push diagnostic branch, trigger ByteIAAS dev image workflow for `openai-devel` / `cu130`。
+
+### P83: C25 diagnostic branch pushed and ByteIAAS dev workflow queued
+
+- Date: 2026-07-01
+- Branch: `codex/vllm-dsv4-mooncake-transfer-diagnostics`
+- Commit: `66e76d57e2dd1cefb3b2122054cf0b907892eb61`
+- Push: `origin/codex/vllm-dsv4-mooncake-transfer-diagnostics`
+- Commit issue:
+  - First `git commit -m "chore: add gated Mooncake transfer diagnostics"` failed due to missing DCO sign-off.
+  - Error: `ERROR: commit is missing the expected DCO sign-off. Expected exactly: Signed-off-by: Hank Han <hanhan7630@outlook.com>`
+  - Fix: reran `git commit -s -m "chore: add gated Mooncake transfer diagnostics"`; commit succeeded with required sign-off.
+  - Prevention: use `git commit -s` for this repo.
+- Workflow:
+  - `gh workflow view byteiaas-release-dev.yml --ref codex/vllm-dsv4-mooncake-transfer-diagnostics --yaml` showed current inputs are only `checkout_ref` and `vllm_version`; older command reference inputs `image_flavors` and `cuda_version` do not exist for this workflow.
+  - Trigger command:
+    `gh workflow run byteiaas-release-dev.yml --ref codex/vllm-dsv4-mooncake-transfer-diagnostics -f checkout_ref=codex/vllm-dsv4-mooncake-transfer-diagnostics`
+  - Run id: `28510442949`
+  - Initial status: `queued`
+  - Run URL: `https://github.com/bytedance-iaas/vllm/actions/runs/28510442949`
+- Current local-only ledger note:
+  - This P83 plan update is intentionally not pushed after the workflow trigger, to avoid moving the branch ref for a run that was dispatched with `checkout_ref` as a branch name.
+- Next:
+  - Poll run `28510442949` until terminal.
+  - If success, extract debug image tag/digest from workflow logs and continue C25 deployment only with `VLLM_DSV4_MOONCAKE_DIAG=1` added.
+  - If failure, inspect failed job/step and record blocker or minimal fix.
+
+### P84: C25 debug image workflow failed on buildx driver and was patched
+
+- Date: 2026-07-01
+- Failed run: `28510442949`
+- Failed job: `build-image / build-and-publish-image`，job id `84509182184`
+- Failed step: `Build and push AMD64 image by digest`
+- Root cause:
+  - Log artifact: `artifacts/2026-06-29-vllm-dsv4-flash-pd/c25-workflow-28510442949/build-image.log`
+  - Error: `ERROR: failed to build: push-by-digest is currently not implemented for docker driver, please create a new builder instance`
+  - This happened before the Dockerfile build began, so it is a CI/buildx builder configuration issue, not a diagnostic code compile/runtime failure.
+- Immediate action:
+  - Submitted `gh run cancel 28510442949 --repo bytedance-iaas/vllm` to stop the already-failed run and avoid continuing the unrelated wheel job.
+- Fix:
+  - File: `.github/workflows/_byteiaas-build-and-publish-image.yml`
+  - Changed `docker/setup-buildx-action@v3` setup to create a per-run `docker-container` builder:
+    - `name: byteiaas-vllm-image-builder-${{ github.run_id }}`
+    - `driver: docker-container`
+    - `keep-state: false`
+    - `cleanup: true`
+  - Local BuildKit cache remains controlled by existing `BYTEIAAS_BUILDX_CACHE_ROOT` and `--cache-from/--cache-to type=local` logic, so this does not remove the intended image build cache path.
+- Validation:
+  - YAML parse check passed for `.github/workflows/_byteiaas-build-and-publish-image.yml` and `.github/workflows/byteiaas-release-dev.yml` using Python `yaml.safe_load`.
+  - `git diff --check -- .github/workflows/_byteiaas-build-and-publish-image.yml` passed.
+- Next:
+  - Commit and push workflow fix to `codex/vllm-dsv4-mooncake-transfer-diagnostics`.
+  - Trigger a new ByteIAAS dev workflow run from the same diagnostic branch.
