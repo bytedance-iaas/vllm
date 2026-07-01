@@ -130,13 +130,18 @@ def _check_planned_prefill(
     max_num_reqs: int,
 ) -> None:
     num_tokens = ONLINE_C128_COMPRESS_RATIO + 2
+    padded_tokens = num_tokens + 6
     torch.manual_seed(11)
-    kv = torch.randn(num_tokens, head_dim, device=device, dtype=torch.float32) * 0.2
-    score = torch.randn(num_tokens, head_dim, device=device, dtype=torch.float32) * 0.1
+    kv = (
+        torch.randn(padded_tokens, head_dim, device=device, dtype=torch.float32) * 0.2
+    )
+    score = (
+        torch.randn(padded_tokens, head_dim, device=device, dtype=torch.float32) * 0.1
+    )
     ape = torch.randn(
         ONLINE_C128_COMPRESS_RATIO, head_dim, device=device, dtype=torch.float32
     ) * 0.01
-    positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    positions = torch.arange(padded_tokens, device=device, dtype=torch.int64)
     run_state = _empty_rows(max_num_reqs, head_dim, device)
     compressed_kv = torch.zeros(
         num_tokens, head_dim, device=device, dtype=torch.float32
@@ -178,10 +183,10 @@ def _check_planned_prefill(
         positions[:ONLINE_C128_COMPRESS_RATIO],
     )
     expected_tail, _ = _online_ref(
-        kv[ONLINE_C128_COMPRESS_RATIO:],
-        score[ONLINE_C128_COMPRESS_RATIO:],
+        kv[ONLINE_C128_COMPRESS_RATIO:num_tokens],
+        score[ONLINE_C128_COMPRESS_RATIO:num_tokens],
         ape,
-        positions[ONLINE_C128_COMPRESS_RATIO:],
+        positions[ONLINE_C128_COMPRESS_RATIO:num_tokens],
     )
     _assert_close(
         "planned_prefill boundary compressed_kv",
@@ -199,16 +204,17 @@ def _check_candidate_chain_and_commit(
     torch.manual_seed(23)
     prefix_len = ONLINE_C128_COMPRESS_RATIO - 2
     verify_len = 3
+    padded_verify_len = verify_len + 2
     num_banks = verify_len + 1
     prefix_kv = torch.randn(prefix_len, head_dim, device=device) * 0.2
     prefix_score = torch.randn(prefix_len, head_dim, device=device) * 0.1
-    query_kv = torch.randn(verify_len, head_dim, device=device) * 0.2
-    query_score = torch.randn(verify_len, head_dim, device=device) * 0.1
+    query_kv = torch.randn(padded_verify_len, head_dim, device=device) * 0.2
+    query_score = torch.randn(padded_verify_len, head_dim, device=device) * 0.1
     ape = torch.randn(ONLINE_C128_COMPRESS_RATIO, head_dim, device=device) * 0.01
     prefix_positions = torch.arange(prefix_len, device=device, dtype=torch.int64)
     query_positions = torch.arange(
         prefix_len,
-        prefix_len + verify_len,
+        prefix_len + padded_verify_len,
         device=device,
         dtype=torch.int64,
     )

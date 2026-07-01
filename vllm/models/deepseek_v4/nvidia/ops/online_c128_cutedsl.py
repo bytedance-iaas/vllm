@@ -35,7 +35,7 @@ class OnlineC128MergeKernel:
         positions: cute.Tensor,  # [num_tokens] int64
         run_state: cute.Tensor,  # [num_rows, 3 * head_dim] fp32
         segments: cute.Tensor,  # [num_segments, 5] int32
-        compressed_kv: cute.Tensor,  # [num_tokens, head_dim] fp32
+        compressed_kv: cute.Tensor,  # [num_output_tokens, head_dim] fp32
         stream: CUstream,
     ):
         grid = (segments.shape[0], 1, 1)
@@ -147,6 +147,7 @@ class OnlineC128MergeKernel:
         num_tokens = cute.sym_int()
         num_rows = cute.sym_int()
         num_segments = cute.sym_int()
+        num_output_tokens = cute.sym_int()
 
         kv = cute.runtime.make_fake_tensor(
             Float32,
@@ -176,7 +177,7 @@ class OnlineC128MergeKernel:
         segments = make_fake_tensor(Int32, (num_segments, 5), divisibility=1)
         compressed_kv = cute.runtime.make_fake_tensor(
             Float32,
-            (num_tokens, head_size),
+            (num_output_tokens, head_size),
             stride=(head_size, 1),
             assumed_align=4,
         )
@@ -249,7 +250,7 @@ class OnlineC128DecodeKernel:
         query_start_loc: cute.Tensor,  # [num_reqs + 1] int32
         req_state_indices: cute.Tensor,  # [num_reqs] int32 (-1 pad)
         run_state: cute.Tensor,  # [num_banks * max_num_reqs, 3*head_dim] fp32
-        compressed_kv: cute.Tensor,  # [num_tokens, head_dim] fp32
+        compressed_kv: cute.Tensor,  # [num_output_tokens, head_dim] fp32
         stream: CUstream,
     ):
         grid = (req_state_indices.shape[0], 1, 1)
@@ -430,6 +431,7 @@ class OnlineC128DecodeKernel:
         num_reqs = cute.sym_int()
         num_query_locs = cute.sym_int()
         num_rows = cute.sym_int()
+        num_output_tokens = cute.sym_int()
 
         kv = cute.runtime.make_fake_tensor(
             Float32,
@@ -462,7 +464,7 @@ class OnlineC128DecodeKernel:
         )
         compressed_kv = cute.runtime.make_fake_tensor(
             Float32,
-            (num_tokens, head_size),
+            (num_output_tokens, head_size),
             stride=(head_size, 1),
             assumed_align=4,
         )
