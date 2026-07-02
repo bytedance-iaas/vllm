@@ -164,7 +164,7 @@ jobs:
             fi
 
             rm -rf "${cache_new}"
-            docker buildx build "${cache_args[@]}" "$@"
+            docker buildx build --builder byteiaas-vllm-image-builder "${cache_args[@]}" "$@"
 
             if [ -d "${cache_new}" ]; then
               rm -rf "${cache_old}"
