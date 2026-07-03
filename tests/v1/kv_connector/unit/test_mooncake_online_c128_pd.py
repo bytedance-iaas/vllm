@@ -174,6 +174,61 @@ def test_append_c128_aux_descriptors_maps_layer_indices_across_pp():
     assert lengths == [row_bytes, row_bytes]
 
 
+def test_append_c128_aux_descriptors_errors_on_producer_superset_layers():
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker._c128_export_pool = C128ExportSlotPool(
+        capacity=1,
+        num_layers=4,
+        row_width=5,
+        device="cpu",
+    )
+    worker._c128_num_layers = 4
+    worker._c128_state_row_bytes = 5 * worker._c128_export_pool.buffer.element_size()
+    worker._c128_layer_indices = [0, 1, 2, 3]
+    worker.tp_size = 1
+    worker.tp_rank = 0
+    worker._producer_cache_is_replicated = lambda: True
+
+    send_meta = SendBlockMeta(
+        p_req_id="p",
+        transfer_id="t",
+        local_block_ids=[[1]],
+        ready=None,
+        c128_export_slot=0,
+    )
+    agent_meta = MooncakeXferMetadata(
+        remote_hostname="host",
+        remote_port=1234,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"d": ("t", [[1]])},
+        kv_caches_base_addr=[],
+        block_lens=[],
+        c128_import_base_addr=0x1000,
+        c128_import_slot_bytes=2 * worker._c128_state_row_bytes,
+        c128_num_layers=2,
+        c128_state_row_bytes=worker._c128_state_row_bytes,
+        c128_layer_indices=[1, 3],
+        c128_req_import_slot={"d": 0},
+        c128_req_needs_partial={"d": True},
+    )
+    err_reqs: list[str] = []
+
+    err_msg = worker._append_c128_aux_descriptors(
+        ready_reqs=[("d", send_meta)],
+        agent_meta=agent_meta,
+        src_ptrs=[],
+        dst_ptrs=[],
+        lengths=[],
+        err_reqs=err_reqs,
+        err_msg=None,
+        aux_events=[],
+    )
+
+    assert "strictly contains the consumer" in err_msg
+    assert err_reqs == ["d"]
+
+
 def test_append_c128_aux_descriptors_fails_on_missing_consumer_layer():
     worker = object.__new__(MooncakeConnectorWorker)
     worker._c128_export_pool = C128ExportSlotPool(

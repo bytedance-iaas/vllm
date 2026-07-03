@@ -2069,6 +2069,35 @@ class MooncakeConnectorWorker:
             else:
                 layer_pos_pairs.append((src_layer_pos, dst_layer_pos))
 
+        needs_any_partial = any(
+            agent_meta.c128_req_needs_partial.get(d_req_id, False)
+            for d_req_id, _ in ready_reqs
+        )
+        local_layer_index_set = set(self._c128_layer_indices)
+        remote_layer_index_set = set(remote_layer_indices)
+        if (
+            needs_any_partial
+            and missing_layer_indices
+            and remote_layer_index_set < local_layer_index_set
+        ):
+            err_msg = (
+                "C128 aux partial-state transfer does not support a producer "
+                "layer set that strictly contains the consumer layer set. "
+                "This usually means prefill is running the full model while "
+                "decode is pipeline-parallel and owns only a layer subset. "
+                f"P(layer_indices={self._c128_layer_indices}) vs "
+                f"D(layer_indices={remote_layer_indices}); "
+                f"producer_only_layer_indices={missing_layer_indices}. "
+                "Use matching PP topology for prefill/decode or disable "
+                "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER."
+            )
+            for d_req_id, _ in ready_reqs:
+                if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
+                    d_req_id not in err_reqs
+                ):
+                    err_reqs.append(d_req_id)
+            return err_msg
+
         expected_remote_slot_bytes = agent_meta.c128_num_layers * row_bytes
         if (
             agent_meta.c128_state_row_bytes != row_bytes
