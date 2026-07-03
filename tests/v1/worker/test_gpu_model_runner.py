@@ -422,13 +422,16 @@ def test_update_states_new_request_restores_c128_state(
 
     kv_transfer_group = FakeKVTransferGroup()
     monkeypatch.setattr(
-        gpu_model_runner_module.envs, "VLLM_DSV4_C128_ONLINE_COMPRESS", True
+        gpu_model_runner_module.envs, "VLLM_USE_ONLINE_C128_COMPRESS", True
     )
     monkeypatch.setattr(
         gpu_model_runner_module.envs,
-        "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER",
+        "VLLM_USE_ONLINE_C128_PD_TRANSFER",
         True,
     )
+    model_runner._online_c128_enabled = True
+    model_runner.req_id_to_state_index = {}
+    model_runner.free_req_state_indices = list(reversed(range(model_runner.max_num_reqs)))
     monkeypatch.setattr(gpu_model_runner_module, "has_kv_transfer_group", lambda: True)
     monkeypatch.setattr(
         gpu_model_runner_module, "get_kv_transfer_group", lambda: kv_transfer_group
@@ -441,6 +444,23 @@ def test_update_states_new_request_restores_c128_state(
         ("bind", req_id, state_index),
         ("restore", req_id, state_index),
     ]
+
+
+def test_update_states_new_request_skips_c128_slots_when_disabled(
+    model_runner, dist_init, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs, "VLLM_USE_ONLINE_C128_COMPRESS", False
+    )
+    model_runner._online_c128_enabled = False
+    for attr in ("req_id_to_state_index", "free_req_state_indices"):
+        if hasattr(model_runner, attr):
+            delattr(model_runner, attr)
+
+    model_runner._update_states(_schedule_new_request("req_0"))
+
+    assert not hasattr(model_runner, "req_id_to_state_index")
+    assert not hasattr(model_runner, "free_req_state_indices")
 
 
 def test_update_states_request_finished(model_runner, dist_init):

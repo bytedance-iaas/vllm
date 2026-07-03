@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Mooncake PD aux transfer helpers for DeepSeek-V4 C128 online state."""
+"""Mooncake PD transfer helpers for C128 online state."""
 
 from __future__ import annotations
 
@@ -129,8 +129,8 @@ def reset_bank0(online_states: list, req_state_idx: int) -> None:
 
 
 @dataclass
-class C128AuxXferPlan:
-    """Source/destination pointer descriptors for one request's aux transfer.
+class C128StateTransferPlan:
+    """Source/destination pointer descriptors for one request's state transfer.
 
     Appended to the KV block descriptors so they ride the same
     ``batch_transfer_sync_write`` call.
@@ -141,7 +141,7 @@ class C128AuxXferPlan:
     lengths: list[int] = field(default_factory=list)
 
 
-def build_c128_aux_descriptors(
+def build_online_c128_state_descriptors(
     export_pool: C128ExportSlotPool,
     export_slot: int,
     remote_import_base_addr: int,
@@ -150,7 +150,7 @@ def build_c128_aux_descriptors(
     num_layers: int,
     row_width_bytes: int,
     layer_pos_pairs: list[tuple[int, int]] | None = None,
-) -> C128AuxXferPlan:
+) -> C128StateTransferPlan:
     """Build per-layer src/dst/len descriptors for one request's bank0 transfer.
 
     Source: the P export slot's per-layer rows.
@@ -159,7 +159,7 @@ def build_c128_aux_descriptors(
     ``layer_pos_pairs`` maps producer-local layer positions to
     consumer-local layer positions; identity mapping is used when omitted.
     """
-    plan = C128AuxXferPlan()
+    plan = C128StateTransferPlan()
     src_base = export_pool.base_addr + export_pool.slot_offset_bytes(export_slot)
     dst_base = remote_import_base_addr + remote_import_slot * remote_slot_bytes
     pairs = (

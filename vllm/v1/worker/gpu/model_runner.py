@@ -206,24 +206,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         import vllm.envs as envs
         from vllm.models.deepseek_v4.online_c128 import (
             online_c128_debug_enabled,
-            online_c128_mtp_enabled,
+            online_c128_uses_mtp,
         )
 
-        self._online_c128_mtp = online_c128_mtp_enabled()
+        self._online_c128_uses_mtp = online_c128_uses_mtp(vllm_config)
         self._online_c128_debug = online_c128_debug_enabled()
         self._online_c128_verify_ctx: tuple | None = None
-        # Runner hooks for Mooncake C128 snapshot/restore; connector gates by role.
-        self._online_c128_pd_aux = bool(
-            envs.VLLM_DSV4_C128_ONLINE_COMPRESS
-        ) and bool(envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER)
+        # Runner hooks for online C128 state snapshot/restore; connector gates by role.
+        self._online_c128_pd_transfer = bool(
+            envs.VLLM_USE_ONLINE_C128_COMPRESS
+        ) and bool(envs.VLLM_USE_ONLINE_C128_PD_TRANSFER)
         if self._online_c128_debug:
             logger.info(
                 "C128 online debug: runner flags compress=%s mtp=%s "
-                "pd_aux=%s spec=%s pp=%d dp=%d tp=%d max_num_reqs=%d "
+                "pd_transfer=%s spec=%s pp=%d dp=%d tp=%d max_num_reqs=%d "
                 "max_num_tokens=%d",
-                bool(envs.VLLM_DSV4_C128_ONLINE_COMPRESS),
-                self._online_c128_mtp,
-                self._online_c128_pd_aux,
+                bool(envs.VLLM_USE_ONLINE_C128_COMPRESS),
+                self._online_c128_uses_mtp,
+                self._online_c128_pd_transfer,
                 getattr(self.speculative_config, "method", None)
                 if self.speculative_config is not None
                 else None,
@@ -233,13 +233,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.max_num_reqs,
                 self.max_num_tokens,
             )
-        if self._online_c128_mtp:
+        if self._online_c128_uses_mtp:
             if self.speculative_config is None or (
                 self.speculative_config.method != "mtp"
             ):
                 raise ValueError(
-                    "VLLM_DSV4_C128_ONLINE_MTP requires the MTP speculative "
-                    "method."
+                    "VLLM_USE_ONLINE_C128_COMPRESS only supports MTP "
+                    "speculative decoding."
                 )
             if getattr(self.speculative_config, "num_speculative_tokens", 1) < 1:
                 raise ValueError("C128 online MTP requires num_speculative_tokens >= 1.")
@@ -521,7 +521,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._online_c128_compress = online_c128_compress_enabled()
         if self._online_c128_compress and cudagraph_mode == CUDAGraphMode.FULL:
             logger.warning(
-                "VLLM_DSV4_C128_ONLINE_COMPRESS supports FULL cudagraphs only "
+                "VLLM_USE_ONLINE_C128_COMPRESS supports FULL cudagraphs only "
                 "for uniform decode batches; degrading cudagraph_mode FULL -> "
                 "FULL_AND_PIECEWISE so decode keeps FULL and mixed/prefill runs "
                 "PIECEWISE."
@@ -841,6 +841,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         request slot is still live, and before ``pre_forward`` starts sender
         tasks.
         """
+        if not self._online_c128_pd_transfer:
+            return
         metadata = scheduler_output.kv_connector_metadata
         reqs_to_send = getattr(metadata, "reqs_to_send", None)
         req_ids = set(reqs_to_send or ())
@@ -848,7 +850,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not req_ids:
             return
         logger.info(
-            "C128 aux snapshot pending sends: req_ids=%s live_req_ids=%s",
+            "C128 online state snapshot pending sends: req_ids=%s live_req_ids=%s",
             sorted(req_ids),
             list(self.req_states.req_id_to_index),
         )
@@ -858,8 +860,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.snapshot_c128_state(req_id, req_idx)
             else:
                 logger.warning(
-                    "C128 aux snapshot skipped: request %s not found in "
-                    "live req_state slots.",
+                    "C128 online state snapshot skipped: request %s not found "
+                    "in live req_state slots.",
                     req_id,
                 )
 
@@ -892,10 +894,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
-            self.kv_connector.bind_c128_state_index(req_id, req_index)
 
-            # Materialize D-side bank0 once the request slot is known.
-            if self._online_c128_pd_aux:
+            if self._online_c128_pd_transfer:
+                self.kv_connector.bind_c128_state_index(req_id, req_index)
+                # Materialize D-side bank0 once the request slot is known.
                 self.kv_connector.restore_c128_state(req_id, req_index)
 
             if self.encoder_cache is not None:
@@ -1245,12 +1247,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
         scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-        has_online_c128_mtp_verify = (
+        has_online_c128_verify = (
             not dummy_run
-            and self._online_c128_mtp
+            and self._online_c128_uses_mtp
             and any(scheduled_spec_decode_tokens.values())
         )
-        if has_online_c128_mtp_verify:
+        if has_online_c128_verify:
             for req_id, draft_ids in scheduled_spec_decode_tokens.items():
                 if (
                     draft_ids
@@ -1273,9 +1275,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Non-verify uniform batches must not replay the MTP candidate-chain graph.
         if (
-            self._online_c128_mtp
+            self._online_c128_uses_mtp
             and uniform_tok_count == self.decode_query_len
-            and not has_online_c128_mtp_verify
+            and not has_online_c128_verify
         ):
             uniform_tok_count = None
 
@@ -1408,7 +1410,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Mark MTP verify rows and record base seq lens for post-sample commit.
         self._online_c128_verify_ctx = None
-        if self._online_c128_mtp and input_batch.num_draft_tokens > 0:
+        if self._online_c128_uses_mtp and input_batch.num_draft_tokens > 0:
             from vllm.models.deepseek_v4.online_c128 import begin_online_c128_verify
 
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req

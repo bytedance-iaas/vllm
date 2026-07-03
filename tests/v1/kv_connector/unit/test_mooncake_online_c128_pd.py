@@ -9,7 +9,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (
     C128ExportSlotPool,
     C128ImportSlotPool,
-    build_c128_aux_descriptors,
+    build_online_c128_state_descriptors,
     reset_bank0,
     restore_bank0_from_slot,
     snapshot_bank0_to_slot,
@@ -40,7 +40,7 @@ def test_c128_slot_pool_reuses_existing_transfer_and_releases_slot():
     assert pool.acquire("transfer-b", timeout=0.0) == slot
 
 
-def test_build_c128_aux_descriptors_uses_slot_and_layer_offsets():
+def test_build_online_c128_state_descriptors_uses_slot_and_layer_offsets():
     pool = C128ExportSlotPool(
         capacity=2,
         num_layers=3,
@@ -53,7 +53,7 @@ def test_build_c128_aux_descriptors_uses_slot_and_layer_offsets():
     remote_import_base_addr = 0x1000
     remote_slot_bytes = 3 * row_width_bytes
 
-    plan = build_c128_aux_descriptors(
+    plan = build_online_c128_state_descriptors(
         export_pool=pool,
         export_slot=export_slot,
         remote_import_base_addr=remote_import_base_addr,
@@ -74,7 +74,7 @@ def test_build_c128_aux_descriptors_uses_slot_and_layer_offsets():
     assert plan.lengths == [row_width_bytes] * 3
 
 
-def test_build_c128_aux_descriptors_maps_producer_to_consumer_layers():
+def test_build_online_c128_state_descriptors_maps_producer_to_consumer_layers():
     pool = C128ExportSlotPool(
         capacity=2,
         num_layers=2,
@@ -87,7 +87,7 @@ def test_build_c128_aux_descriptors_maps_producer_to_consumer_layers():
     remote_import_base_addr = 0x1000
     remote_slot_bytes = 4 * row_width_bytes
 
-    plan = build_c128_aux_descriptors(
+    plan = build_online_c128_state_descriptors(
         export_pool=pool,
         export_slot=export_slot,
         remote_import_base_addr=remote_import_base_addr,
@@ -111,7 +111,7 @@ def test_build_c128_aux_descriptors_maps_producer_to_consumer_layers():
     assert plan.lengths == [row_width_bytes] * 2
 
 
-def test_append_c128_aux_descriptors_maps_layer_indices_across_pp():
+def test_append_online_c128_state_descriptors_maps_layer_indices_across_pp():
     worker = object.__new__(MooncakeConnectorWorker)
     worker._c128_export_pool = C128ExportSlotPool(
         capacity=2,
@@ -154,7 +154,7 @@ def test_append_c128_aux_descriptors_maps_layer_indices_across_pp():
     dst_ptrs: list[int] = []
     lengths: list[int] = []
 
-    err_msg = worker._append_c128_aux_descriptors(
+    err_msg = worker._append_online_c128_state_descriptors(
         ready_reqs=[("d", send_meta)],
         agent_meta=agent_meta,
         src_ptrs=src_ptrs,
@@ -162,7 +162,7 @@ def test_append_c128_aux_descriptors_maps_layer_indices_across_pp():
         lengths=lengths,
         err_reqs=[],
         err_msg=None,
-        aux_events=[],
+        state_transfer_events=[],
     )
 
     row_bytes = worker._c128_state_row_bytes
@@ -174,7 +174,7 @@ def test_append_c128_aux_descriptors_maps_layer_indices_across_pp():
     assert lengths == [row_bytes, row_bytes]
 
 
-def test_append_c128_aux_descriptors_errors_on_producer_superset_layers():
+def test_append_online_c128_state_descriptors_errors_on_producer_superset_layers():
     worker = object.__new__(MooncakeConnectorWorker)
     worker._c128_export_pool = C128ExportSlotPool(
         capacity=1,
@@ -214,7 +214,7 @@ def test_append_c128_aux_descriptors_errors_on_producer_superset_layers():
     )
     err_reqs: list[str] = []
 
-    err_msg = worker._append_c128_aux_descriptors(
+    err_msg = worker._append_online_c128_state_descriptors(
         ready_reqs=[("d", send_meta)],
         agent_meta=agent_meta,
         src_ptrs=[],
@@ -222,14 +222,14 @@ def test_append_c128_aux_descriptors_errors_on_producer_superset_layers():
         lengths=[],
         err_reqs=err_reqs,
         err_msg=None,
-        aux_events=[],
+        state_transfer_events=[],
     )
 
     assert "strictly contains the consumer" in err_msg
     assert err_reqs == ["d"]
 
 
-def test_append_c128_aux_descriptors_fails_on_missing_consumer_layer():
+def test_append_online_c128_state_descriptors_fails_on_missing_consumer_layer():
     worker = object.__new__(MooncakeConnectorWorker)
     worker._c128_export_pool = C128ExportSlotPool(
         capacity=1,
@@ -269,7 +269,7 @@ def test_append_c128_aux_descriptors_fails_on_missing_consumer_layer():
     )
     err_reqs: list[str] = []
 
-    err_msg = worker._append_c128_aux_descriptors(
+    err_msg = worker._append_online_c128_state_descriptors(
         ready_reqs=[("d", send_meta)],
         agent_meta=agent_meta,
         src_ptrs=[],
@@ -277,7 +277,7 @@ def test_append_c128_aux_descriptors_fails_on_missing_consumer_layer():
         lengths=[],
         err_reqs=err_reqs,
         err_msg=None,
-        aux_events=[],
+        state_transfer_events=[],
     )
 
     assert "missing_layer_indices=[3]" in err_msg
@@ -286,7 +286,7 @@ def test_append_c128_aux_descriptors_fails_on_missing_consumer_layer():
 
 def test_bind_c128_state_index_does_not_require_export_pool_registered():
     worker = object.__new__(MooncakeConnectorWorker)
-    worker._c128_aux_transfer_enabled = True
+    worker._online_c128_state_transfer_enabled = True
     worker._c128_export_pool = None
     worker._c128_req_state_indices = {}
 

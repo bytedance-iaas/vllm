@@ -29,21 +29,21 @@ ONLINE_C128_STATE_DTYPE = torch.float32
 
 def online_c128_compress_enabled() -> bool:
     """Whether the C128 online compress feature flag is set."""
-    return bool(envs.VLLM_DSV4_C128_ONLINE_COMPRESS)
+    return bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
 
 
-def online_c128_mtp_enabled() -> bool:
-    """Whether C128 online MTP is requested.
-
-    MTP support is gated on the base online-compress gate: enabling MTP without
-    online compress is meaningless, so this returns ``False`` unless both flags
-    are set.
-    """
-    return bool(envs.VLLM_DSV4_C128_ONLINE_MTP) and online_c128_compress_enabled()
+def online_c128_uses_mtp(vllm_config: VllmConfig) -> bool:
+    """Whether online C128 is running with MTP speculative decoding."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    return (
+        online_c128_compress_enabled()
+        and speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+    )
 
 
 def online_c128_debug_enabled() -> bool:
-    return bool(envs.VLLM_DSV4_C128_ONLINE_DEBUG)
+    return bool(envs.VLLM_ONLINE_C128_DEBUG)
 
 
 def _is_sm90() -> bool:
@@ -63,50 +63,42 @@ def assert_online_c128_supported(
     """
     if not _is_sm90():
         raise ValueError(
-            "VLLM_DSV4_C128_ONLINE_COMPRESS is only supported on CUDA SM90 "
+            "VLLM_USE_ONLINE_C128_COMPRESS is only supported on CUDA SM90 "
             "(Hopper)."
         )
     if compress_ratio != ONLINE_C128_COMPRESS_RATIO:
         raise ValueError(
-            "VLLM_DSV4_C128_ONLINE_COMPRESS requires compress_ratio == "
+            "VLLM_USE_ONLINE_C128_COMPRESS requires compress_ratio == "
             f"{ONLINE_C128_COMPRESS_RATIO}, got {compress_ratio}."
         )
     if head_dim != ONLINE_C128_HEAD_DIM:
         raise ValueError(
-            "VLLM_DSV4_C128_ONLINE_COMPRESS requires head_dim == "
+            "VLLM_USE_ONLINE_C128_COMPRESS requires head_dim == "
             f"{ONLINE_C128_HEAD_DIM}, got {head_dim}."
         )
 
     parallel_config = vllm_config.parallel_config
     if getattr(parallel_config, "decode_context_parallel_size", 1) > 1:
         raise ValueError(
-            "VLLM_DSV4_C128_ONLINE_COMPRESS does not support decode context "
+            "VLLM_USE_ONLINE_C128_COMPRESS does not support decode context "
             "parallelism (DCP)."
         )
     if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
         raise ValueError(
-            "VLLM_DSV4_C128_ONLINE_COMPRESS does not support prefill context "
+            "VLLM_USE_ONLINE_C128_COMPRESS does not support prefill context "
             "parallelism (PCP)."
         )
 
-    # Any speculative decoding under online compress MUST go through the
-    # transactional MTP banks, otherwise target-verify would merge rejected
-    # draft tokens into the committed bank0 and pollute later decode. So when a
-    # speculative config is present we require the MTP gate AND method == 'mtp';
-    # any other combination is fail-closed.
+    # Any speculative decoding under online compress MUST be MTP. Other
+    # speculative methods would merge rejected draft tokens into committed bank0
+    # and pollute later decode.
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is not None:
         method = getattr(speculative_config, "method", None)
-        if not online_c128_mtp_enabled():
-            raise ValueError(
-                "VLLM_DSV4_C128_ONLINE_COMPRESS with speculative decoding "
-                "requires VLLM_DSV4_C128_ONLINE_MTP=1 (transactional banks); "
-                f"got speculative method {method!r} with MTP gate off."
-            )
         if method != "mtp":
             raise ValueError(
-                "VLLM_DSV4_C128_ONLINE_MTP requires the speculative method to "
-                f"be 'mtp', got {method!r}."
+                "VLLM_USE_ONLINE_C128_COMPRESS with speculative decoding only "
+                f"supports the MTP speculative method; got {method!r}."
             )
 
 
@@ -117,7 +109,7 @@ def online_c128_num_banks(vllm_config: VllmConfig) -> int:
     the verify query len upper bound is ``num_speculative_tokens + 1`` (the MTP
     draft tokens plus the bonus token verified by the target model).
     """
-    if not online_c128_mtp_enabled():
+    if not online_c128_uses_mtp(vllm_config):
         return 1
     speculative_config = getattr(vllm_config, "speculative_config", None)
     num_spec = 0

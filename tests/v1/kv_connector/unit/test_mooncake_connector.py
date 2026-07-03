@@ -1383,7 +1383,7 @@ def test_register_kv_caches_keeps_non_mtp_speculative_layers_outside_base_model(
 
 def test_c128_pull_failure_reports_invalid_blocks_after_all_tasks_quiesce():
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
-    worker._c128_aux_transfer_enabled = True
+    worker._online_c128_state_transfer_enabled = True
     worker._c128_import_pool = SimpleNamespace(release=MagicMock())
     worker._c128_active_pulls = {}
     worker._c128_pending_import_reqs = set()
@@ -1422,7 +1422,7 @@ def test_c128_pull_failure_reports_invalid_blocks_after_all_tasks_quiesce():
         MooncakeXferResponse(
             status=MooncakeXferResponseStatus.FINISH,
             err_reqs=["req"],
-            err_msg="C128 aux failed",
+            err_msg="C128 state transfer failed",
         ),
         pull_metas,
     )

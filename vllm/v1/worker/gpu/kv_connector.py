@@ -43,7 +43,7 @@ class KVConnector:
     def set_disabled(self, disabled: bool) -> None:
         pass
 
-    # Mooncake C128 aux hooks; no-op for other connectors.
+    # Online C128 state-transfer hooks; no-op for connectors that do not support it.
     def snapshot_c128_state(self, req_id: str, req_state_idx: int) -> None:
         pass
 

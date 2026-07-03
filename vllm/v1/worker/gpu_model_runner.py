@@ -636,8 +636,12 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
-        self.req_id_to_state_index: dict[str, int] = {}
-        self.free_req_state_indices: list[int] = list(reversed(range(self.max_num_reqs)))
+        self._online_c128_enabled = bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+        if self._online_c128_enabled:
+            self.req_id_to_state_index: dict[str, int] = {}
+            self.free_req_state_indices: list[int] = list(
+                reversed(range(self.max_num_reqs))
+            )
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -1113,27 +1117,27 @@ class GPUModelRunner(
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
-    def _c128_pd_aux_enabled(self) -> bool:
-        return bool(envs.VLLM_DSV4_C128_ONLINE_COMPRESS) and bool(
-            envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER
+    def _online_c128_pd_transfer_enabled(self) -> bool:
+        return bool(getattr(self, "_online_c128_enabled", False)) and bool(
+            envs.VLLM_USE_ONLINE_C128_PD_TRANSFER
         )
 
     def _bind_c128_state_index(self, req_id: str, state_index: int) -> None:
-        if not self._c128_pd_aux_enabled() or not has_kv_transfer_group():
+        if not self._online_c128_pd_transfer_enabled() or not has_kv_transfer_group():
             return
         fn = getattr(get_kv_transfer_group(), "bind_c128_state_index", None)
         if fn is not None:
             fn(req_id, state_index)
 
     def _snapshot_c128_state(self, req_id: str, state_index: int) -> None:
-        if not self._c128_pd_aux_enabled() or not has_kv_transfer_group():
+        if not self._online_c128_pd_transfer_enabled() or not has_kv_transfer_group():
             return
         fn = getattr(get_kv_transfer_group(), "snapshot_c128_state", None)
         if fn is not None:
             fn(req_id, state_index)
 
     def _restore_c128_state(self, req_id: str, state_index: int) -> None:
-        if not self._c128_pd_aux_enabled() or not has_kv_transfer_group():
+        if not self._online_c128_pd_transfer_enabled() or not has_kv_transfer_group():
             return
         fn = getattr(get_kv_transfer_group(), "restore_c128_state", None)
         if fn is not None:
@@ -1166,18 +1170,20 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        for req_id in scheduler_output.finished_req_ids:
-            state_index = self.req_id_to_state_index.get(req_id)
-            if state_index is not None:
-                self._snapshot_c128_state(req_id, state_index)
+        if self._online_c128_enabled:
+            for req_id in scheduler_output.finished_req_ids:
+                state_index = self.req_id_to_state_index.get(req_id)
+                if state_index is not None:
+                    self._snapshot_c128_state(req_id, state_index)
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            state_index = self.req_id_to_state_index.pop(req_id, None)
-            if state_index is not None:
-                self.free_req_state_indices.append(state_index)
+            if self._online_c128_enabled:
+                state_index = self.req_id_to_state_index.pop(req_id, None)
+                if state_index is not None:
+                    self.free_req_state_indices.append(state_index)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1237,10 +1243,11 @@ class GPUModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
-                state_index = self.req_id_to_state_index.get(req_id)
-                if state_index is not None:
-                    self._bind_c128_state_index(req_id, state_index)
-                    self._restore_c128_state(req_id, state_index)
+                if self._online_c128_enabled:
+                    state_index = self.req_id_to_state_index.get(req_id)
+                    if state_index is not None:
+                        self._bind_c128_state_index(req_id, state_index)
+                        self._restore_c128_state(req_id, state_index)
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1280,15 +1287,16 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
-            if not self.free_req_state_indices:
-                raise RuntimeError(
-                    "C128 request-state slots exhausted: "
-                    f"max_num_reqs={self.max_num_reqs}"
-                )
-            state_index = self.free_req_state_indices.pop()
-            self.req_id_to_state_index[req_id] = state_index
-            self._bind_c128_state_index(req_id, state_index)
-            self._restore_c128_state(req_id, state_index)
+            if self._online_c128_enabled:
+                if not self.free_req_state_indices:
+                    raise RuntimeError(
+                        "C128 request-state slots exhausted: "
+                        f"max_num_reqs={self.max_num_reqs}"
+                    )
+                state_index = self.free_req_state_indices.pop()
+                self.req_id_to_state_index[req_id] = state_index
+                self._bind_c128_state_index(req_id, state_index)
+                self._restore_c128_state(req_id, state_index)
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -2486,8 +2494,11 @@ class GPUModelRunner(
 
         req_state_indices_cpu = self.req_state_indices.np[:num_reqs_padded]
         req_state_indices_cpu.fill(-1)
-        for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            req_state_indices_cpu[req_index] = self.req_id_to_state_index[req_id]
+        if self._online_c128_enabled:
+            for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                req_state_indices_cpu[req_index] = self.req_id_to_state_index[req_id]
+        else:
+            req_state_indices_cpu[:num_reqs] = np.arange(num_reqs, dtype=np.int32)
         self.req_state_indices.copy_to_gpu(num_reqs_padded)
         cm_base.req_state_indices = self.req_state_indices.gpu[:num_reqs_padded]
         cm_base.req_state_indices_cpu = req_state_indices_cpu

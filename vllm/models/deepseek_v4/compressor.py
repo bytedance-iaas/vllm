@@ -27,7 +27,7 @@ from vllm.models.deepseek_v4.online_c128 import (
     ensure_online_c128_compressed_kv,
     online_c128_compress_enabled,
     online_c128_debug_enabled,
-    online_c128_mtp_enabled,
+    online_c128_uses_mtp,
     register_online_c128_state,
 )
 from vllm.platforms import current_platform
@@ -376,7 +376,7 @@ class DeepseekCompressor(nn.Module):
         # Only the real C128 layout (compress_ratio==128, head_dim==512) takes
         # the online path; C4 / indexer layers stay on the legacy compressor.
         self.online_c128_state: DeepseekOnlineC128State | None = None
-        self.online_c128_mtp = False
+        self.online_c128_uses_mtp = False
         if self._use_online_c128:
             assert_online_c128_supported(
                 vllm_config,
@@ -390,7 +390,7 @@ class DeepseekCompressor(nn.Module):
                 device=self.device,
             )
             register_online_c128_state(self.online_c128_state)
-            self.online_c128_mtp = online_c128_mtp_enabled()
+            self.online_c128_uses_mtp = online_c128_uses_mtp(vllm_config)
             if online_c128_debug_enabled() and self.online_c128_state.layer_index == 0:
                 state_bytes = (
                     self.online_c128_state.state.numel()
@@ -403,7 +403,7 @@ class DeepseekCompressor(nn.Module):
                     self.prefix,
                     self.compress_ratio,
                     self.head_dim,
-                    self.online_c128_mtp,
+                    self.online_c128_uses_mtp,
                     self.online_c128_state.num_banks,
                     self.online_c128_state.max_num_reqs,
                     state_bytes,
@@ -613,7 +613,7 @@ class DeepseekCompressor(nn.Module):
                 "mtp=%s store_full_kv=%s store_full_fp8=%s",
                 cg_mode.name,
                 num_actual,
-                self.online_c128_mtp,
+                self.online_c128_uses_mtp,
                 store_full_kv,
                 store_full_fp8,
             )
@@ -699,7 +699,7 @@ class DeepseekCompressor(nn.Module):
             max_num_reqs=online_state.max_num_reqs,
             compress_ratio=self.compress_ratio,
             # FULL graph is only used for uniform decode / MTP verify shapes.
-            candidate_chain=self.online_c128_mtp,
+            candidate_chain=self.online_c128_uses_mtp,
         )
 
         store_compressed_kv_cutedsl(
@@ -772,7 +772,7 @@ class DeepseekCompressor(nn.Module):
             device=kv.device,
         )
 
-        verify_mode = self.online_c128_mtp and online_c128_verify_active()
+        verify_mode = self.online_c128_uses_mtp and online_c128_verify_active()
         if verify_mode:
             num_draft_tokens_per_req_cpu = (
                 state_metadata.num_draft_tokens_per_req_cpu

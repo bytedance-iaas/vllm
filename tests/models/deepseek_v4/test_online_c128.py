@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
+import vllm.envs as envs
+from vllm.models.deepseek_v4 import online_c128
 from vllm.models.deepseek_v4.online_c128 import (
+    assert_online_c128_supported,
+    online_c128_uses_mtp,
     plan_online_c128_segments,
     plan_online_c128_verify,
 )
@@ -22,6 +28,30 @@ def test_plan_online_c128_segments_exact_boundary_emits_and_resets_bank0():
     assert plan.emit_segments.cpu().tolist() == [[0, 128, -1, 127, -1]]
     assert plan.update_segments.shape == (0, 5)
     assert plan.reset_rows.cpu().tolist() == [3]
+
+
+def test_online_c128_uses_mtp_from_speculative_method(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_ONLINE_C128_COMPRESS", True)
+    mtp_config = SimpleNamespace(speculative_config=SimpleNamespace(method="mtp"))
+    eagle_config = SimpleNamespace(speculative_config=SimpleNamespace(method="eagle3"))
+
+    assert online_c128_uses_mtp(mtp_config)
+    assert not online_c128_uses_mtp(eagle_config)
+
+
+def test_online_c128_rejects_non_mtp_speculative(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_ONLINE_C128_COMPRESS", True)
+    monkeypatch.setattr(online_c128, "_is_sm90", lambda: True)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="eagle3"),
+    )
+
+    with pytest.raises(ValueError, match="only supports the MTP speculative method"):
+        assert_online_c128_supported(config, compress_ratio=128, head_dim=512)
 
 
 def test_plan_online_c128_segments_partial_start_splits_emit_and_update():

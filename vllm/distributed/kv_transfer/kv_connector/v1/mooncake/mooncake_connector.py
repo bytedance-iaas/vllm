@@ -829,6 +829,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+    supports_online_c128_state_transfer = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1034,10 +1036,10 @@ class MooncakeConnectorScheduler:
         # Consumer req_ids whose import slot is not consumed by admission.
         self._c128_import_release_req_ids: set[ReqId] = set()
 
-        # Aux transfer is valid only for pure producer/consumer Mooncake roles.
-        self._dsv4_c128_aux_transfer = (
-            bool(envs.VLLM_DSV4_C128_ONLINE_COMPRESS)
-            and bool(envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER)
+        # Online C128 state transfer is valid only for pure producer/consumer roles.
+        self._online_c128_state_transfer_enabled = (
+            bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+            and bool(envs.VLLM_USE_ONLINE_C128_PD_TRANSFER)
             and (self.is_kv_producer or self.is_kv_consumer)
         )
 
@@ -1168,7 +1170,7 @@ class MooncakeConnectorScheduler:
                 assert req.kv_transfer_params is not None
                 # Only non-128-aligned resumes need C128 partial state.
                 c128_needs_partial = (
-                    self._dsv4_c128_aux_transfer
+                    self._online_c128_state_transfer_enabled
                     and (req.num_computed_tokens % 128) != 0
                 )
                 meta.add_new_req(
@@ -1220,7 +1222,7 @@ class MooncakeConnectorScheduler:
             # No KV transfer for this request (e.g. a purely-local / exception
             # request on a producer process). The worker still snapshotted its
             # Slot was snapshotted at recycle time; release it without a send.
-            if self._dsv4_c128_aux_transfer and self.is_kv_producer:
+            if self._online_c128_state_transfer_enabled and self.is_kv_producer:
                 self._c128_export_release_req_ids.add(request.request_id)
             return False, None
 
@@ -1239,14 +1241,14 @@ class MooncakeConnectorScheduler:
         if not params.get("do_remote_decode"):
             # Producer ran this request but it is NOT a remote-decode send (e.g.
             # No remote decode send: release the snapshotted export slot.
-            if self._dsv4_c128_aux_transfer and self.is_kv_producer:
+            if self._online_c128_state_transfer_enabled and self.is_kv_producer:
                 self._c128_export_release_req_ids.add(request.request_id)
             # Consumer: a remote-prefill request whose do_remote_prefill was
             # already cleared by update_state_after_alloc lands here on abort. If
             # it was aborted AFTER recv but BEFORE admission, the admission-time
             # restore_c128_state never runs, so flag its reserved import slot for
             # release. (Harmless if no slot was reserved — release is idempotent.)
-            if self._dsv4_c128_aux_transfer and self.is_kv_consumer:
+            if self._online_c128_state_transfer_enabled and self.is_kv_consumer:
                 self._c128_import_release_req_ids.add(request.request_id)
             return False, None
 
@@ -1258,7 +1260,7 @@ class MooncakeConnectorScheduler:
             self._reqs_not_processed.add(params["transfer_id"])
             # Aborted / non-length-capped: no send will happen, so release the
             # snapshotted export slot (by req_id) to avoid leaking it.
-            if self._dsv4_c128_aux_transfer and self.is_kv_producer:
+            if self._online_c128_state_transfer_enabled and self.is_kv_producer:
                 self._c128_export_release_req_ids.add(request.request_id)
             return False, None
 
@@ -1271,7 +1273,7 @@ class MooncakeConnectorScheduler:
                 request,
                 self.get_sw_clipped_blocks(block_ids),
             )
-        elif self._dsv4_c128_aux_transfer and self.is_kv_producer:
+        elif self._online_c128_state_transfer_enabled and self.is_kv_producer:
             # Length-capped but no blocks to send: still no Mooncake send, so the
             # snapshotted export slot must be released.
             self._c128_export_release_req_ids.add(request.request_id)
@@ -1357,14 +1359,14 @@ class MooncakeConnectorWorker:
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
-        # Aux pools are allocated only for online C128 PD transfer.
+        # State-transfer pools are allocated only for online C128 PD transfer.
         import vllm.envs as envs
 
-        self._c128_online = bool(envs.VLLM_DSV4_C128_ONLINE_COMPRESS)
-        # Gate aux pools to pure PD producer/consumer roles.
-        self._c128_aux_transfer_enabled = (
-            self._c128_online
-            and bool(envs.VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER)
+        self._online_c128_enabled = bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+        # Gate state-transfer pools to pure PD producer/consumer roles.
+        self._online_c128_state_transfer_enabled = (
+            self._online_c128_enabled
+            and bool(envs.VLLM_USE_ONLINE_C128_PD_TRANSFER)
             and (self.is_kv_producer or self.is_kv_consumer)
         )
         self._c128_states: list = []  # DeepseekOnlineC128State, one per layer
@@ -1744,7 +1746,7 @@ class MooncakeConnectorWorker:
                 lengths,
                 err_reqs,
                 err_msg,
-                aux_events,
+                state_transfer_events,
             ) = await self._build_transfer_params(
                 ready_reqs,
                 meta,
@@ -1767,7 +1769,7 @@ class MooncakeConnectorWorker:
                     src_ptrs,
                     dst_ptrs,
                     lengths,
-                    aux_events,
+                    state_transfer_events,
                 )
 
                 if ret_value != 0:
@@ -1836,7 +1838,7 @@ class MooncakeConnectorWorker:
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
         # Guard async bank0->export-slot copies before RDMA reads.
-        aux_events: list["torch.cuda.Event"] = []
+        state_transfer_events: list["torch.cuda.Event"] = []
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
         for d_req_id, send_meta in ready_reqs:
@@ -2002,15 +2004,18 @@ class MooncakeConnectorWorker:
             )
 
         # Append C128 bank0 descriptors after KV descriptors.
-        if self._c128_aux_transfer_enabled and agent_meta.c128_import_base_addr:
-            err_msg = self._append_c128_aux_descriptors(
+        if (
+            self._online_c128_state_transfer_enabled
+            and agent_meta.c128_import_base_addr
+        ):
+            err_msg = self._append_online_c128_state_descriptors(
                 ready_reqs, agent_meta, src_ptrs, dst_ptrs, lengths,
-                err_reqs, err_msg, aux_events,
+                err_reqs, err_msg, state_transfer_events,
             )
 
-        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, aux_events
+        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, state_transfer_events
 
-    def _append_c128_aux_descriptors(
+    def _append_online_c128_state_descriptors(
         self,
         ready_reqs: list[tuple[ReqId, SendBlockMeta]],
         agent_meta: MooncakeXferMetadata,
@@ -2019,10 +2024,10 @@ class MooncakeConnectorWorker:
         lengths: list[int],
         err_reqs: list[ReqId],
         err_msg: str | None,
-        aux_events: list["torch.cuda.Event"],
+        state_transfer_events: list["torch.cuda.Event"],
     ) -> str | None:
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
-            build_c128_aux_descriptors,
+            build_online_c128_state_descriptors,
         )
 
         pool = self._c128_export_pool
@@ -2031,14 +2036,14 @@ class MooncakeConnectorWorker:
         num_layers = self._c128_num_layers
         row_bytes = self._c128_state_row_bytes
 
-        # Use the same rank election as replicated KV: one aux writer per D slot.
+        # Use the same rank election as replicated KV: one state writer per D slot.
         if not self._producer_cache_is_replicated():
             err_msg = (
-                "C128 aux partial-state transfer requires a replicated online "
+                "C128 online partial-state transfer requires a replicated online "
                 "state (MLA latent). Got a non-replicated/head-sharded state, "
                 "which cannot be split across producer ranks without racing the "
-                "single D import slot. Disable VLLM_DSV4_C128_ONLINE_PD_AUX_"
-                "TRANSFER or use a replicated (MLA) configuration."
+                "single D import slot. Disable VLLM_USE_ONLINE_C128_PD_TRANSFER "
+                "or use a replicated (MLA) configuration."
             )
             for d_req_id, _ in ready_reqs:
                 if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
@@ -2049,8 +2054,8 @@ class MooncakeConnectorWorker:
         tp_ratio = _get_tp_ratio(self.tp_size, agent_meta.remote_tp_size)
         # tp_ratio > 0 (incl. 1): one elected writer per D slot. tp_ratio < 0:
         # all P ranks write, each into its own paired D rank's distinct slot.
-        sends_aux = tp_ratio < 0 or (self.tp_rank % tp_ratio == 0)
-        if not sends_aux:
+        sends_state = tp_ratio < 0 or (self.tp_rank % tp_ratio == 0)
+        if not sends_state:
             return err_msg
 
         remote_layer_indices = agent_meta.c128_layer_indices or list(
@@ -2081,7 +2086,7 @@ class MooncakeConnectorWorker:
             and remote_layer_index_set < local_layer_index_set
         ):
             err_msg = (
-                "C128 aux partial-state transfer does not support a producer "
+                "C128 online partial-state transfer does not support a producer "
                 "layer set that strictly contains the consumer layer set. "
                 "This usually means prefill is running the full model while "
                 "decode is pipeline-parallel and owns only a layer subset. "
@@ -2089,7 +2094,7 @@ class MooncakeConnectorWorker:
                 f"D(layer_indices={remote_layer_indices}); "
                 f"producer_only_layer_indices={missing_layer_indices}. "
                 "Use matching PP topology for prefill/decode or disable "
-                "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER."
+                "VLLM_USE_ONLINE_C128_PD_TRANSFER."
             )
             for d_req_id, _ in ready_reqs:
                 if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
@@ -2105,7 +2110,7 @@ class MooncakeConnectorWorker:
             or missing_layer_indices
         ):
             err_msg = (
-                "C128 aux descriptor mismatch between producer and consumer: "
+                "C128 online state descriptor mismatch between producer and consumer: "
                 f"P(num_layers={num_layers}, layer_indices="
                 f"{self._c128_layer_indices}, row_bytes={row_bytes}, "
                 f"slot_bytes={num_layers * row_bytes}) vs "
@@ -2130,17 +2135,17 @@ class MooncakeConnectorWorker:
             slot = send_meta.c128_export_slot
             import_slot = agent_meta.c128_req_import_slot.get(d_req_id)
             if slot is None or import_slot is None:
-                # Do not let D restore from an unwritten aux slot.
+                # Do not let D restore from an unwritten state-transfer slot.
                 if d_req_id not in err_reqs:
                     err_reqs.append(d_req_id)
                 if err_msg is None:
                     err_msg = (
-                        "C128 aux partial-state transfer missing export/import "
+                        "C128 online partial-state transfer missing export/import "
                         f"slot for request needing partial state ({d_req_id}: "
                         f"export_slot={slot}, import_slot={import_slot})"
                     )
                 continue
-            plan = build_c128_aux_descriptors(
+            plan = build_online_c128_state_descriptors(
                 export_pool=pool,
                 export_slot=slot,
                 remote_import_base_addr=agent_meta.c128_import_base_addr,
@@ -2158,7 +2163,7 @@ class MooncakeConnectorWorker:
             # the export slot from an executor thread).
             event = self._c128_export_events.get(send_meta.p_req_id)
             if event is not None:
-                aux_events.append(event)
+                state_transfer_events.append(event)
         return err_msg
 
     def _bind_sender_thread_device(self) -> None:
@@ -2173,11 +2178,11 @@ class MooncakeConnectorWorker:
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
-        aux_events: list["torch.cuda.Event"] | None = None,
+        state_transfer_events: list["torch.cuda.Event"] | None = None,
     ) -> int:
-        # Aux snapshots are async GPU copies; wait before RDMA reads.
-        if aux_events:
-            for event in aux_events:
+        # State snapshots are async GPU copies; wait before RDMA reads.
+        if state_transfer_events:
+            for event in state_transfer_events:
                 event.synchronize()
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
@@ -2215,14 +2220,14 @@ class MooncakeConnectorWorker:
         return layer_group_indices
 
     def _register_c128_online_state(self) -> None:
-        """Register C128 aux import/export pools outside the KV block region."""
+        """Register C128 state-transfer pools outside the KV block region."""
         from vllm.models.deepseek_v4.online_c128 import get_online_c128_states
 
         states = get_online_c128_states()
         if not states:
             logger.warning(
                 "C128 online compression enabled but no online states "
-                "registered; skipping aux RDMA registration."
+                "registered; skipping state-transfer RDMA registration."
             )
             return
         self._c128_states = states
@@ -2234,15 +2239,15 @@ class MooncakeConnectorWorker:
         capacity = self.vllm_config.scheduler_config.max_num_seqs
         device = states[0].state.device
 
-        # Aux pool is allocated after KV profiling; fail early if it cannot fit.
+        # State-transfer pool is allocated after KV profiling; fail early if it cannot fit.
         pool_bytes = (
             capacity * self._c128_num_layers * row_width * states[0].state.element_size()
         )
         if device.type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(device)
-            if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+            if envs.VLLM_ONLINE_C128_DEBUG:
                 logger.info(
-                    "C128 online debug: aux pool sizing role=%s capacity=%d "
+                    "C128 online debug: state-transfer pool sizing role=%s capacity=%d "
                     "num_layers=%d row_width=%d pool_bytes=%d free_bytes=%d",
                     "consumer" if self.is_kv_consumer else "producer",
                     capacity,
@@ -2255,12 +2260,12 @@ class MooncakeConnectorWorker:
             margin = int(free_bytes * 0.95)
             if pool_bytes > margin:
                 raise RuntimeError(
-                    "C128 PD aux pool would not fit in free GPU memory: need "
+                    "C128 PD state-transfer pool would not fit in free GPU memory: need "
                     f"{pool_bytes} bytes (capacity={capacity}, "
                     f"num_layers={self._c128_num_layers}, row_width={row_width}, "
                     f"fp32), free={free_bytes} bytes (95% margin={margin}). "
                     "Reduce max_num_seqs or disable "
-                    "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER."
+                    "VLLM_USE_ONLINE_C128_PD_TRANSFER."
                 )
 
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
@@ -2283,8 +2288,8 @@ class MooncakeConnectorWorker:
             if ret != 0:
                 raise RuntimeError("Mooncake C128 import pool registration (D) failed.")
             logger.info(
-                "Registered C128 aux IMPORT pool (D): capacity=%d num_layers=%d "
-                "row_bytes=%d slot_bytes=%d total_bytes=%d",
+                "Registered C128 state-transfer IMPORT pool (D): capacity=%d "
+                "num_layers=%d row_bytes=%d slot_bytes=%d total_bytes=%d",
                 capacity,
                 self._c128_num_layers,
                 self._c128_state_row_bytes,
@@ -2305,8 +2310,8 @@ class MooncakeConnectorWorker:
         if ret != 0:
             raise RuntimeError("Mooncake C128 export pool registration (P) failed.")
         logger.info(
-            "Registered C128 aux EXPORT pool (P): capacity=%d num_layers=%d "
-            "row_bytes=%d slot_bytes=%d total_bytes=%d",
+            "Registered C128 state-transfer EXPORT pool (P): capacity=%d "
+            "num_layers=%d row_bytes=%d slot_bytes=%d total_bytes=%d",
             capacity,
             self._c128_num_layers,
             self._c128_state_row_bytes,
@@ -2440,8 +2445,8 @@ class MooncakeConnectorWorker:
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
-        # Aux pools are independent from the uniform KV block region.
-        if self._c128_aux_transfer_enabled:
+        # Online C128 state-transfer pools are independent from the KV block region.
+        if self._online_c128_state_transfer_enabled:
             self._register_c128_online_state()
 
         assert tensor_size_bytes is not None
@@ -2501,7 +2506,10 @@ class MooncakeConnectorWorker:
 
     def _release_c128_export_slot(self, send_meta: "SendBlockMeta") -> None:
         """Release the P-side C128 export slot bound to this request."""
-        if not self._c128_aux_transfer_enabled or self._c128_export_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_export_pool is None
+        ):
             return
         p_req_id = send_meta.p_req_id
         if p_req_id and p_req_id in self._c128_export_slots:
@@ -2514,7 +2522,10 @@ class MooncakeConnectorWorker:
 
     def _release_c128_export_by_req(self, req_id: str) -> None:
         """Release a P-side export slot for requests that will not send."""
-        if not self._c128_aux_transfer_enabled or self._c128_export_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_export_pool is None
+        ):
             return
         if req_id in self._c128_export_slots:
             self._c128_export_pool.release(req_id)
@@ -2523,19 +2534,23 @@ class MooncakeConnectorWorker:
         self._c128_req_state_indices.pop(req_id, None)
 
     def bind_c128_state_index(self, req_id: str, p_req_state_idx: int) -> None:
-        """P side: track live request-state slots for lazy aux snapshots."""
-        if not self._c128_aux_transfer_enabled:
+        """P side: track live request-state slots for lazy state snapshots."""
+        if not self._online_c128_state_transfer_enabled:
             return
         self._c128_req_state_indices[req_id] = p_req_state_idx
         logger.info(
-            "C128 aux bound live state index: req_id=%s req_state_idx=%d",
+            "C128 online state transfer bound live state index: "
+            "req_id=%s req_state_idx=%d",
             req_id,
             p_req_state_idx,
         )
 
     def snapshot_c128_state(self, req_id: str, p_req_state_idx: int) -> None:
         """P side: snapshot committed bank0 before the request slot is reused."""
-        if not self._c128_aux_transfer_enabled or self._c128_export_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_export_pool is None
+        ):
             return
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
             snapshot_bank0_to_slot,
@@ -2545,7 +2560,7 @@ class MooncakeConnectorWorker:
         snapshot_bank0_to_slot(
             self._c128_states, self._c128_export_pool, slot, p_req_state_idx
         )
-        if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+        if envs.VLLM_ONLINE_C128_DEBUG:
             logger.info(
                 "C128 online debug: snapshotted P bank0 req_id=%s "
                 "req_state_idx=%d export_slot=%d layers=%d slot_bytes=%d",
@@ -2561,8 +2576,8 @@ class MooncakeConnectorWorker:
         self._c128_export_events[req_id] = event
         self._c128_export_slots[req_id] = slot
         logger.info(
-            "C128 aux snapshotted export slot: req_id=%s req_state_idx=%d "
-            "slot=%d pending_sends=%s",
+            "C128 online state transfer snapshotted export slot: "
+            "req_id=%s req_state_idx=%d slot=%d pending_sends=%s",
             req_id,
             p_req_state_idx,
             slot,
@@ -2580,10 +2595,11 @@ class MooncakeConnectorWorker:
         """Bind a freshly snapshotted C128 export slot to pending sends.
 
         Scheduler-side ``request_finished`` can publish block IDs before the
-        worker has removed the request and snapshotted bank0.  When aux transfer
-        is enabled, defer sender readiness until this method attaches the slot.
+        worker has removed the request and snapshotted bank0.  When state
+        transfer is enabled, defer sender readiness until this method attaches
+        the slot.
         """
-        if not self._c128_aux_transfer_enabled:
+        if not self._online_c128_state_transfer_enabled:
             return
         for send_meta in self.reqs_need_send.values():
             if send_meta.p_req_id != req_id:
@@ -2591,8 +2607,8 @@ class MooncakeConnectorWorker:
             send_meta.c128_export_slot = slot
             if send_meta.local_block_ids:
                 logger.info(
-                    "C128 aux attached export slot to pending send: req_id=%s "
-                    "transfer_id=%s slot=%d",
+                    "C128 online state transfer attached export slot to pending "
+                    "send: req_id=%s transfer_id=%s slot=%d",
                     req_id,
                     send_meta.transfer_id,
                     slot,
@@ -2603,12 +2619,15 @@ class MooncakeConnectorWorker:
         self, d_req_id: str, transfer_id: str, needs_partial: bool
     ) -> int | None:
         """D side: reserve the RDMA staging slot before request admission."""
-        if not self._c128_aux_transfer_enabled or self._c128_import_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
             return None
         slot = self._c128_import_pool.acquire(transfer_id, timeout=0.0)
         self._c128_import_slots[transfer_id] = (slot, needs_partial)
         self._c128_req_to_transfer[d_req_id] = transfer_id
-        if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+        if envs.VLLM_ONLINE_C128_DEBUG:
             logger.info(
                 "C128 online debug: reserved D import slot req_id=%s "
                 "transfer_id=%s slot=%d needs_partial=%s slot_bytes=%d",
@@ -2622,7 +2641,10 @@ class MooncakeConnectorWorker:
 
     def restore_c128_state(self, req_id: str, d_req_state_idx: int) -> None:
         """D side: copy staged partial state into live bank0, or reset it."""
-        if not self._c128_aux_transfer_enabled or self._c128_import_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
             return
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
             reset_bank0,
@@ -2641,7 +2663,7 @@ class MooncakeConnectorWorker:
         if entry is None:
             # No staging reserved for this request: reset bank0 to identity.
             reset_bank0(self._c128_states, d_req_state_idx)
-            if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+            if envs.VLLM_ONLINE_C128_DEBUG:
                 logger.info(
                     "C128 online debug: reset D bank0 without import slot "
                     "req_id=%s req_state_idx=%d",
@@ -2658,7 +2680,7 @@ class MooncakeConnectorWorker:
         else:
             reset_bank0(self._c128_states, d_req_state_idx)
             action = "reset"
-        if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+        if envs.VLLM_ONLINE_C128_DEBUG:
             logger.info(
                 "C128 online debug: %s D bank0 req_id=%s transfer_id=%s "
                 "req_state_idx=%d import_slot=%d needs_partial=%s",
@@ -2673,7 +2695,10 @@ class MooncakeConnectorWorker:
 
     def _c128_release_import_slot(self, pull_meta: "PullReqMeta") -> None:
         """Release a single reserved import staging slot (idempotent)."""
-        if not self._c128_aux_transfer_enabled or self._c128_import_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
             return
         self._c128_active_pulls.pop(pull_meta.d_req_id, None)
         self._c128_pending_import_reqs.discard(pull_meta.d_req_id)
@@ -2686,7 +2711,10 @@ class MooncakeConnectorWorker:
 
     def release_c128_import_by_req(self, req_ids: list[ReqId]) -> None:
         """Release import slots, deferring aborts until in-flight pulls quiesce."""
-        if not self._c128_aux_transfer_enabled or self._c128_import_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
             return
         for req_id in req_ids:
             pull_meta = self._c128_active_pulls.get(req_id)
@@ -2715,7 +2743,10 @@ class MooncakeConnectorWorker:
         req_ids: list[ReqId] | None = None,
     ) -> None:
         """Decrement pull-task refs; release failed/aborted slots at quiesce."""
-        if not self._c128_aux_transfer_enabled or self._c128_import_pool is None:
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
             return
         targets = req_ids if req_ids is not None else list(pull_metas.keys())
         for d_req_id in targets:
@@ -2961,8 +2992,11 @@ class MooncakeConnectorWorker:
     ):
         aborted_before_reserve: set[ReqId] = set()
         failed_before_start: list[ReqId] = []
-        # Reserve D-side aux slots before advertising metadata to P.
-        if self._c128_aux_transfer_enabled and self._c128_import_pool is not None:
+        # Reserve D-side state-transfer slots before advertising metadata to P.
+        if (
+            self._online_c128_state_transfer_enabled
+            and self._c128_import_pool is not None
+        ):
             for d_req_id, pull_meta in pull_metas.items():
                 self._c128_pending_import_reqs.discard(d_req_id)
                 if d_req_id in self._c128_aborted_import_reqs:
@@ -3026,12 +3060,12 @@ class MooncakeConnectorWorker:
             # Track the live pull so an abort (which only knows req_id) can defer
             # the import-slot release until all pull tasks quiesce.
             if (
-                self._c128_aux_transfer_enabled
+                self._online_c128_state_transfer_enabled
                 and self._c128_import_pool is not None
                 and pull_meta.c128_import_slot is not None
             ):
                 self._c128_active_pulls[pull_meta.d_req_id] = pull_meta
-                if envs.VLLM_DSV4_C128_ONLINE_DEBUG:
+                if envs.VLLM_ONLINE_C128_DEBUG:
                     logger.info(
                         "C128 online debug: tracking D import slot quiesce "
                         "req_id=%s transfer_id=%s slot=%s pull_tasks=%d "
@@ -3076,7 +3110,10 @@ class MooncakeConnectorWorker:
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
         for remote_engine_id, pull_metas in reqs_to_recv.items():
-            if self._c128_aux_transfer_enabled and self._c128_import_pool is not None:
+            if (
+                self._online_c128_state_transfer_enabled
+                and self._c128_import_pool is not None
+            ):
                 self._c128_pending_import_reqs.update(pull_metas)
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
@@ -3106,7 +3143,7 @@ class MooncakeConnectorWorker:
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
                 # Attach the req-keyed export slot to this transfer.
-                if self._c128_aux_transfer_enabled:
+                if self._online_c128_state_transfer_enabled:
                     slot = self._c128_export_slots.get(p_req_id)
                     if slot is None:
                         req_state_idx = self._c128_req_state_indices.get(p_req_id)
@@ -3115,8 +3152,9 @@ class MooncakeConnectorWorker:
                             slot = self._c128_export_slots.get(p_req_id)
                         else:
                             logger.warning(
-                                "C128 aux no live state index for request %s "
-                                "transfer_id=%s known_state_indices=%s",
+                                "C128 online state transfer has no live state "
+                                "index for request %s transfer_id=%s "
+                                "known_state_indices=%s",
                                 p_req_id,
                                 transfer_id,
                                 list(self._c128_req_state_indices),
@@ -3124,8 +3162,8 @@ class MooncakeConnectorWorker:
                     if slot is not None:
                         send_meta.c128_export_slot = slot
                         logger.info(
-                            "C128 aux attached existing export slot: req_id=%s "
-                            "transfer_id=%s slot=%d",
+                            "C128 online state transfer attached existing "
+                            "export slot: req_id=%s transfer_id=%s slot=%d",
                             p_req_id,
                             transfer_id,
                             slot,
