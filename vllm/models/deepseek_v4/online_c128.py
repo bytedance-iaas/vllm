@@ -13,11 +13,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 # Fixed support envelope for the C128 online path.
 ONLINE_C128_COMPRESS_RATIO = 128
@@ -40,10 +37,6 @@ def online_c128_uses_mtp(vllm_config: VllmConfig) -> bool:
         and speculative_config is not None
         and getattr(speculative_config, "method", None) == "mtp"
     )
-
-
-def online_c128_debug_enabled() -> bool:
-    return bool(envs.VLLM_ONLINE_C128_DEBUG)
 
 
 def _is_sm90() -> bool:
@@ -156,17 +149,6 @@ class DeepseekOnlineC128State(torch.nn.Module):
             device=device,
         )
         self.reset_all()
-        if online_c128_debug_enabled() and layer_index == 0:
-            logger.info(
-                "C128 online debug: allocated state rows=%d banks=%d "
-                "max_num_reqs=%d row_width=%d bytes_per_layer=%d device=%s",
-                self.state.shape[0],
-                self.num_banks,
-                self.max_num_reqs,
-                self.row_width,
-                self.state.numel() * self.state.element_size(),
-                self.state.device,
-            )
 
     @property
     def device(self) -> torch.device:
@@ -230,16 +212,6 @@ def ensure_online_c128_compressed_kv(
             dtype=ONLINE_C128_STATE_DTYPE,
             device=device,
         )
-        if online_c128_debug_enabled():
-            logger.info(
-                "C128 online debug: allocated FULL-graph compressed_kv "
-                "scratch shape=(%d, %d) bytes=%d device=%s",
-                max_num_tokens,
-                head_dim,
-                _ONLINE_C128_COMPRESSED_KV.numel()
-                * _ONLINE_C128_COMPRESSED_KV.element_size(),
-                _ONLINE_C128_COMPRESSED_KV.device,
-            )
 
 
 def online_c128_compressed_kv(num_tokens: int) -> torch.Tensor:
@@ -293,13 +265,6 @@ def commit_all_online_c128_verify(
     compress_ratio: int = ONLINE_C128_COMPRESS_RATIO,
 ) -> None:
     """Commit accepted MTP candidates into bank0 for every online layer."""
-    if online_c128_debug_enabled():
-        logger.info(
-            "C128 online debug: committing verify banks for %d reqs across "
-            "%d layers",
-            req_state_indices.shape[0],
-            len(_ONLINE_C128_STATES),
-        )
     for state in _ONLINE_C128_STATES:
         commit_online_c128_verify(
             run_state=state.state,

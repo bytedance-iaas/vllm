@@ -149,7 +149,6 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_USE_ONLINE_C128_COMPRESS: bool = False
-    VLLM_ONLINE_C128_DEBUG: bool = False
     VLLM_USE_ONLINE_C128_PD_TRANSFER: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1309,11 +1308,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recurrence state and kernel path.
     "VLLM_USE_ONLINE_C128_COMPRESS": lambda: bool(
         int(os.getenv("VLLM_USE_ONLINE_C128_COMPRESS", "0"))
-    ),
-    # Enable verbose debug logging / extra assertions for the C128 online
-    # compression path.
-    "VLLM_ONLINE_C128_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_ONLINE_C128_DEBUG", "0"))
     ),
     # Enable PD transfer of the C128 committed bank0 partial state. Only
     # effective with VLLM_USE_ONLINE_C128_COMPRESS and a PD disaggregated
