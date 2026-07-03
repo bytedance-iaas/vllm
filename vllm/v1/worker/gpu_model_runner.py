@@ -1132,6 +1132,13 @@ class GPUModelRunner(
         if fn is not None:
             fn(req_id, state_index)
 
+    def _restore_c128_state(self, req_id: str, state_index: int) -> None:
+        if not self._c128_pd_aux_enabled() or not has_kv_transfer_group():
+            return
+        fn = getattr(get_kv_transfer_group(), "restore_c128_state", None)
+        if fn is not None:
+            fn(req_id, state_index)
+
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
@@ -1233,6 +1240,7 @@ class GPUModelRunner(
                 state_index = self.req_id_to_state_index.get(req_id)
                 if state_index is not None:
                     self._bind_c128_state_index(req_id, state_index)
+                    self._restore_c128_state(req_id, state_index)
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1280,6 +1288,7 @@ class GPUModelRunner(
             state_index = self.free_req_state_indices.pop()
             self.req_id_to_state_index[req_id] = state_index
             self._bind_c128_state_index(req_id, state_index)
+            self._restore_c128_state(req_id, state_index)
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:

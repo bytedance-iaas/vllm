@@ -407,6 +407,42 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def test_update_states_new_request_restores_c128_state(
+    model_runner, dist_init, monkeypatch: pytest.MonkeyPatch
+):
+    req_id = "req_0"
+    calls: list[tuple[str, str, int]] = []
+
+    class FakeKVTransferGroup:
+        def bind_c128_state_index(self, req_id: str, state_index: int) -> None:
+            calls.append(("bind", req_id, state_index))
+
+        def restore_c128_state(self, req_id: str, state_index: int) -> None:
+            calls.append(("restore", req_id, state_index))
+
+    kv_transfer_group = FakeKVTransferGroup()
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs, "VLLM_DSV4_C128_ONLINE_COMPRESS", True
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_DSV4_C128_ONLINE_PD_AUX_TRANSFER",
+        True,
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_kv_transfer_group", lambda: kv_transfer_group
+    )
+
+    model_runner._update_states(_schedule_new_request(req_id))
+
+    state_index = model_runner.req_id_to_state_index[req_id]
+    assert calls == [
+        ("bind", req_id, state_index),
+        ("restore", req_id, state_index),
+    ]
+
+
 def test_update_states_request_finished(model_runner, dist_init):
     req_id = "req_0"
 
