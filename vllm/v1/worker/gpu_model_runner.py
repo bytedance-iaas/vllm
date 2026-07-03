@@ -1143,6 +1143,26 @@ class GPUModelRunner(
         if fn is not None:
             fn(req_id, state_index)
 
+    def _allocate_c128_state_index(self, req_id: str) -> int:
+        state_index = self.req_id_to_state_index.get(req_id)
+        if state_index is not None:
+            return state_index
+        if not self.free_req_state_indices:
+            raise RuntimeError(
+                "C128 request-state slots exhausted: "
+                f"max_num_reqs={self.max_num_reqs}"
+            )
+        state_index = self.free_req_state_indices.pop()
+        self.req_id_to_state_index[req_id] = state_index
+        self._bind_c128_state_index(req_id, state_index)
+        self._restore_c128_state(req_id, state_index)
+        return state_index
+
+    def _release_c128_state_index(self, req_id: str) -> None:
+        state_index = self.req_id_to_state_index.pop(req_id, None)
+        if state_index is not None:
+            self.free_req_state_indices.append(state_index)
+
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
@@ -1181,9 +1201,10 @@ class GPUModelRunner(
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             if self._online_c128_enabled:
-                state_index = self.req_id_to_state_index.pop(req_id, None)
-                if state_index is not None:
-                    self.free_req_state_indices.append(state_index)
+                self._release_c128_state_index(req_id)
+        if self._online_c128_enabled:
+            for req_id in scheduler_output.preempted_req_ids or ():
+                self._release_c128_state_index(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1245,7 +1266,9 @@ class GPUModelRunner(
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 if self._online_c128_enabled:
                     state_index = self.req_id_to_state_index.get(req_id)
-                    if state_index is not None:
+                    if state_index is None:
+                        self._allocate_c128_state_index(req_id)
+                    else:
                         self._bind_c128_state_index(req_id, state_index)
                         self._restore_c128_state(req_id, state_index)
                 reqs_to_add.append(req_state)
@@ -1288,15 +1311,7 @@ class GPUModelRunner(
             )
             self.requests[req_id] = req_state
             if self._online_c128_enabled:
-                if not self.free_req_state_indices:
-                    raise RuntimeError(
-                        "C128 request-state slots exhausted: "
-                        f"max_num_reqs={self.max_num_reqs}"
-                    )
-                state_index = self.free_req_state_indices.pop()
-                self.req_id_to_state_index[req_id] = state_index
-                self._bind_c128_state_index(req_id, state_index)
-                self._restore_c128_state(req_id, state_index)
+                self._allocate_c128_state_index(req_id)
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -1448,6 +1463,8 @@ class GPUModelRunner(
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
+                if self._online_c128_enabled:
+                    self._allocate_c128_state_index(req_id)
 
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
