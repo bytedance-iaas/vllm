@@ -202,6 +202,8 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
+    VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER: bool = False
+    VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB: int = 512
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
@@ -1543,6 +1545,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
         os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")
+    ),
+    # Split large Mooncake batch_transfer_sync_write payloads into smaller
+    # sequential writes. Disabled by default to preserve the native Mooncake
+    # transfer path unless large-payload failures require it.
+    "VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER": lambda: bool(
+        os.getenv("VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER", "False").lower()
+        in ("true", "1")
+    ),
+    # Per-call payload limit used when VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER=1.
+    "VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB": lambda: int(
+        os.getenv("VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB", "512")
     ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),

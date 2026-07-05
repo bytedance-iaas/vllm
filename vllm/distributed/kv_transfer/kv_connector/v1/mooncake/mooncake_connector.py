@@ -770,6 +770,7 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    pull_failed: bool = False
     # D-side C128 staging slot; absent for aligned prompts.
     c128_import_slot: int | None = None
     c128_needs_partial: bool = False
@@ -1740,53 +1741,67 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
-            (
-                src_ptrs,
-                dst_ptrs,
-                lengths,
-                err_reqs,
-                err_msg,
-                state_transfer_events,
-            ) = await self._build_transfer_params(
-                ready_reqs,
-                meta,
-                local_regions,
-                remote_regions,
-            )
-            err_req_set = set(err_reqs)
-            ok_ready_reqs = [
-                (d_req_id, send_meta)
-                for d_req_id, send_meta in ready_reqs
-                if d_req_id not in err_req_set
-            ]
-
-            if src_ptrs:
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
+            err_reqs: list[ReqId] = []
+            err_req_set: set[ReqId] = set()
+            err_msg: str | None = None
+            ok_ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            try:
+                (
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                    err_reqs,
+                    err_msg,
                     state_transfer_events,
+                ) = await self._build_transfer_params(
+                    ready_reqs,
+                    meta,
+                    local_regions,
+                    remote_regions,
                 )
+                err_req_set = set(err_reqs)
+                ok_ready_reqs = [
+                    (d_req_id, send_meta)
+                    for d_req_id, send_meta in ready_reqs
+                    if d_req_id not in err_req_set
+                ]
 
-                if ret_value != 0:
-                    transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
-                    err_msg = (
-                        transfer_err_msg
-                        if err_msg is None
-                        else f"{err_msg}; {transfer_err_msg}"
+                if src_ptrs:
+                    remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                        state_transfer_events,
                     )
-                    err_reqs = list(err_reqs)
-                    for d_req_id, _ in ok_ready_reqs:
-                        err_reqs.append(d_req_id)
-                        err_req_set.add(d_req_id)
-                    ok_ready_reqs = []
+
+                    if ret_value != 0:
+                        transfer_err_msg = (
+                            f"Mooncake transfer engine returned {ret_value}"
+                        )
+                        err_msg = (
+                            transfer_err_msg
+                            if err_msg is None
+                            else f"{err_msg}; {transfer_err_msg}"
+                        )
+                        err_reqs = list(err_reqs)
+                        for d_req_id, _ in ok_ready_reqs:
+                            err_reqs.append(d_req_id)
+                            err_req_set.add(d_req_id)
+                        ok_ready_reqs = []
+            except Exception as e:
+                err_msg = f"Failed to send Mooncake KV blocks: {e}"
+                err_reqs = [d_req_id for d_req_id, _ in ready_reqs]
+                err_req_set = set(err_reqs)
+                ok_ready_reqs = []
+            finally:
+                for _, send_meta in ready_reqs:
+                    send_meta.sending -= 1
 
             for d_req_id, send_meta in ready_reqs:
-                send_meta.sending -= 1
 
                 if d_req_id in err_req_set:
                     continue
@@ -2184,28 +2199,99 @@ class MooncakeConnectorWorker:
         if state_transfer_events:
             for event in state_transfer_events:
                 event.synchronize()
+
+        total_bytes = sum(lengths)
+        total_descs = len(src_ptrs)
         start_time = time.perf_counter()
-        ret_value = self.engine.batch_transfer_sync_write(
-            remote_session, src_ptrs, dst_ptrs, lengths
-        )
+
+        if not envs.VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER:
+            ret_value = self.engine.batch_transfer_sync_write(
+                remote_session, src_ptrs, dst_ptrs, lengths
+            )
+            chunk_idx = 1
+            chunk_start = 0
+            chunk_end = total_descs
+            chunk_bytes = total_bytes
+        else:
+            max_chunk_bytes = envs.VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB * 1024 * 1024
+            if max_chunk_bytes <= 0:
+                raise ValueError("VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB must be positive")
+            chunked_src_ptrs: list[int] = []
+            chunked_dst_ptrs: list[int] = []
+            chunked_lengths: list[int] = []
+            for src_ptr, dst_ptr, length in zip(src_ptrs, dst_ptrs, lengths):
+                offset = 0
+                while offset < length:
+                    segment_len = min(max_chunk_bytes, length - offset)
+                    chunked_src_ptrs.append(src_ptr + offset)
+                    chunked_dst_ptrs.append(dst_ptr + offset)
+                    chunked_lengths.append(segment_len)
+                    offset += segment_len
+
+            src_ptrs = chunked_src_ptrs
+            dst_ptrs = chunked_dst_ptrs
+            lengths = chunked_lengths
+            total_descs = len(src_ptrs)
+            ret_value = 0
+            chunk_start = 0
+            chunk_idx = 0
+            chunk_end = 0
+            chunk_bytes = 0
+            while chunk_start < total_descs:
+                chunk_bytes = 0
+                chunk_end = chunk_start
+                while chunk_end < total_descs:
+                    next_len = lengths[chunk_end]
+                    if chunk_end > chunk_start and (
+                        chunk_bytes + next_len > max_chunk_bytes
+                    ):
+                        break
+                    chunk_bytes += next_len
+                    chunk_end += 1
+
+                ret_value = self.engine.batch_transfer_sync_write(
+                    remote_session,
+                    src_ptrs[chunk_start:chunk_end],
+                    dst_ptrs[chunk_start:chunk_end],
+                    lengths[chunk_start:chunk_end],
+                )
+                if ret_value != 0:
+                    break
+                chunk_start = chunk_end
+                chunk_idx += 1
+
         duration = time.perf_counter() - start_time
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
-                num_descs=len(src_ptrs),
+                total_bytes=total_bytes,
+                num_descs=total_descs,
             )
-            logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
             self.xfer_stats.record_failed_transfer()
-            logger.warning(
-                "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
-                remote_session,
-                ret_value,
-                duration,
-                len(src_ptrs),
-                sum(lengths),
-            )
+            if envs.VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER:
+                logger.warning(
+                    "Sending chunk to %s failed (ret=%s) after %s "
+                    "(chunk=%d, chunk_descriptors=%d, chunk_bytes=%d, "
+                    "total_descriptors=%d, total_bytes=%d)",
+                    remote_session,
+                    ret_value,
+                    duration,
+                    chunk_idx + 1,
+                    chunk_end - chunk_start,
+                    chunk_bytes,
+                    total_descs,
+                    total_bytes,
+                )
+            else:
+                logger.warning(
+                    "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
+                    remote_session,
+                    ret_value,
+                    duration,
+                    total_descs,
+                    total_bytes,
+                )
         return ret_value
 
     def _build_layer_group_index_map(self) -> dict[str, list[int]]:
@@ -2688,6 +2774,33 @@ class MooncakeConnectorWorker:
                     self._mark_pull_failed(pull_meta)
                 self._c128_release_import_slot(pull_meta)
 
+    def _account_failed_pull_tasks(
+        self,
+        pull_metas: dict[ReqId, "PullReqMeta"],
+        req_ids: list[ReqId],
+    ) -> None:
+        """Account failed async pulls and notify scheduler when safe.
+
+        C128 state transfer needs quiesce accounting before slots can be
+        released. Non-C128 pulls also wait for all worker tasks to quiesce
+        before the scheduler may release or reuse local KV blocks.
+        """
+        self._c128_account_pull_tasks(pull_metas, failed=True, req_ids=req_ids)
+        if (
+            self._online_c128_state_transfer_enabled
+            and self._c128_import_pool is not None
+        ):
+            return
+        for req_id in req_ids:
+            pull_meta = pull_metas.get(req_id)
+            if pull_meta is None:
+                continue
+            pull_meta.pull_failed = True
+            if pull_meta.pull_tasks_count > 0:
+                pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count == 0:
+                self._mark_pull_failed(pull_meta)
+
     def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
         """
         Get requests that are done sending or recving on this specific worker.
@@ -2821,9 +2934,8 @@ class MooncakeConnectorWorker:
                         )
                         self.xfer_stats.record_failed_recv()
                         # Account only requests still pending on this worker.
-                        self._c128_account_pull_tasks(
+                        self._account_failed_pull_tasks(
                             pull_metas,
-                            failed=True,
                             req_ids=list(outstanding_req_ids),
                         )
                         return
@@ -2838,9 +2950,8 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self.xfer_stats.record_failed_recv()
-            self._c128_account_pull_tasks(
+            self._account_failed_pull_tasks(
                 pull_metas,
-                failed=True,
                 req_ids=list(outstanding_req_ids),
             )
             return
@@ -2856,9 +2967,13 @@ class MooncakeConnectorWorker:
         for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
-            pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count > 0:
+                pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
+                if pull_meta.pull_failed:
+                    self._mark_pull_failed(pull_meta)
+                else:
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
         # Success keeps the slot for admission unless another worker fails.
         if ok_reqs:
             self._c128_account_pull_tasks(pull_metas, failed=False, req_ids=ok_reqs)
@@ -2875,9 +2990,7 @@ class MooncakeConnectorWorker:
                 response.err_msg,
             )
             # Failed requests release slots only after all worker tasks quiesce.
-            self._c128_account_pull_tasks(
-                pull_metas, failed=True, req_ids=err_reqs
-            )
+            self._account_failed_pull_tasks(pull_metas, req_ids=err_reqs)
             accounted_req_ids.update(err_reqs)
         return accounted_req_ids
 
@@ -2975,6 +3088,7 @@ class MooncakeConnectorWorker:
         )
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
+            pull_meta.pull_failed = False
             # Separate success count from C128 slot quiesce accounting.
             pull_meta.c128_pull_pending = count
             pull_meta.c128_pull_failed = False
