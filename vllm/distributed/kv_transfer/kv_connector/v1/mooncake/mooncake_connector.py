@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
-import os
 import threading
 import time
 from collections import defaultdict
@@ -1217,26 +1216,22 @@ class MooncakeConnectorWorker:
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
-        extra_config = kv_transfer_config.kv_connector_extra_config
-        self.num_sender_workers = extra_config.get("num_workers", 10)
+        self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
+            "num_workers", 10
+        )
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
         self.num_sender_tasks = self.num_sender_workers * 2
-        protocol = extra_config.get("mooncake_protocol", "rdma")
-        device_name = extra_config.get("mooncake_device")
-        if device_name is None:
-            device_name = extra_config.get("device_name")
-        if device_name is None:
-            device_name = os.environ.get("MOONCAKE_DEVICE", "")
+        protocol = kv_transfer_config.kv_connector_extra_config.get(
+            "mooncake_protocol", "rdma"
+        )
+        device_name = kv_transfer_config.kv_connector_extra_config.get(
+            "device_name", ""
+        )
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
-        if device_name:
-            logger.info(
-                "The Mooncake Transfer Engine is using %s as its device.",
-                device_name,
-            )
         ret_value = self.engine.initialize(
             self.hostname, "P2PHANDSHAKE", protocol, device_name
         )
