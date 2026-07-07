@@ -56,6 +56,11 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    online_c128_candidate_chain: bool = False
+    """
+    True when an Online C128 FULL cudagraph should write MTP candidate banks
+    instead of updating the committed bank0 decode state.
+    """
 
 
 def _compute_sp_num_tokens(

@@ -588,8 +588,13 @@ class DeepseekCompressor(nn.Module):
         assert online_state is not None
         run_state = online_state.state
 
-        cg_mode = get_forward_context().cudagraph_runtime_mode
+        forward_context = get_forward_context()
+        cg_mode = forward_context.cudagraph_runtime_mode
         if cg_mode == CUDAGraphMode.FULL:
+            batch_desc = forward_context.batch_descriptor
+            candidate_chain = self.online_c128_uses_mtp and bool(
+                getattr(batch_desc, "online_c128_candidate_chain", False)
+            )
             self._online_forward_graph_safe(
                 kv=kv,
                 score=score,
@@ -604,6 +609,7 @@ class DeepseekCompressor(nn.Module):
                 store_full_kv=store_full_kv,
                 store_full_fp8=store_full_fp8,
                 fp8_scale=fp8_scale,
+                candidate_chain=candidate_chain,
             )
             return
 
@@ -638,6 +644,7 @@ class DeepseekCompressor(nn.Module):
         store_full_kv: bool,
         store_full_fp8: bool,
         fp8_scale: torch.Tensor | None,
+        candidate_chain: bool,
     ) -> None:
         """FULL-decode-cudagraph path: fixed-address, on-device, plan-free."""
         from vllm.models.deepseek_v4.nvidia.ops.online_c128_cutedsl import (
@@ -670,8 +677,7 @@ class DeepseekCompressor(nn.Module):
             compressed_kv=compressed_kv,
             max_num_reqs=online_state.max_num_reqs,
             compress_ratio=self.compress_ratio,
-            # FULL graph is only used for uniform decode / MTP verify shapes.
-            candidate_chain=self.online_c128_uses_mtp,
+            candidate_chain=candidate_chain,
         )
 
         store_compressed_kv_cutedsl(
