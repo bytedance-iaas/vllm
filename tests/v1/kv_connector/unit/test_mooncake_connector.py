@@ -859,35 +859,23 @@ def patch_worker_dependencies():
 
 
 @pytest.mark.parametrize(
-    ("extra_config", "env_device", "expected_device"),
+    ("extra_config", "expected_device"),
     [
         (
-            {"mooncake_device": "mlx5_1,mlx5_2"},
-            "mlx5_3",
-            "mlx5_1,mlx5_2",
-        ),
-        (
             {"device_name": "mlx5_2"},
-            "mlx5_3",
             "mlx5_2",
         ),
-        ({}, "mlx5_1,mlx5_2,mlx5_3,mlx5_4", "mlx5_1,mlx5_2,mlx5_3,mlx5_4"),
-        ({"mooncake_device": ""}, "mlx5_3", ""),
+        ({}, ""),
     ],
     ids=[
-        "extra_config_mooncake_device",
-        "extra_config_device_name_alias",
-        "mooncake_device_env",
-        "explicit_empty_device",
+        "extra_config_device_name",
+        "default_empty_device",
     ],
 )
 def test_worker_initializes_mooncake_with_configured_device(
-    monkeypatch,
     extra_config: dict[str, str],
-    env_device: str,
     expected_device: str,
 ):
-    monkeypatch.setenv("MOONCAKE_DEVICE", env_device)
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector",
         kv_role="kv_consumer",
