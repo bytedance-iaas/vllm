@@ -54,9 +54,12 @@ class FakeMooncakeWrapper:
     """Mock Mooncake TransferEngine for unit testing environments."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self.initialize_calls = []
 
     def initialize(self, local_hostname, metadata_server, protocol, device_name) -> int:
+        self.initialize_calls.append(
+            (local_hostname, metadata_server, protocol, device_name)
+        )
         return 0
 
     def get_rpc_port(self) -> int:
@@ -853,6 +856,56 @@ def patch_worker_dependencies():
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
         }
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "env_device", "expected_device"),
+    [
+        (
+            {"mooncake_device": "mlx5_1,mlx5_2"},
+            "mlx5_3",
+            "mlx5_1,mlx5_2",
+        ),
+        (
+            {"device_name": "mlx5_2"},
+            "mlx5_3",
+            "mlx5_2",
+        ),
+        ({}, "mlx5_1,mlx5_2,mlx5_3,mlx5_4", "mlx5_1,mlx5_2,mlx5_3,mlx5_4"),
+        ({"mooncake_device": ""}, "mlx5_3", ""),
+    ],
+    ids=[
+        "extra_config_mooncake_device",
+        "extra_config_device_name_alias",
+        "mooncake_device_env",
+        "explicit_empty_device",
+    ],
+)
+def test_worker_initializes_mooncake_with_configured_device(
+    monkeypatch,
+    extra_config: dict[str, str],
+    env_device: str,
+    expected_device: str,
+):
+    monkeypatch.setenv("MOONCAKE_DEVICE", env_device)
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config=extra_config,
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+
+    worker = connector.connector_worker
+    assert worker is not None
+    assert worker.engine.initialize_calls == [
+        ("127.0.0.1", "P2PHANDSHAKE", "rdma", expected_device)
+    ]
 
 
 @pytest.mark.asyncio
