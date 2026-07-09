@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import vllm.utils.deep_gemm as deep_gemm_utils
+from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 
 
@@ -123,18 +124,13 @@ def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
     assert calls == [(None, True)]
 
 
-def test_get_symm_buffer_for_num_tokens_uses_uncached_oversized_buffer(
+def test_get_symm_buffer_for_num_tokens_uses_cached_full_capacity_buffer(
     monkeypatch,
 ):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
     calls = []
-    monkeypatch.setattr(
-        DeepseekV4MegaMoEExperts,
-        "_is_cuda_graph_capturing",
-        staticmethod(lambda: False),
-    )
 
     def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
         calls.append((max_num_tokens, cache))
@@ -144,21 +140,16 @@ def test_get_symm_buffer_for_num_tokens_uses_uncached_oversized_buffer(
 
     experts.get_symm_buffer_for_num_tokens(256)
 
-    assert calls == [(256, False)]
+    assert calls == [(256, True)]
 
 
-def test_get_symm_buffer_for_num_tokens_caches_oversized_buffer_during_capture(
+def test_get_symm_buffer_for_num_tokens_rounds_oversized_to_full_capacity(
     monkeypatch,
 ):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
     calls = []
-    monkeypatch.setattr(
-        DeepseekV4MegaMoEExperts,
-        "_is_cuda_graph_capturing",
-        staticmethod(lambda: True),
-    )
 
     def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
         calls.append((max_num_tokens, cache))
@@ -166,7 +157,29 @@ def test_get_symm_buffer_for_num_tokens_caches_oversized_buffer_during_capture(
 
     monkeypatch.setattr(experts, "get_symm_buffer", fake_get_symm_buffer)
 
-    experts.get_symm_buffer_for_num_tokens(256)
+    experts.get_symm_buffer_for_num_tokens(128)
+
+    assert calls == [(256, True)]
+
+
+def test_get_symm_buffer_for_num_tokens_uses_dp_wide_capacity(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 80
+    experts.max_num_batched_tokens = 256
+    calls = []
+
+    def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
+        calls.append((max_num_tokens, cache))
+        return object()
+
+    monkeypatch.setattr(experts, "get_symm_buffer", fake_get_symm_buffer)
+    dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.tensor([16, 128], dtype=torch.int32)
+    )
+    forward_context = SimpleNamespace(dp_metadata=dp_metadata)
+
+    with override_forward_context(forward_context):
+        experts.get_symm_buffer_for_num_tokens(16)
 
     assert calls == [(256, True)]
 

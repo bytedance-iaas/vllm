@@ -16,7 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -621,48 +621,36 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                     self.hidden_size,
                     self.intermediate_size,
                 )
-            logger.info(
-                "DeepSeek V4 MegaMoE symm buffer created: "
-                "max_num_tokens=%d, mode=%s, cache=%s, device=%s, "
-                "num_experts=%d, top_k=%d, hidden_size=%d, "
-                "intermediate_size=%d",
-                max_num_tokens,
-                buffer_mode,
-                cache,
-                device,
-                self.num_experts,
-                self.top_k,
-                self.hidden_size,
-                self.intermediate_size,
-            )
             if cache:
                 self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
 
     def get_symm_buffer_for_num_tokens(self, num_tokens: int):
-        if num_tokens > self.max_num_batched_tokens:
+        max_num_tokens_across_dp = self._get_max_num_tokens_across_dp(num_tokens)
+        if max_num_tokens_across_dp > self.max_num_batched_tokens:
             raise ValueError(
-                f"DeepSeek V4 MegaMoE got {num_tokens} tokens, but "
+                "DeepSeek V4 MegaMoE got a maximum of "
+                f"{max_num_tokens_across_dp} tokens across DP ranks, but "
                 "max_num_batched_tokens is "
                 f"{self.max_num_batched_tokens}."
             )
-        if num_tokens <= self.max_num_tokens:
+        if max_num_tokens_across_dp <= self.max_num_tokens:
             return self.get_symm_buffer()
-        # Profile/warmup can still feed max_num_batched_tokens-shaped dummy
-        # batches. Keep the steady-state decode buffer small, and allocate an
-        # uncached temporary buffer for oversized calls unless CUDA graph
-        # capture needs the buffer object to stay alive for replay.
-        return self.get_symm_buffer(
-            num_tokens,
-            cache=self._is_cuda_graph_capturing(),
-        )
+        # Profile/warmup and prefill can still feed
+        # max_num_batched_tokens-shaped batches. Keep the steady-state decode
+        # buffer small, but cache one full-capacity buffer so symmetric-memory
+        # rendezvous happens in a stable sequence across EP ranks instead of
+        # being repeated from the request path.
+        return self.get_symm_buffer(self.max_num_batched_tokens)
 
     @staticmethod
-    def _is_cuda_graph_capturing() -> bool:
-        try:
-            return bool(torch.cuda.is_current_stream_capturing())
-        except Exception:
-            return False
+    def _get_max_num_tokens_across_dp(num_tokens: int) -> int:
+        if not is_forward_context_available():
+            return num_tokens
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            return num_tokens
+        return max(num_tokens, int(dp_metadata.num_tokens_across_dp_cpu.max().item()))
 
     def set_eplb_state(
         self,

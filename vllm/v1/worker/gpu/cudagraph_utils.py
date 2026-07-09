@@ -38,6 +38,21 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _reset_online_c128_states_if_enabled() -> bool:
+    """Clear dummy online C128 state after graph warmup/capture."""
+    from vllm.models.deepseek_v4.online_c128 import (
+        get_online_c128_states,
+        online_c128_compress_enabled,
+    )
+
+    if not online_c128_compress_enabled():
+        return False
+    states = get_online_c128_states()
+    for state in states:
+        state.reset_all()
+    return bool(states)
+
+
 class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
@@ -313,18 +328,30 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
+                        online_c128_reset_needed = (
+                            _reset_online_c128_states_if_enabled()
+                        )
+                        if online_c128_reset_needed:
+                            # Warm FULL-only kernels before CUDA graph capture.
+                            get_offloader().sync_prev_onload()
+                            forward_fn(desc.cg_mode)
+                            get_offloader().join_after_forward()
+                            _reset_online_c128_states_if_enabled()
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
                         with torch.cuda.graph(graph, self.pool):
-                            forward_fn(CUDAGraphMode.NONE)
+                            # FULL mode selects graph-safe fixed-address kernels.
+                            forward_fn(desc.cg_mode)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
+                        if online_c128_reset_needed:
+                            _reset_online_c128_states_if_enabled()
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
         return attn_states
@@ -473,6 +500,14 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
+                if cg_mode != CUDAGraphMode.NONE:
+                    batch_descriptor = BatchDescriptor(
+                        num_tokens=num_tokens,
+                        num_reqs=desc.num_reqs,
+                        uniform=desc.uniform_token_count is not None,
+                        has_lora=has_lora,
+                        num_active_loras=desc.num_active_loras,
+                    )
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     assert attn_metadata is None
                     batch_descriptor = BatchDescriptor(
