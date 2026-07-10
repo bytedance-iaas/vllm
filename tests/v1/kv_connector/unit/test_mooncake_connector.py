@@ -73,9 +73,12 @@ class FakeMooncakeWrapper:
     """Mock Mooncake TransferEngine for unit testing environments."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self.initialize_calls = []
 
     def initialize(self, local_hostname, metadata_server, protocol, device_name) -> int:
+        self.initialize_calls.append(
+            (local_hostname, metadata_server, protocol, device_name)
+        )
         return 0
 
     def get_rpc_port(self) -> int:
@@ -859,6 +862,25 @@ def patch_worker_dependencies():
             return_value=False,
         ),
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.current_platform.set_device"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_current_attn_backend",
+            return_value=FlashAttentionBackend,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_current_attn_backends",
+            return_value=[FlashAttentionBackend],
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_kv_cache_layout",
+            return_value="NHD",
+        ),
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.make_zmq_socket"
         ) as mock_make_zmq,
         patch("httpx.AsyncClient") as mock_async_client,
@@ -885,6 +907,37 @@ def patch_worker_dependencies():
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
         }
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "expected_device"),
+    [
+        ({"device_name": "mlx5_2"}, "mlx5_2"),
+        ({}, ""),
+    ],
+    ids=["extra_config_device_name", "default_empty_device"],
+)
+def test_worker_initializes_mooncake_with_configured_device(
+    extra_config: dict[str, str],
+    expected_device: str,
+):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config=extra_config,
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+
+    worker = connector.connector_worker
+    assert worker.engine.initialize_calls == [
+        ("127.0.0.1", "P2PHANDSHAKE", "rdma", expected_device)
+    ]
 
 
 @pytest.mark.asyncio

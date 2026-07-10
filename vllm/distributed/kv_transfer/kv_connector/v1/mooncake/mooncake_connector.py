@@ -1242,10 +1242,10 @@ class MooncakeConnectorWorker:
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
         self.num_sender_tasks = self.num_sender_workers * 2
-        protocol = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
+        protocol = kv_transfer_config.kv_connector_extra_config.get(
             "mooncake_protocol", "rdma"
         )
-        device_name = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
+        device_name = kv_transfer_config.kv_connector_extra_config.get(
             "device_name", ""
         )
         logger.info(
