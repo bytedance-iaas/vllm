@@ -169,12 +169,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             device_req_state_indices = req_state_indices[:num_reqs].to(torch.int32)
             # Map each token to its persistent request-state slot via the
             # batch-local token->req index built above.
-            token_state = device_req_state_indices[
-                token_to_req_indices.to(torch.long)
-            ]
-            token_to_req_state_indices = self.token_to_req_state_indices[
-                : x.shape[0]
-            ]
+            token_state = device_req_state_indices[token_to_req_indices.to(torch.long)]
+            token_to_req_state_indices = self.token_to_req_state_indices[: x.shape[0]]
             token_to_req_state_indices.copy_(token_state, non_blocking=True)
 
             # Host-side inputs for the segment planner (no device sync).
@@ -196,9 +192,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             if ub is not None:
                 seq_lens_cpu = ub[:num_reqs].cpu().numpy()
             else:
-                qlen = (
-                    query_start_loc_cpu_t[1:] - query_start_loc_cpu_t[:-1]
-                ).numpy()
+                qlen = (query_start_loc_cpu_t[1:] - query_start_loc_cpu_t[:-1]).numpy()
                 seq_lens_cpu = qlen  # fallback: seq_len == query_len
 
         return CompressorMetadata(
@@ -580,8 +574,8 @@ class DeepseekCompressor(nn.Module):
         fp8_scale: torch.Tensor | None,
     ) -> None:
         """C128 online path: graph-safe FULL decode or planned eager/PW."""
-        from vllm.forward_context import get_forward_context
         from vllm.config.compilation import CUDAGraphMode
+        from vllm.forward_context import get_forward_context
 
         online_state = self.online_c128_state
         assert online_state is not None
@@ -751,9 +745,7 @@ class DeepseekCompressor(nn.Module):
 
         verify_mode = self.online_c128_uses_mtp and online_c128_verify_active()
         if verify_mode:
-            num_draft_tokens_per_req_cpu = (
-                state_metadata.num_draft_tokens_per_req_cpu
-            )
+            num_draft_tokens_per_req_cpu = state_metadata.num_draft_tokens_per_req_cpu
             if num_draft_tokens_per_req_cpu is None:
                 raise ValueError(
                     "C128 online MTP verify requires per-request draft-token "
