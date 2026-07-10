@@ -31,6 +31,10 @@ class InputBuffers:
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+        # Fixed-address request-state slots for online C128 graph replay.
+        self.req_state_indices = torch.full(
+            (max_num_reqs,), -1, dtype=torch.int32, device=device
+        )
 
 
 @dataclass
@@ -43,6 +47,8 @@ class InputBatch:
     # batch_idx -> req_state_idx
     idx_mapping: torch.Tensor
     idx_mapping_np: np.ndarray
+    # [num_reqs_after_padding] batch_idx -> req_state_idx, padded with -1.
+    req_state_indices: torch.Tensor
     # Identical to idx_mapping except for spec decoding.
     expanded_idx_mapping: torch.Tensor
     # [total_num_logits] position within request for each logit
@@ -112,6 +118,11 @@ class InputBatch:
         req_ids = [f"req_{i}_{random_uuid()}" for i in range(num_reqs)]
         idx_mapping_np = np.arange(num_reqs, dtype=np.int32)
         idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+        # Use the fixed-address req_state_indices buffer (slots 0..num_reqs-1 =
+        # identity, padding = -1) so capture and replay share the same pointer.
+        input_buffers.req_state_indices[:num_reqs] = idx_mapping
+        input_buffers.req_state_indices[num_reqs:] = -1
+        req_state_indices = input_buffers.req_state_indices[:num_reqs]
         expanded_idx_mapping = idx_mapping
         expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
@@ -154,6 +165,7 @@ class InputBatch:
             num_reqs_after_padding=num_reqs,
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
+            req_state_indices=req_state_indices,
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,

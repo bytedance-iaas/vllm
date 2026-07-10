@@ -182,6 +182,9 @@ class DefaultModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
             mm_req_doc_ranges=req_doc_ranges,
+            req_state_indices=input_batch.req_state_indices,
+            req_state_indices_cpu=input_batch.idx_mapping_np,
+            num_draft_tokens_per_req_cpu=input_batch.num_draft_tokens_per_req,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
