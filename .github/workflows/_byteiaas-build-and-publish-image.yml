@@ -1,0 +1,245 @@
+name: ByteIAAS Build And Publish vLLM Image
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      cuda_version:
+        description: "CUDA_VERSION build arg"
+        required: false
+        type: string
+        default: "13.0.2"
+      tag_mode:
+        description: "Image tag mode: dev or release"
+        required: true
+        type: string
+      tag_value:
+        description: "Internal tag value required for release mode"
+        required: false
+        type: string
+        default: ""
+      vllm_version:
+        description: "Explicit vLLM version override"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-and-publish-image:
+    if: github.repository == 'bytedance-iaas/vllm'
+    name: build-and-publish-image
+    runs-on:
+      - self-hosted
+      - x64-vllm-docker-build-node
+      - vllm-byteiaas-build-02
+    timeout-minutes: 1440
+    env:
+      HTTP_PROXY: http://100.68.162.211:3128
+      HTTPS_PROXY: http://100.68.162.211:3128
+      ALL_PROXY: http://100.68.162.211:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
+      BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0%2Blocal-260630mega_moe-cp312-cp312-linux_x86_64.whl
+    steps:
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve Volcengine publish target
+        run: |
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+            echo "::error::VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE variables are required"
+            exit 1
+          fi
+          if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "::error::VOLCENGINE_CR_USERNAME and VOLCENGINE_CR_PASSWORD secrets are required"
+            exit 1
+          fi
+          IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "Resolved image repository ${IMAGE_REPO}"
+
+      - name: Resolve ByteIAAS image tags
+        id: image-tags
+        env:
+          BYTEIAAS_VLLM_VERSION: ${{ inputs.vllm_version }}
+        run: |
+          set -euo pipefail
+          resolve_tag() {
+            local image_flavor="$1"
+            local tag_args=(
+              --mode "${{ inputs.tag_mode }}"
+              --image-flavor "${image_flavor}"
+              --cuda-suffix cu130
+            )
+            if [ -n "${{ inputs.tag_value }}" ]; then
+              tag_args+=(--tag-value "${{ inputs.tag_value }}")
+            fi
+            if [ -n "${BYTEIAAS_VLLM_VERSION}" ]; then
+              tag_args+=(--vllm-version "${BYTEIAAS_VLLM_VERSION}")
+            fi
+            python3 scripts/ci/get_byteiaas_image_tag.py "${tag_args[@]}"
+          }
+
+          OPENAI_IMAGE_TAG="$(resolve_tag openai)"
+          OPENAI_DEVEL_IMAGE_TAG="$(resolve_tag openai-devel)"
+          echo "openai_image_tag=${OPENAI_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "openai_devel_image_tag=${OPENAI_DEVEL_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved openai image tag ${OPENAI_IMAGE_TAG}"
+          echo "Resolved openai-devel image tag ${OPENAI_DEVEL_IMAGE_TAG}"
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: byteiaas-vllm-image-builder
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+          keep-state: true
+          cleanup: false
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Build and push AMD64 image by digest
+        id: build
+        run: |
+          set -euo pipefail
+          ubuntu_version="22.04"
+          final_base_image="nvidia/cuda:${{ inputs.cuda_version }}-base-ubuntu${ubuntu_version}"
+          openai_metadata_file="/tmp/byteiaas-vllm-openai-image.json"
+          openai_devel_metadata_file="/tmp/byteiaas-vllm-openai-devel-image.json"
+          build_cpus="$(nproc)"
+          build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
+          default_nvcc_threads=4
+          if [ "${build_cpus}" -lt "${default_nvcc_threads}" ]; then
+            default_nvcc_threads="${build_cpus}"
+          fi
+          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${default_nvcc_threads}}"
+          cache_root="${BYTEIAAS_BUILDX_CACHE_ROOT}"
+
+          echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}, effective_cuda_jobs=$((build_max_jobs / build_nvcc_threads))"
+          echo "DeepGEMM Python versions: ${DEEPGEMM_PYTHON_VERSIONS:-default}"
+          echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
+          df -h /data /data/docker /data/buildkit || true
+          mkdir -p "${cache_root}"
+
+          buildx_with_local_cache() {
+            local cache_name="$1"
+            shift
+            local cache_dir="${cache_root}/${cache_name}"
+            local cache_new="${cache_dir}.new"
+            local cache_old="${cache_dir}.old"
+            local cache_args=(
+              --cache-to "type=local,dest=${cache_new},mode=max"
+            )
+            if [ -d "${cache_dir}" ]; then
+              cache_args=(
+                --cache-from "type=local,src=${cache_dir}"
+                "${cache_args[@]}"
+              )
+              echo "Using local BuildKit cache: ${cache_dir}"
+            else
+              echo "No local BuildKit cache yet: ${cache_dir}"
+            fi
+
+            rm -rf "${cache_new}"
+            docker buildx build --builder byteiaas-vllm-image-builder "${cache_args[@]}" "$@"
+
+            if [ -d "${cache_new}" ]; then
+              rm -rf "${cache_old}"
+              if [ -d "${cache_dir}" ]; then
+                mv "${cache_dir}" "${cache_old}"
+              fi
+              mv "${cache_new}" "${cache_dir}"
+              rm -rf "${cache_old}"
+              echo "Updated local BuildKit cache: ${cache_dir}"
+            fi
+          }
+
+          build_vllm_openai() {
+            local output_name="$1"
+            local metadata_path="$2"
+            buildx_with_local_cache openai \
+              --target vllm-openai \
+              --platform linux/amd64 \
+              --output "type=image,name=${output_name},push-by-digest=true,name-canonical=true,push=true" \
+              -f docker/Dockerfile \
+              --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+              --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
+              --build-arg INSTALL_KV_CONNECTORS=true \
+              --build-arg DEEPGEMM_WHEEL_X86_64="${BYTEIAAS_DEEPGEMM_WHEEL_X86_64}" \
+              --build-arg max_jobs="${build_max_jobs}" \
+              --build-arg nvcc_threads="${build_nvcc_threads}" \
+              --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+              --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+              --build-arg ALL_PROXY="${ALL_PROXY}" \
+              --build-arg NO_PROXY="${NO_PROXY}" \
+              --build-arg http_proxy="${HTTP_PROXY}" \
+              --build-arg https_proxy="${HTTPS_PROXY}" \
+              --build-arg all_proxy="${ALL_PROXY}" \
+              --build-arg no_proxy="${NO_PROXY}" \
+              --build-arg RUN_WHEEL_CHECK=false \
+              --metadata-file "${metadata_path}" \
+              .
+          }
+
+          build_vllm_openai "${IMAGE_REPO}" "${openai_metadata_file}"
+          openai_digest="$(python3 -c "import json; print(json.load(open('${openai_metadata_file}'))['containerimage.digest'])")"
+          echo "Pushed openai digest: ${openai_digest}"
+
+          buildx_with_local_cache openai-devel \
+            --platform linux/amd64 \
+            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
+            -f docker/byteiaas-openai-devel.Dockerfile \
+            --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${openai_digest}" \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg max_jobs="${build_max_jobs}" \
+            --build-arg nvcc_threads="${build_nvcc_threads}" \
+            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+            --build-arg ALL_PROXY="${ALL_PROXY}" \
+            --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg http_proxy="${HTTP_PROXY}" \
+            --build-arg https_proxy="${HTTPS_PROXY}" \
+            --build-arg all_proxy="${ALL_PROXY}" \
+            --build-arg no_proxy="${NO_PROXY}" \
+            --metadata-file "${openai_devel_metadata_file}" \
+            .
+
+          openai_devel_digest="$(python3 -c "import json; print(json.load(open('${openai_devel_metadata_file}'))['containerimage.digest'])")"
+          echo "Pushed openai-devel digest: ${openai_devel_digest}"
+          echo "openai_digest=${openai_digest}" >> "${GITHUB_OUTPUT}"
+          echo "openai_devel_digest=${openai_devel_digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create Volcengine image tags
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_image_tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.openai_digest }}"
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_image_tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.openai_devel_digest }}"
+          echo "Published openai image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_image_tag }}"
+          echo "Published openai-devel image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_image_tag }}"
