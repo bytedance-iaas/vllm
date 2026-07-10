@@ -213,8 +213,7 @@ def online_c128_merge(
     head_size = compressed_kv.shape[-1]
     if kv.dtype != torch.float32 or score.dtype != torch.float32:
         raise ValueError(
-            "online_c128_merge expects fp32 kv/score, got "
-            f"{kv.dtype} / {score.dtype}."
+            f"online_c128_merge expects fp32 kv/score, got {kv.dtype} / {score.dtype}."
         )
     compiled = OnlineC128MergeKernel.compile(
         head_size=head_size, compress_ratio=compress_ratio
@@ -302,9 +301,7 @@ class OnlineC128DecodeKernel:
 
                 local_max = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
                 local_sum = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
-                local_product = cute.make_rmem_tensor(
-                    (self.elems_per_lane,), Float32
-                )
+                local_product = cute.make_rmem_tensor((self.elems_per_lane,), Float32)
 
                 # Aligned starts seed from identity; bank0 may contain stale carry.
                 first_pos = positions[tok_start.to(Int64)]
@@ -367,35 +364,33 @@ class OnlineC128DecodeKernel:
 
                     if cutlass.const_expr(self.candidate_chain):
                         # Verify writes candidate banks; commit advances bank0.
-                        write_row = (
-                            (j + Int32(1)).to(Int64) * max_num_reqs64 + rsi64
-                        )
+                        write_row = (j + Int32(1)).to(Int64) * max_num_reqs64 + rsi64
                         wbase = write_row * run_state_w + col0.to(Int64)
                         if boundary:
                             for e in cutlass.range_constexpr(self.elems_per_lane):
                                 run_state.iterator[
                                     wbase + max_off + Int64(e)
                                 ] = -Float32.inf
-                                run_state.iterator[
-                                    wbase + sum_off + Int64(e)
-                                ] = Float32(0.0)
-                                run_state.iterator[
-                                    wbase + wsum_off + Int64(e)
-                                ] = Float32(0.0)
+                                run_state.iterator[wbase + sum_off + Int64(e)] = (
+                                    Float32(0.0)
+                                )
+                                run_state.iterator[wbase + wsum_off + Int64(e)] = (
+                                    Float32(0.0)
+                                )
                                 local_max[e] = -Float32.inf
                                 local_sum[e] = Float32(0.0)
                                 local_product[e] = Float32(0.0)
                         else:
                             for e in cutlass.range_constexpr(self.elems_per_lane):
-                                run_state.iterator[
-                                    wbase + max_off + Int64(e)
-                                ] = local_max[e]
-                                run_state.iterator[
-                                    wbase + sum_off + Int64(e)
-                                ] = local_sum[e]
-                                run_state.iterator[
-                                    wbase + wsum_off + Int64(e)
-                                ] = local_product[e]
+                                run_state.iterator[wbase + max_off + Int64(e)] = (
+                                    local_max[e]
+                                )
+                                run_state.iterator[wbase + sum_off + Int64(e)] = (
+                                    local_sum[e]
+                                )
+                                run_state.iterator[wbase + wsum_off + Int64(e)] = (
+                                    local_product[e]
+                                )
                     else:
                         if boundary:
                             # Decode: chunk closed; restart from identity.
@@ -407,15 +402,15 @@ class OnlineC128DecodeKernel:
                 if cutlass.const_expr(not self.candidate_chain):
                     # Decode: write trailing carry back to committed bank0.
                     for e in cutlass.range_constexpr(self.elems_per_lane):
-                        run_state.iterator[
-                            bank0_base + max_off + Int64(e)
-                        ] = local_max[e]
-                        run_state.iterator[
-                            bank0_base + sum_off + Int64(e)
-                        ] = local_sum[e]
-                        run_state.iterator[
-                            bank0_base + wsum_off + Int64(e)
-                        ] = local_product[e]
+                        run_state.iterator[bank0_base + max_off + Int64(e)] = local_max[
+                            e
+                        ]
+                        run_state.iterator[bank0_base + sum_off + Int64(e)] = local_sum[
+                            e
+                        ]
+                        run_state.iterator[bank0_base + wsum_off + Int64(e)] = (
+                            local_product[e]
+                        )
 
     @cache
     @staticmethod
@@ -452,9 +447,7 @@ class OnlineC128DecodeKernel:
             assumed_align=16,
         )
         positions = make_fake_tensor(Int64, (num_tokens,), divisibility=8)
-        query_start_loc = make_fake_tensor(
-            Int32, (num_query_locs,), divisibility=1
-        )
+        query_start_loc = make_fake_tensor(Int32, (num_query_locs,), divisibility=1)
         req_state_indices = make_fake_tensor(Int32, (num_reqs,), divisibility=1)
         run_state = cute.runtime.make_fake_tensor(
             Float32,
@@ -506,8 +499,7 @@ def online_c128_decode(
     head_size = compressed_kv.shape[-1]
     if kv.dtype != torch.float32 or score.dtype != torch.float32:
         raise ValueError(
-            "online_c128_decode expects fp32 kv/score, got "
-            f"{kv.dtype} / {score.dtype}."
+            f"online_c128_decode expects fp32 kv/score, got {kv.dtype} / {score.dtype}."
         )
     compiled = OnlineC128DecodeKernel.compile(
         head_size=head_size,

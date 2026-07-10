@@ -56,8 +56,7 @@ def assert_online_c128_supported(
     """
     if not _is_sm90():
         raise ValueError(
-            "VLLM_USE_ONLINE_C128_COMPRESS is only supported on CUDA SM90 "
-            "(Hopper)."
+            "VLLM_USE_ONLINE_C128_COMPRESS is only supported on CUDA SM90 (Hopper)."
         )
     if compress_ratio != ONLINE_C128_COMPRESS_RATIO:
         raise ValueError(
@@ -177,7 +176,7 @@ class DeepseekOnlineC128State(torch.nn.Module):
 # layer). Populated at model init; lets the model runner drive the MTP
 # begin_verify / commit transition across every layer without threading a layer
 # list through the forward signature.
-_ONLINE_C128_STATES: "list[DeepseekOnlineC128State]" = []
+_ONLINE_C128_STATES: list[DeepseekOnlineC128State] = []
 
 # Shared fixed-address scratch for the per-boundary compressed KV output. The
 # FULL decode cudagraph captures the compressor inside the graph, so the
@@ -187,7 +186,7 @@ _ONLINE_C128_STATES: "list[DeepseekOnlineC128State]" = []
 # its own forward (FULL cudagraph replay is serial on the model stream). The
 # eager / PIECEWISE path keeps allocating per-step (concurrency-safe), so this
 # is only used on the FULL path.
-_ONLINE_C128_COMPRESSED_KV: "torch.Tensor | None" = None
+_ONLINE_C128_COMPRESSED_KV: torch.Tensor | None = None
 
 
 def ensure_online_c128_compressed_kv(
@@ -233,7 +232,7 @@ def register_online_c128_state(state: DeepseekOnlineC128State) -> None:
     _ONLINE_C128_STATES.append(state)
 
 
-def get_online_c128_states() -> "list[DeepseekOnlineC128State]":
+def get_online_c128_states() -> list[DeepseekOnlineC128State]:
     return _ONLINE_C128_STATES
 
 
@@ -433,11 +432,7 @@ def plan_online_c128_verify(
             token = row_start + j
             pos = first_pos + j
             # Aligned starts must not read stale bank0.
-            read_row = (
-                j * max_num_reqs + rsi
-                if j > 0 or seed_from_bank0
-                else -1
-            )
+            read_row = j * max_num_reqs + rsi if j > 0 or seed_from_bank0 else -1
             write_row = (j + 1) * max_num_reqs + rsi
             closes = (pos + 1) % compress_ratio == 0
             emit_token = token if closes else -1

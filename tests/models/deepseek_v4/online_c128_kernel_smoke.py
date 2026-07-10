@@ -132,15 +132,16 @@ def _check_planned_prefill(
     num_tokens = ONLINE_C128_COMPRESS_RATIO + 2
     padded_tokens = num_tokens + 6
     torch.manual_seed(11)
-    kv = (
-        torch.randn(padded_tokens, head_dim, device=device, dtype=torch.float32) * 0.2
-    )
+    kv = torch.randn(padded_tokens, head_dim, device=device, dtype=torch.float32) * 0.2
     score = (
         torch.randn(padded_tokens, head_dim, device=device, dtype=torch.float32) * 0.1
     )
-    ape = torch.randn(
-        ONLINE_C128_COMPRESS_RATIO, head_dim, device=device, dtype=torch.float32
-    ) * 0.01
+    ape = (
+        torch.randn(
+            ONLINE_C128_COMPRESS_RATIO, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.01
+    )
     positions = torch.arange(padded_tokens, device=device, dtype=torch.int64)
     run_state = _empty_rows(max_num_reqs, head_dim, device)
     compressed_kv = torch.zeros(

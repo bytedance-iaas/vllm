@@ -1415,7 +1415,7 @@ class MooncakeConnectorWorker:
         # req_id -> transfer_id).
         self._c128_req_to_transfer: dict[ReqId, TransferId] = {}
         # D side live pulls; used to defer abort releases until RDMA quiesces.
-        self._c128_active_pulls: dict[ReqId, "PullReqMeta"] = {}
+        self._c128_active_pulls: dict[ReqId, PullReqMeta] = {}
         # Pulls pending bootstrap/slot reservation.
         self._c128_pending_import_reqs: set[ReqId] = set()
         # Abort tombstones for pending-before-reserve pulls.
@@ -1757,9 +1757,7 @@ class MooncakeConnectorWorker:
                     )
                     for d_req_id, send_meta in pending_reqs.items()
                 ]
-                logger.warning(
-                    "Timeout waiting for P side ready: %s", pending_state
-                )
+                logger.warning("Timeout waiting for P side ready: %s", pending_state)
                 response = MooncakeXferResponse(
                     status=MooncakeXferResponseStatus.FINISH,
                     err_reqs=list(pending_reqs),
@@ -1852,7 +1850,6 @@ class MooncakeConnectorWorker:
                     send_meta.sending -= 1
 
             for d_req_id, send_meta in ready_reqs:
-
                 if d_req_id in err_req_set:
                     continue
 
@@ -1920,7 +1917,11 @@ class MooncakeConnectorWorker:
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
     ) -> tuple[
-        list[int], list[int], list[int], list[ReqId], str | None,
+        list[int],
+        list[int],
+        list[int],
+        list[ReqId],
+        str | None,
         list["torch.cuda.Event"],
     ]:
         src_ptrs = []
@@ -1929,7 +1930,7 @@ class MooncakeConnectorWorker:
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
         # Guard async bank0->export-slot copies before RDMA reads.
-        state_transfer_events: list["torch.cuda.Event"] = []
+        state_transfer_events: list[torch.cuda.Event] = []
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
         for d_req_id, send_meta in ready_reqs:
@@ -2167,8 +2168,14 @@ class MooncakeConnectorWorker:
             and agent_meta.c128_import_base_addr
         ):
             err_msg = self._append_online_c128_state_descriptors(
-                ready_reqs, agent_meta, src_ptrs, dst_ptrs, lengths,
-                err_reqs, err_msg, state_transfer_events,
+                ready_reqs,
+                agent_meta,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                err_reqs,
+                err_msg,
+                state_transfer_events,
             )
 
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, state_transfer_events
@@ -2358,7 +2365,9 @@ class MooncakeConnectorWorker:
         else:
             max_chunk_bytes = envs.VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB * 1024 * 1024
             if max_chunk_bytes <= 0:
-                raise ValueError("VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB must be positive")
+                raise ValueError(
+                    "VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB must be positive"
+                )
             chunked_src_ptrs: list[int] = []
             chunked_dst_ptrs: list[int] = []
             chunked_lengths: list[int] = []
@@ -2457,9 +2466,13 @@ class MooncakeConnectorWorker:
         capacity = self.vllm_config.scheduler_config.max_num_seqs
         device = states[0].state.device
 
-        # State-transfer pool is allocated after KV profiling; fail early if it cannot fit.
+        # State-transfer pool is allocated after KV profiling; fail early if it
+        # cannot fit.
         pool_bytes = (
-            capacity * self._c128_num_layers * row_width * states[0].state.element_size()
+            capacity
+            * self._c128_num_layers
+            * row_width
+            * states[0].state.element_size()
         )
         if device.type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(device)
@@ -2467,7 +2480,8 @@ class MooncakeConnectorWorker:
             margin = int(free_bytes * 0.95)
             if pool_bytes > margin:
                 raise RuntimeError(
-                    "C128 PD state-transfer pool would not fit in free GPU memory: need "
+                    "C128 PD state-transfer pool would not fit in free GPU "
+                    "memory: need "
                     f"{pool_bytes} bytes (capacity={capacity}, "
                     f"num_layers={self._c128_num_layers}, row_width={row_width}, "
                     f"fp32), free={free_bytes} bytes (95% margin={margin}). "
@@ -2794,9 +2808,7 @@ class MooncakeConnectorWorker:
         self._c128_export_slots[req_id] = slot
         self._attach_c128_export_slot_to_pending_sends(req_id, slot)
 
-    def _attach_c128_export_slot_to_pending_sends(
-        self, req_id: str, slot: int
-    ) -> None:
+    def _attach_c128_export_slot_to_pending_sends(self, req_id: str, slot: int) -> None:
         """Bind a freshly snapshotted C128 export slot to pending sends.
 
         Scheduler-side ``request_finished`` can publish block IDs before the
@@ -3199,10 +3211,7 @@ class MooncakeConnectorWorker:
                 if d_req_id in self._c128_aborted_import_reqs:
                     aborted_before_reserve.add(d_req_id)
                     self._c128_aborted_import_reqs.discard(d_req_id)
-                if (
-                    pull_meta.c128_needs_partial
-                    and pull_meta.c128_import_slot is None
-                ):
+                if pull_meta.c128_needs_partial and pull_meta.c128_import_slot is None:
                     try:
                         pull_meta.c128_import_slot = self.reserve_c128_import_slot(
                             d_req_id,
@@ -3252,9 +3261,7 @@ class MooncakeConnectorWorker:
             # Separate success count from C128 slot quiesce accounting.
             pull_meta.c128_pull_pending = count
             pull_meta.c128_pull_failed = False
-            pull_meta.c128_abort_pending = (
-                pull_meta.d_req_id in aborted_before_reserve
-            )
+            pull_meta.c128_abort_pending = pull_meta.d_req_id in aborted_before_reserve
             # Track the live pull so an abort (which only knows req_id) can defer
             # the import-slot release until all pull tasks quiesce.
             if (
@@ -3384,10 +3391,7 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         c128_release_req_ids = list(metadata.c128_import_release_req_ids)
-        if (
-            not self.is_kv_producer
-            and (metadata.reqs_to_recv or c128_release_req_ids)
-        ):
+        if not self.is_kv_producer and (metadata.reqs_to_recv or c128_release_req_ids):
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv_and_release_c128_imports(
                     metadata.reqs_to_recv, c128_release_req_ids
