@@ -74,10 +74,14 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
-from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import (
+    prepare_megamoe_inputs,
+    prepare_megamoe_inputs_sm90,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -162,7 +166,7 @@ def make_deepseek_v4_expert_params_mapping(
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
-    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int], object] = {}
+    _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, str], object] = {}
 
     def __init__(
         self,
@@ -176,6 +180,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         intermediate_size: int,
         prefix: str = "",
         num_logical_experts: int | None = None,
+        expert_dtype: str = "fp4",
     ):
         super().__init__()
         self.prefix = prefix
@@ -186,7 +191,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self.max_num_tokens = self._resolve_mega_moe_decode_capacity(vllm_config)
+        self.expert_dtype = expert_dtype
+        self._use_sm90_mega_moe = False
+        self._use_sm90_fp4_mega_moe = False
+        self._use_sm90_fp8_mega_moe = False
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -195,6 +207,47 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.eplb_state = EplbLayerState()
 
         weight_attrs = {"weight_loader": self.weight_loader}
+        if expert_dtype == "fp8":
+            self._init_fp8_loader_params(weight_attrs)
+        else:
+            self._init_fp4_loader_params(weight_attrs)
+
+        self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        # Register in the static forward context so the custom-op wrapper
+        # can look up this module by name from within a torch.compile graph.
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
+    @staticmethod
+    def _ceil_div_128(value: int) -> int:
+        return (value + 127) // 128
+
+    @staticmethod
+    def _resolve_mega_moe_decode_capacity(vllm_config: VllmConfig) -> int:
+        """Resolve the MegaMoE symm-buffer / staging token capacity.
+
+        Use decode-shaped capacity so a PD decode worker can decouple MegaMoE
+        steady-state buffer size from the prefill/profile-tuned global budget.
+        """
+        scheduler_config = vllm_config.scheduler_config
+        max_batched = scheduler_config.max_num_batched_tokens
+        decode_tokens_per_seq = 1
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None:
+            decode_tokens_per_seq += (
+                getattr(speculative_config, "num_speculative_tokens", None) or 0
+            )
+        decode_capacity = scheduler_config.max_num_seqs * decode_tokens_per_seq
+        return min(max_batched, decode_capacity)
+
+    def _init_fp4_loader_params(self, weight_attrs: dict) -> None:
+        num_local_experts = self.num_local_experts
+        intermediate_size = self.intermediate_size
+        hidden_size = self.hidden_size
         self.w13_weight = nn.Parameter(
             torch.zeros(
                 num_local_experts,
@@ -241,15 +294,56 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         set_weight_attrs(self.w2_weight_scale, weight_attrs)
         self.w2_weight_scale.quant_method = "block"
 
-        self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None
+    def _init_fp8_loader_params(self, weight_attrs: dict) -> None:
+        num_local_experts = self.num_local_experts
+        intermediate_size = self.intermediate_size
+        hidden_size = self.hidden_size
+        ceil_div = self._ceil_div_128
+        self.w13_weight = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * intermediate_size,
+                hidden_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight, weight_attrs)
 
-        # Register in the static forward context so the custom-op wrapper
-        # can look up this module by name from within a torch.compile graph.
-        compilation_config = vllm_config.compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
+        self.w13_weight_scale_inv = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                2 * ceil_div(intermediate_size),
+                ceil_div(hidden_size),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w13_weight_scale_inv, weight_attrs)
+        self.w13_weight_scale_inv.quant_method = "block"
+
+        self.w2_weight = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                hidden_size,
+                intermediate_size,
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight, weight_attrs)
+
+        self.w2_weight_scale_inv = nn.Parameter(
+            torch.zeros(
+                num_local_experts,
+                ceil_div(hidden_size),
+                ceil_div(intermediate_size),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(self.w2_weight_scale_inv, weight_attrs)
+        self.w2_weight_scale_inv.quant_method = "block"
 
     def _map_global_expert_id(self, expert_id: int) -> list[int]:
         """Return local (per-rank) slot offsets where logical expert
@@ -277,13 +371,24 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         loaded_any = False
         for local_expert_id in local_expert_ids:
             expert_data = param.data[local_expert_id]
+            is_scale = weight_name.endswith("weight_scale_inv") or weight_name.endswith(
+                "weight_scale"
+            )
             if shard_id in ("w1", "w3"):
                 if "w13_" not in weight_name:
                     continue
-                shard_offset = 0 if shard_id == "w1" else self.intermediate_size
-                expert_data = expert_data.narrow(
-                    0, shard_offset, self.intermediate_size
-                )
+                if self.expert_dtype == "fp8" and is_scale:
+                    # FP8 block scales are shaped along ceil_div(N, 128), so the
+                    # w1/w3 split must use the scale-block count, not the raw
+                    # intermediate dimension.
+                    shard_size = self._ceil_div_128(self.intermediate_size)
+                    shard_offset = 0 if shard_id == "w1" else shard_size
+                    expert_data = expert_data.narrow(0, shard_offset, shard_size)
+                else:
+                    shard_offset = 0 if shard_id == "w1" else self.intermediate_size
+                    expert_data = expert_data.narrow(
+                        0, shard_offset, self.intermediate_size
+                    )
             elif shard_id == "w2":
                 if "w2_" not in weight_name:
                     continue
@@ -309,12 +414,63 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def _check_runtime_supported(self) -> None:
         device = self.w13_weight.device
-        if torch.cuda.get_device_capability(device)[0] != 10:
-            raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
+        if device.type != "cuda":
+            raise NotImplementedError(
+                "DeepSeek V4 MegaMoE expert weights must be loaded on CUDA."
+            )
+        major = torch.cuda.get_device_capability(device)[0]
+        if major not in (9, 10):
+            raise NotImplementedError(
+                "DeepSeek V4 MegaMoE requires SM90 or SM100 GPUs."
+            )
+        self._use_sm90_mega_moe = major == 9
+        self._use_sm90_fp4_mega_moe = self._use_sm90_mega_moe and (
+            self.expert_dtype == "fp4"
+        )
+        self._use_sm90_fp8_mega_moe = self._use_sm90_mega_moe and (
+            self.expert_dtype == "fp8"
+        )
+        if self._use_sm90_mega_moe and self.expert_dtype not in ("fp4", "fp8"):
+            raise NotImplementedError(
+                "SM90 MegaMoE requires fp4 or fp8 experts; "
+                f"got expert_dtype={self.expert_dtype!r}."
+            )
+        if not self._use_sm90_mega_moe and self.expert_dtype != "fp4":
+            raise NotImplementedError("SM100 MegaMoE path requires fp4 experts.")
         if self.hidden_size % 128 != 0 or self.intermediate_size % 128 != 0:
             raise ValueError(
                 "DeepGEMM MegaMoE requires hidden and intermediate sizes "
                 "to be multiples of 128."
+            )
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        if self._use_sm90_mega_moe:
+            required = ("get_symm_buffer_for_mega_moe",)
+            if self._use_sm90_fp4_mega_moe:
+                required += (
+                    "fp8_fp4_mega_moe",
+                    "transform_weights_for_mega_moe_sm90_fp4",
+                )
+            else:
+                required += (
+                    "fp8_mega_moe",
+                    "transform_weights_for_mega_moe_sm90",
+                    "transform_sf_into_required_layout",
+                )
+        else:
+            required = (
+                "fp8_fp4_mega_moe",
+                "transform_weights_for_mega_moe",
+                "transform_sf_into_required_layout",
+                "get_symm_buffer_for_mega_moe",
+            )
+        missing = [name for name in required if not hasattr(deep_gemm, name)]
+        if missing:
+            raise NotImplementedError(
+                "The resolved DeepGEMM build is missing required MegaMoE "
+                f"symbols for SM{'90' if self._use_sm90_mega_moe else '100'}: "
+                f"{missing}. Update the DeepGEMM wheel/image."
             )
 
     def finalize_weights(self) -> None:
@@ -322,10 +478,16 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             return
 
         self._check_runtime_supported()
+        if self._use_sm90_mega_moe:
+            self._finalize_weights_sm90()
+        else:
+            self._finalize_weights_sm100()
+        self._drop_loader_side_params()
+
+    def _finalize_weights_sm100(self) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
-
         w13_scale = deep_gemm.transform_sf_into_required_layout(
             self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous(),
             2 * self.intermediate_size,
@@ -346,45 +508,152 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 (self.w2_weight.data.view(torch.int8).contiguous(), w2_scale),
             )
         )
-        # Drop the original loader-side parameters: the MegaMoE kernels only
-        # consume the transformed views above. transform_weights_for_mega_moe
-        # allocates a fresh tensor for the L1 weight (see _interleave_l1_weights)
-        # and fresh SF tensors for L1/L2; the L2 weight is the only tensor that
-        # aliases the original storage, and _transformed_l2_weights still holds
-        # it, so the storage stays live after we drop the Parameter.
-        self.w13_weight = None
-        self.w13_weight_scale = None
-        self.w2_weight = None
-        self.w2_weight_scale = None
 
-    def get_symm_buffer(self):
+    def _finalize_weights_sm90(self) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
+        if self._use_sm90_fp4_mega_moe:
+            # SM90 FP4 MegaMoE consumes FP8 activations and packed E2M1 weights
+            # with per-32-K UE8M0 scales. vLLM stores FP4 checkpoint scales as
+            # uint8 exponents, so decode them to raw FP32 before DeepGEMM packs
+            # them into its SM90 FP4 SFB layout.
+            w13_sf = self._ue8m0_uint8_to_float(self.w13_weight_scale.data).contiguous()
+            w2_sf = self._ue8m0_uint8_to_float(self.w2_weight_scale.data).contiguous()
+            self._transformed_l1_weights, self._transformed_l2_weights = (
+                deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
+                    (self.w13_weight.data.view(torch.int8).contiguous(), w13_sf),
+                    (self.w2_weight.data.view(torch.int8).contiguous(), w2_sf),
+                )
+            )
+            return
+
+        w13 = self.w13_weight.data
+        w2 = self.w2_weight.data
+        w13_sf = self.w13_weight_scale_inv.data.contiguous()
+        w2_sf = self.w2_weight_scale_inv.data.contiguous()
+
+        # SM90 fp8_mega_moe consumes FP8 weights and block-(128, 128) FP32
+        # scales. Normalize the checkpoint scale layout into the block-(128,
+        # 128) layout DeepGEMM expects, keeping raw FP32 (disable UE8M0 cast).
+        w13_sf = deep_gemm.transform_sf_into_required_layout(
+            w13_sf,
+            2 * self.intermediate_size,
+            self.hidden_size,
+            (128, 128),
+            self.num_local_experts,
+            disable_ue8m0_cast=True,
+        )
+        w2_sf = deep_gemm.transform_sf_into_required_layout(
+            w2_sf,
+            self.hidden_size,
+            self.intermediate_size,
+            (128, 128),
+            self.num_local_experts,
+            disable_ue8m0_cast=True,
+        )
+        self._transformed_l1_weights, self._transformed_l2_weights = (
+            deep_gemm.transform_weights_for_mega_moe_sm90(
+                (w13.contiguous(), w13_sf),
+                (w2.contiguous(), w2_sf),
+            )
+        )
+
+    def _drop_loader_side_params(self) -> None:
+        self.w13_weight = None
+        self.w2_weight = None
+        if getattr(self, "w13_weight_scale", None) is not None:
+            self.w13_weight_scale = None
+        if getattr(self, "w2_weight_scale", None) is not None:
+            self.w2_weight_scale = None
+        if getattr(self, "w13_weight_scale_inv", None) is not None:
+            self.w13_weight_scale_inv = None
+        if getattr(self, "w2_weight_scale_inv", None) is not None:
+            self.w2_weight_scale_inv = None
+
+    def get_symm_buffer(
+        self,
+        max_num_tokens: int | None = None,
+        *,
+        cache: bool = True,
+    ):
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        max_num_tokens = (
+            self.max_num_tokens if max_num_tokens is None else max_num_tokens
+        )
 
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
+        if self._use_sm90_fp4_mega_moe:
+            buffer_mode = "sm90_fp4"
+        elif self._use_sm90_fp8_mega_moe:
+            buffer_mode = "sm90_fp8"
+        else:
+            buffer_mode = "sm100"
         key = (
             id(group),
             device,
             self.num_experts,
-            self.max_num_tokens,
+            max_num_tokens,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
+            buffer_mode,
         )
-        symm_buffer = self._symm_buffer_cache.get(key)
+        symm_buffer = self._symm_buffer_cache.get(key) if cache else None
         if symm_buffer is None:
-            symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-                group,
-                self.num_experts,
-                self.max_num_tokens,
-                self.top_k,
-                self.hidden_size,
-                self.intermediate_size,
-            )
-            self._symm_buffer_cache[key] = symm_buffer
+            if self._use_sm90_mega_moe:
+                symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                    group,
+                    self.num_experts,
+                    max_num_tokens,
+                    self.top_k,
+                    self.hidden_size,
+                    self.intermediate_size,
+                    use_fp8_dispatch=True,
+                    activation="swiglu",
+                )
+            else:
+                symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                    group,
+                    self.num_experts,
+                    max_num_tokens,
+                    self.top_k,
+                    self.hidden_size,
+                    self.intermediate_size,
+                )
+            if cache:
+                self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
+
+    def get_symm_buffer_for_num_tokens(self, num_tokens: int):
+        max_num_tokens_across_dp = self._get_max_num_tokens_across_dp(num_tokens)
+        if max_num_tokens_across_dp > self.max_num_batched_tokens:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE got a maximum of "
+                f"{max_num_tokens_across_dp} tokens across DP ranks, but "
+                "max_num_batched_tokens is "
+                f"{self.max_num_batched_tokens}."
+            )
+        if max_num_tokens_across_dp <= self.max_num_tokens:
+            return self.get_symm_buffer()
+        # Profile/warmup and prefill can still feed
+        # max_num_batched_tokens-shaped batches. Keep the steady-state decode
+        # buffer small, but cache one full-capacity buffer so symmetric-memory
+        # rendezvous happens in a stable sequence across EP ranks instead of
+        # being repeated from the request path.
+        return self.get_symm_buffer(self.max_num_batched_tokens)
+
+    @staticmethod
+    def _get_max_num_tokens_across_dp(num_tokens: int) -> int:
+        if not is_forward_context_available():
+            return num_tokens
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            return num_tokens
+        return max(num_tokens, int(dp_metadata.num_tokens_across_dp_cpu.max().item()))
 
     def set_eplb_state(
         self,
@@ -441,18 +710,40 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         activation_clamp: float | None,
         fast_math: bool = True,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] > self.max_num_tokens:
+        if hidden_states.shape[0] > self.max_num_batched_tokens:
             raise ValueError(
                 f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
-                f"but the symmetric buffer was sized for {self.max_num_tokens}."
+                "but max_num_batched_tokens is "
+                f"{self.max_num_batched_tokens}."
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        if hidden_states.shape[0] == 0:
+            return y
+        torch.ops.vllm.deepseek_v4_mega_moe_experts(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            y,
+            self.prefix,
+            activation_clamp,
+            fast_math,
+        )
+        return y
 
-        from vllm.utils.deep_gemm import _import_deep_gemm
+    def _run_mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        y: torch.Tensor,
+        activation_clamp: float | None,
+        fast_math: bool,
+    ) -> None:
+        # This method must have been already called during the weight loading phase.
+        # We call it again here to cover the dummy weight loading case and to
+        # initialize _use_sm90_mega_moe before dispatching.
+        self.finalize_weights()
 
-        deep_gemm = _import_deep_gemm()
-
-        symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
         is_padding = None
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
@@ -481,6 +772,48 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 else None,
             )
 
+        if self._use_sm90_mega_moe:
+            if is_padding is not None:
+                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
+                topk_weights = torch.where(
+                    is_padding.unsqueeze(1), 0.0, topk_weights
+                )
+            self._run_mega_moe_sm90(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                y,
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+        else:
+            self._run_mega_moe_sm100(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                y,
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+                is_padding=is_padding,
+            )
+
+    def _run_mega_moe_sm100(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool,
+        is_padding: torch.Tensor | None,
+    ) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        num_tokens = hidden_states.shape[0]
+        symm_buffer = self.get_symm_buffer_for_num_tokens(num_tokens)
+
         prepare_megamoe_inputs(
             hidden_states,
             topk_weights,
@@ -491,10 +824,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.topk_weights[:num_tokens],
             is_padding=is_padding,
         )
-
-        # This method must have been already called during the weight loading phase.
-        # We call it again here to cover the dummy weight loading case.
-        self.finalize_weights()
 
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
@@ -508,8 +837,101 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         return y
 
+    def _run_mega_moe_sm90(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool,
+    ) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        symm_buffer = self.get_symm_buffer_for_num_tokens(hidden_states.shape[0])
+        # SM90 staging fills the full symmetric buffer (padded topk rows get
+        # -1 / 0.0). routed_scaling_factor is already folded into topk_weights
+        # by fused_topk_bias upstream, so pass 1.0 here to avoid double-apply.
+        prepare_megamoe_inputs_sm90(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            routed_scaling_factor=1.0,
+        )
+
+        assert self._transformed_l1_weights is not None
+        assert self._transformed_l2_weights is not None
+        if self._use_sm90_fp4_mega_moe:
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self._transformed_l1_weights,
+                self._transformed_l2_weights,
+                symm_buffer,
+                recipe=(1, 1, 32),
+                activation="swiglu",
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+        else:
+            deep_gemm.fp8_mega_moe(
+                y,
+                self._transformed_l1_weights,
+                self._transformed_l2_weights,
+                symm_buffer,
+                recipe=(128, 128, 128),
+                activation="swiglu",
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+
 
 DeepseekV4MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
+def _deepseek_v4_mega_moe_experts_op(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+    activation_clamp: float | None,
+    fast_math: bool,
+) -> None:
+    self = get_forward_context().no_compile_layers[layer_name]
+    self._run_mega_moe(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        out,
+        activation_clamp,
+        fast_math,
+    )
+
+
+def _deepseek_v4_mega_moe_experts_op_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    out: torch.Tensor,
+    layer_name: str,
+    activation_clamp: float | None,
+    fast_math: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_mega_moe_experts",
+    op_func=_deepseek_v4_mega_moe_experts_op,
+    mutates_args=["out"],
+    fake_impl=_deepseek_v4_mega_moe_experts_op_fake,
+)
 
 
 class DeepseekV4MoE(nn.Module):
@@ -547,11 +969,14 @@ class DeepseekV4MoE(nn.Module):
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently supports sqrtsoftplus routing only."
             )
-        if self.use_mega_moe and getattr(config, "expert_dtype", "fp4") != "fp4":
+        self.mega_moe_expert_dtype = getattr(config, "expert_dtype", "fp4")
+        if self.use_mega_moe and self.mega_moe_expert_dtype not in ("fp4", "fp8"):
             raise NotImplementedError(
-                "DeepSeek V4 MegaMoE only supports fp4 experts; got expert_dtype="
-                f"{config.expert_dtype!r}. Drop --kernel-config moe_backend="
-                "deep_gemm_mega_moe for this checkpoint."
+                "DeepSeek V4 MegaMoE supports fp4 or fp8 experts; SM100 "
+                "requires fp4. Got expert_dtype="
+                f"{self.mega_moe_expert_dtype!r}. Drop "
+                "--kernel-config moe_backend=deep_gemm_mega_moe for this "
+                "checkpoint."
             )
 
         self.gate = GateLinear(
@@ -645,6 +1070,7 @@ class DeepseekV4MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             prefix=f"{prefix}.experts",
+            expert_dtype=self.mega_moe_expert_dtype,
         )
 
     def _init_fused_moe_experts(
