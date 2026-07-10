@@ -10,7 +10,10 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
     make_deepseek_v4_expert_params_mapping,
 )
-from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import (
+    prepare_megamoe_inputs,
+    prepare_megamoe_inputs_sm90,
+)
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -46,8 +49,12 @@ def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
 
 def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=4,
+            max_num_seqs=4,
+        ),
         compilation_config=SimpleNamespace(static_forward_context={}),
+        speculative_config=None,
     )
     experts = DeepseekV4MegaMoEExperts(
         vllm_config,
@@ -261,3 +268,111 @@ def test_deepseek_v4_mega_moe_fused_input_staging_masks_padding():
         fused_topk_weights.view(torch.uint8),
         ref_topk_weights.view(torch.uint8),
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="DeepSeek V4 SM90 MegaMoE input staging requires an SM90 GPU.",
+)
+@pytest.mark.parametrize(
+    "num_tokens,max_num_tokens",
+    [
+        (5, 8),  # normal: some valid + some padding
+        (0, 8),  # decode warmup / empty batch: all padding
+        (8, 8),  # full buffer: no padding
+        (1, 4096),  # decode single token, large symm buffer (big pad fill)
+    ],
+)
+@pytest.mark.parametrize("topk_ids_dtype", [torch.int32, torch.int64])
+def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference(
+    num_tokens, max_num_tokens, topk_ids_dtype
+):
+    device = torch.device("cuda")
+    hidden_size = 256
+    top_k = 8
+    routed_scaling_factor = 2.5
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    hidden_states = (
+        torch.randn(
+            num_tokens,
+            hidden_size,
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 13.0
+    ).to(torch.bfloat16)
+    if num_tokens > 0:
+        hidden_states[0, :128] = 0
+    if num_tokens > 1:
+        hidden_states[1, 128:] = 1.0e-7
+
+    topk_ids = torch.randint(
+        0,
+        256,
+        (num_tokens, top_k),
+        device=device,
+        dtype=topk_ids_dtype,
+        generator=generator,
+    )
+    topk_weights = torch.randn(
+        num_tokens,
+        top_k,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    # Reference: per-token / per-128-channel FP8 E4M3 quant with raw FP32 scale.
+    group_k = 128
+    num_groups = hidden_size // group_k
+    hs_f32 = hidden_states.float().view(num_tokens, num_groups, group_k)
+    amax = hs_f32.abs().amax(dim=-1).clamp_min(1.0e-10)
+    ref_scale = amax / 448.0
+    ref_x = (hs_f32 / ref_scale[..., None]).to(torch.float8_e4m3fn)
+    ref_x = ref_x.view(num_tokens, hidden_size)
+
+    x_fp8 = torch.empty(
+        max_num_tokens, hidden_size, device=device, dtype=torch.float8_e4m3fn
+    )
+    x_sf = torch.empty(max_num_tokens, num_groups, device=device, dtype=torch.float32)
+    topk_idx_out = torch.empty(max_num_tokens, top_k, device=device, dtype=torch.int64)
+    topk_weights_out = torch.empty(
+        max_num_tokens, top_k, device=device, dtype=torch.float32
+    )
+
+    prepare_megamoe_inputs_sm90(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        x_fp8,
+        x_sf,
+        topk_idx_out,
+        topk_weights_out,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    torch.accelerator.synchronize()
+
+    # Valid rows. The Triton kernel quantizes via `x * (1 / scale)` (matching the
+    # SGLang reference), so compare FP8 codes allowing the occasional 1-ULP
+    # rounding difference vs the division-based reference above.
+    if num_tokens > 0:
+        got_codes = x_fp8[:num_tokens].view(torch.uint8).to(torch.int32)
+        ref_codes = ref_x.view(torch.uint8).to(torch.int32)
+        code_delta = (got_codes - ref_codes).abs()
+        assert int(code_delta.max()) <= 1
+        # at most a tiny fraction of elements may differ by 1 code
+        assert int((code_delta != 0).sum()) <= max(1, got_codes.numel() // 100)
+    assert torch.allclose(x_sf[:num_tokens], ref_scale, rtol=1e-6)
+    assert torch.equal(topk_idx_out[:num_tokens], topk_ids.to(torch.int64))
+    assert torch.allclose(
+        topk_weights_out[:num_tokens],
+        topk_weights * routed_scaling_factor,
+        rtol=1e-6,
+    )
+
+    # Padded rows.
+    assert torch.all(topk_idx_out[num_tokens:] == -1)
+    assert torch.all(topk_weights_out[num_tokens:] == 0.0)
