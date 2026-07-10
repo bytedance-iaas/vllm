@@ -135,6 +135,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        online_c128_candidate_chain: bool = False,
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -146,6 +147,7 @@ class CudagraphDispatcher:
         else:
             uniform_decode = False
             num_reqs = min(num_tokens_padded, max_num_seqs)
+            online_c128_candidate_chain = False
 
         return BatchDescriptor(
             num_tokens=num_tokens_padded,
@@ -153,6 +155,7 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
+            online_c128_candidate_chain=online_c128_candidate_chain,
         )
 
     def add_cudagraph_key(
@@ -182,6 +185,9 @@ class CudagraphDispatcher:
         self.captured_lora_counts = [
             lora_count for lora_count in lora_cases if lora_count
         ]
+        from vllm.models.deepseek_v4.online_c128 import online_c128_uses_mtp
+
+        online_c128_mtp = online_c128_uses_mtp(self.vllm_config)
 
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
@@ -220,13 +226,20 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
-            for bs, num_active_loras in product(
-                cudagraph_capture_sizes_for_decode, lora_cases
+            candidate_chain_values = (False, True) if online_c128_mtp else (False,)
+            for bs, num_active_loras, candidate_chain in product(
+                cudagraph_capture_sizes_for_decode,
+                lora_cases,
+                candidate_chain_values,
             ):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(
-                        bs, True, num_active_loras > 0, num_active_loras
+                        bs,
+                        True,
+                        num_active_loras > 0,
+                        num_active_loras,
+                        online_c128_candidate_chain=candidate_chain,
                     ),
                 )
 
@@ -238,6 +251,7 @@ class CudagraphDispatcher:
         uniform_decode: bool = False,
         has_lora: bool = False,
         num_active_loras: int = 0,
+        online_c128_candidate_chain: bool = False,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
@@ -301,7 +315,11 @@ class CudagraphDispatcher:
 
         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, normalized_uniform, has_lora, effective_num_active_loras
+            num_tokens,
+            normalized_uniform,
+            has_lora,
+            effective_num_active_loras,
+            online_c128_candidate_chain=online_c128_candidate_chain,
         )
 
         if CUDAGraphMode.FULL in allowed_modes:
@@ -313,7 +331,12 @@ class CudagraphDispatcher:
         if CUDAGraphMode.PIECEWISE in allowed_modes:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
-            batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
+            batch_desc_to_check = replace(
+                batch_desc,
+                num_reqs=None,
+                uniform=False,
+                online_c128_candidate_chain=False,
+            )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
 
