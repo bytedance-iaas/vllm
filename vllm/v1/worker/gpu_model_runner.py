@@ -770,9 +770,7 @@ class GPUModelRunner(
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
-        self.req_state_indices = self._make_buffer(
-            self.max_num_reqs, dtype=torch.int32
-        )
+        self.req_state_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -1216,9 +1214,7 @@ class GPUModelRunner(
         self._end_online_c128_mtp_verify()
         self._online_c128_verify_ctx = None
 
-    def _commit_online_c128_mtp_verify(
-        self, sampled_token_ids: torch.Tensor
-    ) -> None:
+    def _commit_online_c128_mtp_verify(self, sampled_token_ids: torch.Tensor) -> None:
         if self._online_c128_verify_ctx is None:
             return
 
@@ -1231,9 +1227,7 @@ class GPUModelRunner(
 
         device = req_state_indices.device
         query_lens_t = torch.from_numpy(query_lens_np).to(device, dtype=torch.int32)
-        base_seq_len_t = torch.from_numpy(base_seq_len_np).to(
-            device, dtype=torch.int32
-        )
+        base_seq_len_t = torch.from_numpy(base_seq_len_np).to(device, dtype=torch.int32)
         valid_sampled = (sampled_token_ids >= 0) & (
             sampled_token_ids < self.input_batch.vocab_size
         )
@@ -1273,8 +1267,7 @@ class GPUModelRunner(
             return state_index
         if not self.free_req_state_indices:
             raise RuntimeError(
-                "C128 request-state slots exhausted: "
-                f"max_num_reqs={self.max_num_reqs}"
+                f"C128 request-state slots exhausted: max_num_reqs={self.max_num_reqs}"
             )
         state_index = self.free_req_state_indices.pop()
         self.req_id_to_state_index[req_id] = state_index
@@ -4452,9 +4445,8 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-            has_online_c128_verify = (
-                self._online_c128_uses_mtp
-                and any(scheduler_output.scheduled_spec_decode_tokens.values())
+            has_online_c128_verify = self._online_c128_uses_mtp and any(
+                scheduler_output.scheduled_spec_decode_tokens.values()
             )
             online_c128_full_verify = has_online_c128_verify and all(
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)

@@ -223,7 +223,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "speculative decoding."
                 )
             if getattr(self.speculative_config, "num_speculative_tokens", 1) < 1:
-                raise ValueError("C128 online MTP requires num_speculative_tokens >= 1.")
+                raise ValueError(
+                    "C128 online MTP requires num_speculative_tokens >= 1."
+                )
             if self.use_pp:
                 raise ValueError("C128 online MTP does not support pipeline parallel.")
 
@@ -808,9 +810,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
-    def _snapshot_c128_pending_sends(
-        self, scheduler_output: SchedulerOutput
-    ) -> None:
+    def _snapshot_c128_pending_sends(self, scheduler_output: SchedulerOutput) -> None:
         """Snapshot producer C128 bank0 for sends advertised this step.
 
         Scheduler-side ``request_finished`` can publish Mooncake block metadata
@@ -1425,12 +1425,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
             assert num_draft_tokens_per_req is not None
             verify_req_mask_np = num_draft_tokens_per_req[: input_batch.num_reqs] > 0
-            verify_req_indices_np = np.nonzero(verify_req_mask_np)[0].astype(
-                np.int64
-            )
+            verify_req_indices_np = np.nonzero(verify_req_mask_np)[0].astype(np.int64)
             query_lens_all_np = (
-                input_batch.query_start_loc_np[1:]
-                - input_batch.query_start_loc_np[:-1]
+                input_batch.query_start_loc_np[1:] - input_batch.query_start_loc_np[:-1]
             )[: input_batch.num_reqs]
             query_lens_np = query_lens_all_np[verify_req_indices_np]
             base_seq_len_np = (
@@ -1656,9 +1653,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._online_c128_verify_ctx
             )
             device = req_state_indices.device
-            query_lens_t = torch.from_numpy(query_lens_np).to(
-                device, dtype=torch.int32
-            )
+            query_lens_t = torch.from_numpy(query_lens_np).to(device, dtype=torch.int32)
             base_seq_len_t = torch.from_numpy(base_seq_len_np).to(
                 device, dtype=torch.int32
             )

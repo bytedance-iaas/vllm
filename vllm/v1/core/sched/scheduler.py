@@ -858,7 +858,8 @@ class Scheduler(SchedulerInterface):
                             )
                         )
 
-                    # Online C128 requires either an aligned resume or PD state transfer.
+                    # Online C128 requires either an aligned resume or PD state
+                    # transfer.
                     if self._online_c128_enabled:
                         if num_new_local_computed_tokens % 128 != 0:
                             raise ValueError(

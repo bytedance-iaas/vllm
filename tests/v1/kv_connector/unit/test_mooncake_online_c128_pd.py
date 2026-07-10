@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+    MooncakeConnectorWorker,
+    MooncakeXferMetadata,
+    SendBlockMeta,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (
     C128ExportSlotPool,
     C128ImportSlotPool,
@@ -13,11 +18,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import
     reset_bank0,
     restore_bank0_from_slot,
     snapshot_bank0_to_slot,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
-    MooncakeConnectorWorker,
-    MooncakeXferMetadata,
-    SendBlockMeta,
 )
 
 
