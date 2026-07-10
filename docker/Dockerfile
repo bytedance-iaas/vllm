@@ -78,6 +78,7 @@ ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_INDEX_URL=${PIP_INDEX_URL}
 ARG UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ARG UV_VERSION=0.11.25
 
 # PyTorch provides its own indexes for standard and nightly builds
 ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
@@ -109,6 +110,10 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
+ARG UV_VERSION
+ARG DEADSNAKES_MIRROR_URL
+ARG DEADSNAKES_GPGKEY_URL
+ARG DEEPGEMM_PYTHON_VERSIONS=3.10,3.11,3.12,3.13,3.14
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -122,6 +127,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # See #15174, #15359, #31959. Child stages inherit these via Dockerfile
 # `ENV` unless they override them explicitly.
 ENV UV_HTTP_TIMEOUT=500
+ENV UV_NATIVE_TLS=true
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/uv/cache
@@ -130,7 +136,7 @@ ENV PATH="/opt/venv/bin:/opt/uv/bin:$PATH"
 ENV VIRTUAL_ENV="/opt/venv"
 
 # Install system dependencies including build tools.
-# The Ubuntu path uses apt + deadsnakes-via-uv for Python; the manylinux path
+# The Ubuntu path installs Python locally via apt/deadsnakes; the manylinux path
 # (AlmaLinux 8, e.g. pytorch/manylinux2_28-builder) uses dnf and the Python
 # interpreters pre-installed at /opt/python/cpXY-cpXY/.
 RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
@@ -162,10 +168,35 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             gcc-11 \
             g++-11 \
         && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
-        # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
-        # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
-        # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
-        && (apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
+        && deepgemm_python_versions="$(printf '%s' "${DEEPGEMM_PYTHON_VERSIONS}" | tr ',' ' ')" \
+        && python_versions="$(printf '%s\n' ${PYTHON_VERSION} ${deepgemm_python_versions} | awk '!seen[$0]++')" \
+        && needs_deadsnakes=0 \
+        && for py_version in ${python_versions}; do \
+            if ! apt-cache show "python${py_version}-dev" >/dev/null 2>&1; then \
+                needs_deadsnakes=1; \
+            fi; \
+        done \
+        && if [ "${needs_deadsnakes}" = "1" ]; then \
+            if [ -n "${DEADSNAKES_MIRROR_URL:-}" ]; then \
+                if [ -n "${DEADSNAKES_GPGKEY_URL:-}" ]; then \
+                    mkdir -p -m 0755 /etc/apt/keyrings \
+                    && curl -L "${DEADSNAKES_GPGKEY_URL}" | gpg --dearmor > /etc/apt/keyrings/deadsnakes.gpg \
+                    && chmod 644 /etc/apt/keyrings/deadsnakes.gpg \
+                    && echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list; \
+                fi; \
+            else \
+                for i in 1 2 3; do \
+                    add-apt-repository -y ppa:deadsnakes/ppa && break || \
+                    { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+                done; \
+            fi \
+            && apt-get update -y; \
+        fi \
+        && python_packages="" \
+        && for py_version in ${python_versions}; do \
+            python_packages="${python_packages} python${py_version} python${py_version}-dev python${py_version}-venv"; \
+        done \
+        && apt-get install -y --no-install-recommends ${python_packages} \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -191,10 +222,19 @@ ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 
 # Install uv and bootstrap /opt/venv. Both paths converge on /opt/venv so all
-# downstream stages stay distro-agnostic.
+# downstream stages stay distro-agnostic. Install uv through pip instead of the
+# astral installer so CI does not depend on downloading release tarballs.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && if [ "${BUILD_OS}" = "manylinux" ]; then \
+           PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
+           && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
+           && "$MANYLINUX_PY" -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+           && ln -sf "/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/uv" "${UV_INSTALL_DIR}/uv"; \
+       else \
+           python3 -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+           && ln -sf "$(command -v uv)" "${UV_INSTALL_DIR}/uv"; \
+       fi \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
@@ -204,10 +244,20 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            # at the matching interpreter rather than letting it fetch one.
            PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
            && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
-           && uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
+           && venv_python="$MANYLINUX_PY"; \
        else \
-           uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
+           venv_python="/usr/bin/python${PYTHON_VERSION}"; \
        fi \
+    && for attempt in 1 2 3 4 5; do \
+           timeout 600s uv venv --seed /opt/venv --python "${venv_python}" && break; \
+           rc=$?; \
+           if [ "${attempt}" = "5" ]; then \
+               exit "${rc}"; \
+           fi; \
+           echo "uv venv failed on attempt ${attempt}/5; cleaning partial state and retrying..." >&2; \
+           rm -rf /opt/venv "${UV_PYTHON_INSTALL_DIR}/.temp" "${UV_CACHE_DIR:?}"/*; \
+           sleep $((attempt * 30)); \
+       done \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
@@ -432,9 +482,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # DEEPGEMM_PYTHON_INTERPRETERS to build DeepGEMM `_C` for each. See
 # cmake/external_projects/deepgemm.cmake for the full picture.
 COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+ENV DEEPGEMM_PYTHON_VERSIONS=${DEEPGEMM_PYTHON_VERSIONS}
 ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
 RUN --mount=type=cache,target=/root/.cache/uv \
-    tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
+    tools/setup_deepgemm_pythons.sh $(printf '%s' "${DEEPGEMM_PYTHON_VERSIONS}" | tr ',' ' ') > /tmp/dg_pythons.txt \
+    && echo "DeepGEMM Python interpreters: $(cat /tmp/dg_pythons.txt)"
 
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
@@ -1020,6 +1072,7 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG DEEPGEMM_WHEEL_X86_64
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1053,6 +1106,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         ); \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
+        if [ "${CUDA_MAJOR}" = "13" ]; then \
+            uv pip uninstall --system mooncake-transfer-engine || true; \
+            uv pip install --system --no-deps "mooncake-transfer-engine-cuda13>=0.3.8"; \
+        fi; \
     fi
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the
@@ -1075,6 +1132,15 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
                 ln -s "libcudart.so.${CUDA_MAJOR}" /usr/local/cuda/lib64/libcudart.so; \
             fi; \
         fi; \
+    fi
+
+# Install the DeepGEMM fork wheel at image build time when the deployment
+# requires fork-only MegaMoE SM90 APIs. vLLM prefers site-packages deep_gemm
+# over its vendored fallback, so this keeps runtime manifests free of hotfixes.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ -n "${DEEPGEMM_WHEEL_X86_64}" ]; then \
+        uv pip install --system "${DEEPGEMM_WHEEL_X86_64}" && \
+        python3 -c 'import deep_gemm; required = ["get_symm_buffer_for_mega_moe", "transform_sf_into_required_layout", "transform_weights_for_mega_moe_sm90", "transform_weights_for_mega_moe_sm90_fp4", "fp8_mega_moe", "fp8_fp4_mega_moe"]; missing = [name for name in required if not hasattr(deep_gemm, name)]; assert not missing, f"DeepGEMM wheel missing required MegaMoE symbols: {missing}"; print("DeepGEMM MegaMoE symbols verified")'; \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image

@@ -1,0 +1,42 @@
+name: ByteIAAS vLLM Development Build
+
+on:
+  push:
+    branches:
+      - iaas_main
+  schedule:
+    # Daily at 02:00 Asia/Shanghai.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: "Optional ref to checkout; defaults to the workflow ref"
+        required: false
+        default: ""
+      vllm_version:
+        description: "Optional vLLM version override for image tag generation"
+        required: false
+        default: ""
+
+concurrency:
+  group: byteiaas-vllm-dev-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-wheel:
+    if: github.repository == 'bytedance-iaas/vllm'
+    uses: ./.github/workflows/_byteiaas-build-wheel.yml
+    with:
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || 'refs/heads/iaas_main' }}
+      cuda_version: "13.0.2"
+      artifact_name: vllm-cu130-wheel-dev
+
+  build-image:
+    if: github.repository == 'bytedance-iaas/vllm'
+    uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
+    with:
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || 'refs/heads/iaas_main' }}
+      cuda_version: "13.0.2"
+      tag_mode: dev
+      vllm_version: ${{ github.event_name == 'workflow_dispatch' && inputs.vllm_version || '' }}
+    secrets: inherit
