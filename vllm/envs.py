@@ -151,6 +151,8 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_USE_ONLINE_C128_COMPRESS: bool = False
+    VLLM_USE_ONLINE_C128_PD_TRANSFER: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -205,6 +207,8 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
+    VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER: bool = False
+    VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB: int = 512
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
@@ -1325,6 +1329,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Enable C128 online (running-state) KV compression. Restricted to CUDA
+    # SM90, head_dim==512 and compress_ratio==128; gates the dedicated online
+    # recurrence state and kernel path.
+    "VLLM_USE_ONLINE_C128_COMPRESS": lambda: bool(
+        int(os.getenv("VLLM_USE_ONLINE_C128_COMPRESS", "0"))
+    ),
+    # Enable PD transfer of the C128 committed bank0 partial state. Only
+    # effective with VLLM_USE_ONLINE_C128_COMPRESS and a PD disaggregated
+    # (producer/consumer) role. When disabled, PD remote prefill is fail-closed
+    # to 128-aligned resumes and no export/import pool is allocated.
+    "VLLM_USE_ONLINE_C128_PD_TRANSFER": lambda: bool(
+        int(os.getenv("VLLM_USE_ONLINE_C128_PD_TRANSFER", "0"))
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
@@ -1565,6 +1582,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
         os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")
+    ),
+    # Split large Mooncake batch_transfer_sync_write payloads into smaller
+    # sequential writes. Disabled by default to preserve the native Mooncake
+    # transfer path unless large-payload failures require it.
+    "VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER": lambda: bool(
+        os.getenv("VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER", "False").lower()
+        in ("true", "1")
+    ),
+    # Per-call payload limit used when VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER=1.
+    "VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB": lambda: int(
+        os.getenv("VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB", "512")
     ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),

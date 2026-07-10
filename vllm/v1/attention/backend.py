@@ -439,6 +439,17 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     sparse metadata for DeepSeek V4 C128A layers."""
 
+    req_state_indices: torch.Tensor | None = None
+    """(num_reqs,) int32 mapping from batch slot -> persistent request-state
+    slot index (the v2 runner ``InputBatch.idx_mapping``). Padding entries are
+    ``-1``. Used by the DeepSeek-V4 C128 online compressor to address its
+    independent per-request running state; ``None`` when unavailable."""
+
+    req_state_indices_cpu: np.ndarray | None = None
+    """(num_reqs,) CPU mirror of ``req_state_indices`` (padding ``-1``). Lets the
+    C128 online compressor build its per-request segment plan host-side without
+    a device sync; ``None`` when unavailable."""
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
@@ -449,6 +460,11 @@ class CommonAttentionMetadata:
     and for all rows outside async spec decode; optimistic for async-spec
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
+
+    num_draft_tokens_per_req_cpu: np.ndarray | None = None
+    """(batch_size,) CPU count of scheduled speculative draft tokens per
+    request. ``None`` when the batch has no speculative verify rows. Used by
+    DeepSeek-V4 online C128 to keep MTP candidate-bank updates per request."""
 
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
@@ -572,8 +588,13 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            req_state_indices=maybe_slice_reqs(self.req_state_indices),
+            req_state_indices_cpu=maybe_slice_reqs(self.req_state_indices_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+            num_draft_tokens_per_req_cpu=maybe_slice_reqs(
+                self.num_draft_tokens_per_req_cpu
+            ),
         )
 
 
