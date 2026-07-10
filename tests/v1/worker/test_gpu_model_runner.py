@@ -418,6 +418,124 @@ def test_update_states_new_request(model_runner, dist_init):
     assert _is_req_state_block_table_match(model_runner, req_id)
 
 
+def _enable_online_c128_slots(model_runner):
+    model_runner._online_c128_enabled = True
+    model_runner.req_id_to_state_index = {}
+    model_runner.free_req_state_indices = list(
+        reversed(range(model_runner.max_num_reqs))
+    )
+
+
+def test_update_states_new_request_restores_c128_state(
+    model_runner, dist_init, monkeypatch: pytest.MonkeyPatch
+):
+    req_id = "req_0"
+    calls: list[tuple[str, str, int]] = []
+
+    class FakeKVTransferGroup:
+        def bind_c128_state_index(self, req_id: str, state_index: int) -> None:
+            calls.append(("bind", req_id, state_index))
+
+        def restore_c128_state(self, req_id: str, state_index: int) -> None:
+            calls.append(("restore", req_id, state_index))
+
+    kv_transfer_group = FakeKVTransferGroup()
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs, "VLLM_USE_ONLINE_C128_COMPRESS", True
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_USE_ONLINE_C128_PD_TRANSFER",
+        True,
+    )
+    _enable_online_c128_slots(model_runner)
+    monkeypatch.setattr(gpu_model_runner_module, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(
+        gpu_model_runner_module, "get_kv_transfer_group", lambda: kv_transfer_group
+    )
+
+    model_runner._update_states(_schedule_new_request(req_id))
+
+    state_index = model_runner.req_id_to_state_index[req_id]
+    assert calls == [
+        ("bind", req_id, state_index),
+        ("restore", req_id, state_index),
+    ]
+
+
+def test_update_states_new_request_skips_c128_slots_when_disabled(
+    model_runner, dist_init, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs, "VLLM_USE_ONLINE_C128_COMPRESS", False
+    )
+    model_runner._online_c128_enabled = False
+    for attr in ("req_id_to_state_index", "free_req_state_indices"):
+        if hasattr(model_runner, attr):
+            delattr(model_runner, attr)
+
+    model_runner._update_states(_schedule_new_request("req_0"))
+
+    assert not hasattr(model_runner, "req_id_to_state_index")
+    assert not hasattr(model_runner, "free_req_state_indices")
+
+
+def test_update_states_preempted_request_releases_c128_slot(model_runner, dist_init):
+    req_id = "req_0"
+    _enable_online_c128_slots(model_runner)
+
+    model_runner._update_states(_schedule_new_request(req_id))
+    state_index = model_runner.req_id_to_state_index[req_id]
+    assert state_index not in model_runner.free_req_state_indices
+
+    preempt_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={},
+        total_num_scheduled_tokens=0,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        preempted_req_ids={req_id},
+    )
+
+    model_runner._update_states(preempt_output)
+
+    assert _is_req_added(model_runner, req_id)
+    assert not _is_req_scheduled(model_runner, req_id)
+    assert req_id not in model_runner.req_id_to_state_index
+    assert state_index in model_runner.free_req_state_indices
+
+    resumed_req_data = CachedRequestData(
+        req_ids=[req_id],
+        resumed_req_ids={req_id},
+        new_token_ids=[[]],
+        all_token_ids={},
+        new_block_ids=[([1],)],
+        num_computed_tokens=[0],
+        num_output_tokens=[0],
+    )
+    resume_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=resumed_req_data,
+        num_scheduled_tokens={req_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+    model_runner._update_states(resume_output)
+
+    assert _is_req_scheduled(model_runner, req_id)
+    assert model_runner.req_id_to_state_index[req_id] == state_index
+    assert state_index not in model_runner.free_req_state_indices
+
+
 def test_update_states_request_finished(model_runner, dist_init):
     req_id = "req_0"
 

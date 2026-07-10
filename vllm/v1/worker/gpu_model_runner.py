@@ -661,6 +661,26 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self._online_c128_enabled = bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+        self._online_c128_uses_mtp = False
+        if self._online_c128_enabled:
+            from vllm.models.deepseek_v4.online_c128 import online_c128_uses_mtp
+
+            self._online_c128_uses_mtp = online_c128_uses_mtp(self.vllm_config)
+            self.req_id_to_state_index: dict[str, int] = {}
+            self.free_req_state_indices: list[int] = list(
+                reversed(range(self.max_num_reqs))
+            )
+            if self._online_c128_uses_mtp:
+                if getattr(self.parallel_config, "pipeline_parallel_size", 1) > 1:
+                    raise ValueError(
+                        "C128 online MTP does not support pipeline parallel."
+                    )
+                logger.info(
+                    "ONLINE_C128_MTP_VERIFY_STATE_TRANSFER_PATCH: enabled "
+                    "candidate-bank verify/commit handling."
+                )
+        self._online_c128_verify_ctx = None
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -749,6 +769,9 @@ class GPUModelRunner(
         )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
+        )
+        self.req_state_indices = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
         )
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -1133,6 +1156,137 @@ class GPUModelRunner(
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
+    def _online_c128_pd_transfer_enabled(self) -> bool:
+        return bool(getattr(self, "_online_c128_enabled", False)) and bool(
+            envs.VLLM_USE_ONLINE_C128_PD_TRANSFER
+        )
+
+    def _begin_online_c128_mtp_verify(
+        self,
+        has_online_c128_verify: bool,
+        num_scheduled_tokens_np: np.ndarray,
+        num_reqs: int,
+    ) -> None:
+        self._online_c128_verify_ctx = None
+        if not has_online_c128_verify:
+            return
+
+        from vllm.models.deepseek_v4.online_c128 import begin_online_c128_verify
+
+        num_draft_tokens_per_req = self.num_decode_draft_tokens.np[:num_reqs]
+        verify_req_mask_np = num_draft_tokens_per_req > 0
+        verify_req_indices_np = np.nonzero(verify_req_mask_np)[0].astype(np.int64)
+        if not verify_req_indices_np.size:
+            return
+
+        query_lens_all_np = num_scheduled_tokens_np[:num_reqs]
+        query_lens_np = query_lens_all_np[verify_req_indices_np]
+        max_query_len = int(query_lens_np.max())
+        if max_query_len > self.uniform_decode_query_len:
+            raise ValueError(
+                "C128 online MTP verify query_len exceeds allocated "
+                f"candidate banks: query_len={max_query_len}, "
+                f"uniform_decode_query_len={self.uniform_decode_query_len}."
+            )
+
+        base_seq_len_np = (
+            self.optimistic_seq_lens_cpu[:num_reqs].numpy() - query_lens_all_np
+        )[verify_req_indices_np]
+        verify_req_indices = torch.from_numpy(verify_req_indices_np).to(
+            self.req_state_indices.gpu.device
+        )
+        req_state_indices = self.req_state_indices.gpu[:num_reqs][verify_req_indices]
+
+        begin_online_c128_verify()
+        self._online_c128_verify_ctx = (
+            req_state_indices,
+            verify_req_indices,
+            query_lens_np,
+            base_seq_len_np,
+        )
+
+    def _end_online_c128_mtp_verify(self) -> None:
+        if self._online_c128_verify_ctx is None:
+            return
+        from vllm.models.deepseek_v4.online_c128 import end_online_c128_verify
+
+        end_online_c128_verify()
+
+    def _clear_online_c128_mtp_verify(self) -> None:
+        self._end_online_c128_mtp_verify()
+        self._online_c128_verify_ctx = None
+
+    def _commit_online_c128_mtp_verify(
+        self, sampled_token_ids: torch.Tensor
+    ) -> None:
+        if self._online_c128_verify_ctx is None:
+            return
+
+        from vllm.models.deepseek_v4.online_c128 import commit_all_online_c128_verify
+
+        req_state_indices, verify_req_indices, query_lens_np, base_seq_len_np = (
+            self._online_c128_verify_ctx
+        )
+        self._online_c128_verify_ctx = None
+
+        device = req_state_indices.device
+        query_lens_t = torch.from_numpy(query_lens_np).to(device, dtype=torch.int32)
+        base_seq_len_t = torch.from_numpy(base_seq_len_np).to(
+            device, dtype=torch.int32
+        )
+        valid_sampled = (sampled_token_ids >= 0) & (
+            sampled_token_ids < self.input_batch.vocab_size
+        )
+        accepted_len = valid_sampled.sum(dim=1).to(torch.int32)[verify_req_indices]
+        accepted_len = torch.minimum(accepted_len, query_lens_t)
+        final_seq_len = base_seq_len_t + accepted_len
+        commit_all_online_c128_verify(
+            req_state_indices=req_state_indices,
+            accepted_len=accepted_len,
+            final_seq_len=final_seq_len,
+        )
+
+    def _bind_c128_state_index(self, req_id: str, state_index: int) -> None:
+        if not self._online_c128_pd_transfer_enabled() or not has_kv_transfer_group():
+            return
+        fn = getattr(get_kv_transfer_group(), "bind_c128_state_index", None)
+        if fn is not None:
+            fn(req_id, state_index)
+
+    def _snapshot_c128_state(self, req_id: str, state_index: int) -> None:
+        if not self._online_c128_pd_transfer_enabled() or not has_kv_transfer_group():
+            return
+        fn = getattr(get_kv_transfer_group(), "snapshot_c128_state", None)
+        if fn is not None:
+            fn(req_id, state_index)
+
+    def _restore_c128_state(self, req_id: str, state_index: int) -> None:
+        if not self._online_c128_pd_transfer_enabled() or not has_kv_transfer_group():
+            return
+        fn = getattr(get_kv_transfer_group(), "restore_c128_state", None)
+        if fn is not None:
+            fn(req_id, state_index)
+
+    def _allocate_c128_state_index(self, req_id: str) -> int:
+        state_index = self.req_id_to_state_index.get(req_id)
+        if state_index is not None:
+            return state_index
+        if not self.free_req_state_indices:
+            raise RuntimeError(
+                "C128 request-state slots exhausted: "
+                f"max_num_reqs={self.max_num_reqs}"
+            )
+        state_index = self.free_req_state_indices.pop()
+        self.req_id_to_state_index[req_id] = state_index
+        self._bind_c128_state_index(req_id, state_index)
+        self._restore_c128_state(req_id, state_index)
+        return state_index
+
+    def _release_c128_state_index(self, req_id: str) -> None:
+        state_index = self.req_id_to_state_index.pop(req_id, None)
+        if state_index is not None:
+            self.free_req_state_indices.append(state_index)
+
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
@@ -1160,10 +1314,21 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if self._online_c128_enabled:
+            for req_id in scheduler_output.finished_req_ids:
+                state_index = self.req_id_to_state_index.get(req_id)
+                if state_index is not None:
+                    self._snapshot_c128_state(req_id, state_index)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            if self._online_c128_enabled:
+                self._release_c128_state_index(req_id)
+        if self._online_c128_enabled:
+            for req_id in scheduler_output.preempted_req_ids or ():
+                self._release_c128_state_index(req_id)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1223,6 +1388,13 @@ class GPUModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                if self._online_c128_enabled:
+                    state_index = self.req_id_to_state_index.get(req_id)
+                    if state_index is None:
+                        self._allocate_c128_state_index(req_id)
+                    else:
+                        self._bind_c128_state_index(req_id, state_index)
+                        self._restore_c128_state(req_id, state_index)
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1262,6 +1434,8 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            if self._online_c128_enabled:
+                self._allocate_c128_state_index(req_id)
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
@@ -1413,6 +1587,8 @@ class GPUModelRunner(
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
+                if self._online_c128_enabled:
+                    self._allocate_c128_state_index(req_id)
 
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
@@ -2472,9 +2648,25 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            num_draft_tokens_per_req_cpu=self.num_decode_draft_tokens.np[
+                :num_reqs_padded
+            ].copy()
+            if self._online_c128_uses_mtp and use_spec_decode
+            else None,
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
         )
+
+        req_state_indices_cpu = self.req_state_indices.np[:num_reqs_padded]
+        req_state_indices_cpu.fill(-1)
+        if self._online_c128_enabled:
+            for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                req_state_indices_cpu[req_index] = self.req_id_to_state_index[req_id]
+        else:
+            req_state_indices_cpu[:num_reqs] = np.arange(num_reqs, dtype=np.int32)
+        self.req_state_indices.copy_to_gpu(num_reqs_padded)
+        cm_base.req_state_indices = self.req_state_indices.gpu[:num_reqs_padded]
+        cm_base.req_state_indices_cpu = req_state_indices_cpu
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -3952,6 +4144,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        has_online_c128_verify: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3988,12 +4181,17 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
+                online_c128_candidate_chain=(
+                    self._online_c128_uses_mtp and has_online_c128_verify
+                ),
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
+        disable_full = use_cascade_attn or has_encoder_output
+
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded, disable_full=disable_full
         )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
@@ -4254,6 +4452,14 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            has_online_c128_verify = (
+                self._online_c128_uses_mtp
+                and any(scheduler_output.scheduled_spec_decode_tokens.values())
+            )
+            online_c128_full_verify = has_online_c128_verify and all(
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                for req_id in req_ids
+            )
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -4283,6 +4489,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                has_online_c128_verify=online_c128_full_verify,
             )
 
             logger.debug(
@@ -4447,31 +4654,42 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+        try:
+            self._begin_online_c128_mtp_verify(
+                has_online_c128_verify,
+                num_scheduled_tokens_np,
+                num_reqs,
             )
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+        except BaseException:
+            self._clear_online_c128_mtp_verify()
+            raise
+        else:
+            self._end_online_c128_mtp_verify()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4597,15 +4815,19 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
-            )
+        try:
+            # Apply structured output bitmasks if present.
+            if grammar_output is not None:
+                apply_grammar_bitmask(
+                    scheduler_output, grammar_output, self.input_batch, logits
+                )
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
+        except BaseException:
+            self._online_c128_verify_ctx = None
+            raise
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
-
+        self._commit_online_c128_mtp_verify(sampler_output.sampled_token_ids)
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -5847,6 +6069,7 @@ class GPUModelRunner(
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
+        online_c128_candidate_chain: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -5967,6 +6190,7 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                has_online_c128_verify=online_c128_candidate_chain,
             )
         )
 
@@ -6851,6 +7075,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 force_attention=force_attention,
                 uniform_decode=desc.uniform,
+                online_c128_candidate_chain=desc.online_c128_candidate_chain,
                 allow_microbatching=allow_microbatching,
                 skip_eplb=True,
                 remove_lora=False,
@@ -6861,6 +7086,7 @@ class GPUModelRunner(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             uniform_decode=desc.uniform,
+            online_c128_candidate_chain=desc.online_c128_candidate_chain,
             allow_microbatching=allow_microbatching,
             skip_eplb=True,
             remove_lora=False,
