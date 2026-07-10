@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1495,6 +1496,58 @@ def test_register_kv_caches_keeps_non_mtp_speculative_layers_outside_base_model(
     assert registered_lens == [normal_cache.nbytes, eagle_cache.nbytes]
     assert worker.registered_layer_names == list(kv_caches)
     assert worker.registered_layer_indices == [0, num_hidden_layers]
+
+
+def test_c128_pull_failure_reports_invalid_blocks_after_all_tasks_quiesce():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._online_c128_state_transfer_enabled = True
+    worker._c128_import_pool = SimpleNamespace(release=MagicMock())
+    worker._c128_active_pulls = {}
+    worker._c128_pending_import_reqs = set()
+    worker._c128_aborted_import_reqs = set()
+    worker._c128_req_to_transfer = {"req": "transfer"}
+    worker._c128_import_slots = {"transfer": (0, True)}
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+
+    pull_meta = PullReqMeta(
+        d_req_id="req",
+        transfer_id="transfer",
+        local_block_ids=[[10, 11]],
+        remote_engine_id="engine",
+        remote_bootstrap_addr="http://bootstrap",
+    )
+    pull_meta.c128_import_slot = 0
+    pull_meta.c128_pull_pending = 2
+    pull_metas = {"req": pull_meta}
+
+    accounted = worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.CONTINUE,
+            ok_reqs=["req"],
+        ),
+        pull_metas,
+    )
+
+    assert accounted == {"req"}
+    assert pull_meta.c128_pull_pending == 1
+    assert worker.finished_recving_reqs == set()
+    assert worker.get_block_ids_with_load_errors() == set()
+
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            err_reqs=["req"],
+            err_msg="C128 state transfer failed",
+        ),
+        pull_metas,
+    )
+
+    assert pull_meta.c128_pull_pending == 0
+    assert worker.finished_recving_reqs == {"req"}
+    assert worker.get_block_ids_with_load_errors() == {10, 11}
+    worker._c128_import_pool.release.assert_called_once_with("transfer")
 
 
 def test_register_kv_caches_preserves_dsv4_shared_region_group_aliases():

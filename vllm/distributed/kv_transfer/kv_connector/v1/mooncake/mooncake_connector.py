@@ -784,6 +784,15 @@ class MooncakeXferMetadata(
     registered_alias_group_indices: list[list[list[int]]] = msgspec.field(
         default_factory=list
     )
+    # D-side C128 staging pool advertised to P.
+    c128_import_base_addr: int = 0
+    c128_import_slot_bytes: int = 0
+    c128_num_layers: int = 0
+    c128_state_row_bytes: int = 0
+    c128_layer_indices: list[int] = msgspec.field(default_factory=list)
+    # Per-request C128 import slot and partial-state flag.
+    c128_req_import_slot: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    c128_req_needs_partial: dict[ReqId, bool] = msgspec.field(default_factory=dict)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -816,6 +825,14 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    pull_failed: bool = False
+    # D-side C128 staging slot; absent for aligned prompts.
+    c128_import_slot: int | None = None
+    c128_needs_partial: bool = False
+    # Shared import slot is released only after every TP/PP pull task quiesces.
+    c128_pull_pending: int = 0
+    c128_pull_failed: bool = False
+    c128_abort_pending: bool = False
 
 
 @dataclass
@@ -828,6 +845,8 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    # P-side export slot for committed bank0 snapshot.
+    c128_export_slot: int | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -837,6 +856,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        # Producer req_ids whose C128 export slot must be released without send.
+        self.c128_export_release_req_ids: set[ReqId] = set()
+        # Consumer req_ids whose C128 import slot is not consumed by admission.
+        self.c128_import_release_req_ids: set[ReqId] = set()
 
     def add_new_req(
         self,
@@ -844,6 +867,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        c128_needs_partial: bool = False,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -854,12 +878,15 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                c128_needs_partial=c128_needs_partial,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
 
 
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+    supports_online_c128_state_transfer = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -954,6 +981,21 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def snapshot_c128_state(self, req_id: str, p_req_state_idx: int) -> None:
+        """P side: snapshot committed bank0 before request-slot reuse."""
+        if self.connector_worker is not None:
+            self.connector_worker.snapshot_c128_state(req_id, p_req_state_idx)
+
+    def bind_c128_state_index(self, req_id: str, p_req_state_idx: int) -> None:
+        """P side: remember the live request-state slot for lazy snapshot."""
+        if self.connector_worker is not None:
+            self.connector_worker.bind_c128_state_index(req_id, p_req_state_idx)
+
+    def restore_c128_state(self, req_id: str, d_req_state_idx: int) -> None:
+        """D side: materialize bank0 after remote-prefill admission."""
+        if self.connector_worker is not None:
+            self.connector_worker.restore_c128_state(req_id, d_req_state_idx)
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -995,6 +1037,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.connector_worker is None:
+            return set()
+        return self.connector_worker.get_block_ids_with_load_errors()
 
     @classmethod
     def build_kv_connector_stats(
@@ -1043,6 +1090,17 @@ class MooncakeConnectorScheduler:
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
+        # Producer req_ids whose snapshotted export slot has no send.
+        self._c128_export_release_req_ids: set[ReqId] = set()
+        # Consumer req_ids whose import slot is not consumed by admission.
+        self._c128_import_release_req_ids: set[ReqId] = set()
+
+        # Online C128 state transfer is valid only for pure producer/consumer roles.
+        self._online_c128_state_transfer_enabled = (
+            bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+            and bool(envs.VLLM_USE_ONLINE_C128_PD_TRANSFER)
+            and (self.is_kv_producer or self.is_kv_consumer)
+        )
 
         # Compute sliding window block counts per KV cache group.
         sw_sizes_tokens: list[tuple[int, int]] = [
@@ -1206,12 +1264,20 @@ class MooncakeConnectorScheduler:
         if not self.is_kv_producer:
             for req_id, (req, block_ids) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
+                # Only non-128-aligned resumes need C128 partial state.
+                c128_needs_partial = (
+                    self._online_c128_state_transfer_enabled
+                    and (req.num_computed_tokens % 128) != 0
+                )
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    c128_needs_partial=c128_needs_partial,
                 )
             self._reqs_need_recv.clear()
+            meta.c128_import_release_req_ids = self._c128_import_release_req_ids
+            self._c128_import_release_req_ids = set()
 
         if not self.is_kv_consumer:
             for req_id, (req, block_ids) in self._reqs_need_send.items():
@@ -1225,6 +1291,8 @@ class MooncakeConnectorScheduler:
             self._reqs_need_send.clear()
             meta.reqs_not_processed = self._reqs_not_processed
             self._reqs_not_processed = set()
+            meta.c128_export_release_req_ids = self._c128_export_release_req_ids
+            self._c128_export_release_req_ids = set()
 
         return meta
 
@@ -1247,6 +1315,11 @@ class MooncakeConnectorScheduler:
             params,
         )
         if not params or not params.get("transfer_id"):
+            # No KV transfer for this request (e.g. a purely-local / exception
+            # request on a producer process). The worker still snapshotted its
+            # Slot was snapshotted at recycle time; release it without a send.
+            if self._online_c128_state_transfer_enabled and self.is_kv_producer:
+                self._c128_export_release_req_ids.add(request.request_id)
             return False, None
 
         if params.get("do_remote_prefill"):
@@ -1262,6 +1335,17 @@ class MooncakeConnectorScheduler:
             return False, None
 
         if not params.get("do_remote_decode"):
+            # Producer ran this request but it is NOT a remote-decode send (e.g.
+            # No remote decode send: release the snapshotted export slot.
+            if self._online_c128_state_transfer_enabled and self.is_kv_producer:
+                self._c128_export_release_req_ids.add(request.request_id)
+            # Consumer: a remote-prefill request whose do_remote_prefill was
+            # already cleared by update_state_after_alloc lands here on abort. If
+            # it was aborted AFTER recv but BEFORE admission, the admission-time
+            # restore_c128_state never runs, so flag its reserved import slot for
+            # release. (Harmless if no slot was reserved — release is idempotent.)
+            if self._online_c128_state_transfer_enabled and self.is_kv_consumer:
+                self._c128_import_release_req_ids.add(request.request_id)
             return False, None
 
         assert not self.is_kv_consumer
@@ -1270,6 +1354,10 @@ class MooncakeConnectorScheduler:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
+            # Aborted / non-length-capped: no send will happen, so release the
+            # snapshotted export slot (by req_id) to avoid leaking it.
+            if self._online_c128_state_transfer_enabled and self.is_kv_producer:
+                self._c128_export_release_req_ids.add(request.request_id)
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -1281,6 +1369,10 @@ class MooncakeConnectorScheduler:
                 request,
                 self.get_sw_clipped_blocks(block_ids),
             )
+        elif self._online_c128_state_transfer_enabled and self.is_kv_producer:
+            # Length-capped but no blocks to send: still no Mooncake send, so the
+            # snapshotted export slot must be released.
+            self._c128_export_release_req_ids.add(request.request_id)
 
         return delay_free_blocks, None
 
@@ -1369,6 +1461,42 @@ class MooncakeConnectorWorker:
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
+        # State-transfer pools are allocated only for online C128 PD transfer.
+        import vllm.envs as envs
+
+        self._online_c128_enabled = bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+        # Gate state-transfer pools to pure PD producer/consumer roles.
+        self._online_c128_state_transfer_enabled = (
+            self._online_c128_enabled
+            and bool(envs.VLLM_USE_ONLINE_C128_PD_TRANSFER)
+            and (self.is_kv_producer or self.is_kv_consumer)
+        )
+        self._c128_states: list = []  # DeepseekOnlineC128State, one per layer
+        self._c128_state_row_width: int = 0
+        self._c128_state_row_bytes: int = 0
+        self._c128_num_layers: int = 0
+        self._c128_layer_indices: list[int] = []
+        # P side: export pool is keyed by req_id until transfer_id is known.
+        self._c128_export_pool = None  # C128ExportSlotPool
+        self._c128_export_slots: dict[ReqId, int] = {}
+        # Sender thread waits on this event before RDMA-reading export slots.
+        self._c128_export_events: dict[ReqId, torch.cuda.Event] = {}
+        self._c128_req_state_indices: dict[ReqId, int] = {}
+        # D side: import pool (RDMA destination) + per-transfer staging info.
+        self._c128_import_pool = None  # C128ImportSlotPool
+        # transfer_id -> (import_slot, needs_partial); set when a pull is built.
+        self._c128_import_slots: dict[TransferId, tuple[int, bool]] = {}
+        # req_id -> transfer_id (D side), so the runner can drive restore by
+        # req_id (it knows req_id -> req_state_idx; the connector knows
+        # req_id -> transfer_id).
+        self._c128_req_to_transfer: dict[ReqId, TransferId] = {}
+        # D side live pulls; used to defer abort releases until RDMA quiesces.
+        self._c128_active_pulls: dict[ReqId, "PullReqMeta"] = {}
+        # Pulls pending bootstrap/slot reservation.
+        self._c128_pending_import_reqs: set[ReqId] = set()
+        # Abort tombstones for pending-before-reserve pulls.
+        self._c128_aborted_import_reqs: set[ReqId] = set()
+
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
             # Background threads for sending kvcaches to D.
@@ -1408,6 +1536,8 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self._invalid_block_ids_lock = threading.Lock()
+        self._invalid_block_ids: set[int] = set()
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1692,8 +1822,19 @@ class MooncakeConnectorWorker:
                 # Timeout, abort all pending requests.
                 for task in wait_tasks:
                     task.cancel()
+                pending_state = [
+                    (
+                        d_req_id,
+                        send_meta.transfer_id,
+                        send_meta.p_req_id,
+                        bool(send_meta.local_block_ids),
+                        send_meta.c128_export_slot,
+                        send_meta.ready.is_set(),
+                    )
+                    for d_req_id, send_meta in pending_reqs.items()
+                ]
                 logger.warning(
-                    "Timeout waiting for P side ready: %s", list(pending_reqs)
+                    "Timeout waiting for P side ready: %s", pending_state
                 )
                 response = MooncakeXferResponse(
                     status=MooncakeXferResponseStatus.FINISH,
@@ -1726,51 +1867,67 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
-            (
-                src_ptrs,
-                dst_ptrs,
-                lengths,
-                err_reqs,
-                err_msg,
-            ) = await self._build_transfer_params(
-                ready_reqs,
-                meta,
-                local_regions,
-                remote_regions,
-            )
-            err_req_set = set(err_reqs)
-            ok_ready_reqs = [
-                (d_req_id, send_meta)
-                for d_req_id, send_meta in ready_reqs
-                if d_req_id not in err_req_set
-            ]
-
-            if src_ptrs:
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
+            err_reqs: list[ReqId] = []
+            err_req_set: set[ReqId] = set()
+            err_msg: str | None = None
+            ok_ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            try:
+                (
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                    err_reqs,
+                    err_msg,
+                    state_transfer_events,
+                ) = await self._build_transfer_params(
+                    ready_reqs,
+                    meta,
+                    local_regions,
+                    remote_regions,
                 )
+                err_req_set = set(err_reqs)
+                ok_ready_reqs = [
+                    (d_req_id, send_meta)
+                    for d_req_id, send_meta in ready_reqs
+                    if d_req_id not in err_req_set
+                ]
 
-                if ret_value != 0:
-                    transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
-                    err_msg = (
-                        transfer_err_msg
-                        if err_msg is None
-                        else f"{err_msg}; {transfer_err_msg}"
+                if src_ptrs:
+                    remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                        state_transfer_events,
                     )
-                    err_reqs = list(err_reqs)
-                    for d_req_id, _ in ok_ready_reqs:
-                        err_reqs.append(d_req_id)
-                        err_req_set.add(d_req_id)
-                    ok_ready_reqs = []
+
+                    if ret_value != 0:
+                        transfer_err_msg = (
+                            f"Mooncake transfer engine returned {ret_value}"
+                        )
+                        err_msg = (
+                            transfer_err_msg
+                            if err_msg is None
+                            else f"{err_msg}; {transfer_err_msg}"
+                        )
+                        err_reqs = list(err_reqs)
+                        for d_req_id, _ in ok_ready_reqs:
+                            err_reqs.append(d_req_id)
+                            err_req_set.add(d_req_id)
+                        ok_ready_reqs = []
+            except Exception as e:
+                err_msg = f"Failed to send Mooncake KV blocks: {e}"
+                err_reqs = [d_req_id for d_req_id, _ in ready_reqs]
+                err_req_set = set(err_reqs)
+                ok_ready_reqs = []
+            finally:
+                for _, send_meta in ready_reqs:
+                    send_meta.sending -= 1
 
             for d_req_id, send_meta in ready_reqs:
-                send_meta.sending -= 1
 
                 if d_req_id in err_req_set:
                     continue
@@ -1781,6 +1938,8 @@ class MooncakeConnectorWorker:
                     and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
+                    # Release the C128 export slot now that the send is done.
+                    self._release_c128_export_slot(send_meta)
 
             response = MooncakeXferResponse(
                 status=response_status,
@@ -1836,12 +1995,17 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
-    ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
+    ) -> tuple[
+        list[int], list[int], list[int], list[ReqId], str | None,
+        list["torch.cuda.Event"],
+    ]:
         src_ptrs = []
         dst_ptrs = []
         lengths = []
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
+        # Guard async bank0->export-slot copies before RDMA reads.
+        state_transfer_events: list["torch.cuda.Event"] = []
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
         for d_req_id, send_meta in ready_reqs:
@@ -2073,7 +2237,168 @@ class MooncakeConnectorWorker:
                 remote_session,
             )
 
-        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
+        # Append C128 bank0 descriptors after KV descriptors.
+        if (
+            self._online_c128_state_transfer_enabled
+            and agent_meta.c128_import_base_addr
+        ):
+            err_msg = self._append_online_c128_state_descriptors(
+                ready_reqs, agent_meta, src_ptrs, dst_ptrs, lengths,
+                err_reqs, err_msg, state_transfer_events,
+            )
+
+        return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, state_transfer_events
+
+    def _append_online_c128_state_descriptors(
+        self,
+        ready_reqs: list[tuple[ReqId, SendBlockMeta]],
+        agent_meta: MooncakeXferMetadata,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        err_reqs: list[ReqId],
+        err_msg: str | None,
+        state_transfer_events: list["torch.cuda.Event"],
+    ) -> str | None:
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
+            build_online_c128_state_descriptors,
+        )
+
+        pool = self._c128_export_pool
+        if pool is None:
+            return err_msg
+        num_layers = self._c128_num_layers
+        row_bytes = self._c128_state_row_bytes
+
+        # Use the same rank election as replicated KV: one state writer per D slot.
+        if not self._producer_cache_is_replicated():
+            err_msg = (
+                "C128 online partial-state transfer requires a replicated online "
+                "state (MLA latent). Got a non-replicated/head-sharded state, "
+                "which cannot be split across producer ranks without racing the "
+                "single D import slot. Disable VLLM_USE_ONLINE_C128_PD_TRANSFER "
+                "or use a replicated (MLA) configuration."
+            )
+            for d_req_id, _ in ready_reqs:
+                if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
+                    d_req_id not in err_reqs
+                ):
+                    err_reqs.append(d_req_id)
+            return err_msg
+        tp_ratio = _get_tp_ratio(self.tp_size, agent_meta.remote_tp_size)
+        # tp_ratio > 0 (incl. 1): one elected writer per D slot. tp_ratio < 0:
+        # all P ranks write, each into its own paired D rank's distinct slot.
+        sends_state = tp_ratio < 0 or (self.tp_rank % tp_ratio == 0)
+        if not sends_state:
+            return err_msg
+
+        remote_layer_indices = agent_meta.c128_layer_indices or list(
+            range(agent_meta.c128_num_layers)
+        )
+        remote_layer_pos = {
+            layer_index: layer_pos
+            for layer_pos, layer_index in enumerate(remote_layer_indices)
+        }
+        layer_pos_pairs: list[tuple[int, int]] = []
+        missing_layer_indices: list[int] = []
+        for src_layer_pos, layer_index in enumerate(self._c128_layer_indices):
+            dst_layer_pos = remote_layer_pos.get(layer_index)
+            if dst_layer_pos is None:
+                missing_layer_indices.append(layer_index)
+            else:
+                layer_pos_pairs.append((src_layer_pos, dst_layer_pos))
+
+        needs_any_partial = any(
+            agent_meta.c128_req_needs_partial.get(d_req_id, False)
+            for d_req_id, _ in ready_reqs
+        )
+        local_layer_index_set = set(self._c128_layer_indices)
+        remote_layer_index_set = set(remote_layer_indices)
+        if (
+            needs_any_partial
+            and missing_layer_indices
+            and remote_layer_index_set < local_layer_index_set
+        ):
+            err_msg = (
+                "C128 online partial-state transfer does not support a producer "
+                "layer set that strictly contains the consumer layer set. "
+                "This usually means prefill is running the full model while "
+                "decode is pipeline-parallel and owns only a layer subset. "
+                f"P(layer_indices={self._c128_layer_indices}) vs "
+                f"D(layer_indices={remote_layer_indices}); "
+                f"producer_only_layer_indices={missing_layer_indices}. "
+                "Use matching PP topology for prefill/decode or disable "
+                "VLLM_USE_ONLINE_C128_PD_TRANSFER."
+            )
+            for d_req_id, _ in ready_reqs:
+                if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
+                    d_req_id not in err_reqs
+                ):
+                    err_reqs.append(d_req_id)
+            return err_msg
+
+        expected_remote_slot_bytes = agent_meta.c128_num_layers * row_bytes
+        if (
+            agent_meta.c128_state_row_bytes != row_bytes
+            or agent_meta.c128_import_slot_bytes != expected_remote_slot_bytes
+            or missing_layer_indices
+        ):
+            err_msg = (
+                "C128 online state descriptor mismatch between producer and consumer: "
+                f"P(num_layers={num_layers}, layer_indices="
+                f"{self._c128_layer_indices}, row_bytes={row_bytes}, "
+                f"slot_bytes={num_layers * row_bytes}) vs "
+                f"D(num_layers={agent_meta.c128_num_layers}, "
+                f"layer_indices={remote_layer_indices}, "
+                f"row_bytes={agent_meta.c128_state_row_bytes}, "
+                f"slot_bytes={agent_meta.c128_import_slot_bytes}); "
+                f"missing_layer_indices={missing_layer_indices}."
+            )
+            for d_req_id, _ in ready_reqs:
+                if agent_meta.c128_req_needs_partial.get(d_req_id, False) and (
+                    d_req_id not in err_reqs
+                ):
+                    err_reqs.append(d_req_id)
+            return err_msg
+
+        for d_req_id, send_meta in ready_reqs:
+            needs_partial = agent_meta.c128_req_needs_partial.get(d_req_id, False)
+            if not needs_partial:
+                # 128-aligned resume: no partial carry; D resets bank0 locally.
+                continue
+            slot = send_meta.c128_export_slot
+            import_slot = agent_meta.c128_req_import_slot.get(d_req_id)
+            if slot is None or import_slot is None:
+                # Do not let D restore from an unwritten state-transfer slot.
+                if d_req_id not in err_reqs:
+                    err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = (
+                        "C128 online partial-state transfer missing export/import "
+                        f"slot for request needing partial state ({d_req_id}: "
+                        f"export_slot={slot}, import_slot={import_slot})"
+                    )
+                continue
+            plan = build_online_c128_state_descriptors(
+                export_pool=pool,
+                export_slot=slot,
+                remote_import_base_addr=agent_meta.c128_import_base_addr,
+                remote_slot_bytes=agent_meta.c128_import_slot_bytes,
+                remote_import_slot=import_slot,
+                num_layers=num_layers,
+                row_width_bytes=row_bytes,
+                layer_pos_pairs=layer_pos_pairs,
+            )
+            src_ptrs.extend(plan.src_ptrs)
+            dst_ptrs.extend(plan.dst_ptrs)
+            lengths.extend(plan.lengths)
+            # Defer the RDMA read until the snapshot copy for this request has
+            # landed (the copy ran async on the runner stream; the sender reads
+            # the export slot from an executor thread).
+            event = self._c128_export_events.get(send_meta.p_req_id)
+            if event is not None:
+                state_transfer_events.append(event)
+        return err_msg
 
     def _bind_sender_thread_device(self) -> None:
         """ThreadPoolExecutor initializer — binds each pool thread to the
@@ -2087,34 +2412,198 @@ class MooncakeConnectorWorker:
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
+        state_transfer_events: list["torch.cuda.Event"] | None = None,
     ) -> int:
+        # State snapshots are async GPU copies; wait before RDMA reads.
+        if state_transfer_events:
+            for event in state_transfer_events:
+                event.synchronize()
+
+        total_bytes = sum(lengths)
+        total_descs = len(src_ptrs)
         start_time = time.perf_counter()
-        ret_value = self.engine.batch_transfer_sync_write(
-            remote_session, src_ptrs, dst_ptrs, lengths
-        )
+
+        if not envs.VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER:
+            ret_value = self.engine.batch_transfer_sync_write(
+                remote_session, src_ptrs, dst_ptrs, lengths
+            )
+            chunk_idx = 1
+            chunk_start = 0
+            chunk_end = total_descs
+            chunk_bytes = total_bytes
+        else:
+            max_chunk_bytes = envs.VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB * 1024 * 1024
+            if max_chunk_bytes <= 0:
+                raise ValueError("VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB must be positive")
+            chunked_src_ptrs: list[int] = []
+            chunked_dst_ptrs: list[int] = []
+            chunked_lengths: list[int] = []
+            for src_ptr, dst_ptr, length in zip(src_ptrs, dst_ptrs, lengths):
+                offset = 0
+                while offset < length:
+                    segment_len = min(max_chunk_bytes, length - offset)
+                    chunked_src_ptrs.append(src_ptr + offset)
+                    chunked_dst_ptrs.append(dst_ptr + offset)
+                    chunked_lengths.append(segment_len)
+                    offset += segment_len
+
+            src_ptrs = chunked_src_ptrs
+            dst_ptrs = chunked_dst_ptrs
+            lengths = chunked_lengths
+            total_descs = len(src_ptrs)
+            ret_value = 0
+            chunk_start = 0
+            chunk_idx = 0
+            chunk_end = 0
+            chunk_bytes = 0
+            while chunk_start < total_descs:
+                chunk_bytes = 0
+                chunk_end = chunk_start
+                while chunk_end < total_descs:
+                    next_len = lengths[chunk_end]
+                    if chunk_end > chunk_start and (
+                        chunk_bytes + next_len > max_chunk_bytes
+                    ):
+                        break
+                    chunk_bytes += next_len
+                    chunk_end += 1
+
+                ret_value = self.engine.batch_transfer_sync_write(
+                    remote_session,
+                    src_ptrs[chunk_start:chunk_end],
+                    dst_ptrs[chunk_start:chunk_end],
+                    lengths[chunk_start:chunk_end],
+                )
+                if ret_value != 0:
+                    break
+                chunk_start = chunk_end
+                chunk_idx += 1
+
         duration = time.perf_counter() - start_time
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
-                num_descs=len(src_ptrs),
+                total_bytes=total_bytes,
+                num_descs=total_descs,
             )
-            logger.debug("Sending to %s done, took %s", remote_session, duration)
         else:
             self.xfer_stats.record_failed_transfer()
-            logger.warning(
-                "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
-                remote_session,
-                ret_value,
-                duration,
-                len(src_ptrs),
-                sum(lengths),
-            )
+            if envs.VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER:
+                logger.warning(
+                    "Sending chunk to %s failed (ret=%s) after %s "
+                    "(chunk=%d, chunk_descriptors=%d, chunk_bytes=%d, "
+                    "total_descriptors=%d, total_bytes=%d)",
+                    remote_session,
+                    ret_value,
+                    duration,
+                    chunk_idx + 1,
+                    chunk_end - chunk_start,
+                    chunk_bytes,
+                    total_descs,
+                    total_bytes,
+                )
+            else:
+                logger.warning(
+                    "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
+                    remote_session,
+                    ret_value,
+                    duration,
+                    total_descs,
+                    total_bytes,
+                )
         return ret_value
+
+    def _register_c128_online_state(self) -> None:
+        """Register C128 state-transfer pools outside the KV block region."""
+        from vllm.models.deepseek_v4.online_c128 import get_online_c128_states
+
+        states = get_online_c128_states()
+        if not states:
+            logger.warning(
+                "C128 online compression enabled but no online states "
+                "registered; skipping state-transfer RDMA registration."
+            )
+            return
+        self._c128_states = states
+        row_width = states[0].row_width
+        self._c128_state_row_width = row_width
+        self._c128_state_row_bytes = row_width * states[0].state.element_size()
+        self._c128_num_layers = len(states)
+        self._c128_layer_indices = [state.layer_index for state in states]
+        capacity = self.vllm_config.scheduler_config.max_num_seqs
+        device = states[0].state.device
+
+        # State-transfer pool is allocated after KV profiling; fail early if it cannot fit.
+        pool_bytes = (
+            capacity * self._c128_num_layers * row_width * states[0].state.element_size()
+        )
+        if device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            # Keep a 5% headroom so registration / fragmentation does not OOM.
+            margin = int(free_bytes * 0.95)
+            if pool_bytes > margin:
+                raise RuntimeError(
+                    "C128 PD state-transfer pool would not fit in free GPU memory: need "
+                    f"{pool_bytes} bytes (capacity={capacity}, "
+                    f"num_layers={self._c128_num_layers}, row_width={row_width}, "
+                    f"fp32), free={free_bytes} bytes (95% margin={margin}). "
+                    "Reduce max_num_seqs or disable "
+                    "VLLM_USE_ONLINE_C128_PD_TRANSFER."
+                )
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
+            C128ExportSlotPool,
+            C128ImportSlotPool,
+        )
+
+        if self.is_kv_consumer:
+            # D: import staging pool (RDMA destination).
+            self._c128_import_pool = C128ImportSlotPool(
+                capacity=capacity,
+                num_layers=self._c128_num_layers,
+                row_width=row_width,
+                device=device,
+            )
+            pool = self._c128_import_pool
+            ret = self.engine.batch_register_memory(
+                [pool.base_addr], [pool.total_bytes]
+            )
+            if ret != 0:
+                raise RuntimeError("Mooncake C128 import pool registration (D) failed.")
+            logger.info(
+                "Registered C128 state-transfer IMPORT pool (D): capacity=%d "
+                "num_layers=%d row_bytes=%d slot_bytes=%d total_bytes=%d",
+                capacity,
+                self._c128_num_layers,
+                self._c128_state_row_bytes,
+                pool.slot_bytes,
+                pool.total_bytes,
+            )
+            return
+
+        # P: export snapshot pool (RDMA source).
+        self._c128_export_pool = C128ExportSlotPool(
+            capacity=capacity,
+            num_layers=self._c128_num_layers,
+            row_width=row_width,
+            device=device,
+        )
+        pool = self._c128_export_pool
+        ret = self.engine.batch_register_memory([pool.base_addr], [pool.total_bytes])
+        if ret != 0:
+            raise RuntimeError("Mooncake C128 export pool registration (P) failed.")
+        logger.info(
+            "Registered C128 state-transfer EXPORT pool (P): capacity=%d "
+            "num_layers=%d row_bytes=%d slot_bytes=%d total_bytes=%d",
+            capacity,
+            self._c128_num_layers,
+            self._c128_state_row_bytes,
+            pool.slot_bytes,
+            pool.total_bytes,
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
-
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
 
         kv_data_ptrs: list[int] = []
@@ -2267,6 +2756,9 @@ class MooncakeConnectorWorker:
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
+        # Online C128 state-transfer pools are independent from the KV block region.
+        if self._online_c128_state_transfer_enabled:
+            self._register_c128_online_state()
         self.device_kv_caches = kv_caches
         logger.debug(
             "registered block_lens=%s kv_block_lens=%s",
@@ -2314,9 +2806,233 @@ class MooncakeConnectorWorker:
                 expired_transfer_id.append(transfer_id)
 
         for transfer_id in expired_transfer_id:
-            del self.reqs_need_send[transfer_id]
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None:
+                self._release_c128_export_slot(send_meta)
 
         return finished_sending_reqs
+
+    def _release_c128_export_slot(self, send_meta: "SendBlockMeta") -> None:
+        """Release the P-side C128 export slot bound to this request."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_export_pool is None
+        ):
+            return
+        p_req_id = send_meta.p_req_id
+        if p_req_id and p_req_id in self._c128_export_slots:
+            self._c128_export_pool.release(p_req_id)
+            self._c128_export_slots.pop(p_req_id, None)
+            self._c128_export_events.pop(p_req_id, None)
+        if p_req_id:
+            self._c128_req_state_indices.pop(p_req_id, None)
+        send_meta.c128_export_slot = None
+
+    def _release_c128_export_by_req(self, req_id: str) -> None:
+        """Release a P-side export slot for requests that will not send."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_export_pool is None
+        ):
+            return
+        if req_id in self._c128_export_slots:
+            self._c128_export_pool.release(req_id)
+            self._c128_export_slots.pop(req_id, None)
+            self._c128_export_events.pop(req_id, None)
+        self._c128_req_state_indices.pop(req_id, None)
+
+    def bind_c128_state_index(self, req_id: str, p_req_state_idx: int) -> None:
+        """P side: track live request-state slots for lazy state snapshots."""
+        if not self._online_c128_state_transfer_enabled:
+            return
+        self._c128_req_state_indices[req_id] = p_req_state_idx
+
+    def snapshot_c128_state(self, req_id: str, p_req_state_idx: int) -> None:
+        """P side: snapshot committed bank0 before the request slot is reused."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_export_pool is None
+        ):
+            return
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
+            snapshot_bank0_to_slot,
+        )
+
+        slot = self._c128_export_pool.acquire(req_id)
+        snapshot_bank0_to_slot(
+            self._c128_states, self._c128_export_pool, slot, p_req_state_idx
+        )
+        # Sender waits on this event before RDMA-reading the export slot.
+        event = torch.cuda.Event()
+        event.record()
+        self._c128_export_events[req_id] = event
+        self._c128_export_slots[req_id] = slot
+        self._attach_c128_export_slot_to_pending_sends(req_id, slot)
+
+    def _attach_c128_export_slot_to_pending_sends(
+        self, req_id: str, slot: int
+    ) -> None:
+        """Bind a freshly snapshotted C128 export slot to pending sends.
+
+        Scheduler-side ``request_finished`` can publish block IDs before the
+        worker has removed the request and snapshotted bank0.  When state
+        transfer is enabled, defer sender readiness until this method attaches
+        the slot.
+        """
+        if not self._online_c128_state_transfer_enabled:
+            return
+        for send_meta in self.reqs_need_send.values():
+            if send_meta.p_req_id != req_id:
+                continue
+            send_meta.c128_export_slot = slot
+            if send_meta.local_block_ids:
+                send_meta.ready.set()
+
+    def reserve_c128_import_slot(
+        self, d_req_id: str, transfer_id: str, needs_partial: bool
+    ) -> int | None:
+        """D side: reserve the RDMA staging slot before request admission."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
+            return None
+        slot = self._c128_import_pool.acquire(transfer_id, timeout=0.0)
+        self._c128_import_slots[transfer_id] = (slot, needs_partial)
+        self._c128_req_to_transfer[d_req_id] = transfer_id
+        return slot
+
+    def restore_c128_state(self, req_id: str, d_req_state_idx: int) -> None:
+        """D side: copy staged partial state into live bank0, or reset it."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
+            return
+        from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.online_c128_pd import (  # noqa: E501
+            reset_bank0,
+            restore_bank0_from_slot,
+        )
+
+        transfer_id = self._c128_req_to_transfer.pop(req_id, None)
+        self._c128_active_pulls.pop(req_id, None)
+        self._c128_pending_import_reqs.discard(req_id)
+        self._c128_aborted_import_reqs.discard(req_id)
+        entry = (
+            self._c128_import_slots.pop(transfer_id, None)
+            if transfer_id is not None
+            else None
+        )
+        if entry is None:
+            # No staging reserved for this request: reset bank0 to identity.
+            reset_bank0(self._c128_states, d_req_state_idx)
+            return
+        slot, needs_partial = entry
+        if needs_partial:
+            restore_bank0_from_slot(
+                self._c128_states, self._c128_import_pool, slot, d_req_state_idx
+            )
+        else:
+            reset_bank0(self._c128_states, d_req_state_idx)
+        self._c128_import_pool.release(transfer_id)
+
+    def _c128_release_import_slot(self, pull_meta: "PullReqMeta") -> None:
+        """Release a single reserved import staging slot (idempotent)."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
+            return
+        self._c128_active_pulls.pop(pull_meta.d_req_id, None)
+        self._c128_pending_import_reqs.discard(pull_meta.d_req_id)
+        self._c128_aborted_import_reqs.discard(pull_meta.d_req_id)
+        transfer_id = self._c128_req_to_transfer.pop(pull_meta.d_req_id, None)
+        if transfer_id is None:
+            transfer_id = pull_meta.transfer_id
+        self._c128_import_slots.pop(transfer_id, None)
+        self._c128_import_pool.release(transfer_id)
+
+    def release_c128_import_by_req(self, req_ids: list[ReqId]) -> None:
+        """Release import slots, deferring aborts until in-flight pulls quiesce."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
+            return
+        for req_id in req_ids:
+            pull_meta = self._c128_active_pulls.get(req_id)
+            if pull_meta is not None and pull_meta.c128_pull_pending > 0:
+                # Do not reuse a slot while a worker may still RDMA-write it.
+                pull_meta.c128_abort_pending = True
+                continue
+            # No in-flight pull task: safe to release now.
+            transfer_id = self._c128_req_to_transfer.pop(req_id, None)
+            self._c128_active_pulls.pop(req_id, None)
+            if transfer_id is None:
+                if req_id in self._c128_pending_import_reqs:
+                    # Abort arrived before slot reservation finished.
+                    self._c128_aborted_import_reqs.add(req_id)
+                continue
+            self._c128_pending_import_reqs.discard(req_id)
+            self._c128_aborted_import_reqs.discard(req_id)
+            self._c128_import_slots.pop(transfer_id, None)
+            self._c128_import_pool.release(transfer_id)
+
+    def _c128_account_pull_tasks(
+        self,
+        pull_metas: dict[ReqId, "PullReqMeta"],
+        *,
+        failed: bool,
+        req_ids: list[ReqId] | None = None,
+    ) -> None:
+        """Decrement pull-task refs; release failed/aborted slots at quiesce."""
+        if (
+            not self._online_c128_state_transfer_enabled
+            or self._c128_import_pool is None
+        ):
+            return
+        targets = req_ids if req_ids is not None else list(pull_metas.keys())
+        for d_req_id in targets:
+            pull_meta = pull_metas.get(d_req_id)
+            if pull_meta is None:
+                continue
+            if failed:
+                pull_meta.c128_pull_failed = True
+            if pull_meta.c128_pull_pending > 0:
+                pull_meta.c128_pull_pending -= 1
+            if pull_meta.c128_pull_pending == 0 and (
+                pull_meta.c128_pull_failed or pull_meta.c128_abort_pending
+            ):
+                if pull_meta.c128_pull_failed:
+                    self._mark_pull_failed(pull_meta)
+                self._c128_release_import_slot(pull_meta)
+
+    def _account_failed_pull_tasks(
+        self,
+        pull_metas: dict[ReqId, "PullReqMeta"],
+        req_ids: list[ReqId],
+    ) -> None:
+        """Account failed async pulls and notify scheduler when safe.
+
+        C128 state transfer needs quiesce accounting before slots can be
+        released. Non-C128 pulls also wait for all worker tasks to quiesce
+        before the scheduler may release or reuse local KV blocks.
+        """
+        self._c128_account_pull_tasks(pull_metas, failed=True, req_ids=req_ids)
+        if (
+            self._online_c128_state_transfer_enabled
+            and self._c128_import_pool is not None
+        ):
+            return
+        for req_id in req_ids:
+            pull_meta = pull_metas.get(req_id)
+            if pull_meta is None:
+                continue
+            pull_meta.pull_failed = True
+            if pull_meta.pull_tasks_count > 0:
+                pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count == 0:
+                self._mark_pull_failed(pull_meta)
 
     def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
         """
@@ -2350,6 +3066,22 @@ class MooncakeConnectorWorker:
 
         return finished_sending_reqs or None, finished_recving_reqs or None
 
+    def _mark_pull_failed(self, pull_meta: "PullReqMeta") -> None:
+        """Report a failed async pull to the scheduler after RDMA quiesce."""
+        invalid_blocks = {
+            block_id for group in pull_meta.local_block_ids for block_id in group
+        }
+        if invalid_blocks:
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.update(invalid_blocks)
+        self.finished_recving_reqs.add(pull_meta.d_req_id)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        with self._invalid_block_ids_lock:
+            invalid_block_ids = set(self._invalid_block_ids)
+            self._invalid_block_ids.clear()
+        return invalid_block_ids
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return transfer stats collected since the last call, or None
         if nothing has been recorded in this interval."""
@@ -2362,7 +3094,8 @@ class MooncakeConnectorWorker:
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
-        req_ids = set(pull_metas)
+        req_ids = list(pull_metas.keys())
+        outstanding_req_ids: set[ReqId] = set(req_ids)
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -2382,6 +3115,29 @@ class MooncakeConnectorWorker:
             registered_layer_index_aliases=self.registered_layer_index_aliases,
             registered_logical_group_indices=self.registered_logical_group_indices,
             registered_alias_group_indices=self.registered_alias_group_indices,
+            c128_import_base_addr=(
+                self._c128_import_pool.base_addr
+                if self._c128_import_pool is not None
+                else 0
+            ),
+            c128_import_slot_bytes=(
+                self._c128_import_pool.slot_bytes
+                if self._c128_import_pool is not None
+                else 0
+            ),
+            c128_num_layers=self._c128_num_layers,
+            c128_state_row_bytes=self._c128_state_row_bytes,
+            c128_layer_indices=list(self._c128_layer_indices),
+            c128_req_import_slot={
+                req_id: pull_meta.c128_import_slot
+                for req_id, pull_meta in pull_metas.items()
+                if pull_meta.c128_import_slot is not None
+            },
+            c128_req_needs_partial={
+                req_id: pull_meta.c128_needs_partial
+                for req_id, pull_meta in pull_metas.items()
+                if pull_meta.c128_import_slot is not None
+            },
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2412,8 +3168,16 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         self.xfer_stats.record_failed_recv()
+                        # Account only requests still pending on this worker.
+                        self._account_failed_pull_tasks(
+                            pull_metas,
+                            req_ids=list(outstanding_req_ids),
+                        )
                         return
-                    self.process_pulling_result(response, pull_metas)
+                    accounted_req_ids = self.process_pulling_result(
+                        response, pull_metas
+                    )
+                    outstanding_req_ids.difference_update(accounted_req_ids)
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
         except zmq.ContextTerminated:
@@ -2421,31 +3185,49 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self.xfer_stats.record_failed_recv()
+            self._account_failed_pull_tasks(
+                pull_metas,
+                req_ids=list(outstanding_req_ids),
+            )
             return
 
     def process_pulling_result(
         self,
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
-    ):
+    ) -> set[ReqId]:
+        accounted_req_ids: set[ReqId] = set()
         ok_reqs: list[ReqId] = response.ok_reqs or []
 
         for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
-            pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count > 0:
+                pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
+                if pull_meta.pull_failed:
+                    self._mark_pull_failed(pull_meta)
+                else:
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
+        # Success keeps the slot for admission unless another worker fails.
+        if ok_reqs:
+            self._c128_account_pull_tasks(pull_metas, failed=False, req_ids=ok_reqs)
+            accounted_req_ids.update(ok_reqs)
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
 
         if response.err_reqs:
+            err_reqs = list(response.err_reqs)
             logger.error(
                 "pulling kv_caches for %s failed: %s",
-                response.err_reqs,
+                err_reqs,
                 response.err_msg,
             )
+            # Failed requests release slots only after all worker tasks quiesce.
+            self._account_failed_pull_tasks(pull_metas, req_ids=err_reqs)
+            accounted_req_ids.update(err_reqs)
+        return accounted_req_ids
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
@@ -2480,6 +3262,43 @@ class MooncakeConnectorWorker:
         remote_engine_id: EngineId,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        aborted_before_reserve: set[ReqId] = set()
+        failed_before_start: list[ReqId] = []
+        # Reserve D-side state-transfer slots before advertising metadata to P.
+        if (
+            self._online_c128_state_transfer_enabled
+            and self._c128_import_pool is not None
+        ):
+            for d_req_id, pull_meta in pull_metas.items():
+                self._c128_pending_import_reqs.discard(d_req_id)
+                if d_req_id in self._c128_aborted_import_reqs:
+                    aborted_before_reserve.add(d_req_id)
+                    self._c128_aborted_import_reqs.discard(d_req_id)
+                if (
+                    pull_meta.c128_needs_partial
+                    and pull_meta.c128_import_slot is None
+                ):
+                    try:
+                        pull_meta.c128_import_slot = self.reserve_c128_import_slot(
+                            d_req_id,
+                            pull_meta.transfer_id,
+                            pull_meta.c128_needs_partial,
+                        )
+                    except TimeoutError as exc:
+                        logger.error(
+                            "C128 import slot unavailable for request %s: %s",
+                            d_req_id,
+                            exc,
+                        )
+                        self._mark_pull_failed(pull_meta)
+                        failed_before_start.append(d_req_id)
+            for d_req_id in failed_before_start:
+                pull_metas.pop(d_req_id, None)
+                self._c128_pending_import_reqs.discard(d_req_id)
+                self._c128_aborted_import_reqs.discard(d_req_id)
+            if not pull_metas:
+                return
+
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
@@ -2504,6 +3323,21 @@ class MooncakeConnectorWorker:
         )
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
+            pull_meta.pull_failed = False
+            # Separate success count from C128 slot quiesce accounting.
+            pull_meta.c128_pull_pending = count
+            pull_meta.c128_pull_failed = False
+            pull_meta.c128_abort_pending = (
+                pull_meta.d_req_id in aborted_before_reserve
+            )
+            # Track the live pull so an abort (which only knows req_id) can defer
+            # the import-slot release until all pull tasks quiesce.
+            if (
+                self._online_c128_state_transfer_enabled
+                and self._c128_import_pool is not None
+                and pull_meta.c128_import_slot is not None
+            ):
+                self._c128_active_pulls[pull_meta.d_req_id] = pull_meta
         for worker_addr in worker_addrs:
             asyncio.create_task(
                 self.receive_kv_from_single_worker(worker_addr, pull_metas)
@@ -2527,6 +3361,9 @@ class MooncakeConnectorWorker:
                 remote_engine_id,
                 remote_bootstrap_addr,
             )
+            for req_id in pull_metas:
+                self._c128_pending_import_reqs.discard(req_id)
+                self._c128_aborted_import_reqs.discard(req_id)
             return
 
         self.receive_kv(remote_engine_id, pull_metas)
@@ -2535,12 +3372,27 @@ class MooncakeConnectorWorker:
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
         for remote_engine_id, pull_metas in reqs_to_recv.items():
+            if (
+                self._online_c128_state_transfer_enabled
+                and self._c128_import_pool is not None
+            ):
+                self._c128_pending_import_reqs.update(pull_metas)
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
                     self.handle_new_engine_id(remote_engine_id, pull_metas)
                 )
             else:
                 self.receive_kv(remote_engine_id, pull_metas)
+
+    async def _start_load_kv_and_release_c128_imports(
+        self,
+        reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]],
+        c128_release_req_ids: list[ReqId],
+    ):
+        if c128_release_req_ids:
+            self.release_c128_import_by_req(c128_release_req_ids)
+        if reqs_to_recv:
+            await self._start_load_kv(reqs_to_recv)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
@@ -2552,7 +3404,37 @@ class MooncakeConnectorWorker:
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
-                send_meta.ready.set()
+                # Attach the req-keyed export slot to this transfer.
+                if self._online_c128_state_transfer_enabled:
+                    slot = self._c128_export_slots.get(p_req_id)
+                    if slot is None:
+                        req_state_idx = self._c128_req_state_indices.get(p_req_id)
+                        if req_state_idx is not None:
+                            self.snapshot_c128_state(p_req_id, req_state_idx)
+                            slot = self._c128_export_slots.get(p_req_id)
+                        else:
+                            logger.warning(
+                                "C128 online state transfer has no live state "
+                                "index for request %s transfer_id=%s "
+                                "known_state_indices=%s",
+                                p_req_id,
+                                transfer_id,
+                                list(self._c128_req_state_indices),
+                            )
+                    if slot is not None:
+                        send_meta.c128_export_slot = slot
+                        send_meta.ready.set()
+                    else:
+                        logger.warning(
+                            "Deferring Mooncake send readiness for request %s "
+                            "transfer_id=%s until C128 export slot is "
+                            "snapshotted. known_export_slots=%s",
+                            p_req_id,
+                            transfer_id,
+                            list(self._c128_export_slots),
+                        )
+                else:
+                    send_meta.ready.set()
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet
@@ -2569,15 +3451,29 @@ class MooncakeConnectorWorker:
             send_meta = self.reqs_need_send.pop(transfer_id)
             if send_meta:
                 assert not send_meta.ready.is_set()
+                self._release_c128_export_slot(send_meta)
+        # Release export slots snapshotted for producer requests that will not be
+        # sent (purely local / aborted / no-block). Keyed by req_id; idempotent.
+        for req_id in metadata.c128_export_release_req_ids:
+            self._release_c128_export_by_req(req_id)
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
-        if not self.is_kv_producer and metadata.reqs_to_recv:
+        c128_release_req_ids = list(metadata.c128_import_release_req_ids)
+        if (
+            not self.is_kv_producer
+            and (metadata.reqs_to_recv or c128_release_req_ids)
+        ):
             asyncio.run_coroutine_threadsafe(
-                self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
+                self._start_load_kv_and_release_c128_imports(
+                    metadata.reqs_to_recv, c128_release_req_ids
+                ),
+                self.receiver_loop,
             )
 
         if not self.is_kv_consumer and (
-            metadata.reqs_to_send or metadata.reqs_not_processed
+            metadata.reqs_to_send
+            or metadata.reqs_not_processed
+            or metadata.c128_export_release_req_ids
         ):
             asyncio.run_coroutine_threadsafe(
                 self.record_send_reqs(metadata), self.sender_loop
