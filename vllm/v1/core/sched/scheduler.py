@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -52,7 +53,11 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -167,6 +172,33 @@ class Scheduler(SchedulerInterface):
         self.block_size = block_size
         self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        # Online C128 needs aligned local hits; PD state transfer handles partials.
+        self._online_c128_enabled = bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
+        # Mirror worker gating: state transfer is only defined for pure P/D roles.
+        _c128_pure_pd_role = kv_transfer_config is not None and (
+            kv_transfer_config.kv_role in ("kv_producer", "kv_consumer")
+        )
+        _online_c128_pd_transfer_requested = self._online_c128_enabled and bool(
+            envs.VLLM_USE_ONLINE_C128_PD_TRANSFER
+        )
+        _online_c128_state_transfer_connector = bool(
+            self.connector is not None
+            and getattr(self.connector, "supports_online_c128_state_transfer", False)
+        )
+        if (
+            _online_c128_pd_transfer_requested
+            and _c128_pure_pd_role
+            and not _online_c128_state_transfer_connector
+        ):
+            raise ValueError(
+                "VLLM_USE_ONLINE_C128_PD_TRANSFER requires a KV connector that "
+                "supports online C128 state transfer."
+            )
+        self._online_c128_pd_transfer_enabled = (
+            _online_c128_pd_transfer_requested
+            and _c128_pure_pd_role
+            and _online_c128_state_transfer_connector
+        )
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
@@ -722,33 +754,49 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
+                    coordinator = self.kv_cache_manager.coordinator
+                    computed_per_group: tuple[list[KVCacheBlock], ...] | None = None
+                    is_remote_prefill = bool(
+                        request.kv_transfer_params
+                        and request.kv_transfer_params.get("do_remote_prefill")
+                    )
                     if (
                         self.connector is not None
-                        and self.has_mamba_layers
-                        and isinstance(
-                            self.kv_cache_manager.coordinator,
-                            HybridKVCacheCoordinator,
-                        )
+                        and is_remote_prefill
+                        and self.kv_cache_manager.enable_caching
+                        and not request.skip_reading_prefix_cache
+                        and isinstance(coordinator, HybridKVCacheCoordinator)
                     ):
                         computed, per_group_hits = (
-                            self.kv_cache_manager.coordinator.find_longest_cache_hit_per_group(
+                            coordinator.find_longest_cache_hit_per_group(
                                 request.block_hashes,
                                 request.num_tokens - 1,
                             )
                         )
-                        new_computed_blocks = (
-                            self.kv_cache_manager.create_kv_cache_blocks(computed)
+                        dense_kinds = (
+                            KVCacheSpecKind.FULL_ATTENTION,
+                            KVCacheSpecKind.MLA_ATTENTION,
+                            KVCacheSpecKind.SINK_FULL_ATTENTION,
                         )
-                        # NOTE(ZhanqiuHu): For Mamba hybrid models,
-                        # num_new_local_computed_tokens should be the FA hit
-                        # length. This value is passed to the connector's
-                        # get_num_new_matched_tokens which computes:
-                        # external = total - local_computed.
-                        # Using the FA hit skips re-transferring FA blocks
-                        # already cached on D-side. The Mamba state (always
-                        # the last block) is transferred unconditionally by
-                        # _apply_prefix_caching in nixl/worker.py.
-                        num_new_local_computed_tokens = max(per_group_hits)
+                        dense_hits: list[int] = []
+                        for group in coordinator.attention_groups:
+                            if get_kv_cache_spec_kind(group.spec) in dense_kinds:
+                                dense_hits.extend(
+                                    per_group_hits[group_id]
+                                    for group_id in group.group_ids
+                                )
+                        num_new_local_computed_tokens = (
+                            min(dense_hits) if dense_hits else 0
+                        )
+                        for group in coordinator.attention_groups:
+                            if get_kv_cache_spec_kind(group.spec) in dense_kinds:
+                                num_dense_blocks = (
+                                    num_new_local_computed_tokens
+                                    // group.spec.block_size
+                                )
+                                for group_id in group.group_ids:
+                                    del computed[group_id][num_dense_blocks:]
+                        computed_per_group = computed
                         if self.kv_cache_manager.log_stats:
                             assert self.kv_cache_manager.prefix_cache_stats is not None
                             self.kv_cache_manager.prefix_cache_stats.record(
@@ -797,6 +845,39 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if computed_per_group is not None:
+                        for group in coordinator.attention_groups:
+                            num_computed_blocks = (
+                                num_computed_tokens // group.spec.block_size
+                            )
+                            for group_id in group.group_ids:
+                                del computed_per_group[group_id][num_computed_blocks:]
+                        new_computed_blocks = (
+                            self.kv_cache_manager.create_kv_cache_blocks(
+                                computed_per_group
+                            )
+                        )
+
+                    # Online C128 requires either an aligned resume or PD state transfer.
+                    if self._online_c128_enabled:
+                        if num_new_local_computed_tokens % 128 != 0:
+                            raise ValueError(
+                                "C128 online compression requires 128-aligned "
+                                "local prefix-cache hits, got "
+                                f"{num_new_local_computed_tokens}."
+                            )
+                        if (
+                            not self._online_c128_pd_transfer_enabled
+                            and num_external_computed_tokens > 0
+                            and num_computed_tokens % 128 != 0
+                        ):
+                            raise ValueError(
+                                "C128 online compression PD remote prefill with a "
+                                "non-128-aligned resume requires "
+                                "VLLM_USE_ONLINE_C128_PD_TRANSFER=1 (committed "
+                                "bank0 state transfer); got "
+                                f"num_computed_tokens={num_computed_tokens}."
+                            )
 
                     # Skip request with pending mm encoding prefetches
                     if (
@@ -2533,13 +2614,21 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.warning(
+                    "Ignoring stale KV recv completion for request %s; "
+                    "request is no longer tracked by scheduler.",
+                    req_id,
+                )
+                self.finished_recving_kv_req_ids.discard(req_id)
+                self.failed_recving_kv_req_ids.discard(req_id)
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
@@ -2588,7 +2677,7 @@ class Scheduler(SchedulerInterface):
             marked_invalid_block = False
             req_id = request.request_id
             # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2598,13 +2687,23 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
+            for idx in range(req_num_computed_blocks):
+                invalid_at_idx = [
+                    block_ids[idx]
+                    for block_ids in req_block_id_groups
+                    if idx < len(block_ids) and block_ids[idx] in invalid_block_ids
+                ]
+                if not invalid_at_idx:
                     continue
 
                 is_affected = True
 
-                if block_id in marked_invalid_block_ids:
+                unmarked_invalid_at_idx = [
+                    block_id
+                    for block_id in invalid_at_idx
+                    if block_id not in marked_invalid_block_ids
+                ]
+                if not unmarked_invalid_at_idx:
                     # This invalid block is shared with a previous request
                     # and was already marked for recomputation.
                     # This means this request can still consider this block
@@ -2613,7 +2712,7 @@ class Scheduler(SchedulerInterface):
                     # loading does not yet support block sharing
                     continue
 
-                marked_invalid_block_ids.add(block_id)
+                marked_invalid_block_ids.update(unmarked_invalid_at_idx)
 
                 if marked_invalid_block:
                     # This request has already marked an invalid block for
@@ -2630,7 +2729,8 @@ class Scheduler(SchedulerInterface):
 
                 # collect invalid block and all downstream dependent blocks
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    for block_ids in req_block_id_groups:
+                        blocks_to_evict.update(block_ids[idx:])
 
             if is_affected:
                 if not marked_invalid_block:
