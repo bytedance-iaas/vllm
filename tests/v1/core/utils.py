@@ -55,6 +55,7 @@ def create_scheduler(
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
     speculative_method: str | None = None,
+    speculative_model: str = "ngram",
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -127,8 +128,11 @@ def create_scheduler(
 
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
+        is_ngram_gpu = speculative_model == "ngram_gpu"
         spec_kwargs: dict = dict(
-            model="ngram", num_speculative_tokens=num_speculative_tokens
+            model=None if is_ngram_gpu else speculative_model,
+            method="ngram_gpu" if is_ngram_gpu else None,
+            num_speculative_tokens=num_speculative_tokens,
         )
         if speculative_method is not None:
             spec_kwargs["method"] = speculative_method

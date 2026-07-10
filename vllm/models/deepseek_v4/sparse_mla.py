@@ -373,12 +373,13 @@ def _build_c128a_topk_metadata_kernel(
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
-            is_valid = offset < num_compressed
+            is_valid = is_valid_token & (offset < num_compressed)
 
             block_indices = offset // block_size
             block_numbers = tl.load(
                 block_table_ptr + req_idx * block_table_stride + block_indices,
                 mask=mask & is_valid,
+                other=0,
             )
             block_offsets = offset % block_size
             slot_ids = block_numbers * block_size + block_offsets

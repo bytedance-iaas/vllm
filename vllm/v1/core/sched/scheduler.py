@@ -477,6 +477,22 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+
+            if (
+                self.scheduler_config.async_scheduling
+                and self.num_sampled_tokens_per_step > 0
+                and request.spec_token_ids
+                and not request.is_prefill_chunk
+                and num_new_tokens > token_budget
+            ):
+                # Do not split a speculative decode group across scheduler
+                # steps. The async GPU runner prepares input_ids by placing
+                # the previous sampled token immediately before the scheduled
+                # draft tokens; scheduling only the tail draft tokens breaks
+                # that invariant.
+                req_index += 1
+                continue
+
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -510,6 +526,24 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
+
+            if (
+                self.scheduler_config.async_scheduling
+                and self.num_sampled_tokens_per_step > 0
+                and request.spec_token_ids
+                and not request.is_prefill_chunk
+            ):
+                num_scheduled_spec_tokens = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                    - request.num_output_placeholders
+                )
+                if num_scheduled_spec_tokens >= num_new_tokens or (
+                    0 < num_scheduled_spec_tokens < len(request.spec_token_ids)
+                ):
+                    req_index += 1
+                    continue
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -1945,6 +1979,13 @@ class Scheduler(SchedulerInterface):
                 # rejection or drafter gather can reference it.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    @staticmethod
+    def _trim_invalid_spec_token_ids(spec_token_ids: list[int]) -> list[int]:
+        for i, token_id in enumerate(spec_token_ids):
+            if token_id < 0:
+                return spec_token_ids[:i]
+        return spec_token_ids
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
@@ -1961,6 +2002,7 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            spec_token_ids = self._trim_invalid_spec_token_ids(spec_token_ids)
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -1990,6 +2032,7 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
+            spec_token_ids = self._trim_invalid_spec_token_ids(spec_token_ids)
             # Filter out spec tokens which do not adhere to the grammar.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request

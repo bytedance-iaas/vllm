@@ -1042,6 +1042,8 @@ class InputBatch:
                 assert self.async_copy_ready_event is not None
                 self.async_copy_ready_event.synchronize()
                 sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            if prev_index >= len(sampled_token_ids):
+                continue
             # Replace placeholder token id(s) with actual sampled id(s).
             new_ids: list[int] = sampled_token_ids[prev_index]
             if not new_ids:
@@ -1076,7 +1078,7 @@ class InputBatch:
             for req_id, spec_ids in zip(self.req_ids, spec_token_ids):
                 if spec_ids:
                     prev_index = self.prev_req_id_to_index.get(req_id)
-                    if prev_index is not None:
+                    if prev_index is not None and prev_index < len(draft_token_ids):
                         draft_ids = draft_token_ids[prev_index]
                         if draft_ids:
                             del draft_ids[len(spec_ids) :]

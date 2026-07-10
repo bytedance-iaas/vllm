@@ -57,6 +57,20 @@ NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 
 
+def test_calc_spec_decode_metadata_rejects_all_draft_schedule():
+    runner = object.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"req-0 has 3 scheduled tokens but 3 draft tokens",
+    ):
+        runner._calc_spec_decode_metadata(
+            num_draft_tokens=np.array([3], dtype=np.int32),
+            cu_num_scheduled_tokens=np.array([3], dtype=np.int32),
+        )
+
+
 def initialize_kv_cache(runner: GPUModelRunner):
     """
     Only perform necessary steps in GPUModelRunner.initialize_kv_cache()

@@ -215,8 +215,9 @@ def eagle_prepare_next_token_padded_kernel(
         row_ptr = sampled_token_ids_ptr + req_idx * stride_sampled_token_ids
         token_ids = tl.load(row_ptr + token_offs, mask=token_mask, other=-1)
 
-        # Rejected tokens are -1, valid tokens are in [0, vocab_size)
-        is_valid_mask = (token_ids != -1) & (token_ids < vocab_size) & token_mask
+        # Rejected/padded tokens are negative; valid tokens are in
+        # [0, vocab_size).
+        is_valid_mask = (token_ids >= 0) & (token_ids < vocab_size) & token_mask
         valid_count = tl.sum(is_valid_mask)
 
         if valid_count > 0:
@@ -576,14 +577,23 @@ def update_num_computed_tokens_for_batch_change(
     Requests that had drafts: corrected = prev_gpu + valid_count.
     New requests or non-draft (e.g. prefills): use CPU value directly.
     """
-    # Clamp because prev_positions can be -1 for new requests
-    gather_indices = prev_positions.clamp(min=0)
+    valid_prev = (
+        (prev_positions >= 0)
+        & (prev_positions < valid_sampled_token_count.shape[0])
+        & (prev_positions < num_computed_tokens.shape[0])
+        & (prev_positions < prev_num_draft_tokens.shape[0])
+    )
+    # Clamp invalid rows to zero before gathering; they are masked out below and
+    # fall back to the CPU value just like new or non-draft requests.
+    gather_indices = torch.where(
+        valid_prev, prev_positions, torch.zeros_like(prev_positions)
+    )
 
     valid_counts = valid_sampled_token_count[gather_indices]
     prev_computed = num_computed_tokens[gather_indices]
     prev_drafts = prev_num_draft_tokens[gather_indices]
 
-    participating = (prev_positions >= 0) & (prev_drafts > 0)
+    participating = valid_prev & (prev_drafts > 0)
     corrected = prev_computed + valid_counts.int()
 
     n = prev_positions.shape[0]
