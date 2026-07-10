@@ -48,7 +48,7 @@ jobs:
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
-      BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0-mega_moe-linux-x86_64-260630.whl
+      BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0%2Blocal-260630mega_moe-cp312-cp312-linux_x86_64.whl
     steps:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
