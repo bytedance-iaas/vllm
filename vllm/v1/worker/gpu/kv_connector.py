@@ -43,6 +43,16 @@ class KVConnector:
     def set_disabled(self, disabled: bool) -> None:
         pass
 
+    # Online C128 state-transfer hooks; no-op for connectors that do not support it.
+    def snapshot_c128_state(self, req_id: str, req_state_idx: int) -> None:
+        pass
+
+    def bind_c128_state_index(self, req_id: str, req_state_idx: int) -> None:
+        pass
+
+    def restore_c128_state(self, req_id: str, req_state_idx: int) -> None:
+        pass
+
 
 class ActiveKVConnector(KVConnector):
     def __init__(
@@ -108,6 +118,21 @@ class ActiveKVConnector(KVConnector):
         # Ensure that layer-wise connector hooks aren't called when disabled.
         kv_transfer_state._KV_CONNECTOR_AGENT = None if disabled else self.kv_connector
         self._disabled = disabled
+
+    def snapshot_c128_state(self, req_id: str, req_state_idx: int) -> None:
+        fn = getattr(self.kv_connector, "snapshot_c128_state", None)
+        if fn is not None:
+            fn(req_id, req_state_idx)
+
+    def bind_c128_state_index(self, req_id: str, req_state_idx: int) -> None:
+        fn = getattr(self.kv_connector, "bind_c128_state_index", None)
+        if fn is not None:
+            fn(req_id, req_state_idx)
+
+    def restore_c128_state(self, req_id: str, req_state_idx: int) -> None:
+        fn = getattr(self.kv_connector, "restore_c128_state", None)
+        if fn is not None:
+            fn(req_id, req_state_idx)
 
 
 NO_OP_KV_CONNECTOR = KVConnector()
