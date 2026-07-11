@@ -817,6 +817,56 @@ class Scheduler(SchedulerInterface):
                             0,
                         )
 
+                    # Online C128 does not persist the partial 128-token carry
+                    # in prefix cache. Recompute from the previous C128 boundary
+                    # instead of failing the whole scheduler step.
+                    if self._online_c128_enabled:
+                        aligned_local_tokens = (
+                            num_new_local_computed_tokens // 128
+                        ) * 128
+                        if aligned_local_tokens != num_new_local_computed_tokens:
+                            logger.debug(
+                                "Truncating Online C128 local prefix hit from %d "
+                                "to %d tokens for request %s.",
+                                num_new_local_computed_tokens,
+                                aligned_local_tokens,
+                                request.request_id,
+                            )
+                            num_new_local_computed_tokens = aligned_local_tokens
+                            if computed_per_group is not None:
+                                for group in coordinator.attention_groups:
+                                    if (
+                                        get_kv_cache_spec_kind(group.spec)
+                                        in dense_kinds
+                                    ):
+                                        num_dense_blocks = (
+                                            num_new_local_computed_tokens
+                                            // group.spec.block_size
+                                        )
+                                        for group_id in group.group_ids:
+                                            del computed_per_group[group_id][
+                                                num_dense_blocks:
+                                            ]
+                            else:
+                                trimmed_blocks: list[list[KVCacheBlock]] = []
+                                for group_idx, blocks in enumerate(
+                                    new_computed_blocks.blocks
+                                ):
+                                    spec = self.kv_cache_config.kv_cache_groups[
+                                        group_idx
+                                    ].kv_cache_spec
+                                    num_group_blocks = (
+                                        num_new_local_computed_tokens // spec.block_size
+                                    )
+                                    trimmed_blocks.append(
+                                        list(blocks[:num_group_blocks])
+                                    )
+                                new_computed_blocks = (
+                                    self.kv_cache_manager.create_kv_cache_blocks(
+                                        tuple(trimmed_blocks)
+                                    )
+                                )
+
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         ext_tokens, load_kv_async = (
@@ -860,25 +910,19 @@ class Scheduler(SchedulerInterface):
 
                     # Online C128 requires either an aligned resume or PD state
                     # transfer.
-                    if self._online_c128_enabled:
-                        if num_new_local_computed_tokens % 128 != 0:
-                            raise ValueError(
-                                "C128 online compression requires 128-aligned "
-                                "local prefix-cache hits, got "
-                                f"{num_new_local_computed_tokens}."
-                            )
-                        if (
-                            not self._online_c128_pd_transfer_enabled
-                            and num_external_computed_tokens > 0
-                            and num_computed_tokens % 128 != 0
-                        ):
-                            raise ValueError(
-                                "C128 online compression PD remote prefill with a "
-                                "non-128-aligned resume requires "
-                                "VLLM_USE_ONLINE_C128_PD_TRANSFER=1 (committed "
-                                "bank0 state transfer); got "
-                                f"num_computed_tokens={num_computed_tokens}."
-                            )
+                    if (
+                        self._online_c128_enabled
+                        and not self._online_c128_pd_transfer_enabled
+                        and num_external_computed_tokens > 0
+                        and num_computed_tokens % 128 != 0
+                    ):
+                        raise ValueError(
+                            "C128 online compression PD remote prefill with a "
+                            "non-128-aligned resume requires "
+                            "VLLM_USE_ONLINE_C128_PD_TRANSFER=1 (committed "
+                            "bank0 state transfer); got "
+                            f"num_computed_tokens={num_computed_tokens}."
+                        )
 
                     # Skip request with pending mm encoding prefetches
                     if (

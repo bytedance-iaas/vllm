@@ -5558,6 +5558,14 @@ class GPUModelRunner(
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
+                if self._online_c128_enabled:
+                    # Model construction re-registers the Online C128 per-layer
+                    # states, so clear stale legacy reload state first.
+                    from vllm.models.deepseek_v4.online_c128 import (
+                        clear_online_c128_states,
+                    )
+
+                    clear_online_c128_states()
                 model_loader = get_model_loader(self.load_config)
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
