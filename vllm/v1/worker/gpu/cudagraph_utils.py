@@ -376,13 +376,20 @@ class CudaGraphManager:
                             forward_fn(desc.cg_mode)
                             get_offloader().join_after_forward()
                             _reset_online_c128_states_if_enabled()
+                        capture_mode = (
+                            desc.cg_mode
+                            if online_c128_reset_needed
+                            else CUDAGraphMode.NONE
+                        )
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
                         with torch.cuda.graph(graph, self.pool):
-                            # FULL mode selects graph-safe fixed-address kernels.
-                            forward_fn(desc.cg_mode)
+                            # Online C128 needs FULL context to select graph-safe
+                            # fixed-address kernels. Other models keep main's
+                            # capture semantics and see NONE during capture.
+                            forward_fn(capture_mode)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
