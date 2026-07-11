@@ -18,8 +18,15 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     # DSpark uses non-causal attention.
     causal = False
+    # The draft is a dense (non-MLA) transformer, so MLA-only kv-cache layouts
+    # like fp8_ds_mla don't apply to it and no dense attention backend accepts
+    # them. Store the draft KV cache in the model dtype instead.
+    draft_cache_config = vllm_config.cache_config
+    if draft_cache_config.cache_dtype == "fp8_ds_mla":
+        draft_cache_config = replace(draft_cache_config, cache_dtype="auto")
     draft_vllm_config = replace(
         vllm_config,
+        cache_config=draft_cache_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=not causal,
