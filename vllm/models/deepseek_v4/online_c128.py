@@ -237,9 +237,10 @@ def get_online_c128_states() -> list[DeepseekOnlineC128State]:
 
 
 def clear_online_c128_states() -> None:
-    global _ONLINE_C128_COMPRESSED_KV
+    global _ONLINE_C128_COMPRESSED_KV, _ONLINE_C128_VERIFY_ACTIVE
     _ONLINE_C128_STATES.clear()
     _ONLINE_C128_COMPRESSED_KV = None
+    _ONLINE_C128_VERIFY_ACTIVE = False
 
 
 def begin_online_c128_verify() -> None:

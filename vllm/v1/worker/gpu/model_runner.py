@@ -301,13 +301,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
-        # DeepSeek-V4 C128 online: clear the module-level state registry +
-        # shared scratch before (re)loading so a reload / multi-model worker
-        # does not accumulate stale per-layer states from a prior model. The new
-        # model's compressors re-register during construction below.
-        from vllm.models.deepseek_v4.online_c128 import clear_online_c128_states
+        if self._online_c128_uses_mtp:
+            # DeepSeek-V4 C128 online: clear the module-level state registry +
+            # shared scratch before (re)loading so a reload does not accumulate
+            # stale per-layer states from a prior model. The new model's
+            # compressors re-register during construction below.
+            from vllm.models.deepseek_v4.online_c128 import clear_online_c128_states
 
-        clear_online_c128_states()
+            clear_online_c128_states()
         self.eplb.prepare_load()
         eplb_models_added = False
         with DeviceMemoryProfiler() as m:
