@@ -150,6 +150,12 @@ class DefaultModelState(ModelState):
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+        is_prefilling_np = torch.zeros(
+            input_batch.num_reqs_after_padding, dtype=torch.bool
+        )
+        is_prefilling_np[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.is_prefilling_np
+        )
         if for_capture:
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
@@ -184,8 +190,11 @@ class DefaultModelState(ModelState):
             mm_req_doc_ranges=req_doc_ranges,
             req_state_indices=input_batch.req_state_indices,
             req_state_indices_cpu=input_batch.idx_mapping_np,
+            is_prefilling=is_prefilling_np,
             num_draft_tokens_per_req_cpu=input_batch.num_draft_tokens_per_req,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            skip_online_c128_plan=for_capture
+            or cudagraph_mode == CUDAGraphMode.FULL,
         )
         return attn_metadata

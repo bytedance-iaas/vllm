@@ -22,11 +22,18 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.models.deepseek_v4.online_c128 import (
+    ONLINE_C128_COMPRESS_RATIO,
+    ONLINE_C128_ROW_MODE_NORMAL,
+    ONLINE_C128_ROW_MODE_PREFILL,
+    ONLINE_C128_ROW_MODE_VERIFY,
     DeepseekOnlineC128State,
+    OnlineC128Plan,
     assert_online_c128_supported,
     ensure_online_c128_compressed_kv,
     online_c128_compress_enabled,
+    online_c128_compressed_kv,
     online_c128_uses_mtp,
+    plan_online_c128_segments,
     register_online_c128_state,
 )
 from vllm.platforms import current_platform
@@ -91,21 +98,20 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    # [num_tokens] token -> persistent request-state slot index (padded reqs
-    # map to -1). Only populated when C128 online compression is enabled; used
-    # to address the independent DeepseekOnlineC128State rows.
-    token_to_req_state_indices: torch.Tensor | None = None
     # Device per-request inputs for the graph-safe online C128 decode / verify
     # kernel (fixed-address; safe to capture in a FULL decode cudagraph). Only
     # populated when C128 online is enabled.
     query_start_loc: torch.Tensor | None = None  # [num_reqs + 1] int32
     req_state_indices: torch.Tensor | None = None  # [num_reqs] int32 (-1 pad)
+    online_c128_row_modes: torch.Tensor | None = None  # [num_reqs] int32
+    online_c128_has_decode_rows: bool = False
     # Host-side per-step inputs for building the C128 online segment plan. All
     # CPU (no device sync). Only populated when C128 online is enabled.
     query_start_loc_cpu: torch.Tensor | None = None
     seq_lens_cpu: "np.ndarray | None" = None
     req_state_indices_cpu: "np.ndarray | None" = None
     num_draft_tokens_per_req_cpu: "np.ndarray | None" = None
+    online_c128_plan: OnlineC128Plan | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -123,16 +129,17 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
 
-        # C128 online compression addresses an independent per-request running
-        # state by stable request-state slot (CommonAttentionMetadata
-        # .req_state_indices). When enabled, expand that per-request mapping to a
-        # per-token mapping (padded reqs / tokens carry -1). Kept in a persistent
-        # buffer for CUDA-graph address stability, mirroring token_to_req_indices.
-        self._online_c128 = online_c128_compress_enabled()
+        # Only the true C128 online state-cache spec addresses request state per
+        # request, so only that path skips the legacy per-token request mapping.
+        self._online_c128 = (
+            online_c128_compress_enabled()
+            and isinstance(mla_spec, SlidingWindowMLASpec)
+            and mla_spec.sliding_window == mla_spec.block_size
+        )
         if self._online_c128:
-            self.token_to_req_state_indices = torch.full(
-                (self.vllm_config.scheduler_config.max_num_batched_tokens,),
-                -1,
+            self.online_c128_row_modes = torch.full(
+                (self.vllm_config.scheduler_config.max_num_seqs,),
+                ONLINE_C128_ROW_MODE_PREFILL,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -143,19 +150,22 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
-        )
         num_reqs = common_attn_metadata.num_reqs
-
-        token_to_req_state_indices = None
+        token_to_req_indices = None
         query_start_loc_cpu = None
         seq_lens_cpu = None
         req_state_indices_cpu = None
         num_draft_tokens_per_req_cpu = None
         device_query_start_loc = None
         device_req_state_indices = None
-        if self._online_c128:
+        online_c128_row_modes = None
+        online_c128_has_decode_rows = False
+        online_c128_plan = None
+        if not self._online_c128:
+            token_to_req_indices = common_attn_metadata.token_to_req_indices(
+                self.token_to_req_indices
+            )
+        else:
             req_state_indices = common_attn_metadata.req_state_indices
             assert req_state_indices is not None, (
                 "C128 online compression requires req_state_indices in "
@@ -165,19 +175,17 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             # (fixed-address; safe to capture in a FULL decode cudagraph).
             device_query_start_loc = common_attn_metadata.query_start_loc
             device_req_state_indices = req_state_indices[:num_reqs].to(torch.int32)
-            # Map each token to its persistent request-state slot via the
-            # batch-local token->req index built above.
-            token_state = device_req_state_indices[
-                token_to_req_indices.to(torch.long)
-            ]
-            token_to_req_state_indices = self.token_to_req_state_indices[
-                : common_attn_metadata.num_actual_tokens
-            ]
-            token_to_req_state_indices.fill_(-1)
-            num_mapped_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
-            token_to_req_state_indices[:num_mapped_tokens].copy_(
-                token_state[:num_mapped_tokens], non_blocking=True
+            row_modes_cpu = torch.full(
+                (num_reqs,),
+                ONLINE_C128_ROW_MODE_NORMAL,
+                dtype=torch.int32,
             )
+            is_prefilling = common_attn_metadata.is_prefilling
+            if is_prefilling is not None:
+                prefill_req_mask = is_prefilling[:num_reqs].cpu().numpy().astype(bool)
+            else:
+                prefill_req_mask = np.zeros(num_reqs, dtype=np.bool_)
+            row_modes_cpu[prefill_req_mask] = ONLINE_C128_ROW_MODE_PREFILL
 
             # Host-side inputs for the segment planner (no device sync).
             query_start_loc_cpu = query_start_loc_cpu_t = (
@@ -190,28 +198,56 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             num_draft_tokens_per_req_cpu = (
                 common_attn_metadata.num_draft_tokens_per_req_cpu
             )
+            if num_draft_tokens_per_req_cpu is not None:
+                verify_req_mask = (
+                    num_draft_tokens_per_req_cpu[:num_reqs] > 0
+                ) & ~prefill_req_mask
+                row_modes_cpu[verify_req_mask] = ONLINE_C128_ROW_MODE_VERIFY
+            online_c128_has_decode_rows = bool(
+                np.any(row_modes_cpu.numpy() >= ONLINE_C128_ROW_MODE_NORMAL)
+            )
+            online_c128_row_modes = self.online_c128_row_modes[:num_reqs]
+            online_c128_row_modes.copy_(row_modes_cpu, non_blocking=True)
             # seq_lens_cpu = num_computed + query_len. seq_lens_cpu_upper_bound is
-            # precise for prefill rows (the only rows that emit/store via the
-            # segment plan); decode rows use single-token recurrence and ignore
-            # the plan's per-segment math beyond num_rows==1.
+            # precise for prefill rows, which are the only rows allowed to use
+            # the host segment plan. Decode/verify rows use device positions.
             ub = common_attn_metadata.seq_lens_cpu_upper_bound
             if ub is not None:
                 seq_lens_cpu = ub[:num_reqs].cpu().numpy()
             else:
                 qlen = (query_start_loc_cpu_t[1:] - query_start_loc_cpu_t[:-1]).numpy()
                 seq_lens_cpu = qlen  # fallback: seq_len == query_len
+
+            if (
+                not common_attn_metadata.skip_online_c128_plan
+                and np.any(prefill_req_mask)
+            ):
+                query_start_loc_np = query_start_loc_cpu_t.numpy()
+                max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+                online_c128_plan = plan_online_c128_segments(
+                    query_start_loc_cpu=query_start_loc_np,
+                    seq_lens_cpu=seq_lens_cpu,
+                    req_state_indices_cpu=req_state_indices_cpu,
+                    max_num_reqs=max_num_reqs,
+                    device=self.device,
+                    bank_id=0,
+                    compress_ratio=ONLINE_C128_COMPRESS_RATIO,
+                    req_mask=prefill_req_mask,
+                )
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
             slot_mapping=common_attn_metadata.slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
-            token_to_req_state_indices=token_to_req_state_indices,
             query_start_loc=device_query_start_loc,
             req_state_indices=device_req_state_indices,
+            online_c128_row_modes=online_c128_row_modes,
+            online_c128_has_decode_rows=online_c128_has_decode_rows,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
             req_state_indices_cpu=req_state_indices_cpu,
             num_draft_tokens_per_req_cpu=num_draft_tokens_per_req_cpu,
+            online_c128_plan=online_c128_plan,
         )
 
 
@@ -589,10 +625,6 @@ class DeepseekCompressor(nn.Module):
         forward_context = get_forward_context()
         cg_mode = forward_context.cudagraph_runtime_mode
         if cg_mode == CUDAGraphMode.FULL:
-            batch_desc = forward_context.batch_descriptor
-            candidate_chain = self.online_c128_uses_mtp and bool(
-                getattr(batch_desc, "online_c128_candidate_chain", False)
-            )
             self._online_forward_graph_safe(
                 kv=kv,
                 score=score,
@@ -607,7 +639,6 @@ class DeepseekCompressor(nn.Module):
                 store_full_kv=store_full_kv,
                 store_full_fp8=store_full_fp8,
                 fp8_scale=fp8_scale,
-                candidate_chain=candidate_chain,
             )
             return
 
@@ -642,7 +673,6 @@ class DeepseekCompressor(nn.Module):
         store_full_kv: bool,
         store_full_fp8: bool,
         fp8_scale: torch.Tensor | None,
-        candidate_chain: bool,
     ) -> None:
         """FULL-decode-cudagraph path: fixed-address, on-device, plan-free."""
         from vllm.models.deepseek_v4.nvidia.ops.online_c128_cutedsl import (
@@ -651,18 +681,21 @@ class DeepseekCompressor(nn.Module):
         from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
             store_compressed_kv_cutedsl,
         )
-        from vllm.models.deepseek_v4.online_c128 import online_c128_compressed_kv
 
         query_start_loc = state_metadata.query_start_loc
         req_state_indices = state_metadata.req_state_indices
-        assert query_start_loc is not None and req_state_indices is not None, (
+        row_modes = state_metadata.online_c128_row_modes
+        assert (
+            query_start_loc is not None
+            and req_state_indices is not None
+            and row_modes is not None
+        ), (
             "C128 online FULL-graph path requires device query_start_loc / "
-            "req_state_indices in the compressor metadata."
+            "req_state_indices / row_modes in the compressor metadata."
         )
 
-        # Stable scratch for FULL graph replay; zero non-boundary rows before store.
+        # Store kernels guard on 128-token boundaries before reading this scratch.
         compressed_kv = online_c128_compressed_kv(num_actual)
-        compressed_kv.zero_()
 
         online_c128_decode(
             kv=kv,
@@ -671,11 +704,11 @@ class DeepseekCompressor(nn.Module):
             positions=positions,
             query_start_loc=query_start_loc,
             req_state_indices=req_state_indices,
+            row_modes=row_modes,
             run_state=run_state,
             compressed_kv=compressed_kv,
             max_num_reqs=online_state.max_num_reqs,
             compress_ratio=self.compress_ratio,
-            candidate_chain=candidate_chain,
         )
 
         store_compressed_kv_cutedsl(
@@ -722,15 +755,11 @@ class DeepseekCompressor(nn.Module):
     ) -> None:
         """Eager / PIECEWISE C128 path using host-built segment plans."""
         from vllm.models.deepseek_v4.nvidia.ops.online_c128_cutedsl import (
+            online_c128_decode,
             online_c128_merge,
         )
         from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
             store_compressed_kv_cutedsl,
-        )
-        from vllm.models.deepseek_v4.online_c128 import (
-            online_c128_verify_active,
-            plan_online_c128_segments,
-            plan_online_c128_verify,
         )
 
         query_start_loc_cpu = state_metadata.query_start_loc_cpu
@@ -741,95 +770,38 @@ class DeepseekCompressor(nn.Module):
             and seq_lens_cpu is not None
             and req_state_indices_cpu is not None
         ), "C128 online forward requires host-side segment-plan metadata."
-
-        compressed_kv = torch.empty(
-            (num_actual, self.head_dim),
-            dtype=torch.float32,
-            device=kv.device,
+        query_start_loc = state_metadata.query_start_loc
+        req_state_indices = state_metadata.req_state_indices
+        row_modes = state_metadata.online_c128_row_modes
+        assert (
+            query_start_loc is not None
+            and req_state_indices is not None
+            and row_modes is not None
+        ), (
+            "C128 online planned path requires device query_start_loc / "
+            "req_state_indices / row_modes in the compressor metadata."
         )
 
-        verify_mode = self.online_c128_uses_mtp and online_c128_verify_active()
-        if verify_mode:
-            num_draft_tokens_per_req_cpu = state_metadata.num_draft_tokens_per_req_cpu
-            if num_draft_tokens_per_req_cpu is None:
-                raise ValueError(
-                    "C128 online MTP verify requires per-request draft-token "
-                    "counts in compressor metadata."
-                )
-            num_draft_tokens_per_req_cpu = num_draft_tokens_per_req_cpu[
-                : len(req_state_indices_cpu)
-            ]
-            verify_req_mask = num_draft_tokens_per_req_cpu > 0
-            # Verify rows use candidate banks; mixed non-verify rows update bank0.
-            if np.any(verify_req_mask):
-                verify_segments_by_step = plan_online_c128_verify(
-                    query_start_loc_cpu=query_start_loc_cpu.numpy(),
-                    seq_lens_cpu=seq_lens_cpu,
-                    req_state_indices_cpu=req_state_indices_cpu,
-                    max_num_reqs=online_state.max_num_reqs,
-                    device=kv.device,
-                    compress_ratio=self.compress_ratio,
-                    req_mask=verify_req_mask,
-                    max_query_len=online_state.num_banks - 1,
-                )
-                for step_segments in verify_segments_by_step:
-                    online_c128_merge(
-                        kv=kv,
-                        score=score,
-                        ape=self.ape,
-                        positions=positions,
-                        run_state=run_state,
-                        segments=step_segments,
-                        compressed_kv=compressed_kv,
-                        compress_ratio=self.compress_ratio,
-                    )
+        # Reuse the same per-layer scratch discipline as the FULL graph path:
+        # each compressor produces and stores before the next layer reuses it.
+        compressed_kv = online_c128_compressed_kv(num_actual)
 
-            normal_req_mask = ~verify_req_mask
-            if np.any(normal_req_mask):
-                plan = plan_online_c128_segments(
-                    query_start_loc_cpu=query_start_loc_cpu.numpy(),
-                    seq_lens_cpu=seq_lens_cpu,
-                    req_state_indices_cpu=req_state_indices_cpu,
-                    max_num_reqs=online_state.max_num_reqs,
-                    device=kv.device,
-                    bank_id=0,
-                    compress_ratio=self.compress_ratio,
-                    req_mask=normal_req_mask,
-                )
-                online_c128_merge(
-                    kv=kv,
-                    score=score,
-                    ape=self.ape,
-                    positions=positions,
-                    run_state=run_state,
-                    segments=plan.emit_segments,
-                    compressed_kv=compressed_kv,
-                    compress_ratio=self.compress_ratio,
-                )
-                online_c128_merge(
-                    kv=kv,
-                    score=score,
-                    ape=self.ape,
-                    positions=positions,
-                    run_state=run_state,
-                    segments=plan.update_segments,
-                    compressed_kv=compressed_kv,
-                    compress_ratio=self.compress_ratio,
-                )
-                if plan.reset_rows.numel() > 0:
-                    rows = plan.reset_rows.to(torch.long)
-                    run_state[rows, : self.head_dim] = float("-inf")
-                    run_state[rows, self.head_dim :] = 0.0
-        else:
-            plan = plan_online_c128_segments(
-                query_start_loc_cpu=query_start_loc_cpu.numpy(),
-                seq_lens_cpu=seq_lens_cpu,
-                req_state_indices_cpu=req_state_indices_cpu,
+        if state_metadata.online_c128_has_decode_rows:
+            online_c128_decode(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                query_start_loc=query_start_loc,
+                req_state_indices=req_state_indices,
+                row_modes=row_modes,
+                run_state=run_state,
+                compressed_kv=compressed_kv,
                 max_num_reqs=online_state.max_num_reqs,
-                device=kv.device,
-                bank_id=0,
                 compress_ratio=self.compress_ratio,
             )
+
+        def run_segment_plan(plan: OnlineC128Plan) -> None:
             # Phase 1 (emit): read committed carry read-only, write compressed_kv.
             online_c128_merge(
                 kv=kv,
@@ -854,9 +826,13 @@ class DeepseekCompressor(nn.Module):
             )
             # Reset bank rows whose step ended exactly on a 128 boundary.
             if plan.reset_rows.numel() > 0:
-                rows = plan.reset_rows.to(torch.long)
+                rows = plan.reset_rows_long
                 run_state[rows, : self.head_dim] = float("-inf")
                 run_state[rows, self.head_dim :] = 0.0
+
+        plan = state_metadata.online_c128_plan
+        if plan is not None:
+            run_segment_plan(plan)
 
         # Store boundary tokens (RMSNorm + RoPE + UE8M0 / FlashInfer full KV).
         store_compressed_kv_cutedsl(

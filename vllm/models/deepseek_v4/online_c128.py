@@ -22,6 +22,10 @@ ONLINE_C128_HEAD_DIM = 512
 # Number of running-state vectors per row: [run_max, run_sum, run_weighted_sum].
 ONLINE_C128_NUM_STATE_VECTORS = 3
 ONLINE_C128_STATE_DTYPE = torch.float32
+# Per-request decode row modes used by the device recurrence.
+ONLINE_C128_ROW_MODE_PREFILL = -1
+ONLINE_C128_ROW_MODE_NORMAL = 0
+ONLINE_C128_ROW_MODE_VERIFY = 1
 
 
 def online_c128_compress_enabled() -> bool:
@@ -80,7 +84,15 @@ def assert_online_c128_supported(
             "VLLM_USE_ONLINE_C128_COMPRESS does not support prefill context "
             "parallelism (PCP)."
         )
-
+    if (
+        bool(getattr(parallel_config, "use_ubatching", False))
+        or bool(getattr(parallel_config, "enable_dbo", False))
+        or getattr(parallel_config, "ubatch_size", 0) > 1
+    ):
+        raise ValueError(
+            "VLLM_USE_ONLINE_C128_COMPRESS does not support DBO/u-batching. "
+            "The shared online C128 compressed-KV scratch is single-forward only."
+        )
     # Any speculative decoding under online compress MUST be MTP. Other
     # speculative methods would merge rejected draft tokens into committed bank0
     # and pollute later decode.
@@ -139,12 +151,14 @@ class DeepseekOnlineC128State(torch.nn.Module):
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.num_banks = online_c128_num_banks(vllm_config)
 
-        # [num_banks * max_num_reqs, num_state_vectors * head_dim], fp32.
-        # run_max initialized to -inf, run_sum / run_weighted_sum to 0 so an
-        # "empty" row is a valid online-softmax identity.
-        self.state = torch.empty(
-            (self.num_banks * self.max_num_reqs, self.row_width),
-            dtype=ONLINE_C128_STATE_DTYPE,
+        # View into the module-level packed arena, shape
+        # [num_banks * max_num_reqs, num_state_vectors * head_dim], fp32. Keeping
+        # the per-layer view preserves snapshot/restore users of ``state`` while
+        # letting MTP verify commit update all C128 layers in one kernel launch.
+        self.state = ensure_online_c128_packed_state(
+            vllm_config=vllm_config,
+            head_dim=head_dim,
+            layer_index=layer_index,
             device=device,
         )
         self.reset_all()
@@ -178,15 +192,30 @@ class DeepseekOnlineC128State(torch.nn.Module):
 # list through the forward signature.
 _ONLINE_C128_STATES: list[DeepseekOnlineC128State] = []
 
+# Packed running-state arena for all C128 online compressor layers:
+# [num_c128_layers, num_banks * max_num_reqs, num_state_vectors * head_dim].
+# Per-layer modules keep 2-D views into this arena for compatibility, while the
+# verify commit path launches once over (request, layer).
+_ONLINE_C128_PACKED_STATE: torch.Tensor | None = None
+_ONLINE_C128_LAYER_SLOT_BY_INDEX: dict[int, int] = {}
+_ONLINE_C128_LAYER_INDICES: tuple[int, ...] = ()
+_ONLINE_C128_PACKED_COMPATIBILITY_KEY: tuple[object, ...] | None = None
+
 # Shared fixed-address scratch for the per-boundary compressed KV output. The
 # FULL decode cudagraph captures the compressor inside the graph, so the
 # ``compressed_kv`` the merge kernel writes (and the store kernel reads) must be
 # a stable pointer rather than a fresh ``torch.empty`` each step. One buffer is
 # shared across all layers because each layer fully produces+consumes it within
-# its own forward (FULL cudagraph replay is serial on the model stream). The
-# eager / PIECEWISE path keeps allocating per-step (concurrency-safe), so this
-# is only used on the FULL path.
+# its own forward before the next layer can reuse it.
 _ONLINE_C128_COMPRESSED_KV: torch.Tensor | None = None
+
+
+def _canonical_device(device: torch.device | str) -> torch.device:
+    canonical = torch.device(device)
+    if canonical.type == "cuda" and canonical.index is None:
+        if torch.cuda.is_available():
+            canonical = torch.device(canonical.type, torch.cuda.current_device())
+    return canonical
 
 
 def ensure_online_c128_compressed_kv(
@@ -194,27 +223,27 @@ def ensure_online_c128_compressed_kv(
 ) -> None:
     """Allocate the shared fixed-address compressed-KV scratch at model init.
 
-    Sized to the maximum batched token count so any FULL cudagraph capture size
-    slices a fixed prefix (stable base pointer). Called from the compressor
-    constructor before any capture happens.
+    Sized to the maximum batched token count so any forward path can slice a
+    fixed prefix without allocating per C128 layer.
     """
     global _ONLINE_C128_COMPRESSED_KV
     buf = _ONLINE_C128_COMPRESSED_KV
+    canonical_device = _canonical_device(device)
     if (
         buf is None
         or buf.shape[0] < max_num_tokens
         or buf.shape[1] != head_dim
-        or str(buf.device) != str(device)
+        or _canonical_device(buf.device) != canonical_device
     ):
         _ONLINE_C128_COMPRESSED_KV = torch.empty(
             (max_num_tokens, head_dim),
             dtype=ONLINE_C128_STATE_DTYPE,
-            device=device,
+            device=canonical_device,
         )
 
 
 def online_c128_compressed_kv(num_tokens: int) -> torch.Tensor:
-    """Fixed-address compressed-KV scratch sliced to ``num_tokens`` (FULL path)."""
+    """Fixed-address compressed-KV scratch sliced to ``num_tokens``."""
     assert _ONLINE_C128_COMPRESSED_KV is not None, (
         "online C128 compressed-kv scratch not allocated; "
         "ensure_online_c128_compressed_kv must run at model init."
@@ -222,9 +251,176 @@ def online_c128_compressed_kv(num_tokens: int) -> torch.Tensor:
     return _ONLINE_C128_COMPRESSED_KV[:num_tokens]
 
 
-# MTP verify mode flag. The model runner sets this for the target-verify forward
-# so the compressor uses the transactional candidate-chain planner instead of
-# the committed bank0 planner. Reset after commit.
+def _online_c128_local_layer_indices(vllm_config: VllmConfig) -> tuple[int, ...]:
+    hf_config = vllm_config.model_config.hf_config
+    compress_ratios = getattr(hf_config, "compress_ratios", None)
+    assert compress_ratios is not None, (
+        "online C128 packed state requires hf_config.compress_ratios."
+    )
+    start_layer, end_layer = vllm_config.model_config.get_layers_start_end_indices(
+        vllm_config.parallel_config
+    )
+    end_layer = min(end_layer, len(compress_ratios))
+    return tuple(
+        idx
+        for idx in range(start_layer, end_layer)
+        if int(compress_ratios[idx]) == ONLINE_C128_COMPRESS_RATIO
+    )
+
+
+def _online_c128_registered_layer_indices() -> tuple[int, ...]:
+    return tuple(sorted(state.layer_index for state in _ONLINE_C128_STATES))
+
+
+def _online_c128_packed_compatibility_key(
+    layer_indices: tuple[int, ...],
+    num_banks: int,
+    max_num_reqs: int,
+    row_width: int,
+    device: torch.device,
+) -> tuple[object, ...]:
+    return (
+        layer_indices,
+        num_banks,
+        max_num_reqs,
+        row_width,
+        device.type,
+        device.index,
+        ONLINE_C128_STATE_DTYPE,
+    )
+
+
+def _clear_online_c128_packed_state() -> None:
+    global _ONLINE_C128_LAYER_INDICES, _ONLINE_C128_LAYER_SLOT_BY_INDEX
+    global _ONLINE_C128_PACKED_COMPATIBILITY_KEY, _ONLINE_C128_PACKED_STATE
+    _ONLINE_C128_PACKED_STATE = None
+    _ONLINE_C128_LAYER_SLOT_BY_INDEX = {}
+    _ONLINE_C128_LAYER_INDICES = ()
+    _ONLINE_C128_PACKED_COMPATIBILITY_KEY = None
+
+
+def _assert_no_duplicate_live_online_c128_state(layer_index: int) -> None:
+    registered_layer_indices = _online_c128_registered_layer_indices()
+    if layer_index in registered_layer_indices:
+        raise RuntimeError(
+            "online C128 packed state for layer "
+            f"{layer_index} is already live in this process. Call "
+            "clear_online_c128_states() before constructing another model/state "
+            "set; refusing to reset the existing live state."
+        )
+
+
+def _assert_online_c128_registration_complete() -> None:
+    if _ONLINE_C128_PACKED_STATE is None:
+        raise RuntimeError(
+            "online C128 packed state must be allocated before verify commit."
+        )
+    registered_layer_indices = _online_c128_registered_layer_indices()
+    if registered_layer_indices != _ONLINE_C128_LAYER_INDICES:
+        raise RuntimeError(
+            "online C128 registered layer set mismatch: "
+            f"registered={registered_layer_indices}, "
+            f"packed={_ONLINE_C128_LAYER_INDICES}."
+        )
+
+
+def _online_c128_packed_state_for_commit() -> torch.Tensor:
+    _assert_online_c128_registration_complete()
+    assert _ONLINE_C128_PACKED_STATE is not None
+    return _ONLINE_C128_PACKED_STATE
+
+
+def _reset_online_c128_packed_state(
+    packed_state: torch.Tensor,
+    head_dim: int,
+) -> None:
+    packed_state[:, :, :head_dim].fill_(float("-inf"))
+    packed_state[:, :, head_dim:].zero_()
+
+
+def ensure_online_c128_packed_state(
+    vllm_config: VllmConfig,
+    head_dim: int,
+    layer_index: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Return the 2-D state view for ``layer_index`` from the packed arena."""
+    global _ONLINE_C128_LAYER_INDICES, _ONLINE_C128_LAYER_SLOT_BY_INDEX
+    global _ONLINE_C128_PACKED_COMPATIBILITY_KEY, _ONLINE_C128_PACKED_STATE
+
+    _assert_no_duplicate_live_online_c128_state(layer_index)
+    layer_indices = _online_c128_local_layer_indices(vllm_config)
+    assert layer_indices, "online C128 packed state found no C128 layers."
+    assert layer_index in layer_indices, (
+        f"online C128 layer {layer_index} missing from packed layer list "
+        f"{layer_indices}."
+    )
+
+    max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+    num_banks = online_c128_num_banks(vllm_config)
+    row_width = ONLINE_C128_NUM_STATE_VECTORS * head_dim
+    shape = (len(layer_indices), num_banks * max_num_reqs, row_width)
+    canonical_device = _canonical_device(device)
+    compatibility_key = _online_c128_packed_compatibility_key(
+        layer_indices,
+        num_banks,
+        max_num_reqs,
+        row_width,
+        canonical_device,
+    )
+
+    if (
+        _ONLINE_C128_PACKED_STATE is not None
+        and _ONLINE_C128_PACKED_COMPATIBILITY_KEY != compatibility_key
+    ):
+        if _ONLINE_C128_STATES:
+            raise RuntimeError(
+                "online C128 packed state compatibility mismatch while live "
+                "states exist. Call clear_online_c128_states() before "
+                "constructing a different model/state set."
+            )
+        _clear_online_c128_packed_state()
+
+    if _ONLINE_C128_PACKED_STATE is None:
+        _ONLINE_C128_LAYER_INDICES = layer_indices
+        _ONLINE_C128_LAYER_SLOT_BY_INDEX = {
+            c128_layer_index: slot
+            for slot, c128_layer_index in enumerate(layer_indices)
+        }
+        _ONLINE_C128_PACKED_COMPATIBILITY_KEY = compatibility_key
+        _ONLINE_C128_PACKED_STATE = torch.empty(
+            shape,
+            dtype=ONLINE_C128_STATE_DTYPE,
+            device=canonical_device,
+        )
+        _reset_online_c128_packed_state(_ONLINE_C128_PACKED_STATE, head_dim)
+    else:
+        assert _ONLINE_C128_PACKED_COMPATIBILITY_KEY == compatibility_key, (
+            "online C128 packed state compatibility key mismatch."
+        )
+        assert _ONLINE_C128_LAYER_INDICES == layer_indices, (
+            "online C128 packed layer order changed: "
+            f"{_ONLINE_C128_LAYER_INDICES} vs {layer_indices}."
+        )
+        assert tuple(_ONLINE_C128_PACKED_STATE.shape) == shape, (
+            "online C128 packed state shape mismatch: "
+            f"{tuple(_ONLINE_C128_PACKED_STATE.shape)} vs {shape}."
+        )
+        packed_device = _canonical_device(_ONLINE_C128_PACKED_STATE.device)
+        assert packed_device == canonical_device, (
+            "online C128 packed state device mismatch: "
+            f"{_ONLINE_C128_PACKED_STATE.device} vs {device}."
+        )
+
+    slot = _ONLINE_C128_LAYER_SLOT_BY_INDEX[layer_index]
+    assert 0 <= slot < _ONLINE_C128_PACKED_STATE.shape[0], (
+        f"online C128 packed state slot exhausted for layer {layer_index}."
+    )
+    return _ONLINE_C128_PACKED_STATE[slot]
+
+
+# MTP verify lifecycle flag retained for runner begin/end bookkeeping. The
+# compressor dispatch itself is driven by per-request row modes.
 _ONLINE_C128_VERIFY_ACTIVE = False
 
 
@@ -239,6 +435,7 @@ def get_online_c128_states() -> list[DeepseekOnlineC128State]:
 def clear_online_c128_states() -> None:
     global _ONLINE_C128_COMPRESSED_KV, _ONLINE_C128_VERIFY_ACTIVE
     _ONLINE_C128_STATES.clear()
+    _clear_online_c128_packed_state()
     _ONLINE_C128_COMPRESSED_KV = None
     _ONLINE_C128_VERIFY_ACTIVE = False
 
@@ -265,16 +462,25 @@ def commit_all_online_c128_verify(
     compress_ratio: int = ONLINE_C128_COMPRESS_RATIO,
 ) -> None:
     """Commit accepted MTP candidates into bank0 for every online layer."""
-    for state in _ONLINE_C128_STATES:
-        commit_online_c128_verify(
-            run_state=state.state,
-            req_state_indices=req_state_indices,
-            accepted_len=accepted_len,
-            final_seq_len=final_seq_len,
-            max_num_reqs=state.max_num_reqs,
-            head_dim=state.head_dim,
-            compress_ratio=compress_ratio,
-        )
+    num_reqs = req_state_indices.shape[0]
+    if num_reqs == 0 or not _ONLINE_C128_STATES:
+        return
+    packed_state = _online_c128_packed_state_for_commit()
+    first_state = _ONLINE_C128_STATES[0]
+    row_width = packed_state.shape[2]
+    _commit_verify_kernel[(num_reqs, packed_state.shape[0])](
+        packed_state,
+        packed_state.stride(0),
+        packed_state.stride(1),
+        req_state_indices,
+        accepted_len,
+        final_seq_len,
+        first_state.max_num_reqs,
+        row_width,
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK_SIZE=1024,
+        HEAD_DIM=first_state.head_dim,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +511,7 @@ class OnlineC128Plan:
         self.emit_segments = emit_segments
         self.update_segments = update_segments
         self.reset_rows = reset_rows
+        self.reset_rows_long = reset_rows.to(torch.long)
 
     @property
     def is_empty(self) -> bool:
@@ -453,6 +660,7 @@ def plan_online_c128_verify(
 @triton.jit
 def _commit_verify_kernel(
     run_state_ptr,
+    layer_stride,
     run_state_stride,
     req_state_indices_ptr,  # [num_reqs] persistent slot per batch req (-1 pad)
     accepted_len_ptr,  # [num_reqs] = query_len - num_rejected
@@ -463,8 +671,9 @@ def _commit_verify_kernel(
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """Commit the accepted MTP candidate bank into bank0 (one program / req)."""
+    """Commit accepted MTP candidates into bank0 (one program / req / layer)."""
     req = tl.program_id(0)
+    layer = tl.program_id(1)
     rsi = tl.load(req_state_indices_ptr + req)
     if rsi < 0:
         return
@@ -472,7 +681,8 @@ def _commit_verify_kernel(
     final_seq_len = tl.load(final_seq_len_ptr + req)
 
     bank0_row = rsi
-    dst_base = bank0_row * run_state_stride
+    layer_base = layer * layer_stride
+    dst_base = layer_base + bank0_row * run_state_stride
 
     if final_seq_len % COMPRESS_RATIO == 0:
         # Chunk closed exactly on the accepted boundary: clear bank0.
@@ -486,7 +696,7 @@ def _commit_verify_kernel(
 
     # Copy candidate bank `accepted` -> bank0.
     src_row = accepted * max_num_reqs + rsi
-    src_base = src_row * run_state_stride
+    src_base = layer_base + src_row * run_state_stride
     for off in tl.range(0, row_width, BLOCK_SIZE):
         block = off + tl.arange(0, BLOCK_SIZE)
         mask = block < row_width
@@ -508,8 +718,9 @@ def commit_online_c128_verify(
     if num_reqs == 0:
         return
     row_width = run_state.shape[1]
-    _commit_verify_kernel[(num_reqs,)](
+    _commit_verify_kernel[(num_reqs, 1)](
         run_state,
+        0,
         run_state.stride(0),
         req_state_indices,
         accepted_len,

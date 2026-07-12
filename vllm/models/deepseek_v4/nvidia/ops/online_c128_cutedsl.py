@@ -231,12 +231,10 @@ class OnlineC128DecodeKernel:
         head_size: int,
         compress_ratio: int,
         max_num_reqs: int,
-        candidate_chain: bool,
     ):
         self.head_dim = head_size
         self.compress_ratio = compress_ratio
         self.max_num_reqs = max_num_reqs
-        self.candidate_chain = candidate_chain
         self.tb_size = head_size // self.elems_per_lane
 
     @cute.jit
@@ -248,6 +246,7 @@ class OnlineC128DecodeKernel:
         positions: cute.Tensor,  # [num_tokens] int64
         query_start_loc: cute.Tensor,  # [num_reqs + 1] int32
         req_state_indices: cute.Tensor,  # [num_reqs] int32 (-1 pad)
+        row_modes: cute.Tensor,  # [num_reqs] int32: -1=prefill, 0=decode, >0=verify
         run_state: cute.Tensor,  # [num_banks * max_num_reqs, 3*head_dim] fp32
         compressed_kv: cute.Tensor,  # [num_output_tokens, head_dim] fp32
         stream: CUstream,
@@ -260,6 +259,7 @@ class OnlineC128DecodeKernel:
             positions,
             query_start_loc,
             req_state_indices,
+            row_modes,
             run_state,
             compressed_kv,
         ).launch(grid=grid, block=(self.tb_size, 1, 1), stream=stream)
@@ -273,6 +273,7 @@ class OnlineC128DecodeKernel:
         positions: cute.Tensor,
         query_start_loc: cute.Tensor,
         req_state_indices: cute.Tensor,
+        row_modes: cute.Tensor,
         run_state: cute.Tensor,
         compressed_kv: cute.Tensor,
     ):
@@ -282,7 +283,8 @@ class OnlineC128DecodeKernel:
         col0 = tid * self.elems_per_lane
 
         rsi = req_state_indices[req]
-        if rsi >= Int32(0):
+        row_mode = row_modes[req]
+        if rsi >= Int32(0) and row_mode >= Int32(0):
             tok_start = query_start_loc[req]
             tok_end = query_start_loc[req + Int32(1)]
             query_len = tok_end - tok_start
@@ -325,6 +327,7 @@ class OnlineC128DecodeKernel:
                         local_product[e] = Float32(0.0)
 
                 rsi64 = rsi.to(Int64)
+                candidate_chain = row_mode > Int32(0)
                 # Walk the request's query tokens sequentially.
                 for j in cutlass.range(query_len, unroll=1):
                     token = tok_start + j
@@ -362,7 +365,7 @@ class OnlineC128DecodeKernel:
                                 local_product[e] / local_sum[e]
                             )
 
-                    if cutlass.const_expr(self.candidate_chain):
+                    if candidate_chain:
                         # Verify writes candidate banks; commit advances bank0.
                         write_row = (j + Int32(1)).to(Int64) * max_num_reqs64 + rsi64
                         wbase = write_row * run_state_w + col0.to(Int64)
@@ -399,7 +402,9 @@ class OnlineC128DecodeKernel:
                                 local_sum[e] = Float32(0.0)
                                 local_product[e] = Float32(0.0)
 
-                if cutlass.const_expr(not self.candidate_chain):
+                if candidate_chain:
+                    pass
+                else:
                     # Decode: write trailing carry back to committed bank0.
                     for e in cutlass.range_constexpr(self.elems_per_lane):
                         run_state.iterator[bank0_base + max_off + Int64(e)] = local_max[
@@ -418,7 +423,6 @@ class OnlineC128DecodeKernel:
         head_size: int = 512,
         compress_ratio: int = 128,
         max_num_reqs: int = 1,
-        candidate_chain: bool = False,
     ):
         if head_size % OnlineC128DecodeKernel.elems_per_lane != 0:
             raise ValueError("head_size must be even.")
@@ -449,6 +453,7 @@ class OnlineC128DecodeKernel:
         positions = make_fake_tensor(Int64, (num_tokens,), divisibility=8)
         query_start_loc = make_fake_tensor(Int32, (num_query_locs,), divisibility=1)
         req_state_indices = make_fake_tensor(Int32, (num_reqs,), divisibility=1)
+        row_modes = make_fake_tensor(Int32, (num_reqs,), divisibility=1)
         run_state = cute.runtime.make_fake_tensor(
             Float32,
             (num_rows, 3 * head_size),
@@ -461,9 +466,7 @@ class OnlineC128DecodeKernel:
             stride=(head_size, 1),
             assumed_align=4,
         )
-        kernel = OnlineC128DecodeKernel(
-            head_size, compress_ratio, max_num_reqs, candidate_chain
-        )
+        kernel = OnlineC128DecodeKernel(head_size, compress_ratio, max_num_reqs)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
             kernel,
@@ -473,6 +476,7 @@ class OnlineC128DecodeKernel:
             positions,
             query_start_loc,
             req_state_indices,
+            row_modes,
             run_state,
             compressed_kv,
             stream,
@@ -487,11 +491,11 @@ def online_c128_decode(
     positions: torch.Tensor,
     query_start_loc: torch.Tensor,
     req_state_indices: torch.Tensor,
+    row_modes: torch.Tensor,
     run_state: torch.Tensor,
     compressed_kv: torch.Tensor,
     max_num_reqs: int,
     compress_ratio: int = 128,
-    candidate_chain: bool = False,
 ) -> None:
     """Launch the fixed-address decode / MTP-verify recurrence."""
     if req_state_indices.numel() == 0:
@@ -505,7 +509,6 @@ def online_c128_decode(
         head_size=head_size,
         compress_ratio=compress_ratio,
         max_num_reqs=max_num_reqs,
-        candidate_chain=candidate_chain,
     )
     compiled(
         kv,
@@ -514,6 +517,7 @@ def online_c128_decode(
         positions,
         query_start_loc,
         req_state_indices,
+        row_modes,
         run_state,
         compressed_kv,
     )
