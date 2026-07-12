@@ -283,10 +283,15 @@ class Scheduler(SchedulerInterface):
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
             if speculative_config.use_dspark():
-                # DSpark drafts a block of num_spec_tokens query tokens in which the
-                # anchor itself is the first prediction position (no separate bonus
-                # query), so it needs exactly num_spec_tokens lookahead slots.
-                self.num_lookahead_tokens = self.num_spec_tokens
+                # Dense DSpark samples from the anchor slot, but Speculators-format
+                # DSpark uses a separate bonus anchor query before the draft block.
+                draft_model_config = speculative_config.draft_model_config
+                dspark_bonus_anchor = draft_model_config is not None and getattr(
+                    draft_model_config.hf_config, "dspark_bonus_anchor", False
+                )
+                self.num_lookahead_tokens = self.num_spec_tokens + int(
+                    dspark_bonus_anchor
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
