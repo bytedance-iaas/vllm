@@ -4,6 +4,8 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import os
+import signal
 import threading
 import time
 import weakref
@@ -498,14 +500,70 @@ def run_api_server_worker_proc(
 
     client_config = client_config or {}
     server_index = client_config.get("client_index", 0)
+    worker_pid = os.getpid()
 
     # Set process title and add process-specific prefix to stdout and stderr.
     set_process_title("APIServer", str(server_index))
     decorate_logs()
 
-    uvloop.run(
-        run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+    logger.info(
+        "API server worker process starting: index=%s pid=%s",
+        server_index,
+        worker_pid,
     )
+    try:
+        uvloop.run(
+            run_server_worker(
+                listen_address, sock, args, client_config, **uvicorn_kwargs
+            )
+        )
+    except BaseException:
+        logger.exception(
+            "API server worker process failed: index=%s pid=%s",
+            server_index,
+            worker_pid,
+        )
+        raise
+    finally:
+        logger.info(
+            "API server worker process exiting: index=%s pid=%s",
+            server_index,
+            worker_pid,
+        )
+
+
+def _signal_name_from_exitcode(exitcode: int | None) -> str | None:
+    if exitcode is None or exitcode >= 0:
+        return None
+
+    signum = -exitcode
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
+def _refresh_process_exitcode(
+    proc: BaseProcess | _SubprocessWrapper,
+    timeout: float = 0.1,
+) -> int | None:
+    """Best-effort refresh of a ready process sentinel's exit code."""
+
+    with contextlib.suppress(Exception):
+        proc.join(timeout=0)
+
+    if proc.exitcode is not None:
+        return proc.exitcode
+
+    deadline = time.monotonic() + timeout
+    while proc.exitcode is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        with contextlib.suppress(Exception):
+            proc.join(timeout=min(0.01, remaining))
+
+    return proc.exitcode
 
 
 def wait_for_completion_or_failure(
@@ -561,10 +619,25 @@ def wait_for_completion_or_failure(
                 proc = sentinel_to_proc.pop(sentinel)
 
                 # Check if process exited with error
-                if proc is not None and proc.exitcode != 0:
+                if proc is not None:
+                    exitcode = _refresh_process_exitcode(proc)
+                    signal_name = _signal_name_from_exitcode(exitcode)
+                    signal_msg = (
+                        f" signal={signal_name}" if signal_name is not None else ""
+                    )
+                    log_fn = logger.error if exitcode != 0 else logger.info
+                    log_fn(
+                        "Process %s exited: pid=%s exitcode=%s%s",
+                        proc.name,
+                        proc.pid,
+                        exitcode,
+                        signal_msg,
+                    )
+
+                if proc is not None and exitcode != 0:
                     raise RuntimeError(
                         f"Process {proc.name} (PID: {proc.pid}) "
-                        f"died with exit code {proc.exitcode}"
+                        f"died with exit code {exitcode}"
                     )
                 if engine_manager and engine_manager.failed_proc_name is not None:
                     raise RuntimeError(
