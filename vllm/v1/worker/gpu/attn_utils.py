@@ -469,9 +469,11 @@ def build_attn_metadata(
     positions: torch.Tensor | None = None,
     req_state_indices: torch.Tensor | None = None,
     req_state_indices_cpu: np.ndarray | None = None,
+    is_prefilling: torch.Tensor | None = None,
     num_draft_tokens_per_req_cpu: np.ndarray | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
+    skip_online_c128_plan: bool = False,
     causal: bool = True,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
@@ -483,6 +485,8 @@ def build_attn_metadata(
         req_state_indices = req_state_indices[:num_reqs]
     if req_state_indices_cpu is not None:
         req_state_indices_cpu = req_state_indices_cpu[:num_reqs]
+    if is_prefilling is not None:
+        is_prefilling = is_prefilling[:num_reqs]
     if num_draft_tokens_per_req_cpu is not None:
         num_draft_tokens_per_req_cpu = num_draft_tokens_per_req_cpu[:num_reqs]
 
@@ -513,7 +517,9 @@ def build_attn_metadata(
             positions=positions,
             req_state_indices=req_state_indices,
             req_state_indices_cpu=req_state_indices_cpu,
+            is_prefilling=is_prefilling,
             num_draft_tokens_per_req_cpu=num_draft_tokens_per_req_cpu,
+            skip_online_c128_plan=skip_online_c128_plan,
             **common_attn_metadata_extra_kwargs,
         )
 
