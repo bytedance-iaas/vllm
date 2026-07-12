@@ -311,7 +311,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         return (
             kv_transfer_config is not None
-            and kv_transfer_config.kv_role == "kv_producer"
+            and kv_transfer_config.is_kv_producer
+            and not kv_transfer_config.is_kv_consumer
         )
 
     def update_max_model_len(self, max_model_len: int) -> None:
