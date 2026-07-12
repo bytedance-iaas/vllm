@@ -29,6 +29,7 @@ from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
 )
 from vllm.models.deepseek_v4.online_c128 import (
     ONLINE_C128_COMPRESS_RATIO,
+    ONLINE_C128_ROW_MODE_VERIFY,
     commit_online_c128_verify,
     plan_online_c128_segments,
 )
@@ -98,13 +99,6 @@ def _compile_smoke(head_dim: int, max_num_reqs: int) -> None:
         head_size=head_dim,
         compress_ratio=ONLINE_C128_COMPRESS_RATIO,
         max_num_reqs=max_num_reqs,
-        candidate_chain=False,
-    )
-    OnlineC128DecodeKernel.compile(
-        head_size=head_dim,
-        compress_ratio=ONLINE_C128_COMPRESS_RATIO,
-        max_num_reqs=max_num_reqs,
-        candidate_chain=True,
     )
     compile_split_sparse_attn_cutedsl(
         head_size=head_dim,
@@ -233,6 +227,9 @@ def _check_candidate_chain_and_commit(
     )
     query_start_loc = torch.tensor([0, verify_len], dtype=torch.int32, device=device)
     req_state_indices = torch.tensor([0], dtype=torch.int32, device=device)
+    row_modes = torch.tensor(
+        [ONLINE_C128_ROW_MODE_VERIFY], dtype=torch.int32, device=device
+    )
 
     online_c128_decode(
         kv=query_kv,
@@ -241,11 +238,11 @@ def _check_candidate_chain_and_commit(
         positions=query_positions,
         query_start_loc=query_start_loc,
         req_state_indices=req_state_indices,
+        row_modes=row_modes,
         run_state=run_state,
         compressed_kv=compressed_kv,
         max_num_reqs=max_num_reqs,
         compress_ratio=ONLINE_C128_COMPRESS_RATIO,
-        candidate_chain=True,
     )
     torch.cuda.synchronize(device)
 
