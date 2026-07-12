@@ -203,7 +203,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # their prior producer behavior unchanged.
             is_aux_hidden_state_method = method in ("eagle3", "dflash", "dspark")
             skip_draft_on_producer = (
-                is_aux_hidden_state_method and self._is_kv_producer_instance()
+                is_aux_hidden_state_method and self._is_kv_producer_only_instance()
             )
 
             if not skip_draft_on_producer:
@@ -300,16 +300,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
 
-    def _is_kv_producer_instance(self) -> bool:
-        """True when this engine is the PD-disaggregation prefill (producer).
+    def _is_kv_producer_only_instance(self) -> bool:
+        """True when this engine is a pure PD-disaggregation prefill producer.
 
         A producer instance transfers KV to the decode side and never runs the
         speculator, so speculative-method restrictions that only concern the
         drafting path (e.g. the aux-hidden-state / pipeline-parallel guard) do
-        not apply to it.
+        not apply to it. A kv_both instance is decode-capable and still drafts.
         """
         kv_transfer_config = self.vllm_config.kv_transfer_config
-        return kv_transfer_config is not None and kv_transfer_config.is_kv_producer
+        return (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_role == "kv_producer"
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
