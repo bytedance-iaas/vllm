@@ -1187,20 +1187,23 @@ class GPUModelRunner(
                 f"uniform_decode_query_len={self.uniform_decode_query_len}."
             )
 
-        base_seq_len_np = (
-            self.optimistic_seq_lens_cpu[:num_reqs].numpy() - query_lens_all_np
-        )[verify_req_indices_np]
         verify_req_indices = torch.from_numpy(verify_req_indices_np).to(
             self.req_state_indices.gpu.device
         )
         req_state_indices = self.req_state_indices.gpu[:num_reqs][verify_req_indices]
+        query_lens_all = (
+            self.query_start_loc.gpu[1 : num_reqs + 1]
+            - self.query_start_loc.gpu[:num_reqs]
+        )
+        query_lens = query_lens_all[verify_req_indices].to(torch.int32)
+        base_seq_len = self.seq_lens[:num_reqs][verify_req_indices] - query_lens
 
         begin_online_c128_verify()
         self._online_c128_verify_ctx = (
             req_state_indices,
             verify_req_indices,
-            query_lens_np,
-            base_seq_len_np,
+            query_lens,
+            base_seq_len,
         )
 
     def _end_online_c128_mtp_verify(self) -> None:
@@ -1220,14 +1223,11 @@ class GPUModelRunner(
 
         from vllm.models.deepseek_v4.online_c128 import commit_all_online_c128_verify
 
-        req_state_indices, verify_req_indices, query_lens_np, base_seq_len_np = (
+        req_state_indices, verify_req_indices, query_lens_t, base_seq_len_t = (
             self._online_c128_verify_ctx
         )
         self._online_c128_verify_ctx = None
 
-        device = req_state_indices.device
-        query_lens_t = torch.from_numpy(query_lens_np).to(device, dtype=torch.int32)
-        base_seq_len_t = torch.from_numpy(base_seq_len_np).to(device, dtype=torch.int32)
         valid_sampled = (sampled_token_ids >= 0) & (
             sampled_token_ids < self.input_batch.vocab_size
         )
@@ -2496,6 +2496,7 @@ class GPUModelRunner(
         logits_indices: torch.Tensor | None = None,
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
+        skip_online_c128_plan: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
@@ -2648,6 +2649,7 @@ class GPUModelRunner(
             else None,
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            skip_online_c128_plan=for_cudagraph_capture or skip_online_c128_plan,
         )
 
         req_state_indices_cpu = self.req_state_indices.np[:num_reqs_padded]
@@ -4602,6 +4604,7 @@ class GPUModelRunner(
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
                     use_spec_decode=use_spec_decode,
+                    skip_online_c128_plan=pad_attn,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,

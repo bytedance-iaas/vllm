@@ -466,6 +466,10 @@ class CommonAttentionMetadata:
     request. ``None`` when the batch has no speculative verify rows. Used by
     DeepSeek-V4 online C128 to keep MTP candidate-bank updates per request."""
 
+    skip_online_c128_plan: bool = False
+    """Skip host-side online C128 segment-plan construction when the current
+    forward path will not consume the planned metadata."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges
@@ -567,6 +571,9 @@ class CommonAttentionMetadata:
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
+            seq_lens_cpu_upper_bound=maybe_slice_reqs(
+                self.seq_lens_cpu_upper_bound
+            ),
             _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
             if self._seq_lens_cpu is not None
             else None,
@@ -588,6 +595,9 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            positions=self.positions[:num_actual_tokens]
+            if self.positions is not None
+            else None,
             req_state_indices=maybe_slice_reqs(self.req_state_indices),
             req_state_indices_cpu=maybe_slice_reqs(self.req_state_indices_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
@@ -595,6 +605,7 @@ class CommonAttentionMetadata:
             num_draft_tokens_per_req_cpu=maybe_slice_reqs(
                 self.num_draft_tokens_per_req_cpu
             ),
+            skip_online_c128_plan=self.skip_online_c128_plan,
         )
 
 

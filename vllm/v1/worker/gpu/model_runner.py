@@ -1427,27 +1427,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert num_draft_tokens_per_req is not None
             verify_req_mask_np = num_draft_tokens_per_req[: input_batch.num_reqs] > 0
             verify_req_indices_np = np.nonzero(verify_req_mask_np)[0].astype(np.int64)
-            query_lens_all_np = (
-                input_batch.query_start_loc_np[1:] - input_batch.query_start_loc_np[:-1]
-            )[: input_batch.num_reqs]
-            query_lens_np = query_lens_all_np[verify_req_indices_np]
-            base_seq_len_np = (
-                input_batch.seq_lens_cpu_upper_bound[: input_batch.num_reqs]
-                .cpu()
-                .numpy()
-                - query_lens_all_np
-            )[verify_req_indices_np]
             if verify_req_indices_np.size:
                 verify_req_indices = torch.from_numpy(verify_req_indices_np).to(
                     input_batch.req_state_indices.device
+                )
+                query_lens_all = (
+                    input_batch.query_start_loc[1 : input_batch.num_reqs + 1]
+                    - input_batch.query_start_loc[: input_batch.num_reqs]
+                )
+                query_lens = query_lens_all[verify_req_indices].to(torch.int32)
+                base_seq_len = (
+                    input_batch.seq_lens[: input_batch.num_reqs][verify_req_indices]
+                    - query_lens
                 )
                 self._online_c128_verify_ctx = (
                     input_batch.req_state_indices[: input_batch.num_reqs][
                         verify_req_indices
                     ],
                     verify_req_indices,
-                    query_lens_np,
-                    base_seq_len_np,
+                    query_lens,
+                    base_seq_len,
                 )
 
         # Run model.
@@ -1650,13 +1649,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 end_online_c128_verify,
             )
 
-            req_state_indices, verify_req_indices, query_lens_np, base_seq_len_np = (
+            req_state_indices, verify_req_indices, query_lens_t, base_seq_len_t = (
                 self._online_c128_verify_ctx
-            )
-            device = req_state_indices.device
-            query_lens_t = torch.from_numpy(query_lens_np).to(device, dtype=torch.int32)
-            base_seq_len_t = torch.from_numpy(base_seq_len_np).to(
-                device, dtype=torch.int32
             )
             accepted_len = query_lens_t - num_rejected[verify_req_indices].to(
                 torch.int32
