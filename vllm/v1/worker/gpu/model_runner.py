@@ -189,17 +189,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
-            if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+            method = self.speculative_config.method
+            # Aux-hidden-state draft methods (dspark / dflash / eagle3) draft from
+            # the target's intermediate hidden states, which are only materialized
+            # whole on a single rank — hence PP-incompatible on a drafting
+            # instance. In PD-disaggregation, however, only the decode
+            # (kv_consumer) side drafts; the prefill (kv_producer) side just
+            # generates and transfers KV. So on a producer we skip speculator
+            # construction and aux-hidden-state emission entirely, keeping its
+            # forward identical to a plain target run and letting prefill keep
+            # pipeline parallelism even when handed the shared spec config. This
+            # is scoped to the aux-hidden-state methods; MTP/other methods keep
+            # their prior producer behavior unchanged.
+            is_aux_hidden_state_method = method in ("eagle3", "dflash", "dspark")
+            skip_draft_on_producer = (
+                is_aux_hidden_state_method and self._is_kv_producer_instance()
+            )
 
-            if self.speculative_config.method in ("eagle3", "dflash"):
-                # Drafting may require auxiliary hidden states from target model outputs
-                self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
+            if not skip_draft_on_producer:
+                if self.is_last_pp_rank:
+                    self.speculator = init_speculator(self.vllm_config, self.device)
+
+                if is_aux_hidden_state_method:
+                    # Drafting may require auxiliary hidden states from target
+                    # model outputs.
+                    self.use_aux_hidden_state_outputs = True
+                    if self.use_pp:
+                        raise ValueError(
+                            f"{method} with pipeline parallel is not supported."
+                        )
 
         # Online C128 MTP uses transactional candidate banks.
         import vllm.envs as envs
@@ -281,6 +299,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+    def _is_kv_producer_instance(self) -> bool:
+        """True when this engine is the PD-disaggregation prefill (producer).
+
+        A producer instance transfers KV to the decode side and never runs the
+        speculator, so speculative-method restrictions that only concern the
+        drafting path (e.g. the aux-hidden-state / pipeline-parallel guard) do
+        not apply to it.
+        """
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        return kv_transfer_config is not None and kv_transfer_config.is_kv_producer
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
