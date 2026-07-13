@@ -15,9 +15,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_model_config = speculative_config.draft_model_config
 
     from vllm.compilation.backends import set_model_tag
+    from vllm.model_executor.models.qwen3_dflash import dflash_has_any_noncausal
 
-    # DSpark uses non-causal attention.
-    causal = False
     # MLA-only kv-cache layouts (fp8_ds_mla) don't apply to a dense draft such
     # as Qwen3DSparkModel, and no dense attention backend accepts them: store
     # that draft's KV cache in the model dtype instead. DeepSeek-V4's DSpark
@@ -33,7 +32,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         cache_config=draft_cache_config,
         attention_config=replace(
             vllm_config.attention_config,
-            use_non_causal=not causal,
+            use_non_causal=dflash_has_any_noncausal(draft_model_config.hf_config),
             backend=speculative_config.attention_backend,
         ),
     )

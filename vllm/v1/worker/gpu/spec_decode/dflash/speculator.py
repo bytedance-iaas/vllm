@@ -19,10 +19,7 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
-    get_dflash_causal,
-    load_dflash_model,
-)
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 
@@ -49,7 +46,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.draft_model_config.hf_config
         )
 
-        self.dflash_causal = get_dflash_causal(self.draft_model_config)
+        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_noncausal
+
+        self.use_non_causal = dflash_has_any_noncausal(
+            self.draft_model_config.hf_config
+        )
 
         # Whether the anchor query position is itself a prediction. DFlash default uses
         # the anchor as the bonus token (only mask tokens predict); DSpark samples from
@@ -90,7 +91,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.vllm_config,
             attention_config=replace(
                 self.vllm_config.attention_config,
-                use_non_causal=not self.dflash_causal,
+                use_non_causal=self.use_non_causal,
             ),
         )
 
@@ -118,7 +119,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
-            causal=self.dflash_causal,
+            causal=not self.use_non_causal,
         )
 
     def capture(self, attn_states: dict | None = None) -> None:
@@ -175,6 +176,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # of the kv-cache group its cache belongs to. Models that share a single group
         # leave this as None and share one context slot mapping.
         self._layer_group_idx: list[int] | None = None
+        self._group_causal = not self.use_non_causal
         if hasattr(self.model, "get_draft_kv_cache_layer_names"):
             name_to_gid = {
                 ln: gid
@@ -410,7 +412,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             num_tokens_padded=num_tokens_padded,
-            causal=self.dflash_causal,
+            causal=self._group_causal,
         )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
