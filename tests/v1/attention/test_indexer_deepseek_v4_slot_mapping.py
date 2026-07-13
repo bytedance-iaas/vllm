@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
+
 import pytest
 import torch
+from transformers import LlamaConfig
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -14,7 +17,9 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_size():
+def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_size(
+    tmp_path: Path,
+):
     """Regression test: DeepseekV4 compression path must compute slot_mapping from
     compressed positions, not reuse the uncompressed common metadata mapping.
     """
@@ -28,7 +33,20 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         dtype=torch.bfloat16,
         compress_ratio=4,
     )
-    vllm_config = create_vllm_config(max_model_len=1024)
+    model_dir = tmp_path / "model"
+    LlamaConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=4,
+        vocab_size=256,
+        max_position_embeddings=2048,
+    ).save_pretrained(model_dir)
+    vllm_config = create_vllm_config(
+        model_name=str(model_dir),
+        max_model_len=1024,
+    )
     builder = DeepseekV32IndexerMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy"],

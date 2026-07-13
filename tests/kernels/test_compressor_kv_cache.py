@@ -543,6 +543,9 @@ def _reference_kv_compress_norm_rope(
 @pytest.mark.parametrize("use_fp4", [False, True])
 def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: bool):
     """Fused K compress+norm+rope+quant+insert for the indexer KV cache."""
+    if use_fp4 and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP4 indexer cache conversion requires SM100 or newer")
+
     HEAD_DIM = 128
     ROPE_DIM = 64
     BLOCK_SIZE = 16
