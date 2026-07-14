@@ -96,6 +96,10 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+# Flag enables vllm-router in openai-style images for PD routing deployments
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_VERSION=0.1.15
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -1067,6 +1071,8 @@ RUN mv vllm src/vllm
 FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_VERSION=0.1.15
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
@@ -1141,6 +1147,15 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ -n "${DEEPGEMM_WHEEL_X86_64}" ]; then \
         uv pip install --system "${DEEPGEMM_WHEEL_X86_64}" && \
         python3 -c 'import deep_gemm; required = ["get_symm_buffer_for_mega_moe", "transform_sf_into_required_layout", "transform_weights_for_mega_moe_sm90", "transform_weights_for_mega_moe_sm90_fp4", "fp8_mega_moe", "fp8_fp4_mega_moe"]; missing = [name for name in required if not hasattr(deep_gemm, name)]; assert not missing, f"DeepGEMM wheel missing required MegaMoE symbols: {missing}"; print("DeepGEMM MegaMoE symbols verified")'; \
+    fi
+
+# Install vllm-router in ByteIAAS PD images so router pods do not need runtime
+# network access before their liveness probes start.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$INSTALL_VLLM_ROUTER" = "true" ]; then \
+        uv pip install --system "vllm-router==${VLLM_ROUTER_VERSION}" && \
+        command -v vllm-router && \
+        python3 -m pip show vllm-router >/dev/null; \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image

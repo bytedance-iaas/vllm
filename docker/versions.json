@@ -34,6 +34,12 @@
     "INSTALL_KV_CONNECTORS": {
       "default": "false"
     },
+    "INSTALL_VLLM_ROUTER": {
+      "default": "false"
+    },
+    "VLLM_ROUTER_VERSION": {
+      "default": "0.1.15"
+    },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
     },
