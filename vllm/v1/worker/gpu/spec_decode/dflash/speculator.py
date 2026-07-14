@@ -119,7 +119,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
-            causal=not self.use_non_causal,
+            causal=self._group_causal,
         )
 
     def capture(self, attn_states: dict | None = None) -> None:
@@ -176,8 +176,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # of the kv-cache group its cache belongs to. Models that share a single group
         # leave this as None and share one context slot mapping.
         self._layer_group_idx: list[int] | None = None
-        self._group_causal = not self.use_non_causal
+        self._group_causal: dict[int, bool] | bool = not self.use_non_causal
         if hasattr(self.model, "get_draft_kv_cache_layer_names"):
+            layer_names = self.model.get_draft_kv_cache_layer_names()
             name_to_gid = {
                 ln: gid
                 for gid, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -185,9 +186,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             }
             gid_to_idx = {gid: i for i, gid in enumerate(self.draft_kv_cache_group_ids)}
             self._layer_group_idx = [
-                gid_to_idx[name_to_gid[name]]
-                for name in self.model.get_draft_kv_cache_layer_names()
+                gid_to_idx[name_to_gid[name]] for name in layer_names
             ]
+            if hasattr(self.model, "get_draft_attn_causal"):
+                self._group_causal = {
+                    name_to_gid[name]: layer_causal
+                    for name, layer_causal in zip(
+                        layer_names, self.model.get_draft_attn_causal()
+                    )
+                }
 
     @torch.inference_mode()
     def _run_model(

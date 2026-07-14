@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
@@ -488,7 +488,7 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     skip_online_c128_plan: bool = False,
-    causal: bool = True,
+    causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -509,6 +509,7 @@ def build_attn_metadata(
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -526,7 +527,7 @@ def build_attn_metadata(
             max_query_len=max_query_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
-            causal=causal,
+            causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
             req_state_indices=req_state_indices,

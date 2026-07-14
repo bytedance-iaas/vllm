@@ -29,6 +29,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -232,14 +233,18 @@ class CudaGraphManager:
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
-            # Each entry is (range_start, range_end, num_speculative_tokens).
+            schedule_lookup = build_dynamic_sd_schedule_lookup(
+                num_spec_per_batch_size,
+                self.max_num_reqs,
+                self.vllm_config.num_speculative_tokens,
+            )
             # K=0 disables drafting at that concurrency; skip it here since no
             # uniform decode graph is needed (and qlen=0 would divide by zero).
             decode_query_lens = sorted(
                 {
-                    x[2] + num_new_sampled_tokens_per_step
-                    for x in num_spec_per_batch_size
-                    if x[2] + num_new_sampled_tokens_per_step > 0
+                    k + num_new_sampled_tokens_per_step
+                    for k in schedule_lookup[1:]
+                    if k + num_new_sampled_tokens_per_step > 0
                 }
             )
         else:

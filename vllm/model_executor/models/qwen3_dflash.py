@@ -147,6 +147,9 @@ class DFlashQwen3Attention(nn.Module):
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
+        add_swa_attention_sink_bias: bool = False,
+        sliding_window: int | None = None,
+        causal: bool = False,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -192,6 +195,13 @@ class DFlashQwen3Attention(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
+        self.attention_sink_bias = (
+            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            if add_swa_attention_sink_bias
+            else None
+        )
+        self.sliding_window = sliding_window
+        self.causal = causal
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -199,8 +209,10 @@ class DFlashQwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            sinks=self.attention_sink_bias,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -239,6 +251,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         *,
         config: Qwen3Config,
+        layer_idx: int,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -247,6 +260,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
+        sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -255,6 +269,11 @@ class DFlashQwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
+            add_swa_attention_sink_bias=getattr(
+                config, "add_swa_attention_sink_bias", False
+            ),
+            sliding_window=sliding_window,
+            causal=causal,
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
@@ -331,6 +350,7 @@ class DFlashQwen3Model(nn.Module):
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
                     config=self.config,
+                    layer_idx=layer_idx,
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
@@ -626,6 +646,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
+
+    def get_draft_kv_cache_layer_names(self) -> list[str]:
+        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        """Per-layer attention causality aligned with draft KV layer names."""
+        return [layer.self_attn.causal for layer in self.model.layers]
 
     def compute_logits(
         self,

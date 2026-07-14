@@ -15,10 +15,19 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    # MLA-only kv-cache layouts (fp8_ds_mla) don't apply to dense DFlash
+    # drafters, and no dense attention backend accepts them.
+    draft_cache_config = vllm_config.cache_config
+    if (
+        draft_cache_config.cache_dtype == "fp8_ds_mla"
+        and not getattr(draft_model_config, "use_mla", False)
+    ):
+        draft_cache_config = replace(draft_cache_config, cache_dtype="auto")
     # Select an attention backend that supports the drafter's attention: mixing
     # a non-causal layer onto a causal-only backend would fail.
     draft_vllm_config = replace(
         vllm_config,
+        cache_config=draft_cache_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_noncausal(draft_model_config.hf_config),
