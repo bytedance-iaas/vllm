@@ -49,6 +49,7 @@ jobs:
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
       BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0%2Blocal-260630mega_moe-cp312-cp312-linux_x86_64.whl
+      BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
     steps:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
@@ -188,6 +189,8 @@ jobs:
               --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
               --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
               --build-arg INSTALL_KV_CONNECTORS=true \
+              --build-arg INSTALL_VLLM_ROUTER=true \
+              --build-arg VLLM_ROUTER_VERSION="${BYTEIAAS_VLLM_ROUTER_VERSION}" \
               --build-arg DEEPGEMM_WHEEL_X86_64="${BYTEIAAS_DEEPGEMM_WHEEL_X86_64}" \
               --build-arg max_jobs="${build_max_jobs}" \
               --build-arg nvcc_threads="${build_nvcc_threads}" \
