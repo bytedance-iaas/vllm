@@ -601,6 +601,7 @@ def build_attn_metadata(
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        group_causal = causal.get(i, True) if isinstance(causal, Mapping) else causal
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -618,7 +619,7 @@ def build_attn_metadata(
             max_query_len=max_query_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
-            causal=causal,
+            causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
             mm_req_doc_ranges=mm_req_doc_ranges,

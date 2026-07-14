@@ -200,7 +200,6 @@ class DFlashQwen3Attention(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
-
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
             if add_swa_attention_sink_bias
@@ -208,6 +207,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
+        self.causal = causal
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -721,6 +721,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
+
+    def get_draft_kv_cache_layer_names(self) -> list[str]:
+        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        """Per-layer attention causality aligned with draft KV layer names."""
+        return [layer.self_attn.causal for layer in self.model.layers]
 
     def compute_logits(
         self,

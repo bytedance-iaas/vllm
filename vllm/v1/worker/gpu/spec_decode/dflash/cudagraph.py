@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import torch
 
@@ -29,7 +29,7 @@ def _prepare_dflash_inputs_to_capture(
     kv_cache_config: KVCacheConfig,
     max_model_len: int,
     skip_attn: bool,
-    causal: bool,
+    causal: bool | Mapping[int, bool],
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
@@ -63,7 +63,9 @@ class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
 
-    def __init__(self, *args, causal: bool = False, **kwargs) -> None:
+    def __init__(
+        self, *args, causal: bool | Mapping[int, bool] = False, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.causal = causal
 
