@@ -566,6 +566,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
             )
+            if hasattr(self.speculator, "set_num_cached_tokens"):
+                self.speculator.set_num_cached_tokens(
+                    self.req_states.num_cached_tokens.gpu
+                )
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
