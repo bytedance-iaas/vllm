@@ -9,7 +9,10 @@ import torch
 
 import vllm.envs as envs
 from vllm.models.deepseek_v4 import online_c128
-from vllm.models.deepseek_v4.compressor import CompressorMetadataBuilder
+from vllm.models.deepseek_v4.compressor import (
+    CompressorMetadataBuilder,
+    _get_compression_state_dtype,
+)
 from vllm.models.deepseek_v4.online_c128 import (
     ONLINE_C128_ROW_MODE_PREFILL,
     ONLINE_C128_ROW_MODE_VERIFY,
@@ -19,6 +22,23 @@ from vllm.models.deepseek_v4.online_c128 import (
     plan_online_c128_verify,
 )
 from vllm.v1.attention.backend import CommonAttentionMetadata
+
+
+@pytest.mark.parametrize(
+    ("compress_ratio", "expected_dtype"),
+    [(4, torch.float32), (128, torch.bfloat16)],
+)
+def test_compression_state_dtype_is_selected_per_ratio(
+    compress_ratio: int, expected_dtype: torch.dtype
+):
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            c4_compression_state_dtype="fp32",
+            c128_compression_state_dtype="bf16",
+        )
+    )
+
+    assert _get_compression_state_dtype(config, compress_ratio) is expected_dtype
 
 
 def test_plan_online_c128_segments_exact_boundary_emits_and_resets_bank0():

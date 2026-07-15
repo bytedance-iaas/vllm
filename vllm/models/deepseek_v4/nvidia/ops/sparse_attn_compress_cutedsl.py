@@ -944,10 +944,12 @@ class SparseAttnCompressC128Block8Kernel:
         self,
         head_size: int,
         state_width: int,
+        state_dtype: type,
     ):
         self.head_dim = head_size
         self.num_splits = head_size // self.head_tile
         self.state_width = state_width
+        self.state_dtype = state_dtype
 
     @cute.jit
     def __call__(
@@ -1086,34 +1088,82 @@ class SparseAttnCompressC128Block8Kernel:
             block0_i32 = cute.arch.shuffle_sync(block0_i32, offset=0)
             block1_i32 = cute.arch.shuffle_sync(block1_i32, offset=0)
 
-            cp_f32x2 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64
-            )
             col_tile = col_base.to(Int64) // Int64(self.elems_per_lane)
             score_col_tile = col_tile + Int64(self.state_width // self.elems_per_lane)
 
-            for i in cutlass.range_constexpr(self.rows_per_warp):
-                block_number_i32 = block0_i32
-                block_offset = Int64(i)
-                if const_expr(i >= self.state_block_size):
-                    block_number_i32 = block1_i32
-                    block_offset = Int64(i - self.state_block_size)
-                row_tensor = state_cache[block_number_i32.to(Int64), block_offset, None]
-                kv_src = cute.local_tile(
-                    row_tensor,
-                    tiler=(self.elems_per_lane,),
-                    coord=(col_tile,),
+            if const_expr(self.state_dtype is Float32):
+                cp_f32x2 = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64
                 )
-                score_src = cute.local_tile(
-                    row_tensor,
-                    tiler=(self.elems_per_lane,),
-                    coord=(score_col_tile,),
-                )
-                cute.copy(cp_f32x2, kv_src, kv_vals[i, None])
-                cute.copy(cp_f32x2, score_src, score_vals[i, None])
+                for i in cutlass.range_constexpr(self.rows_per_warp):
+                    block_number_i32 = block0_i32
+                    block_offset = Int64(i)
+                    if const_expr(i >= self.state_block_size):
+                        block_number_i32 = block1_i32
+                        block_offset = Int64(i - self.state_block_size)
+                    row_tensor = state_cache[
+                        block_number_i32.to(Int64), block_offset, None
+                    ]
+                    kv_src = cute.local_tile(
+                        row_tensor,
+                        tiler=(self.elems_per_lane,),
+                        coord=(col_tile,),
+                    )
+                    score_src = cute.local_tile(
+                        row_tensor,
+                        tiler=(self.elems_per_lane,),
+                        coord=(score_col_tile,),
+                    )
+                    cute.copy(cp_f32x2, kv_src, kv_vals[i, None])
+                    cute.copy(cp_f32x2, score_src, score_vals[i, None])
 
-                for e in cutlass.range_constexpr(self.elems_per_lane):
-                    local_max[e] = cute.arch.fmax(local_max[e], score_vals[i, e])
+                    for e in cutlass.range_constexpr(self.elems_per_lane):
+                        local_max[e] = cute.arch.fmax(
+                            local_max[e], score_vals[i, e]
+                        )
+            else:
+                cp_u32 = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), Uint32, num_bits_per_copy=32
+                )
+                kv_bf16x2 = cute.make_rmem_tensor((self.rows_per_warp,), Uint32)
+                score_bf16x2 = cute.make_rmem_tensor((self.rows_per_warp,), Uint32)
+                for i in cutlass.range_constexpr(self.rows_per_warp):
+                    block_number_i32 = block0_i32
+                    block_offset = Int64(i)
+                    if const_expr(i >= self.state_block_size):
+                        block_number_i32 = block1_i32
+                        block_offset = Int64(i - self.state_block_size)
+                    row_tensor = state_cache[
+                        block_number_i32.to(Int64), block_offset, None
+                    ]
+                    kv_src = cute.local_tile(
+                        row_tensor,
+                        tiler=(self.elems_per_lane,),
+                        coord=(col_tile,),
+                    )
+                    score_src = cute.local_tile(
+                        row_tensor,
+                        tiler=(self.elems_per_lane,),
+                        coord=(score_col_tile,),
+                    )
+                    cute.copy(
+                        cp_u32,
+                        cute.recast_tensor(kv_src, Uint32),
+                        kv_bf16x2[i, None],
+                    )
+                    cute.copy(
+                        cp_u32,
+                        cute.recast_tensor(score_src, Uint32),
+                        score_bf16x2[i, None],
+                    )
+                    kv0, kv1 = _bf16x2_to_fp32(kv_bf16x2[i])
+                    score0, score1 = _bf16x2_to_fp32(score_bf16x2[i])
+                    kv_vals[i, 0] = kv0
+                    kv_vals[i, 1] = kv1
+                    score_vals[i, 0] = score0
+                    score_vals[i, 1] = score1
+                    local_max[0] = cute.arch.fmax(local_max[0], score0)
+                    local_max[1] = cute.arch.fmax(local_max[1], score1)
 
             for e in cutlass.range_constexpr(self.elems_per_lane):
                 for i in cutlass.range_constexpr(self.rows_per_warp):
@@ -1166,9 +1216,16 @@ class SparseAttnCompressC128Block8Kernel:
     def compile(
         head_size: int = 512,
         state_width: int = 512,
+        state_cache_dtype: torch.dtype = torch.float32,
     ):
         if head_size % SparseAttnCompressC128Block8Kernel.head_tile != 0:
             raise ValueError("head_size must be divisible by the 64-wide head tile.")
+        if state_cache_dtype not in _TORCH_TO_CUTE:
+            raise ValueError(
+                "C128 compressor state cache supports bf16/fp32, "
+                f"got {state_cache_dtype}."
+            )
+        state_dtype = _TORCH_TO_CUTE[state_cache_dtype]
         num_positions = cute.sym_int()
         num_slots = cute.sym_int()
         num_req_indices = cute.sym_int()
@@ -1178,7 +1235,7 @@ class SparseAttnCompressC128Block8Kernel:
         state_cache_width = state_width * 2
 
         state_cache = cute.runtime.make_fake_tensor(
-            Float32,
+            state_dtype,
             (num_blocks, state_cache_block_size, state_cache_width),
             stride=(
                 cute.sym_int64(divisibility=16),
@@ -1205,6 +1262,7 @@ class SparseAttnCompressC128Block8Kernel:
         kernel = SparseAttnCompressC128Block8Kernel(
             head_size,
             state_width,
+            state_dtype,
         )
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
@@ -1787,6 +1845,7 @@ def compile_split_sparse_attn_cutedsl(
     kv_block_stride: int,
     compress_ratio: int,
     overlap: bool,
+    state_cache_dtype: torch.dtype,
     rms_norm_weight_dtype: torch.dtype,
     store_full_kv: bool = False,
     store_full_fp8: bool = False,
@@ -1806,6 +1865,7 @@ def compile_split_sparse_attn_cutedsl(
     compress = SparseAttnCompressC128Block8Kernel.compile(
         head_size=head_size,
         state_width=state_width,
+        state_cache_dtype=state_cache_dtype,
     )
     norm_weight_dtype = _TORCH_TO_CUTE[rms_norm_weight_dtype]
     if store_full_kv:
@@ -1884,6 +1944,11 @@ def split_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
             "CuTe DSL sparse-attn store supports rms_norm_weight dtype "
             f"bf16/fp32, got {rms_norm_weight.dtype}."
         )
+    if state_cache.dtype not in _TORCH_TO_CUTE:
+        raise ValueError(
+            "C128 compressor state cache supports bf16/fp32, "
+            f"got {state_cache.dtype}."
+        )
     if store_full_fp8 and not store_full_kv:
         raise ValueError("store_full_fp8 requires store_full_kv.")
     compress, store = compile_split_sparse_attn_cutedsl(
@@ -1899,6 +1964,7 @@ def split_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
         kv_block_stride,
         compress_ratio,
         overlap,
+        state_cache.dtype,
         rms_norm_weight.dtype,
         store_full_kv=store_full_kv,
         store_full_fp8=store_full_fp8,
@@ -2008,6 +2074,7 @@ def store_compressed_kv_cutedsl(
         kv_block_stride,
         compress_ratio,
         overlap,
+        torch.float32,
         rms_norm_weight.dtype,
         store_full_kv=store_full_kv,
         store_full_fp8=store_full_fp8,
