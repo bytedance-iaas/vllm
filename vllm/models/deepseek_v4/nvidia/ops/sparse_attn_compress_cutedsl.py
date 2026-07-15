@@ -80,6 +80,7 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
         self,
         head_size: int,
         state_width: int,
+        state_dtype: type[cutlass.Numeric],
         rope_head_dim: int,
         fp8_max: float,
         quant_block: int,
@@ -90,6 +91,7 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
     ):
         self.head_dim = head_size
         self.state_width = state_width
+        self.state_dtype = state_dtype
         self.rope_dim = rope_head_dim
         self.nope_dim = head_size - rope_head_dim
         self.fp8_max = fp8_max
@@ -218,15 +220,26 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
                 local_sum[e] = Float32(0.0)
                 local_product[e] = Float32(0.0)
 
-            cp_f32x4 = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
-            )
             copy_layout = cute.make_layout(
                 (self.copy_chunks, self.copy_elems),
                 stride=(self.copy_elems, 1),
             )
             kv_vals = cute.make_rmem_tensor(copy_layout, Float32)
             score_vals = cute.make_rmem_tensor(copy_layout, Float32)
+            if const_expr(self.state_dtype is Float32):
+                cp_f32x4 = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+                )
+            else:
+                cp_u32 = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), Uint32, num_bits_per_copy=32
+                )
+                packed_layout = cute.make_layout(
+                    (self.copy_chunks, self.copy_elems // 2),
+                    stride=(self.copy_elems // 2, 1),
+                )
+                kv_bf16x2 = cute.make_rmem_tensor(packed_layout, Uint32)
+                score_bf16x2 = cute.make_rmem_tensor(packed_layout, Uint32)
 
             for row in cutlass.range_constexpr(self.window):
                 pos = start + Int64(row)
@@ -253,8 +266,34 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
                                 col_tile + Int64(self.state_width // self.copy_elems),
                             ),
                         )
-                        cute.copy(cp_f32x4, kv_src, kv_vals[chunk, None])
-                        cute.copy(cp_f32x4, score_src, score_vals[chunk, None])
+                        if const_expr(self.state_dtype is Float32):
+                            cute.copy(cp_f32x4, kv_src, kv_vals[chunk, None])
+                            cute.copy(cp_f32x4, score_src, score_vals[chunk, None])
+                        else:
+                            cute.copy(
+                                cp_u32,
+                                cute.recast_tensor(kv_src, Uint32),
+                                kv_bf16x2[chunk, None],
+                            )
+                            cute.copy(
+                                cp_u32,
+                                cute.recast_tensor(score_src, Uint32),
+                                score_bf16x2[chunk, None],
+                            )
+                            for pair in cutlass.range_constexpr(
+                                self.copy_elems // 2
+                            ):
+                                kv0, kv1 = _bf16x2_to_fp32(
+                                    kv_bf16x2[chunk, pair]
+                                )
+                                score0, score1 = _bf16x2_to_fp32(
+                                    score_bf16x2[chunk, pair]
+                                )
+                                elem = const_expr(pair * 2)
+                                kv_vals[chunk, elem] = kv0
+                                kv_vals[chunk, elem + 1] = kv1
+                                score_vals[chunk, elem] = score0
+                                score_vals[chunk, elem + 1] = score1
 
                     for e in cutlass.range_constexpr(self.elems_per_lane):
                         chunk = const_expr(e // self.copy_elems)
@@ -401,6 +440,7 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
         kv_block_stride: int = 74752,
         compress_ratio: int = 4,
         overlap: bool = True,
+        state_cache_dtype: torch.dtype = torch.float32,
         norm_weight_dtype: type[cutlass.Numeric] = Float32,
     ):
         if compress_ratio != 4 or not overlap:
@@ -426,6 +466,12 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
         expected_scale_dim = (head_size - rope_head_dim) // quant_block + 1
         if scale_dim < expected_scale_dim:
             raise ValueError("scale_dim is too small for the UE8M0 scale row.")
+        if state_cache_dtype not in _TORCH_TO_CUTE:
+            raise ValueError(
+                "C4 compressor state cache supports bf16/fp32, "
+                f"got {state_cache_dtype}."
+            )
+        state_dtype = _TORCH_TO_CUTE[state_cache_dtype]
 
         num_positions = cute.sym_int()
         num_slots = cute.sym_int()
@@ -439,7 +485,7 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
         state_cache_width = state_width * 2
 
         state_cache = cute.runtime.make_fake_tensor(
-            Float32,
+            state_dtype,
             (num_state_blocks, state_cache_block_size, state_cache_width),
             stride=(
                 cute.sym_int64(divisibility=16),
@@ -480,6 +526,7 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
         kernel = SparseAttnCompressNormRopeStoreC4Kernel(
             head_size,
             state_width,
+            state_dtype,
             rope_head_dim,
             fp8_max,
             quant_block,
@@ -515,6 +562,7 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
         self,
         head_size: int,
         state_width: int,
+        state_dtype: type[cutlass.Numeric],
         rope_head_dim: int,
         fp8_max: float,
         quant_block: int,
@@ -527,6 +575,7 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
         super().__init__(
             head_size,
             state_width,
+            state_dtype,
             rope_head_dim,
             fp8_max,
             quant_block,
@@ -824,6 +873,7 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
         compress_ratio: int = 4,
         overlap: bool = True,
         store_full_fp8: bool = False,
+        state_cache_dtype: torch.dtype = torch.float32,
         norm_weight_dtype: type[cutlass.Numeric] = Float32,
     ):
         if compress_ratio != 4 or not overlap:
@@ -844,6 +894,12 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
             raise ValueError(
                 "CuTe DSL C4 fused sparse-attn currently requires rope_head_dim=64."
             )
+        if state_cache_dtype not in _TORCH_TO_CUTE:
+            raise ValueError(
+                "C4 compressor state cache supports bf16/fp32, "
+                f"got {state_cache_dtype}."
+            )
+        state_dtype = _TORCH_TO_CUTE[state_cache_dtype]
         num_positions = cute.sym_int()
         num_slots = cute.sym_int()
         num_req_indices = cute.sym_int()
@@ -856,7 +912,7 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
         state_cache_width = state_width * 2
 
         state_cache = cute.runtime.make_fake_tensor(
-            Float32,
+            state_dtype,
             (num_state_blocks, state_cache_block_size, state_cache_width),
             stride=(
                 cute.sym_int64(divisibility=16),
@@ -898,6 +954,7 @@ class SparseAttnCompressNormRopeStoreFullC4Kernel(
         kernel = SparseAttnCompressNormRopeStoreFullC4Kernel(
             head_size,
             state_width,
+            state_dtype,
             rope_head_dim,
             fp8_max,
             quant_block,
@@ -2076,6 +2133,11 @@ def fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
             "CuTe DSL sparse-attn fused store supports rms_norm_weight dtype "
             f"bf16/fp32, got {rms_norm_weight.dtype}."
         )
+    if state_cache.dtype not in _TORCH_TO_CUTE:
+        raise ValueError(
+            "C4 compressor state cache supports bf16/fp32, "
+            f"got {state_cache.dtype}."
+        )
     if k_cache.ndim != 3:
         raise ValueError(
             "CuTe DSL sparse-attn fused store expects the real DeepSeek V4 "
@@ -2099,6 +2161,7 @@ def fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
             compress_ratio=compress_ratio,
             overlap=overlap,
             store_full_fp8=store_full_fp8,
+            state_cache_dtype=state_cache.dtype,
             norm_weight_dtype=norm_weight_dtype,
         )
         compiled(
@@ -2129,6 +2192,7 @@ def fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
         kv_block_stride=kv_block_stride,
         compress_ratio=compress_ratio,
         overlap=overlap,
+        state_cache_dtype=state_cache.dtype,
         norm_weight_dtype=norm_weight_dtype,
     )
     compiled(

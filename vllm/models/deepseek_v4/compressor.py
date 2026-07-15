@@ -51,6 +51,29 @@ from vllm.v1.kv_cache_interface import (
 )
 
 
+_COMPRESSION_STATE_DTYPES = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+}
+
+
+def _get_compression_state_dtype(
+    vllm_config: VllmConfig, compress_ratio: int
+) -> torch.dtype:
+    if compress_ratio == 4:
+        dtype_name = vllm_config.attention_config.c4_compression_state_dtype
+    elif compress_ratio == 128:
+        dtype_name = vllm_config.attention_config.c128_compression_state_dtype
+        if dtype_name != "fp32":
+            raise ValueError(
+                "c128_compression_state_dtype='bf16' requires the C128 BF16 "
+                "compressor implementation."
+            )
+    else:
+        raise ValueError(f"Invalid compress ratio: {compress_ratio}")
+    return _COMPRESSION_STATE_DTYPES[dtype_name]
+
+
 class CompressorBackend(AttentionBackend):
     def __init__(self):
         super().__init__()
@@ -270,7 +293,11 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        assert self.dtype == torch.float32
+        if self.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "Compressor state cache only supports fp32 or bf16, "
+                f"got {self.dtype}."
+            )
         assert compress_ratio in [4, 128]
         coff = 1 + (compress_ratio == 4)
         # Block size is constrained by tensor sharing between compressor states
@@ -359,11 +386,11 @@ class DeepseekCompressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
 
-        state_dtype = torch.float32
+        state_dtype = _get_compression_state_dtype(vllm_config, compress_ratio)
         self.ape = nn.Parameter(
             torch.empty(
                 (compress_ratio, self.coff * self.head_dim),
-                dtype=state_dtype,
+                dtype=torch.float32,
                 device=self.device,
             ),
             requires_grad=False,

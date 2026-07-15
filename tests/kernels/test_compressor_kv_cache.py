@@ -25,6 +25,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
 )
+from vllm.models.deepseek_v4.common.ops.save_partial_states import save_partial_states
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
 
@@ -538,6 +539,60 @@ def _reference_kv_compress_norm_rope(
         return torch.stack(quants), torch.cat(scales)
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_save_partial_states_supports_c4_state_dtype(state_dtype: torch.dtype):
+    head_dim = 512
+    state_width = 2 * head_dim
+    block_size = 16
+    compress_ratio = 4
+    num_tokens = 4
+    device = "cuda"
+    torch.manual_seed(13)
+
+    kv = torch.randn(num_tokens, state_width, dtype=torch.bfloat16, device=device)
+    score = torch.randn(
+        num_tokens, state_width, dtype=torch.bfloat16, device=device
+    )
+    ape = torch.randn(
+        compress_ratio, state_width, dtype=torch.float32, device=device
+    )
+    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device)
+    slot_mapping = torch.tensor([0, 1, -1, 3], dtype=torch.int64, device=device)
+    state_cache = torch.zeros(
+        1, block_size, 2 * state_width, dtype=state_dtype, device=device
+    )
+
+    save_partial_states(
+        kv=kv,
+        score=score,
+        ape=ape,
+        positions=positions,
+        state_cache=state_cache,
+        slot_mapping=slot_mapping,
+        block_size=block_size,
+        state_width=state_width,
+        compress_ratio=compress_ratio,
+    )
+
+    for token_idx in (0, 1, 3):
+        torch.testing.assert_close(
+            state_cache[0, token_idx, :state_width],
+            kv[token_idx].to(state_dtype),
+            rtol=0.0,
+            atol=0.0,
+        )
+        expected_score = (score[token_idx].float() + ape[positions[token_idx]]).to(
+            state_dtype
+        )
+        torch.testing.assert_close(
+            state_cache[0, token_idx, state_width:],
+            expected_score,
+            rtol=0.0,
+            atol=0.0,
+        )
+    assert torch.count_nonzero(state_cache[0, 2]) == 0
+
+
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])
 @pytest.mark.parametrize("kv_block_size", [16, 32])
 @pytest.mark.parametrize("use_fp4", [False, True])
@@ -679,11 +734,21 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
             )
 
 
-@pytest.mark.parametrize("compress_ratio", [4, 128])
+@pytest.mark.parametrize(
+    ("compress_ratio", "state_dtype"),
+    [
+        (4, torch.float32),
+        (4, torch.bfloat16),
+        (128, torch.float32),
+    ],
+)
 @pytest.mark.parametrize("store_fp8", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 8])
 def test_cutedsl_full_cache_store(
-    compress_ratio: int, store_fp8: bool, num_tokens: int
+    compress_ratio: int,
+    state_dtype: torch.dtype,
+    store_fp8: bool,
+    num_tokens: int,
 ):
     """CuTeDSL compressor full-cache (FlashInfer) store parity for head=512.
 
@@ -709,9 +774,12 @@ def test_cutedsl_full_cache_store(
     overlap = 1 if compress_ratio == 4 else 0
     coff = 1 + overlap
     num_pages = (compress_ratio * num_tokens - 1) // BLOCK_SIZE + 2
-    # The production CompressorStateCache is fp32.
     state_cache = torch.randn(
-        num_pages, BLOCK_SIZE, 2 * coff * HEAD_DIM, dtype=torch.float32, device=device
+        num_pages,
+        BLOCK_SIZE,
+        2 * coff * HEAD_DIM,
+        dtype=state_dtype,
+        device=device,
     )
     block_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
     token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
