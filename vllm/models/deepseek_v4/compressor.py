@@ -50,7 +50,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-
 _COMPRESSION_STATE_DTYPES = {
     "fp32": torch.float32,
     "bf16": torch.bfloat16,
