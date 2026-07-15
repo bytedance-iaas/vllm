@@ -550,9 +550,7 @@ def test_save_partial_states_supports_mixed_state_dtype(state_dtype: torch.dtype
 
     kv = torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device=device)
     score = torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device=device)
-    ape = torch.randn(
-        compress_ratio, head_dim, dtype=torch.float32, device=device
-    )
+    ape = torch.randn(compress_ratio, head_dim, dtype=torch.float32, device=device)
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device)
     slot_mapping = torch.tensor([0, 1, -1, 3], dtype=torch.int64, device=device)
     state_cache = torch.zeros(

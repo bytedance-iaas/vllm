@@ -1118,9 +1118,7 @@ class SparseAttnCompressC128Block8Kernel:
                     cute.copy(cp_f32x2, score_src, score_vals[i, None])
 
                     for e in cutlass.range_constexpr(self.elems_per_lane):
-                        local_max[e] = cute.arch.fmax(
-                            local_max[e], score_vals[i, e]
-                        )
+                        local_max[e] = cute.arch.fmax(local_max[e], score_vals[i, e])
             else:
                 cp_u32 = cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(), Uint32, num_bits_per_copy=32
@@ -1946,8 +1944,7 @@ def split_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
         )
     if state_cache.dtype not in _TORCH_TO_CUTE:
         raise ValueError(
-            "C128 compressor state cache supports bf16/fp32, "
-            f"got {state_cache.dtype}."
+            f"C128 compressor state cache supports bf16/fp32, got {state_cache.dtype}."
         )
     if store_full_fp8 and not store_full_kv:
         raise ValueError("store_full_fp8 requires store_full_kv.")
