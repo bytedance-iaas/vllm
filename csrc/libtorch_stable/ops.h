@@ -338,6 +338,14 @@ void persistent_topk(const torch::stable::Tensor& logits,
                      torch::stable::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
 
+void persistent_topk_with_page_table(
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& lengths, torch::stable::Tensor& output,
+    torch::stable::Tensor& topk_lens, torch::stable::Tensor& workspace,
+    int64_t k, int64_t max_seq_len,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& valid_token_mask, int64_t page_block_size);
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
 void cooperative_topk(const torch::stable::Tensor& logits,
                       const torch::stable::Tensor& lengths,

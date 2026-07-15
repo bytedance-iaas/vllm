@@ -8,12 +8,61 @@ import torch
 from transformers import LlamaConfig
 
 from tests.v1.attention.utils import create_vllm_config
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    can_use_indexer_topk_page_table_fusion,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "enabled",
+        "num_tokens",
+        "num_seqs",
+        "requires_padding",
+        "has_global_seq_lens",
+        "expected",
+    ),
+    [
+        (True, 4, 4, False, False, True),
+        (False, 4, 4, False, False, False),
+        (True, 5, 5, False, False, False),
+        (True, 8, 2, False, False, False),
+        (True, 4, 4, True, False, False),
+        (True, 4, 4, False, True, False),
+    ],
+)
+def test_indexer_topk_page_table_fusion_gate(
+    enabled: bool,
+    num_tokens: int,
+    num_seqs: int,
+    requires_padding: bool,
+    has_global_seq_lens: bool,
+    expected: bool,
+) -> None:
+    page_table = torch.empty((4, 8), dtype=torch.int32, device="cuda")
+    topk_lens = torch.empty(4, dtype=torch.int32, device="cuda")
+    assert (
+        can_use_indexer_topk_page_table_fusion(
+            enabled=enabled,
+            topk_lens_buffer=topk_lens,
+            topk_tokens=2048,
+            num_tokens=num_tokens,
+            num_seqs=num_seqs,
+            page_table_block_size=64,
+            page_table=page_table,
+            valid_token_mask=torch.ones(4, dtype=torch.bool, device="cuda"),
+            requires_padding=requires_padding,
+            has_global_seq_lens=has_global_seq_lens,
+        )
+        is expected
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

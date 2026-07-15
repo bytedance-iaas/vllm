@@ -391,6 +391,8 @@ def test_attention_config():
             "true",
             "--attention-config.disable_flashinfer_q_quantization",
             "true",
+            "--attention-config.use_indexer_topk_page_table_fusion",
+            "true",
         ]
     )
     assert args is not None
@@ -402,6 +404,9 @@ def test_attention_config():
     assert engine_args.attention_config.flash_attn_max_num_splits_for_cuda_graph == 16
     assert engine_args.attention_config.use_trtllm_attention is True
     assert engine_args.attention_config.disable_flashinfer_q_quantization is True
+    assert (
+        engine_args.attention_config.use_indexer_topk_page_table_fusion is True
+    )
 
     # set to string form of a dict with all fields
     args = parser.parse_args(

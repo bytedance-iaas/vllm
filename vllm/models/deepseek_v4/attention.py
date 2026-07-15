@@ -117,6 +117,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    supports_indexer_topk_page_table_fusion: ClassVar[bool] = False
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -159,6 +160,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_lens_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
@@ -254,6 +256,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
+        self.topk_lens_buffer = topk_lens_buffer
 
         self.indexer = None
         if self.compress_ratio == 4:
@@ -272,9 +275,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 quant_config=quant_config,
                 cache_config=cache_config,
                 topk_indices_buffer=topk_indices_buffer,
+                topk_lens_buffer=topk_lens_buffer,
                 compress_ratio=self.compress_ratio,
                 prefix=f"{prefix}.indexer",
                 aux_stream=indexer_aux_stream,
+                enable_page_table_fusion=(
+                    vllm_config.attention_config.use_indexer_topk_page_table_fusion
+                    and self.supports_indexer_topk_page_table_fusion
+                ),
             )
 
         # Will be None on ROCm for now.
@@ -681,9 +689,11 @@ class DeepseekV4Indexer(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
+        topk_lens_buffer: torch.Tensor | None = None,
         compress_ratio: int = 1,
         prefix: str = "",
         aux_stream: torch.cuda.Stream | None = None,
+        enable_page_table_fusion: bool = False,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -765,6 +775,11 @@ class DeepseekV4Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            topk_lens_buffer=topk_lens_buffer,
+            page_table_block_size=cache_config.block_size // self.compress_ratio,
+            enable_page_table_fusion=(
+                enable_page_table_fusion and self.compress_ratio == 4
+            ),
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
         )

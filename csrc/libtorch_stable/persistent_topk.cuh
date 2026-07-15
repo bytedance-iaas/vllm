@@ -140,6 +140,52 @@ struct PersistentTopKParams {
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
 };
 
+struct PersistentTopKWithPageTableParams : PersistentTopKParams {
+  const int32_t* __restrict__ block_table;   // [num_rows, max_blocks]
+  const bool* __restrict__ valid_token_mask;  // [num_rows]
+  int32_t* __restrict__ topk_lens;           // [num_rows]
+  uint32_t block_table_stride;
+  uint32_t page_block_size;
+};
+
+__device__ __forceinline__ int32_t local_to_physical_slot(
+    const PersistentTopKWithPageTableParams& params, uint32_t row_idx,
+    int32_t local_idx) {
+  if (local_idx < 0) return -1;
+  const uint32_t block_idx =
+      static_cast<uint32_t>(local_idx) / params.page_block_size;
+  const uint32_t block_offset =
+      static_cast<uint32_t>(local_idx) - block_idx * params.page_block_size;
+  const int32_t physical_block =
+      params.block_table[row_idx * params.block_table_stride + block_idx];
+  if (physical_block < 0) return -1;
+  return physical_block * static_cast<int32_t>(params.page_block_size) +
+         static_cast<int32_t>(block_offset);
+}
+
+template <int TopK>
+__device__ __forceinline__ void transform_topk_row_to_physical_slots(
+    const PersistentTopKWithPageTableParams& params, uint32_t row_idx,
+    int32_t* __restrict__ row_output, uint32_t seq_len, uint32_t tx) {
+  __syncthreads();
+  const bool is_valid_token = params.valid_token_mask[row_idx];
+  const uint32_t valid_len =
+      is_valid_token
+          ? (seq_len < static_cast<uint32_t>(TopK)
+                 ? seq_len
+                 : static_cast<uint32_t>(TopK))
+          : 0;
+  if (tx == 0) {
+    params.topk_lens[row_idx] = static_cast<int32_t>(valid_len);
+  }
+  for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);
+       i += kThreadsPerBlock) {
+    row_output[i] = is_valid_token
+                        ? local_to_physical_slot(params, row_idx, row_output[i])
+                        : -1;
+  }
+}
+
 // ============================================================================
 // Decode path: 2048-bin histogram for short sequences (seq_len <= 8192)
 // Uses 11-bit half-precision bins for fine granularity.
@@ -653,7 +699,7 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
 // Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 
-template <int TopK, uint32_t VEC_SIZE>
+template <int TopK, uint32_t VEC_SIZE, bool NeedsFinalBarrier>
 __device__ void radix_topk(const float* __restrict__ row_input,
                            int32_t* __restrict__ row_output, uint32_t seq_len,
                            uint32_t my_chunk_start, uint32_t chunk_size,
@@ -853,6 +899,16 @@ __device__ void radix_topk(const float* __restrict__ row_input,
       }
     }
   }
+
+  if constexpr (NeedsFinalBarrier) {
+    if (tx == 0) {
+      red_release(&state->arrival_counter, 1);
+    }
+    wait_ge(&state->arrival_counter,
+            (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
+    barrier_phase++;
+    __syncthreads();
+  }
 }
 
 // ============================================================================
@@ -861,9 +917,10 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 // see filtered_topk.cuh)
 // ============================================================================
 
-template <int TopK = 2048, uint32_t VEC_SIZE = 1>
+template <int TopK = 2048, uint32_t VEC_SIZE = 1,
+          bool WithPageTable = false, typename Params = PersistentTopKParams>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
-    persistent_topk_kernel(PersistentTopKParams params) {
+    persistent_topk_kernel(Params params) {
   const uint32_t tx = threadIdx.x;
   extern __shared__ uint8_t smem_raw[];
 
@@ -922,15 +979,25 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
         } else {
           histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
         }
+        if constexpr (WithPageTable) {
+          transform_topk_row_to_physical_slots<TopK>(
+              params, row_idx, row_output, seq_len, tx);
+        }
       }
       continue;
     }
 
     const uint32_t my_chunk_start = cta_in_group * chunk_size;
-    radix_topk<TopK, VEC_SIZE>(
+    radix_topk<TopK, VEC_SIZE, WithPageTable>(
         row_input, row_output, seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
         cta_in_group, ctas_per_group, barrier_phase, iter, tx);
+    if constexpr (WithPageTable) {
+      if (cta_in_group == 0) {
+        transform_topk_row_to_physical_slots<TopK>(
+            params, row_idx, row_output, seq_len, tx);
+      }
+    }
   }
 }
 

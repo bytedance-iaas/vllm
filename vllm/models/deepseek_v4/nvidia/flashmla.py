@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    can_use_indexer_topk_page_table_fusion,
+)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
@@ -34,6 +37,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
     backend_cls = DeepseekV4FlashMLABackend
+    supports_indexer_topk_page_table_fusion = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -164,14 +168,43 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
-                global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
+                assert self.indexer is not None
+                forward_metadata = get_forward_context().attn_metadata
+                assert isinstance(forward_metadata, dict)
+                indexer_metadata = forward_metadata[self.indexer.k_cache.prefix]
+                indexer_decode_metadata = indexer_metadata.decode
+                assert indexer_decode_metadata is not None
+                use_page_table_fusion = can_use_indexer_topk_page_table_fusion(
+                    enabled=self.indexer.indexer_op.enable_page_table_fusion,
+                    topk_lens_buffer=self.topk_lens_buffer,
+                    topk_tokens=self.topk_indices_buffer.shape[-1],
+                    num_tokens=num_decode_tokens,
+                    num_seqs=num_decodes,
+                    page_table_block_size=block_size,
+                    page_table=attn_metadata.block_table,
+                    valid_token_mask=is_valid,
+                    requires_padding=indexer_decode_metadata.requires_padding,
+                    has_global_seq_lens=(
+                        indexer_decode_metadata.global_seq_lens is not None
+                    ),
                 )
-                topk_indices = global_indices.view(num_decode_tokens, 1, -1)
+                if use_page_table_fusion:
+                    assert self.topk_lens_buffer is not None
+                    topk_indices = self.topk_indices_buffer[
+                        :num_decode_tokens
+                    ].view(num_decode_tokens, 1, -1)
+                    topk_lens = self.topk_lens_buffer[:num_decode_tokens]
+                else:
+                    global_indices, topk_lens = (
+                        compute_global_topk_indices_and_lens(
+                            self.topk_indices_buffer[:num_decode_tokens],
+                            swa_metadata.token_to_req_indices,
+                            attn_metadata.block_table[:num_decodes],
+                            block_size,
+                            is_valid,
+                        )
+                    )
+                    topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
                 # C128A: pre-computed during metadata build.
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices

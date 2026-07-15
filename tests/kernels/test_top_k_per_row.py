@@ -838,6 +838,98 @@ def test_cooperative_topk_512_tie_workspace_is_per_row() -> None:
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @pytest.mark.parametrize(
+    ("top_k", "seq_lens", "invalid_rows"),
+    [
+        (512, [1, 10, 900, 8192], [2]),
+        (1024, [600, 1024, 5000, 10000], [1]),
+        (2048, [2048, 4096, 12000, 65537], [3]),
+    ],
+)
+@torch.inference_mode()
+def test_persistent_topk_with_page_table(
+    top_k: int,
+    seq_lens: list[int],
+    invalid_rows: list[int],
+) -> None:
+    """Compare fused TopK slots with the existing local-index kernel."""
+    set_random_seed(42)
+    page_block_size = 64
+    num_rows = len(seq_lens)
+    max_seq_len = max(seq_lens)
+    max_blocks = (max_seq_len + page_block_size - 1) // page_block_size
+
+    logits = torch.randn(
+        num_rows, max_seq_len, dtype=torch.float32, device="cuda"
+    )
+    lengths = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    local_indices = torch.empty(
+        (num_rows, top_k), dtype=torch.int32, device="cuda"
+    )
+    fused_indices = torch.empty_like(local_indices)
+    fused_lens = torch.empty(num_rows, dtype=torch.int32, device="cuda")
+    workspace = torch.empty(
+        RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda"
+    )
+    fused_workspace = torch.empty_like(workspace)
+
+    block_table = (
+        torch.arange(
+            num_rows * max_blocks, dtype=torch.int32, device="cuda"
+        ).reshape(num_rows, max_blocks)
+        + 17
+    )
+    valid_token_mask = torch.ones(num_rows, dtype=torch.bool, device="cuda")
+    for row in invalid_rows:
+        valid_token_mask[row] = False
+
+    torch.ops._C.persistent_topk(
+        logits, lengths, local_indices, workspace, top_k, max_seq_len
+    )
+    torch.ops._C.persistent_topk_with_page_table(
+        logits,
+        lengths,
+        fused_indices,
+        fused_lens,
+        fused_workspace,
+        top_k,
+        max_seq_len,
+        block_table,
+        valid_token_mask,
+        page_block_size,
+    )
+    torch.accelerator.synchronize()
+
+    invalid_rows_set = set(invalid_rows)
+    expected_lens = torch.tensor(
+        [
+            0 if row in invalid_rows_set else min(seq_len, top_k)
+            for row, seq_len in enumerate(seq_lens)
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    torch.testing.assert_close(fused_lens, expected_lens)
+
+    for row in range(num_rows):
+        fused_row = fused_indices[row]
+        if row in invalid_rows_set:
+            assert torch.all(fused_row == -1)
+            continue
+
+        valid_fused = fused_row[fused_row >= 0]
+        physical_blocks = valid_fused // page_block_size
+        block_offsets = valid_fused % page_block_size
+        inverse_local_indices = (
+            physical_blocks - (17 + row * max_blocks)
+        ) * page_block_size + block_offsets
+        expected_local = local_indices[row][local_indices[row] >= 0]
+        assert set(inverse_local_indices.cpu().tolist()) == set(
+            expected_local.cpu().tolist()
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize(
     "test_config",
     [
         # Mixed batch: rows spanning all four paths (trivial, decode, medium, large)

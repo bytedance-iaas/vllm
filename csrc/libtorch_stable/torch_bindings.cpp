@@ -488,6 +488,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
       "Tensor workspace, int k, int max_seq_len) -> ()");
 
+  ops.def(
+      "persistent_topk_with_page_table(Tensor logits, Tensor lengths, "
+      "Tensor! output, Tensor! topk_lens, Tensor workspace, int k, "
+      "int max_seq_len, Tensor block_table, Tensor valid_token_mask, "
+      "int page_block_size) -> ()");
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
   ops.def(
       "cooperative_topk(Tensor logits, Tensor lengths, Tensor! output, "

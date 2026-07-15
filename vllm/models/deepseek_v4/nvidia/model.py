@@ -1222,6 +1222,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         vllm_config,
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_lens_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
     ):
         super().__init__()
@@ -1234,6 +1235,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
+            topk_lens_buffer=topk_lens_buffer,
             aux_stream_list=aux_stream_list,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
@@ -1400,6 +1402,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             config.index_topk,
             dtype=torch.int32,
         )
+        self.topk_lens_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+        )
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1417,6 +1423,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
+                topk_lens_buffer=self.topk_lens_buffer,
                 aux_stream_list=aux_stream_list,
             ),
             prefix=f"{prefix}.layers",

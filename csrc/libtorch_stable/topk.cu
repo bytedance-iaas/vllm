@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <type_traits>
 
 #include "torch_utils.h"
 
@@ -13,13 +14,20 @@
 namespace {
 
 #ifndef USE_ROCM
-template <int TopK>
+template <int TopK, bool WithPageTable = false>
 void launch_persistent_topk(const torch::stable::Tensor& logits,
                             const torch::stable::Tensor& lengths,
                             torch::stable::Tensor& output,
                             torch::stable::Tensor& workspace,
-                            int64_t max_seq_len) {
+                            int64_t max_seq_len,
+                            const torch::stable::Tensor* block_table = nullptr,
+                            const torch::stable::Tensor* valid_token_mask = nullptr,
+                            torch::stable::Tensor* topk_lens = nullptr,
+                            int64_t page_block_size = 0) {
   namespace P = vllm::persistent;
+  using Params =
+      std::conditional_t<WithPageTable, P::PersistentTopKWithPageTableParams,
+                         P::PersistentTopKParams>;
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       logits.get_device_index());
@@ -35,7 +43,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     max_smem_per_block = device_prop->sharedMemPerBlockOptin;
   }
 
-  if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
+  if (!WithPageTable && num_rows > 32 && max_smem_per_block >= 128 * 1024) {
     cudaError_t status =
         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
             logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
@@ -92,16 +100,19 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     cudaError_t occ_err = cudaSuccess;
     if (vec_size == 4) {
       occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occupancy, P::persistent_topk_kernel<TopK, 4>, P::kThreadsPerBlock,
-          smem_size);
+          &occupancy,
+          P::persistent_topk_kernel<TopK, 4, WithPageTable, Params>,
+          P::kThreadsPerBlock, smem_size);
     } else if (vec_size == 2) {
       occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occupancy, P::persistent_topk_kernel<TopK, 2>, P::kThreadsPerBlock,
-          smem_size);
+          &occupancy,
+          P::persistent_topk_kernel<TopK, 2, WithPageTable, Params>,
+          P::kThreadsPerBlock, smem_size);
     } else {
       occ_err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occupancy, P::persistent_topk_kernel<TopK, 1>, P::kThreadsPerBlock,
-          smem_size);
+          &occupancy,
+          P::persistent_topk_kernel<TopK, 1, WithPageTable, Params>,
+          P::kThreadsPerBlock, smem_size);
     }
     STD_TORCH_CHECK(occ_err == cudaSuccess,
                     "persistent_topk occupancy query failed: ",
@@ -191,7 +202,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
                       "row_states memset failed: ", cudaGetErrorString(mz_err));
     }
 
-    P::PersistentTopKParams params;
+    Params params;
     params.input = logits.const_data_ptr<float>();
     params.output = output.mutable_data_ptr<int32_t>();
     params.lengths = lengths.const_data_ptr<int32_t>();
@@ -203,10 +214,19 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         workspace.mutable_data_ptr<uint8_t>());
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+    if constexpr (WithPageTable) {
+      params.block_table = block_table->const_data_ptr<int32_t>();
+      params.valid_token_mask = valid_token_mask->const_data_ptr<bool>();
+      params.topk_lens = topk_lens->mutable_data_ptr<int32_t>();
+      params.block_table_stride =
+          static_cast<uint32_t>(block_table->stride(0));
+      params.page_block_size = static_cast<uint32_t>(page_block_size);
+    }
 
   #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                     \
     do {                                                                      \
-      auto kernel = &P::persistent_topk_kernel<TOPK_VAL, VS>;                 \
+      auto kernel =                                                           \
+          &P::persistent_topk_kernel<TOPK_VAL, VS, WithPageTable, Params>;    \
       cudaError_t err = cudaFuncSetAttribute(                                 \
           kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);    \
       STD_TORCH_CHECK(err == cudaSuccess,                                     \
@@ -277,5 +297,112 @@ void persistent_topk(const torch::stable::Tensor& logits,
   }
 #else
   STD_TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
+#endif
+}
+
+void persistent_topk_with_page_table(
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& lengths, torch::stable::Tensor& output,
+    torch::stable::Tensor& topk_lens, torch::stable::Tensor& workspace,
+    int64_t k, int64_t max_seq_len,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& valid_token_mask, int64_t page_block_size) {
+#ifndef USE_ROCM
+  STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
+  STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
+  STD_TORCH_CHECK(output.is_cuda(), "output must be CUDA tensor");
+  STD_TORCH_CHECK(topk_lens.is_cuda(), "topk_lens must be CUDA tensor");
+  STD_TORCH_CHECK(workspace.is_cuda(), "workspace must be CUDA tensor");
+  STD_TORCH_CHECK(block_table.is_cuda(), "block_table must be CUDA tensor");
+  STD_TORCH_CHECK(valid_token_mask.is_cuda(),
+                  "valid_token_mask must be CUDA tensor");
+  const int64_t device_index = logits.get_device_index();
+  STD_TORCH_CHECK(
+      lengths.get_device_index() == device_index &&
+          output.get_device_index() == device_index &&
+          topk_lens.get_device_index() == device_index &&
+          workspace.get_device_index() == device_index &&
+          block_table.get_device_index() == device_index &&
+          valid_token_mask.get_device_index() == device_index,
+      "all tensors must be on the same CUDA device");
+  STD_TORCH_CHECK(logits.scalar_type() == torch::headeronly::ScalarType::Float,
+                  "Only float32 supported");
+  STD_TORCH_CHECK(lengths.scalar_type() == torch::headeronly::ScalarType::Int,
+                  "lengths must be int32");
+  STD_TORCH_CHECK(output.scalar_type() == torch::headeronly::ScalarType::Int,
+                  "output must be int32");
+  STD_TORCH_CHECK(topk_lens.scalar_type() ==
+                      torch::headeronly::ScalarType::Int,
+                  "topk_lens must be int32");
+  STD_TORCH_CHECK(block_table.scalar_type() ==
+                      torch::headeronly::ScalarType::Int,
+                  "block_table must be int32");
+  STD_TORCH_CHECK(valid_token_mask.scalar_type() ==
+                      torch::headeronly::ScalarType::Bool,
+                  "valid_token_mask must be bool");
+  STD_TORCH_CHECK(workspace.scalar_type() ==
+                      torch::headeronly::ScalarType::Byte,
+                  "workspace must be uint8");
+  STD_TORCH_CHECK(logits.dim() == 2, "logits must be 2D");
+  STD_TORCH_CHECK(lengths.dim() == 1 || lengths.dim() == 2,
+                  "lengths must be 1D or 2D");
+  STD_TORCH_CHECK(lengths.is_contiguous(), "lengths must be contiguous");
+  STD_TORCH_CHECK(output.dim() == 2, "output must be 2D");
+  STD_TORCH_CHECK(logits.stride(1) == 1,
+                  "logits rows must be contiguous");
+  STD_TORCH_CHECK(output.stride(1) == 1,
+                  "output rows must be contiguous");
+  STD_TORCH_CHECK(topk_lens.dim() == 1, "topk_lens must be 1D");
+  STD_TORCH_CHECK(block_table.dim() == 2, "block_table must be 2D");
+  STD_TORCH_CHECK(valid_token_mask.dim() == 1,
+                  "valid_token_mask must be 1D");
+  STD_TORCH_CHECK(valid_token_mask.is_contiguous(),
+                  "valid_token_mask must be contiguous");
+  STD_TORCH_CHECK(topk_lens.is_contiguous(),
+                  "topk_lens must be contiguous");
+  STD_TORCH_CHECK(block_table.stride(1) == 1,
+                  "block_table rows must be contiguous");
+  STD_TORCH_CHECK(page_block_size > 0, "page_block_size must be positive");
+
+  const int64_t num_rows = logits.size(0);
+  STD_TORCH_CHECK(
+      num_rows <= 4,
+      "persistent_topk_with_page_table currently supports <=4 rows");
+  STD_TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
+  STD_TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
+                  "output size mismatch");
+  STD_TORCH_CHECK(topk_lens.size(0) >= num_rows,
+                  "topk_lens size mismatch");
+  STD_TORCH_CHECK(block_table.size(0) >= num_rows,
+                  "block_table row mismatch");
+  STD_TORCH_CHECK(valid_token_mask.size(0) >= num_rows,
+                  "valid_token_mask size mismatch");
+  STD_TORCH_CHECK(
+      block_table.size(1) >=
+          (logits.size(1) + page_block_size - 1) / page_block_size,
+      "block_table does not cover the logits row width");
+  STD_TORCH_CHECK(
+      k == 512 || k == 1024 || k == 2048,
+      "persistent_topk_with_page_table supports k=512, k=1024, or k=2048, got ",
+      k);
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      device_index);
+  if (k == 512) {
+    launch_persistent_topk<512, true>(
+        logits, lengths, output, workspace, max_seq_len, &block_table,
+        &valid_token_mask, &topk_lens, page_block_size);
+  } else if (k == 1024) {
+    launch_persistent_topk<1024, true>(
+        logits, lengths, output, workspace, max_seq_len, &block_table,
+        &valid_token_mask, &topk_lens, page_block_size);
+  } else {
+    launch_persistent_topk<2048, true>(
+        logits, lengths, output, workspace, max_seq_len, &block_table,
+        &valid_token_mask, &topk_lens, page_block_size);
+  }
+#else
+  STD_TORCH_CHECK(false,
+                  "persistent_topk_with_page_table is not supported on ROCm");
 #endif
 }

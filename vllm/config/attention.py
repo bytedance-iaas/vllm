@@ -52,6 +52,11 @@ class AttentionConfig:
     use_fp4_indexer_cache: bool = False
     """If set, use fp4 indexer cache for dsv32 family model (not support yet)"""
 
+    use_indexer_topk_page_table_fusion: bool = False
+    """Fuse persistent indexer TopK with the C4 page-table transform on the
+    supported DeepSeek-V4 FlashMLA decode path. This is an experimental,
+    low-batch optimization and is disabled by default."""
+
     indexer_kv_dtype: IndexerKVDType = "bf16"
     """Data type for the sparse-attention indexer K cache. Quantized formats
     (fp8, mxfp4, nvfp4) require indexer kernel support in the backend."""
