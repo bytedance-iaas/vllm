@@ -41,6 +41,18 @@ def test_compression_state_dtype_is_selected_per_ratio(
     assert _get_compression_state_dtype(config, compress_ratio) is expected_dtype
 
 
+def test_c4_bf16_state_dtype_fails_before_kernel_dispatch():
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            c4_compression_state_dtype="bf16",
+            c128_compression_state_dtype="fp32",
+        )
+    )
+
+    with pytest.raises(ValueError, match="C4 compressor kernels"):
+        _get_compression_state_dtype(config, 4)
+
+
 def test_plan_online_c128_segments_exact_boundary_emits_and_resets_bank0():
     plan = plan_online_c128_segments(
         query_start_loc_cpu=np.array([0, 128], dtype=np.int32),

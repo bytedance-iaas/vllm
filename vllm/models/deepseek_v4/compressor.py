@@ -61,6 +61,11 @@ def _get_compression_state_dtype(
 ) -> torch.dtype:
     if compress_ratio == 4:
         dtype_name = vllm_config.attention_config.c4_compression_state_dtype
+        if dtype_name != "fp32":
+            raise ValueError(
+                "c4_compression_state_dtype='bf16' is not supported by the "
+                "C4 compressor kernels yet."
+            )
     elif compress_ratio == 128:
         dtype_name = vllm_config.attention_config.c128_compression_state_dtype
     else:
