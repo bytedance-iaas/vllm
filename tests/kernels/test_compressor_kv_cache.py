@@ -550,12 +550,8 @@ def test_save_partial_states_supports_c4_state_dtype(state_dtype: torch.dtype):
     torch.manual_seed(13)
 
     kv = torch.randn(num_tokens, state_width, dtype=torch.bfloat16, device=device)
-    score = torch.randn(
-        num_tokens, state_width, dtype=torch.bfloat16, device=device
-    )
-    ape = torch.randn(
-        compress_ratio, state_width, dtype=torch.float32, device=device
-    )
+    score = torch.randn(num_tokens, state_width, dtype=torch.bfloat16, device=device)
+    ape = torch.randn(compress_ratio, state_width, dtype=torch.float32, device=device)
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device=device)
     slot_mapping = torch.tensor([0, 1, -1, 3], dtype=torch.int64, device=device)
     state_cache = torch.zeros(

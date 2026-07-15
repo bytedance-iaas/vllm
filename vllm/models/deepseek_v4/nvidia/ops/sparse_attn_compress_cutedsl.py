@@ -280,12 +280,8 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
                                 cute.recast_tensor(score_src, Uint32),
                                 score_bf16x2[chunk, None],
                             )
-                            for pair in cutlass.range_constexpr(
-                                self.copy_elems // 2
-                            ):
-                                kv0, kv1 = _bf16x2_to_fp32(
-                                    kv_bf16x2[chunk, pair]
-                                )
+                            for pair in cutlass.range_constexpr(self.copy_elems // 2):
+                                kv0, kv1 = _bf16x2_to_fp32(kv_bf16x2[chunk, pair])
                                 score0, score1 = _bf16x2_to_fp32(
                                     score_bf16x2[chunk, pair]
                                 )
@@ -2135,8 +2131,7 @@ def fused_kv_compress_norm_rope_insert_sparse_attn_cutedsl(
         )
     if state_cache.dtype not in _TORCH_TO_CUTE:
         raise ValueError(
-            "C4 compressor state cache supports bf16/fp32, "
-            f"got {state_cache.dtype}."
+            f"C4 compressor state cache supports bf16/fp32, got {state_cache.dtype}."
         )
     if k_cache.ndim != 3:
         raise ValueError(

@@ -240,9 +240,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
                 qlen = (query_start_loc_cpu_t[1:] - query_start_loc_cpu_t[:-1]).numpy()
                 seq_lens_cpu = qlen  # fallback: seq_len == query_len
 
-            if (
-                not common_attn_metadata.skip_online_c128_plan
-                and np.any(prefill_req_mask)
+            if not common_attn_metadata.skip_online_c128_plan and np.any(
+                prefill_req_mask
             ):
                 query_start_loc_np = query_start_loc_cpu_t.numpy()
                 max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
@@ -294,8 +293,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
 
         if self.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
-                "Compressor state cache only supports fp32 or bf16, "
-                f"got {self.dtype}."
+                f"Compressor state cache only supports fp32 or bf16, got {self.dtype}."
             )
         assert compress_ratio in [4, 128]
         coff = 1 + (compress_ratio == 4)
