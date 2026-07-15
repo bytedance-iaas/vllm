@@ -2762,22 +2762,14 @@ def test_failed_request_skips_kv_postprocessing(
         ("cache_dtype", {"cache_dtype": "fp8"}, {}, True, True),
         (
             "c4_compression_state_dtype",
-            {
-                "attention_config_kwargs": {
-                    "c4_compression_state_dtype": "bf16"
-                }
-            },
+            {"attention_config_kwargs": {"c4_compression_state_dtype": "bf16"}},
             {},
             True,
             True,
         ),
         (
             "c128_compression_state_dtype",
-            {
-                "attention_config_kwargs": {
-                    "c128_compression_state_dtype": "bf16"
-                }
-            },
+            {"attention_config_kwargs": {"c128_compression_state_dtype": "bf16"}},
             {},
             True,
             True,

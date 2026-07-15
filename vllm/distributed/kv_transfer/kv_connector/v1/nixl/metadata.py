@@ -123,9 +123,7 @@ def compute_nixl_compatibility_hash(
         "attn_backend_name": attn_backend_name,
         "cache_dtype": str(cache_config.cache_dtype),
         "c4_compression_state_dtype": attention_config.c4_compression_state_dtype,
-        "c128_compression_state_dtype": (
-            attention_config.c128_compression_state_dtype
-        ),
+        "c128_compression_state_dtype": (attention_config.c128_compression_state_dtype),
         "cross_layers_blocks": cross_layers_blocks,
         "is_hma_enabled": is_hma_enabled,
     }

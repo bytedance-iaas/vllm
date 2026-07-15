@@ -57,12 +57,10 @@ def test_compression_state_dtypes_affect_attention_config_hash():
     base_hash = AttentionConfig().compute_hash()
 
     assert (
-        AttentionConfig(c4_compression_state_dtype="bf16").compute_hash()
-        != base_hash
+        AttentionConfig(c4_compression_state_dtype="bf16").compute_hash() != base_hash
     )
     assert (
-        AttentionConfig(c128_compression_state_dtype="bf16").compute_hash()
-        != base_hash
+        AttentionConfig(c128_compression_state_dtype="bf16").compute_hash() != base_hash
     )
 
 

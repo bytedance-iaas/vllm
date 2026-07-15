@@ -67,9 +67,7 @@ def test_online_c128_rejects_bf16_paged_state(monkeypatch):
         attention_config=SimpleNamespace(c128_compression_state_dtype="bf16"),
     )
 
-    with pytest.raises(
-        ValueError, match="c128_compression_state_dtype='fp32'"
-    ):
+    with pytest.raises(ValueError, match="c128_compression_state_dtype='fp32'"):
         assert_online_c128_supported(config, compress_ratio=128, head_dim=512)
 
 
@@ -152,9 +150,9 @@ def _make_common_metadata(
 
 def test_compressor_metadata_builder_keeps_offline_token_mapping(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
-    metadata = _make_compressor_metadata_builder(
-        online_c128_enabled=False
-    ).build(0, _make_common_metadata())
+    metadata = _make_compressor_metadata_builder(online_c128_enabled=False).build(
+        0, _make_common_metadata()
+    )
 
     assert metadata.token_to_req_indices is not None
     assert metadata.token_to_req_indices.cpu().tolist() == [0, 1, 1]
@@ -168,9 +166,9 @@ def test_compressor_metadata_builder_skips_online_token_mapping(monkeypatch):
         is_prefilling=torch.tensor([True, False]),
         num_draft_tokens_per_req_cpu=np.array([0, 2], dtype=np.int32),
     )
-    metadata = _make_compressor_metadata_builder(
-        online_c128_enabled=True
-    ).build(0, common_metadata)
+    metadata = _make_compressor_metadata_builder(online_c128_enabled=True).build(
+        0, common_metadata
+    )
 
     assert metadata.token_to_req_indices is None
     assert metadata.req_state_indices is not None

@@ -74,9 +74,7 @@ def assert_online_c128_supported(
         )
 
     attention_config = getattr(vllm_config, "attention_config", None)
-    c128_state_dtype = getattr(
-        attention_config, "c128_compression_state_dtype", "fp32"
-    )
+    c128_state_dtype = getattr(attention_config, "c128_compression_state_dtype", "fp32")
     if c128_state_dtype != "fp32":
         raise ValueError(
             "VLLM_USE_ONLINE_C128_COMPRESS requires "
