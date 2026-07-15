@@ -391,6 +391,10 @@ def test_attention_config():
             "true",
             "--attention-config.disable_flashinfer_q_quantization",
             "true",
+            "--attention-config.c4_compression_state_dtype",
+            "bf16",
+            "--attention-config.c128_compression_state_dtype",
+            "bf16",
         ]
     )
     assert args is not None
@@ -402,6 +406,8 @@ def test_attention_config():
     assert engine_args.attention_config.flash_attn_max_num_splits_for_cuda_graph == 16
     assert engine_args.attention_config.use_trtllm_attention is True
     assert engine_args.attention_config.disable_flashinfer_q_quantization is True
+    assert engine_args.attention_config.c4_compression_state_dtype == "bf16"
+    assert engine_args.attention_config.c128_compression_state_dtype == "bf16"
 
     # set to string form of a dict with all fields
     args = parser.parse_args(
@@ -411,7 +417,9 @@ def test_attention_config():
             '"use_prefill_decode_attention": false, '
             '"flash_attn_max_num_splits_for_cuda_graph": 8, '
             '"use_trtllm_attention": false, '
-            '"disable_flashinfer_q_quantization": false}',
+            '"disable_flashinfer_q_quantization": false, '
+            '"c4_compression_state_dtype": "bf16", '
+            '"c128_compression_state_dtype": "bf16"}',
         ]
     )
     assert args is not None
@@ -423,6 +431,8 @@ def test_attention_config():
     assert engine_args.attention_config.flash_attn_max_num_splits_for_cuda_graph == 8
     assert engine_args.attention_config.use_trtllm_attention is False
     assert engine_args.attention_config.disable_flashinfer_q_quantization is False
+    assert engine_args.attention_config.c4_compression_state_dtype == "bf16"
+    assert engine_args.attention_config.c128_compression_state_dtype == "bf16"
 
     # test --attention-backend flows into VllmConfig.attention_config
     args = parser.parse_args(

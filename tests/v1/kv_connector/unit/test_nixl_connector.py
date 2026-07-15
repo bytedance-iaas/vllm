@@ -2760,6 +2760,28 @@ def test_failed_request_skips_kv_postprocessing(
         ("model_name", {"model": "facebook/opt-350m"}, {}, True, True),
         ("dtype", {"dtype": "bfloat16"}, {}, True, True),
         ("cache_dtype", {"cache_dtype": "fp8"}, {}, True, True),
+        (
+            "c4_compression_state_dtype",
+            {
+                "attention_config_kwargs": {
+                    "c4_compression_state_dtype": "bf16"
+                }
+            },
+            {},
+            True,
+            True,
+        ),
+        (
+            "c128_compression_state_dtype",
+            {
+                "attention_config_kwargs": {
+                    "c128_compression_state_dtype": "bf16"
+                }
+            },
+            {},
+            True,
+            True,
+        ),
         ("num_kv_heads", {"hf_overrides": {"num_key_value_heads": 8}}, {}, True, True),
         (
             "num_hidden_layers",

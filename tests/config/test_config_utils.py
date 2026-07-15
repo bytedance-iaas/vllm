@@ -6,6 +6,7 @@ from enum import Enum
 
 import pytest
 
+from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
 
@@ -50,6 +51,28 @@ def test_hash_factors_deterministic():
     assert hash_factors(factors_reordered) == hash1
     assert len(hash1) == 64
     assert all(c in "0123456789abcdef" for c in hash1)
+
+
+def test_compression_state_dtypes_affect_attention_config_hash():
+    base_hash = AttentionConfig().compute_hash()
+
+    assert (
+        AttentionConfig(c4_compression_state_dtype="bf16").compute_hash()
+        != base_hash
+    )
+    assert (
+        AttentionConfig(c128_compression_state_dtype="bf16").compute_hash()
+        != base_hash
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["c4_compression_state_dtype", "c128_compression_state_dtype"],
+)
+def test_compression_state_dtype_rejects_unsupported_value(field):
+    with pytest.raises(ValueError):
+        AttentionConfig(**{field: "fp16"})
 
 
 @pytest.mark.parametrize(

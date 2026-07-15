@@ -101,6 +101,7 @@ def create_vllm_config(
     cache_dtype: str = "auto",
     hf_overrides: dict[str, Any] | None = None,
     attention_backend: str | None = None,
+    attention_config_kwargs: dict[str, Any] | None = None,
     kv_load_failure_policy: Literal["recompute", "fail"] = "fail",
     kv_connector: str = "NixlConnector",
     kv_connector_module_path: str | None = None,
@@ -138,7 +139,9 @@ def create_vllm_config(
         kv_connector_extra_config=kv_connector_extra_config or {},
         kv_load_failure_policy=kv_load_failure_policy,
     )
-    attention_config = AttentionConfig(backend=attention_backend)
+    attention_config = AttentionConfig(
+        backend=attention_backend, **(attention_config_kwargs or {})
+    )
     return VllmConfig(
         scheduler_config=scheduler_config,
         model_config=model_config,

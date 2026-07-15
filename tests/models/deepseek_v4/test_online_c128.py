@@ -60,6 +60,19 @@ def test_online_c128_rejects_non_mtp_speculative(monkeypatch):
         assert_online_c128_supported(config, compress_ratio=128, head_dim=512)
 
 
+def test_online_c128_rejects_bf16_paged_state(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_ONLINE_C128_COMPRESS", True)
+    monkeypatch.setattr(online_c128, "_is_sm90", lambda: True)
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(c128_compression_state_dtype="bf16"),
+    )
+
+    with pytest.raises(
+        ValueError, match="c128_compression_state_dtype='fp32'"
+    ):
+        assert_online_c128_supported(config, compress_ratio=128, head_dim=512)
+
+
 def test_online_c128_rejects_dbo_ubatching(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_USE_ONLINE_C128_COMPRESS", True)
     monkeypatch.setattr(online_c128, "_is_sm90", lambda: True)

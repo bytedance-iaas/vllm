@@ -10,6 +10,7 @@ from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnu
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 IndexerKVDType = Literal["bf16", "fp8", "mxfp4", "nvfp4"]
+CompressionStateDType = Literal["fp32", "bf16"]
 
 
 @config
@@ -55,6 +56,12 @@ class AttentionConfig:
     indexer_kv_dtype: IndexerKVDType = "bf16"
     """Data type for the sparse-attention indexer K cache. Quantized formats
     (fp8, mxfp4, nvfp4) require indexer kernel support in the backend."""
+
+    c4_compression_state_dtype: CompressionStateDType = "fp32"
+    """Data type for DeepSeek-V4 C4 paged compression states."""
+
+    c128_compression_state_dtype: CompressionStateDType = "fp32"
+    """Data type for DeepSeek-V4 C128 paged compression states."""
 
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""

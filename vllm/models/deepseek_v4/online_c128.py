@@ -73,6 +73,17 @@ def assert_online_c128_supported(
             f"{ONLINE_C128_HEAD_DIM}, got {head_dim}."
         )
 
+    attention_config = getattr(vllm_config, "attention_config", None)
+    c128_state_dtype = getattr(
+        attention_config, "c128_compression_state_dtype", "fp32"
+    )
+    if c128_state_dtype != "fp32":
+        raise ValueError(
+            "VLLM_USE_ONLINE_C128_COMPRESS requires "
+            "c128_compression_state_dtype='fp32'; "
+            f"got {c128_state_dtype!r}."
+        )
+
     parallel_config = vllm_config.parallel_config
     if getattr(parallel_config, "decode_context_parallel_size", 1) > 1:
         raise ValueError(
