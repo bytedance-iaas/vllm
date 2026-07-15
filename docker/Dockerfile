@@ -327,6 +327,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         fi; \
     fi
 
+# DeepEP v2 uses NCCL Gin and requires a newer runtime than the version pinned
+# by the PyTorch wheel. Install it after PyTorch without re-resolving torch.
+ARG DEEPEP_V2_NCCL_VERSION=2.30.4
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --python /opt/venv/bin/python3 --force-reinstall --no-deps \
+        "nvidia-nccl-cu13==${DEEPEP_V2_NCCL_VERSION}"
+
 # Track PyTorch lib versions used during build and match in downstream instances.
 # We do this for both nightly and release so we can strip dependencies/*.txt as needed.
 # Otherwise library dependencies can upgrade/downgrade torch incorrectly.
@@ -540,7 +547,7 @@ WORKDIR /workspace
 # Build DeepEP wheels
 COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
-ARG DEEPEP_COMMIT_HASH=73b6ea4
+ARG DEEPEP_COMMIT_HASH=dd758caf451848bd150e1046af3d0a73e5fff38d
 ARG NVSHMEM_VER
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
@@ -959,6 +966,13 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system ep_kernels/dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+
+# vLLM and extension wheel installation may restore PyTorch's NCCL pin. Keep
+# the final runtime aligned with the NCCL headers used to build DeepEP v2.
+ARG DEEPEP_V2_NCCL_VERSION=2.30.4
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system --force-reinstall --no-deps \
+        "nvidia-nccl-cu13==${DEEPEP_V2_NCCL_VERSION}"
 
 # nvidia-cutlass-dsl[cu13] installs -libs-base and -libs-cu13 wheels that
 # share paths with different content. Force -libs-cu13 last after runtime
