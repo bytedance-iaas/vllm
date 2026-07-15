@@ -681,7 +681,10 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
 
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 @pytest.mark.parametrize("store_fp8", [False, True])
-def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_cutedsl_full_cache_store(
+    compress_ratio: int, store_fp8: bool, num_tokens: int
+):
     """CuTeDSL compressor full-cache (FlashInfer) store parity for head=512.
 
     Exercises the contiguous bf16 / per-tensor fp8 store branch of both the C4
@@ -705,8 +708,6 @@ def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
 
     overlap = 1 if compress_ratio == 4 else 0
     coff = 1 + overlap
-    num_tokens = 8
-
     num_pages = (compress_ratio * num_tokens - 1) // BLOCK_SIZE + 2
     # The production CompressorStateCache is fp32.
     state_cache = torch.randn(

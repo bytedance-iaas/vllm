@@ -935,8 +935,6 @@ class SparseAttnCompressC128Block8Kernel:
     lanes_per_row = head_tile // elems_per_lane
     num_warps = 8
     stats_lane_stride = lanes_per_row + 1
-    final_reduce_steps = 3
-    final_reduce_initial_offset = 4
     tb_size = num_warps * 32
     compress_ratio = 128
     state_block_size = 8
@@ -1091,9 +1089,6 @@ class SparseAttnCompressC128Block8Kernel:
             cp_f32x2 = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=64
             )
-            final_mask_and_clamp = const_expr(
-                (cute.arch.WARP_SIZE - self.num_warps) << 8 | (cute.arch.WARP_SIZE - 1)
-            )
             col_tile = col_base.to(Int64) // Int64(self.elems_per_lane)
             score_col_tile = col_tile + Int64(self.state_width // self.elems_per_lane)
 
@@ -1135,53 +1130,36 @@ class SparseAttnCompressC128Block8Kernel:
                 s_product[warp_id, col_group, e] = local_product[e]
             cute.arch.sync_threads()
 
-            out_group = tid // self.num_warps
-            final_lane = tid % self.num_warps
-            final_groups_per_pass = const_expr(self.tb_size // self.num_warps)
-            for pass_idx in cutlass.range_constexpr(
-                self.head_tile // final_groups_per_pass
-            ):
-                out_idx = pass_idx * final_groups_per_pass + out_group
-                out_lane = out_idx // self.elems_per_lane
-                out_elem = out_idx % self.elems_per_lane
+            if tid < self.head_tile:
+                out_lane = tid // self.elems_per_lane
+                out_elem = tid % self.elems_per_lane
+                partial_max = cute.make_rmem_tensor((self.num_warps,), Float32)
+                partial_sum = cute.make_rmem_tensor((self.num_warps,), Float32)
+                partial_product = cute.make_rmem_tensor((self.num_warps,), Float32)
 
-                local_warp_max = s_max[final_lane, out_lane, out_elem]
-                global_max = local_warp_max
-                for step in cutlass.range_constexpr(self.final_reduce_steps):
-                    offset = const_expr(self.final_reduce_initial_offset >> step)
-                    global_max = cute.arch.fmax(
-                        global_max,
-                        cute.arch.shuffle_sync_bfly(
-                            global_max,
-                            offset=offset,
-                            mask_and_clamp=final_mask_and_clamp,
-                        ),
-                    )
+                for warp in cutlass.range_constexpr(self.num_warps):
+                    partial_max[warp] = s_max[warp, out_lane, out_elem]
+                    partial_sum[warp] = s_sum[warp, out_lane, out_elem]
+                    partial_product[warp] = s_product[warp, out_lane, out_elem]
 
-                scale = cute.math.exp2(
-                    (local_warp_max - global_max) * Float32(self.rcp_ln2),
-                    fastmath=True,
-                )
-                global_sum = s_sum[final_lane, out_lane, out_elem] * scale
-                global_product = s_product[final_lane, out_lane, out_elem] * scale
-                for step in cutlass.range_constexpr(self.final_reduce_steps):
-                    offset = const_expr(self.final_reduce_initial_offset >> step)
-                    global_sum += cute.arch.shuffle_sync_bfly(
-                        global_sum,
-                        offset=offset,
-                        mask_and_clamp=final_mask_and_clamp,
-                    )
-                    global_product += cute.arch.shuffle_sync_bfly(
-                        global_product,
-                        offset=offset,
-                        mask_and_clamp=final_mask_and_clamp,
-                    )
+                global_max = partial_max[0]
+                for warp in cutlass.range_constexpr(1, self.num_warps):
+                    global_max = cute.arch.fmax(global_max, partial_max[warp])
 
-                if final_lane == 0:
-                    compressed_kv.iterator[
-                        token_idx.to(Int64) * compressed_kv.stride[0]
-                        + (split_idx * self.head_tile + out_idx).to(Int64)
-                    ] = global_product / global_sum
+                global_sum = Float32(0.0)
+                global_product = Float32(0.0)
+                for warp in cutlass.range_constexpr(self.num_warps):
+                    scale = cute.math.exp2(
+                        (partial_max[warp] - global_max) * Float32(self.rcp_ln2),
+                        fastmath=True,
+                    )
+                    global_sum += partial_sum[warp] * scale
+                    global_product += partial_product[warp] * scale
+
+                compressed_kv.iterator[
+                    token_idx.to(Int64) * compressed_kv.stride[0]
+                    + (split_idx * self.head_tile + tid).to(Int64)
+                ] = global_product / global_sum
 
     @cache
     @staticmethod
