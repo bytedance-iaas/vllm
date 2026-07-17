@@ -47,6 +47,7 @@ jobs:
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      BYTEIAAS_BUILDX_BUILDER: byteiaas-vllm-image-builder-${{ github.run_id }}-${{ github.run_attempt }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
       BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0%2Blocal-260630mega_moe-cp312-cp312-linux_x86_64.whl
     steps:
@@ -107,14 +108,14 @@ jobs:
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
         with:
-          name: byteiaas-vllm-image-builder
+          name: ${{ env.BYTEIAAS_BUILDX_BUILDER }}
           driver-opts: |
             network=host
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
-          keep-state: true
-          cleanup: false
+          keep-state: false
+          cleanup: true
 
       - name: Login to Volcengine CR
         run: |
@@ -164,7 +165,7 @@ jobs:
             fi
 
             rm -rf "${cache_new}"
-            docker buildx build --builder byteiaas-vllm-image-builder "${cache_args[@]}" "$@"
+            docker buildx build --builder "${BYTEIAAS_BUILDX_BUILDER}" "${cache_args[@]}" "$@"
 
             if [ -d "${cache_new}" ]; then
               rm -rf "${cache_old}"
