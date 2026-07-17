@@ -752,9 +752,12 @@ def _pair_pcp_block_ids(
     )
     local_tokens = full_cycles * interleave_size + rank_tail
     local_total_blocks = cdiv(local_tokens, group_block_size)
-    if len(local_block_ids) > local_total_blocks:
-        return [], [], "P block list exceeds the rank-local token range"
-    local_first_block = local_total_blocks - len(local_block_ids)
+    # PCP allocates block-table entries uniformly across ranks. For short or
+    # partial final interleave chunks, a rank can therefore receive trailing
+    # padding pages even though it owns fewer (or zero) valid tokens. Keep the
+    # suffix offset for normal prefix-hit transfers and let the token-boundary
+    # check below discard only those padded tail pages.
+    local_first_block = max(local_total_blocks - len(local_block_ids), 0)
 
     paired_local: list[int] = []
     paired_remote: list[int] = []

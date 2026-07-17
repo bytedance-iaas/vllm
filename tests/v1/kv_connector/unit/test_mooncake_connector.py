@@ -138,6 +138,40 @@ def test_pair_pcp_blocks_skips_padding_after_partial_final_chunk():
     assert rank1 == ([20], [101], None)
 
 
+def test_pair_pcp_blocks_skips_padding_on_rank_without_tokens():
+    """A short request may allocate one page on every PCP rank."""
+
+    rank0 = _pair_pcp_block_ids(
+        [10],
+        [100],
+        total_tokens=9,
+        num_external_tokens=9,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+    rank1 = _pair_pcp_block_ids(
+        [20],
+        [100],
+        total_tokens=9,
+        num_external_tokens=9,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=1,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+
+    assert rank0 == ([10], [100], None)
+    assert rank1 == ([], [], None)
+
+
 @pytest.mark.parametrize("group_block_size", [256, 64, 8, 4])
 def test_pair_pcp_blocks_maps_exact_external_suffix(group_block_size: int):
     """Prefix hits must not shift producer-local suffix pages on Decode."""
