@@ -4,6 +4,7 @@
 from .cache_utils import (
     build_flashinfer_mixed_sparse_indices,
     combine_topk_swa_indices,
+    combine_topk_swa_indices_with_positions,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -18,6 +19,7 @@ __all__ = [
     "MXFP4_BLOCK_SIZE",
     "build_flashinfer_mixed_sparse_indices",
     "combine_topk_swa_indices",
+    "combine_topk_swa_indices_with_positions",
     "compute_global_topk_indices_and_lens",
     "dequantize_and_gather_k_cache",
     "fused_indexer_q_rope_quant",

@@ -116,7 +116,9 @@ def xpu_qnorm_rope_kv_fp8_insert(
     cos_sin_cache: torch.Tensor,  # [max_pos, ROPE_DIM]
     eps: float,
     block_size: int,
-):
+    insert_mask: torch.Tensor | None = None,
+    return_kv_roped: bool = False,
+) -> torch.Tensor | None:
     """XPU Triton: qnorm+rope on Q, rope on KV, then FP8 UE8M0 quant+insert."""
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
         quantize_and_insert_k_cache,
@@ -151,9 +153,18 @@ def xpu_qnorm_rope_kv_fp8_insert(
     # swa_kv_cache may be [num_blocks, block_size, 584] or [num_blocks, flat]
     # quantize_and_insert_k_cache expects [num_blocks, block_bytes] uint8
     cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-    quantize_and_insert_k_cache(
-        kv_roped,
-        cache_2d,
-        slot_mapping,
-        block_size=block_size,
-    )
+    if insert_mask is not None:
+        kv_to_insert = kv_roped[insert_mask]
+        slot_mapping = slot_mapping[insert_mask]
+    else:
+        kv_to_insert = kv_roped
+    if kv_to_insert.numel() > 0:
+        quantize_and_insert_k_cache(
+            kv_to_insert,
+            cache_2d,
+            slot_mapping,
+            block_size=block_size,
+        )
+    if return_kv_roped:
+        return kv_roped
+    return None

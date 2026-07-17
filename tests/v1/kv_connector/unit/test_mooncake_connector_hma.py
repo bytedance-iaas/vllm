@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -26,18 +27,42 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _common_group_indices_for_regions,
     _select_region_block_ids,
 )
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
 from .utils import create_request, create_vllm_config, make_kv_cache_config
 
 
-def make_transfer_worker() -> MooncakeConnectorWorker:
+def make_transfer_worker(num_groups: int) -> MooncakeConnectorWorker:
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = SimpleNamespace(term=lambda: None)
     worker.is_kv_consumer = True
     worker.is_kv_producer = True
     worker.tp_rank = 0
     worker.tp_size = 1
+    worker.pcp_rank = 0
+    worker.pcp_size = 1
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"model.layers.{group_index}.attn"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            )
+            for group_index in range(num_groups)
+        ],
+    )
     worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
     return worker
 
@@ -75,6 +100,36 @@ def test_sw_sizes(swa_enabled, expected_blocks_per_sw):
         kv_cache_config=kv_cache_config,
     )
     assert scheduler.blocks_per_sw == expected_blocks_per_sw
+
+
+@pytest.mark.cpu_test
+def test_sw_sizes_scale_with_pcp():
+    """Each scheduler block covers one physical page on every PCP rank."""
+
+    block_size = 16
+    pcp_size = 2
+    sw_size = 2048
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_both",
+        block_size=block_size,
+    )
+    vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    kv_cache_config = make_kv_cache_config(
+        block_size=block_size,
+        swa_enabled=True,
+        sw_size=sw_size,
+    )
+
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config=vllm_config,
+        engine_id="test-engine",
+        kv_cache_config=kv_cache_config,
+    )
+
+    assert scheduler.block_size == block_size * pcp_size
+    assert scheduler.blocks_per_sw == [0, sw_size // (block_size * pcp_size) + 1]
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +357,7 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
             lengths,
             err_reqs,
             err_msg,
+            _,
         ) = await worker._build_transfer_params(
             ready_reqs, xfer_meta, local_regions, remote_regions
         )
@@ -318,14 +374,14 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
         worker.shutdown()
 
 
-def test_common_group_indices_treats_missing_metadata_as_all_groups():
+def test_common_group_indices_falls_back_to_matching_physical_group():
     local_region = TransferRegion(
         layer_name="model.layers.4.self_attn",
         layer_index=4,
         base_addr=0x1000,
         block_len=4096,
         kv_block_len=4096,
-        group_indices=(0,),
+        logical_group_indices=(0,),
     )
     remote_region = TransferRegion(
         layer_name="model.layers.4.self_attn",
@@ -340,19 +396,19 @@ def test_common_group_indices_treats_missing_metadata_as_all_groups():
         base_addr=0x3000,
         block_len=4096,
         kv_block_len=4096,
-        group_indices=(0, 2),
+        logical_group_indices=(0, 2),
     )
 
     assert _common_group_indices_for_regions(
         local_region,
         remote_region,
         num_groups=3,
-    ) == (0, 1, 2)
+    ) == (0,)
     assert _common_group_indices_for_regions(
         remote_region,
         local_region,
         num_groups=3,
-    ) == (0, 1, 2)
+    ) == (0,)
     assert _common_group_indices_for_regions(
         local_region,
         annotated_remote_region,
@@ -391,7 +447,7 @@ def test_align_transfer_regions_fans_out_shared_physical_region_groups():
             "model.layers.4.attn.compressor.state_cache",
         ),
         layer_indices=(4, 4),
-        group_indices=(1, 3),
+        logical_group_indices=(1, 3),
         alias_group_indices=((1,), (3,)),
     )
     local_layer = TransferRegion(
@@ -408,7 +464,7 @@ def test_align_transfer_regions_fans_out_shared_physical_region_groups():
             "model.layers.5.attn.compressor.state_cache",
         ),
         layer_indices=(6, 6, 5, 6, 5),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
     remote_prev_layer = TransferRegion(
@@ -425,7 +481,7 @@ def test_align_transfer_regions_fans_out_shared_physical_region_groups():
             "model.layers.5.attn.compressor.state_cache",
         ),
         layer_indices=(4, 2, 3, 4, 5),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
     remote_current_layer = TransferRegion(
@@ -442,7 +498,7 @@ def test_align_transfer_regions_fans_out_shared_physical_region_groups():
             "model.layers.7.attn.compressor.state_cache",
         ),
         layer_indices=(6, 4, 5, 6, 7),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
     remote_next_layer = TransferRegion(
@@ -459,7 +515,7 @@ def test_align_transfer_regions_fans_out_shared_physical_region_groups():
             "model.layers.9.attn.compressor.state_cache",
         ),
         layer_indices=(8, 6, 7, 8, 9),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
 
@@ -522,7 +578,7 @@ def test_align_transfer_regions_rejects_unbound_alias_index_match():
             "model.layers.11.attn.swa_cache",
         ),
         layer_indices=(10, 11),
-        group_indices=(0, 1),
+        logical_group_indices=(0, 1),
         alias_group_indices=((0,), (1,)),
     )
     remote_region = TransferRegion(
@@ -536,7 +592,7 @@ def test_align_transfer_regions_rejects_unbound_alias_index_match():
             "model.layers.12.attn.swa_cache",
         ),
         layer_indices=(12, 11),
-        group_indices=(0, 1),
+        logical_group_indices=(0, 1),
         alias_group_indices=((0,), (1,)),
     )
 
@@ -560,7 +616,7 @@ def test_align_transfer_regions_rejects_duplicate_remote_alias_group():
         kv_block_len=100,
         layer_aliases=("model.layers.4.attn",),
         layer_indices=(4,),
-        group_indices=(0,),
+        logical_group_indices=(0,),
         alias_group_indices=((0,),),
     )
     local_region_b = TransferRegion(
@@ -571,7 +627,7 @@ def test_align_transfer_regions_rejects_duplicate_remote_alias_group():
         kv_block_len=100,
         layer_aliases=("model.layers.4.attn",),
         layer_indices=(4,),
-        group_indices=(0,),
+        logical_group_indices=(0,),
         alias_group_indices=((0,),),
     )
     remote_region = TransferRegion(
@@ -582,7 +638,7 @@ def test_align_transfer_regions_rejects_duplicate_remote_alias_group():
         kv_block_len=100,
         layer_aliases=("model.layers.4.attn",),
         layer_indices=(4,),
-        group_indices=(0,),
+        logical_group_indices=(0,),
         alias_group_indices=((0,),),
     )
 
@@ -599,7 +655,7 @@ def test_align_transfer_regions_rejects_duplicate_remote_alias_group():
 
 @pytest.mark.asyncio
 async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
-    worker = make_transfer_worker()
+    worker = make_transfer_worker(num_groups=5)
     block_len = 100
     transfer_id = "xfer-dsv4-shifted-alias"
     send_meta = SendBlockMeta(
@@ -633,6 +689,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
         },
         kv_caches_base_addr=[0x2000, 0x3000],
         block_lens=[block_len, block_len],
+        kv_block_lens=[block_len, block_len],
     )
 
     local_region = TransferRegion(
@@ -649,7 +706,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
             "model.layers.31.attn.compressor.state_cache",
         ),
         layer_indices=(30, 30, 31, 30, 31),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
     remote_current_layer = TransferRegion(
@@ -666,7 +723,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
             "model.layers.31.attn.compressor.state_cache",
         ),
         layer_indices=(30, 28, 29, 30, 31),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
     remote_shifted_layer = TransferRegion(
@@ -683,7 +740,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
             "model.layers.33.attn.compressor.state_cache",
         ),
         layer_indices=(32, 30, 31, 32, 33),
-        group_indices=(0, 1, 2, 3, 4),
+        logical_group_indices=(0, 1, 2, 3, 4),
         alias_group_indices=((0,), (1,), (2,), (3,), (4,)),
     )
 
@@ -693,6 +750,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
         lengths,
         err_reqs,
         err_msg,
+        _,
     ) = await worker._build_transfer_params(
         [("d-dsv4-shifted-alias", send_meta)],
         xfer_meta,
@@ -727,7 +785,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
 
 @pytest.mark.asyncio
 async def test_build_transfer_params_filters_groups_per_shared_region():
-    worker = make_transfer_worker()
+    worker = make_transfer_worker(num_groups=3)
     block_len = 4096
     transfer_id = "xfer-dsv4-shared"
     send_meta = SendBlockMeta(
@@ -757,6 +815,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
         },
         kv_caches_base_addr=[0x2000, 0x3000],
         block_lens=[block_len, block_len],
+        kv_block_lens=[block_len, block_len],
     )
 
     local_regions = [
@@ -768,7 +827,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
             kv_block_len=block_len,
             layer_aliases=("model.layers.4.self_attn",),
             layer_indices=(4,),
-            group_indices=(0, 1),
+            logical_group_indices=(0, 1),
         ),
         TransferRegion(
             layer_name="model.layers.4.swa_attn",
@@ -778,7 +837,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
             kv_block_len=block_len,
             layer_aliases=("model.layers.4.swa_attn",),
             layer_indices=(4,),
-            group_indices=(2,),
+            logical_group_indices=(2,),
         ),
     ]
     remote_regions = [
@@ -790,7 +849,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
             kv_block_len=block_len,
             layer_aliases=("model.layers.4.self_attn",),
             layer_indices=(4,),
-            group_indices=(0,),
+            logical_group_indices=(0,),
         ),
         TransferRegion(
             layer_name="model.layers.4.swa_attn",
@@ -800,7 +859,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
             kv_block_len=block_len,
             layer_aliases=("model.layers.4.swa_attn",),
             layer_indices=(4,),
-            group_indices=(1, 2),
+            logical_group_indices=(1, 2),
         ),
     ]
 
@@ -810,6 +869,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
         lengths,
         err_reqs,
         err_msg,
+        _,
     ) = await worker._build_transfer_params(
         [("d-dsv4-shared", send_meta)],
         xfer_meta,
@@ -906,6 +966,7 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
             lengths,
             err_reqs,
             err_msg,
+            _,
         ) = await worker._build_transfer_params(
             ready_reqs, xfer_meta, local_regions, remote_regions
         )

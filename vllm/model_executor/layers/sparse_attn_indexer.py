@@ -9,7 +9,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -91,7 +91,51 @@ def _merge_dcp_topk_global(
     padding); the attention backend localizes them back to physical slots per
     rank.
     """
-    if dcp_world_size <= 1:
+    return _merge_cp_topk_global(
+        logits,
+        topk_indices,
+        topk_tokens,
+        dcp_rank,
+        dcp_world_size,
+        cp_interleave,
+        get_dcp_group(),
+        row_starts=row_starts,
+    )
+
+
+def _merge_pcp_topk_global(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    pcp_rank: int,
+    pcp_world_size: int,
+    cp_interleave: int,
+    row_starts: torch.Tensor | None = None,
+) -> None:
+    """Merge local sparse-indexer candidates across the prefill CP group."""
+    return _merge_cp_topk_global(
+        logits,
+        topk_indices,
+        topk_tokens,
+        pcp_rank,
+        pcp_world_size,
+        cp_interleave,
+        get_pcp_group(),
+        row_starts=row_starts,
+    )
+
+
+def _merge_cp_topk_global(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    cp_rank: int,
+    cp_world_size: int,
+    cp_interleave: int,
+    cp_group,
+    row_starts: torch.Tensor | None = None,
+) -> None:
+    if cp_world_size <= 1:
         return
 
     # CuteDSL-only path (no PyTorch fallback): Triton-pack each rank's
@@ -112,12 +156,12 @@ def _merge_dcp_topk_global(
         logits,
         topk_indices,
         packed,
-        dcp_rank,
-        dcp_world_size,
+        cp_rank,
+        cp_world_size,
         cp_interleave,
         row_starts,
     )
-    gathered = get_dcp_group().all_gather(packed, dim=1)
+    gathered = cp_group.all_gather(packed, dim=1)
     stable_topk_from_gathered_candidates_cutedsl(
         gathered, topk_tokens, out=topk_indices
     )
@@ -312,6 +356,8 @@ def sparse_attn_indexer(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    pcp_rank: int = 0,
+    pcp_world_size: int = 1,
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
@@ -395,7 +441,7 @@ def sparse_attn_indexer(
     # [:num_tokens, :topk] region earlier in this forward, so skip the redundant
     # fill.
     if not skip_topk_buffer_clear:
-        topk_indices_buffer[: hidden_states.shape[0]] = -1
+        topk_indices_buffer[: q_quant.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -483,15 +529,26 @@ def sparse_attn_indexer(
                     topk_tokens,
                 )
 
-            _merge_dcp_topk_global(
-                logits,
-                topk_indices,
-                topk_tokens,
-                dcp_rank,
-                dcp_world_size,
-                cp_kv_cache_interleave_size,
-                row_starts=chunk.cu_seqlen_ks,
-            )
+            if pcp_world_size > 1:
+                _merge_pcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    pcp_rank,
+                    pcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
+            else:
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -667,6 +724,8 @@ def sparse_attn_indexer_fake(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    pcp_rank: int = 0,
+    pcp_world_size: int = 1,
     skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
@@ -724,7 +783,21 @@ class SparseAttnIndexer(CustomOp):
         parallel_config = get_current_vllm_config().parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
+        if self.pcp_world_size > 1 and self.dcp_world_size > 1:
+            raise NotImplementedError(
+                "SparseAttnIndexer does not yet support combined PCP and DCP."
+            )
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.indexer_cp_interleave_size = self.cp_kv_cache_interleave_size
+        if self.pcp_world_size > 1:
+            compress_ratio = getattr(self.k_cache, "compress_ratio", 1)
+            if self.cp_kv_cache_interleave_size % compress_ratio != 0:
+                raise NotImplementedError(
+                    "PCP indexer interleave must be divisible by compression ratio."
+                )
+            self.indexer_cp_interleave_size //= compress_ratio
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -780,7 +853,9 @@ class SparseAttnIndexer(CustomOp):
             self.use_fp4_cache,
             self.dcp_rank,
             self.dcp_world_size,
-            self.cp_kv_cache_interleave_size,
+            self.indexer_cp_interleave_size,
+            self.pcp_rank,
+            self.pcp_world_size,
         )
 
     def forward_xpu(

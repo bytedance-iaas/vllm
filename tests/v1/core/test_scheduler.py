@@ -5,13 +5,16 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from transformers import OPTConfig
 
 import vllm.envs as envs
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
@@ -25,7 +28,10 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
-from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    HybridKVCacheCoordinator,
+    KVCacheCoordinatorNoPrefixCache,
+)
 from vllm.v1.core.kv_cache_utils import (
     get_group_id,
     get_request_block_hasher,
@@ -1617,11 +1623,14 @@ def _step_until_kv_transfer_finished(scheduler: Scheduler, req_ids: list[str]):
 def _make_hybrid_scheduler(
     kv_cache_groups: list[KVCacheGroupSpec],
     num_blocks: int = 800,
+    enable_prefix_caching: bool = True,
+    pcp_world_size: int = 1,
+    model: str = "facebook/opt-125m",
 ) -> Scheduler:
     scheduler_block_size = 256
     hash_block_size = 4
     model_config = ModelConfig(
-        model="facebook/opt-125m",
+        model=model,
         trust_remote_code=True,
         dtype="float16",
         seed=42,
@@ -1637,10 +1646,10 @@ def _make_hybrid_scheduler(
     )
     cache_config = CacheConfig(
         block_size=scheduler_block_size,
-        hash_block_size=hash_block_size,
+        prefix_match_unit=hash_block_size,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
-        enable_prefix_caching=True,
+        enable_prefix_caching=enable_prefix_caching,
         mamba_cache_mode="all",
     )
     cache_config.num_gpu_blocks = num_blocks
@@ -1653,6 +1662,10 @@ def _make_hybrid_scheduler(
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
+        parallel_config=ParallelConfig(
+            prefill_context_parallel_size=pcp_world_size,
+        ),
+        device_config=DeviceConfig("cpu"),
         kv_transfer_config=kv_transfer_config,
     )
     register_all_kvcache_specs(vllm_config)
@@ -1668,7 +1681,12 @@ def _make_hybrid_scheduler(
         hash_block_size=hash_block_size,
         log_stats=True,
     )
-    assert isinstance(scheduler.kv_cache_manager.coordinator, HybridKVCacheCoordinator)
+    expected_coordinator = (
+        HybridKVCacheCoordinator
+        if enable_prefix_caching
+        else KVCacheCoordinatorNoPrefixCache
+    )
+    assert isinstance(scheduler.kv_cache_manager.coordinator, expected_coordinator)
     return scheduler
 
 
@@ -1739,6 +1757,47 @@ def _mamba_like_kv_cache_groups() -> list[KVCacheGroupSpec]:
                 mamba_cache_mode="all",
             ),
         ),
+    ]
+
+
+def test_dsv4_hybrid_pcp_requires_prefix_cache_off(tmp_path):
+    model_path = tmp_path / "opt"
+    OPTConfig().save_pretrained(model_path)
+
+    with pytest.raises(AssertionError, match="PCP not support hybrid attn now"):
+        _make_hybrid_scheduler(
+            _dsv4_like_kv_cache_groups(),
+            pcp_world_size=2,
+            model=str(model_path),
+        )
+
+    scheduler = _make_hybrid_scheduler(
+        _dsv4_like_kv_cache_groups(),
+        enable_prefix_caching=False,
+        pcp_world_size=2,
+        model=str(model_path),
+    )
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    assert [manager.block_size for manager in managers] == [512, 128, 8, 16]
+
+    [request] = create_requests(
+        num_requests=1,
+        num_tokens=1024,
+        max_tokens=1,
+        same_prompt=True,
+        block_size=4,
+        req_ids=["pcp2"],
+    )
+    blocks = scheduler.kv_cache_manager.allocate_slots(
+        request,
+        num_new_tokens=request.num_tokens,
+    )
+    assert blocks is not None
+    assert [len(manager.req_to_blocks[request.request_id]) for manager in managers] == [
+        2,
+        8,
+        128,
+        64,
     ]
 
 

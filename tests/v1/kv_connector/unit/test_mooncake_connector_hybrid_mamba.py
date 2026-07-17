@@ -306,7 +306,7 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
             ),
         ]
 
-        src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = asyncio.run(
+        src_ptrs, dst_ptrs, lengths, err_reqs, err_msg, _ = asyncio.run(
             build_transfer_params()
         )
 
