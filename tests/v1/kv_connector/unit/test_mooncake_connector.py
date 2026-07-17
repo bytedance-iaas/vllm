@@ -1498,6 +1498,53 @@ def test_multi_shard_late_failure_waits_for_quiesce_and_invalidates_blocks():
     assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
+def test_pd_trace_lifecycle_clears_on_success_and_failure(monkeypatch):
+    """Request-scoped trace timestamps must not survive terminal outcomes."""
+
+    monkeypatch.setattr(envs, "VLLM_MOONCAKE_PD_TRACE", True)
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker._online_c128_state_transfer_enabled = False
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    worker.dp_rank = worker.pp_rank = worker.pcp_rank = worker.tp_rank = 0
+    worker._pd_trace_pull_started = {
+        "d-req-ok": time.perf_counter(),
+        "d-req-failed": time.perf_counter(),
+    }
+
+    ok_meta = PullReqMeta(
+        d_req_id="d-req-ok",
+        transfer_id="xfer-ok",
+        local_block_ids=[[100]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        pull_tasks_count=1,
+    )
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=[ok_meta.d_req_id],
+        ),
+        {ok_meta.d_req_id: ok_meta},
+    )
+
+    failed_meta = PullReqMeta(
+        d_req_id="d-req-failed",
+        transfer_id="xfer-failed",
+        local_block_ids=[[101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+    worker._mark_pull_failed(failed_meta)
+
+    assert worker._pd_trace_pull_started == {}
+    assert worker.finished_recving_reqs == {"d-req-ok", "d-req-failed"}
+    assert worker.get_block_ids_with_load_errors() == {101}
+
+
 def test_resolve_need_send_accounts_for_remote_tp_fanout():
     """Producer-side completion waits for every paired consumer TP pull."""
 

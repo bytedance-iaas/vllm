@@ -544,3 +544,16 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(ValueError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("false", False), ("1", True), ("TRUE", True)],
+)
+def test_mooncake_pd_trace_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("VLLM_MOONCAKE_PD_TRACE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MOONCAKE_PD_TRACE", value)
+
+    assert envs.environment_variables["VLLM_MOONCAKE_PD_TRACE"]() is expected

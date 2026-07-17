@@ -1617,6 +1617,7 @@ class MooncakeConnectorWorker:
         self.finished_recving_reqs: set[ReqId] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
+        self._pd_trace_pull_started: dict[ReqId, float] = {}
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1806,6 +1807,8 @@ class MooncakeConnectorWorker:
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
+        trace_enabled = envs.VLLM_MOONCAKE_PD_TRACE
+        query_started = time.perf_counter() if trace_enabled else 0.0
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
@@ -1952,6 +1955,7 @@ class MooncakeConnectorWorker:
             err_msg: str | None = None
             ok_ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
             try:
+                build_started = time.perf_counter() if trace_enabled else 0.0
                 (
                     src_ptrs,
                     dst_ptrs,
@@ -1965,6 +1969,9 @@ class MooncakeConnectorWorker:
                     local_regions,
                     remote_regions,
                 )
+                build_duration = (
+                    time.perf_counter() - build_started if trace_enabled else 0.0
+                )
                 err_req_set = set(err_reqs)
                 ok_ready_reqs = [
                     (d_req_id, send_meta)
@@ -1974,6 +1981,7 @@ class MooncakeConnectorWorker:
 
                 if src_ptrs:
                     remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                    send_started = time.perf_counter() if trace_enabled else 0.0
                     ret_value = await self.sender_loop.run_in_executor(
                         self._sender_executor,
                         self._send_blocks,
@@ -1983,6 +1991,25 @@ class MooncakeConnectorWorker:
                         lengths,
                         state_transfer_events,
                     )
+                    send_duration = (
+                        time.perf_counter() - send_started if trace_enabled else 0.0
+                    )
+
+                    if trace_enabled:
+                        logger.info(
+                            "PCP_PD_TRACE P_BATCH reqs=%s pp=%d pcp=%d tp=%d "
+                            "ready_wait_ms=%.3f build_ms=%.3f send_ms=%.3f "
+                            "descriptors=%d bytes=%d",
+                            [req_id for req_id, _ in ready_reqs],
+                            self.pp_rank,
+                            self.pcp_rank,
+                            self.tp_rank,
+                            (build_started - query_started) * 1e3,
+                            build_duration * 1e3,
+                            send_duration * 1e3,
+                            len(src_ptrs),
+                            sum(lengths),
+                        )
 
                     if ret_value != 0:
                         transfer_err_msg = (
@@ -2090,8 +2117,14 @@ class MooncakeConnectorWorker:
         # Guard async bank0->export-slot copies before RDMA reads.
         state_transfer_events: list[torch.cuda.Event] = []
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
+        trace_enabled = envs.VLLM_MOONCAKE_PD_TRACE
 
         for d_req_id, send_meta in ready_reqs:
+            req_desc_start = len(lengths) if trace_enabled else 0
+            req_bytes_start = sum(lengths) if trace_enabled else 0
+            trace_group_bytes: dict[tuple[int, ...], int] | None = (
+                defaultdict(int) if trace_enabled else None
+            )
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
 
             if not remote_block_ids_per_group or all(
@@ -2189,7 +2222,13 @@ class MooncakeConnectorWorker:
             )
 
             selected_region_blocks: list[
-                tuple[TransferRegion, TransferRegion, list[int], list[int]]
+                tuple[
+                    TransferRegion,
+                    TransferRegion,
+                    list[int],
+                    list[int],
+                    tuple[int, ...],
+                ]
             ] = []
             selected_block_count = 0
             num_groups = len(remote_block_ids_by_group)
@@ -2223,7 +2262,13 @@ class MooncakeConnectorWorker:
                     continue
                 selected_block_count += len(local_block_ids)
                 selected_region_blocks.append(
-                    (local_region, remote_region, local_block_ids, remote_block_ids)
+                    (
+                        local_region,
+                        remote_region,
+                        local_block_ids,
+                        remote_block_ids,
+                        tuple(region_group_indices),
+                    )
                 )
 
             if not selected_region_blocks:
@@ -2235,7 +2280,9 @@ class MooncakeConnectorWorker:
                 remote_region,
                 local_block_ids,
                 remote_block_ids,
+                region_group_indices,
             ) in selected_region_blocks:
+                region_desc_start = len(lengths) if trace_enabled else 0
                 # Group by indices within this region's KV-cache group only.
                 group_local_block_ids, group_remote_block_ids = (
                     group_concurrent_contiguous(local_block_ids, remote_block_ids)
@@ -2306,6 +2353,11 @@ class MooncakeConnectorWorker:
                             )
                             lengths.append(transfer_len)
 
+                if trace_group_bytes is not None:
+                    trace_group_bytes[region_group_indices] += sum(
+                        lengths[region_desc_start:]
+                    )
+
                 if not logged_transfer_plan:
                     logger.debug(
                         "Mooncake transfer plan for request %s: local_tp=%d "
@@ -2331,6 +2383,31 @@ class MooncakeConnectorWorker:
                 selected_block_count,
                 remote_session,
             )
+            if trace_enabled:
+                assert trace_group_bytes is not None
+                group_labels = {
+                    "+".join(
+                        f"{group_index}:"
+                        f"{type(group_specs[group_index].kv_cache_spec).__name__}"
+                        for group_index in group_indices
+                    ): num_bytes
+                    for group_indices, num_bytes in trace_group_bytes.items()
+                }
+                logger.info(
+                    "PCP_PD_TRACE P_PLAN req=%s transfer=%s pp=%d pcp=%d tp=%d "
+                    "tokens=%d external_tokens=%d descriptors=%d bytes=%d "
+                    "group_bytes=%s",
+                    d_req_id,
+                    send_meta.transfer_id,
+                    self.pp_rank,
+                    self.pcp_rank,
+                    self.tp_rank,
+                    agent_meta.req_total_tokens.get(d_req_id, 0),
+                    agent_meta.req_num_external_tokens.get(d_req_id, 0),
+                    len(lengths) - req_desc_start,
+                    sum(lengths) - req_bytes_start,
+                    group_labels,
+                )
 
         # Append C128 bank0 descriptors after KV descriptors.
         if (
@@ -2589,6 +2666,18 @@ class MooncakeConnectorWorker:
                 total_bytes=total_bytes,
                 num_descs=total_descs,
             )
+            if envs.VLLM_MOONCAKE_PD_TRACE:
+                logger.info(
+                    "PCP_PD_TRACE P_XFER pp=%d pcp=%d tp=%d duration_ms=%.3f "
+                    "descriptors=%d bytes=%d throughput_mib_s=%.3f",
+                    self.pp_rank,
+                    self.pcp_rank,
+                    self.tp_rank,
+                    duration * 1e3,
+                    total_descs,
+                    total_bytes,
+                    (total_bytes / 2**20 / duration) if duration > 0 else 0.0,
+                )
         else:
             self.xfer_stats.record_failed_transfer()
             if envs.VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER:
@@ -3174,6 +3263,7 @@ class MooncakeConnectorWorker:
 
     def _mark_pull_failed(self, pull_meta: "PullReqMeta") -> None:
         """Report a failed async pull to the scheduler after RDMA quiesce."""
+        getattr(self, "_pd_trace_pull_started", {}).pop(pull_meta.d_req_id, None)
         invalid_blocks = {
             block_id for group in pull_meta.local_block_ids for block_id in group
         }
@@ -3200,6 +3290,8 @@ class MooncakeConnectorWorker:
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        trace_enabled = envs.VLLM_MOONCAKE_PD_TRACE
+        worker_started = time.perf_counter() if trace_enabled else 0.0
         req_ids = list(pull_metas.keys())
         outstanding_req_ids: set[ReqId] = set(req_ids)
         metadata = MooncakeXferMetadata(
@@ -3300,6 +3392,18 @@ class MooncakeConnectorWorker:
                     outstanding_req_ids.difference_update(accounted_req_ids)
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
+            if trace_enabled:
+                logger.info(
+                    "PCP_PD_TRACE D_WORKER reqs=%s dp=%d pp=%d pcp=%d tp=%d "
+                    "worker=%s duration_ms=%.3f",
+                    req_ids,
+                    self.dp_rank,
+                    self.pp_rank,
+                    self.pcp_rank,
+                    self.tp_rank,
+                    worker_addr,
+                    (time.perf_counter() - worker_started) * 1e3,
+                )
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
         except Exception as e:
@@ -3328,7 +3432,23 @@ class MooncakeConnectorWorker:
                 if pull_meta.pull_failed:
                     self._mark_pull_failed(pull_meta)
                 else:
+                    ready_started = time.perf_counter()
                     self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    if envs.VLLM_MOONCAKE_PD_TRACE:
+                        pull_started = self._pd_trace_pull_started.pop(
+                            pull_meta.d_req_id, ready_started
+                        )
+                        logger.info(
+                            "PCP_PD_TRACE D_READY req=%s dp=%d pp=%d pcp=%d "
+                            "tp=%d wait_ms=%.3f bookkeeping_us=%.3f",
+                            pull_meta.d_req_id,
+                            self.dp_rank,
+                            self.pp_rank,
+                            self.pcp_rank,
+                            self.tp_rank,
+                            (ready_started - pull_started) * 1e3,
+                            (time.perf_counter() - ready_started) * 1e6,
+                        )
         # Success keeps the slot for admission unless another worker fails.
         if ok_reqs:
             self._c128_account_pull_tasks(pull_metas, failed=False, req_ids=ok_reqs)
@@ -3503,6 +3623,21 @@ class MooncakeConnectorWorker:
                 and pull_meta.c128_import_slot is not None
             ):
                 self._c128_active_pulls[pull_meta.d_req_id] = pull_meta
+        if envs.VLLM_MOONCAKE_PD_TRACE:
+            trace_started = time.perf_counter()
+            for pull_meta in pull_metas.values():
+                self._pd_trace_pull_started[pull_meta.d_req_id] = trace_started
+            logger.info(
+                "PCP_PD_TRACE D_START reqs=%s engine=%s workers=%d "
+                "dp=%d pp=%d pcp=%d tp=%d",
+                list(pull_metas),
+                remote_engine_id,
+                count,
+                self.dp_rank,
+                self.pp_rank,
+                self.pcp_rank,
+                self.tp_rank,
+            )
         for worker_addr in worker_addrs:
             asyncio.create_task(
                 self.receive_kv_from_single_worker(worker_addr, pull_metas)
