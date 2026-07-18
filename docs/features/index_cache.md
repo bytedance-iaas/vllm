@@ -1,10 +1,10 @@
 # IndexCache
 
-IndexCache reduces redundant top-k computation in DeepSeek-V3.2 (DSA) models by caching and reusing top-k indices across layers.
+IndexCache reduces redundant top-k computation in DeepSeek-V3.2 (DSA) and compatible DeepSeek-V4 CUDA SM90/Hopper models by caching and reusing top-k indices across layers.
 
 ## Background
 
-DeepSeek-V3.2 uses a DeepSeek Sparse Attention (DSA) mechanism where top-k token selection is computed per layer. For deep models with many layers, this computation can be expensive. IndexCache allows skipping redundant top-k computations by reusing indices from previous layers.
+DeepSeek-V3.2 and compatible DeepSeek-V4 CUDA SM90/Hopper models use a DeepSeek Sparse Attention (DSA) mechanism where top-k token selection is computed per layer. For deep models with many layers, this computation can be expensive. IndexCache allows skipping redundant top-k computations by reusing indices from previous layers.
 
 See: [IndexCache Paper](https://arxiv.org/abs/2603.12201)
 
@@ -50,5 +50,5 @@ vllm serve deepseek-ai/DeepSeek-V3.2 \
 
 ## Requirements
 
-- DeepSeek-V3.2 or compatible DSA model
+- DeepSeek-V3.2, DeepSeek-V4 on CUDA SM90/Hopper, or compatible DSA model
 - `use_index_cache: true` via `--hf-overrides`
