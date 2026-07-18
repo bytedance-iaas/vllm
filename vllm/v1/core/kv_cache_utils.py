@@ -1639,16 +1639,25 @@ def _get_kv_cache_groups_uniform_groups(
             if current_size < candidate:
                 object.__setattr__(layer_spec, "page_size_padded", candidate)
             layers_per_size[candidate].append(layer_name)
-        # NOTE(yifan): for now, inside a UniformKV group, each page_size should
-        # have the same number of layers. This also means we don't need to pad layers
-        # inside a partial-full layer tuple.
-        assert len(set(len(layers) for layers in layers_per_size.values())) == 1
-        num_layers_per_size = len(next(iter(layers_per_size.values())))
+        # DeepSeek V4 index cache can make SlidingWindowMLASpec groups ragged:
+        # this group holds the indexer's compressor state cache, while the real
+        # indexer K cache belongs to the full MLA group. When frequency or
+        # pattern config skips top-k for a layer, it does not create the
+        # compressor state cache here. Build layer tuples by slot and skip
+        # missing entries instead of asserting strict uniformity.
+        num_layers_per_size = max(len(layers) for layers in layers_per_size.values())
 
         # Split layers inside each UniformKV group for aligned #(layers).
         # See `_get_kv_cache_groups_uniform_page_size` for more details.
         num_tuple_groups = cdiv(num_layers_per_size, num_layer_tuples)
-        layer_tuples = list(zip(*layers_per_size.values()))
+        layer_tuples = [
+            tuple(
+                layers[i]
+                for layers in layers_per_size.values()
+                if i < len(layers)
+            )
+            for i in range(num_layers_per_size)
+        ]
         for i in range(num_tuple_groups):
             group_layer_tuples = layer_tuples[i::num_tuple_groups]
             # Flatten tuples and build dict for from_specs

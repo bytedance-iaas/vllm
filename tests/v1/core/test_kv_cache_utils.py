@@ -1947,6 +1947,60 @@ def new_mla_spec(cache_dtype_str=None):
         cache_dtype_str=cache_dtype_str,
     )
 
+def test_deepseek_v4_uniform_groups_allow_ragged_swa_page_size_buckets():
+    def new_dsv4_mla_spec(head_size: int) -> MLAAttentionSpec:
+        return MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.float16,
+            model_version="deepseek_v4",
+        )
+
+    def new_dsv4_swa_mla_spec(head_size: int) -> SlidingWindowMLASpec:
+        return SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.float16,
+            sliding_window=128,
+            model_version="deepseek_v4",
+        )
+
+    def make_uniform_group(
+        specs: dict[str, KVCacheSpec],
+    ) -> UniformTypeKVCacheSpecs:
+        group = UniformTypeKVCacheSpecs.from_specs(specs)
+        assert group is not None
+        return group
+
+    full_specs: dict[str, KVCacheSpec] = {
+        "full.small.0": new_dsv4_mla_spec(64),
+        "full.large.0": new_dsv4_mla_spec(128),
+        "full.small.1": new_dsv4_mla_spec(64),
+        "full.large.1": new_dsv4_mla_spec(128),
+    }
+    swa_specs: dict[str, KVCacheSpec] = {}
+    for idx in range(4):
+        swa_specs[f"swa.small.{idx}"] = new_dsv4_swa_mla_spec(64)
+        swa_specs[f"swa.large.{idx}"] = new_dsv4_swa_mla_spec(128)
+    swa_specs["swa.small.4"] = new_dsv4_swa_mla_spec(64)
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
+        [make_uniform_group(full_specs), make_uniform_group(swa_specs)]
+    )
+
+    assert len(groups) == 4
+    assert groups[0].layer_names == list(full_specs)
+    assert [group.layer_names for group in groups[1:]] == [
+        ["swa.small.0", "swa.large.0", "swa.small.3", "swa.large.3"],
+        ["swa.small.1", "swa.large.1", "swa.small.4"],
+        ["swa.small.2", "swa.large.2"],
+    ]
+    flattened_swa_layers = [name for group in groups[1:] for name in group.layer_names]
+    assert sorted(flattened_swa_layers) == sorted(swa_specs)
+    for group in groups[1:]:
+        assert set(group.kv_cache_spec.kv_cache_specs) == set(group.layer_names)
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
     assert get_kv_cache_spec_kind(new_mla_spec()) == KVCacheSpecKind.MLA_ATTENTION
