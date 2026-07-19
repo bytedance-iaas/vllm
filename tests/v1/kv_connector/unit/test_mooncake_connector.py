@@ -455,7 +455,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
     """
     Tests the bootstrap server's api for worker registration and querying.
 
-    Validates DP/TP/PP rank indexing and error handling for duplicate registrations.
+    Validates DP/TP/PP/PCP rank indexing and duplicate registration handling.
     """
 
     import httpx
@@ -468,12 +468,15 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert response.status_code == 200
         assert response.json() == {}
 
-    # Register multiple PP workers from the same producer engine.
+    # Register multiple PCP replicas for the same producer TP/PP worker.
     payload1 = {
         "engine_id": "eng-1",
         "dp_rank": 0,
         "tp_rank": 0,
         "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 2,
+        "dcp_size": 1,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -485,7 +488,10 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "engine_id": "eng-1",
         "dp_rank": 0,
         "tp_rank": 0,
-        "pp_rank": 1,
+        "pp_rank": 0,
+        "pcp_rank": 1,
+        "pcp_size": 2,
+        "dcp_size": 1,
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
@@ -493,15 +499,19 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
-    # Query after registration should preserve the PP dimension.
+    # Query after registration should preserve the PCP dimension.
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{base_url}/query")
         assert response.status_code == 200
         data = response.json()
         assert "0" in data
         assert data["0"]["engine_id"] == "eng-1"
+        assert data["0"]["pcp_size"] == 2
+        assert data["0"]["dcp_size"] == 1
+        # Preserve the pre-PCP bootstrap response for older consumers.
         assert data["0"]["worker_addr"]["0"]["0"] == "tcp://1.1.1.1:1111"
-        assert data["0"]["worker_addr"]["0"]["1"] == "tcp://2.2.2.2:2222"
+        assert data["0"]["pcp_worker_addr"]["0"]["0"]["0"] == ("tcp://1.1.1.1:1111")
+        assert data["0"]["pcp_worker_addr"]["0"]["0"]["1"] == ("tcp://2.2.2.2:2222")
 
     # Test failure: re-registering the same worker
     async with httpx.AsyncClient() as client:
@@ -509,13 +519,89 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert response.status_code == 400
         assert "is already registered" in response.text
 
+    # Test failure: all workers in one engine must report the same PCP size.
+    inconsistent_pcp_size = {
+        "engine_id": "eng-1",
+        "dp_rank": 0,
+        "tp_rank": 1,
+        "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 3,
+        "dcp_size": 1,
+        "addr": "tcp://3.3.3.3:3333",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=inconsistent_pcp_size)
+        assert response.status_code == 400
+        assert "PCP size mismatch" in response.text
+
+    # Test failure: canonical PCP replica selection requires replicated DCP1 KV.
+    unsupported_dcp_size = {
+        "engine_id": "eng-2",
+        "dp_rank": 1,
+        "tp_rank": 0,
+        "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 2,
+        "dcp_size": 2,
+        "addr": "tcp://4.4.4.4:4444",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=unsupported_dcp_size)
+        assert response.status_code == 400
+        assert "requires DCP size 1" in response.text
+
+    invalid_pcp_rank = {
+        "engine_id": "eng-3",
+        "dp_rank": 2,
+        "tp_rank": 0,
+        "pp_rank": 0,
+        "pcp_rank": 2,
+        "pcp_size": 2,
+        "dcp_size": 1,
+        "addr": "tcp://5.5.5.5:5555",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=invalid_pcp_rank)
+        assert response.status_code == 400
+        assert "must be less than PCP size" in response.text
+
+    # Test failure: all workers in one engine must report the same DCP size.
+    dcp2_payload = {
+        "engine_id": "eng-4",
+        "dp_rank": 3,
+        "tp_rank": 0,
+        "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 1,
+        "dcp_size": 2,
+        "addr": "tcp://7.7.7.7:7777",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=dcp2_payload)
+        assert response.status_code == 200
+
+    inconsistent_dcp_size = {
+        **dcp2_payload,
+        "tp_rank": 1,
+        "dcp_size": 3,
+        "addr": "tcp://8.8.8.8:8888",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=inconsistent_dcp_size)
+        assert response.status_code == 400
+        assert "DCP size mismatch" in response.text
+
     # Test failure: engine_id mismatch for same dp_rank
     payload3_fail = {
         "engine_id": "eng-2",
         "dp_rank": 0,
         "tp_rank": 1,
         "pp_rank": 0,
-        "addr": "tcp://3.3.3.3:3333",
+        "pcp_rank": 0,
+        "pcp_size": 2,
+        "dcp_size": 1,
+        "addr": "tcp://6.6.6.6:6666",
     }
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{base_url}/register", json=payload3_fail)
@@ -546,22 +632,25 @@ def _make_bootstrap_vllm_config(
     (
         "tp_rank",
         "pp_rank",
+        "pcp_rank",
         "local_engines_only",
         "data_parallel_rank_local",
         "data_parallel_index",
         "expected",
     ),
     [
-        (1, 0, False, 0, 0, False),
-        (0, 1, False, 0, 0, False),
-        (0, 0, True, 0, 1, True),
-        (0, 0, True, 1, 0, False),
-        (0, 0, False, 0, 0, True),
-        (0, 0, False, 0, 1, False),
+        (1, 0, 0, False, 0, 0, False),
+        (0, 1, 0, False, 0, 0, False),
+        (0, 0, 1, False, 0, 0, False),
+        (0, 0, 0, True, 0, 1, True),
+        (0, 0, 0, True, 1, 0, False),
+        (0, 0, 0, False, 0, 0, True),
+        (0, 0, 0, False, 0, 1, False),
     ],
     ids=[
         "nonzero_tp_rank",
         "nonzero_pp_rank",
+        "nonzero_pcp_rank",
         "local_engine_rank_zero",
         "local_engine_nonzero_rank",
         "internal_lb_first_dp_engine",
@@ -571,6 +660,7 @@ def _make_bootstrap_vllm_config(
 def test_should_launch_bootstrap_server_selects_single_owner(
     tp_rank: int,
     pp_rank: int,
+    pcp_rank: int,
     local_engines_only: bool,
     data_parallel_rank_local: int,
     data_parallel_index: int,
@@ -591,8 +681,13 @@ def test_should_launch_bootstrap_server_selects_single_owner(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.get_pp_group"
         ) as mock_pp_group,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pcp_group"
+        ) as mock_pcp_group,
     ):
         mock_pp_group.return_value.rank_in_group = pp_rank
+        mock_pcp_group.return_value.rank_in_group = pcp_rank
         assert should_launch_bootstrap_server(vllm_config) is expected
 
 
@@ -655,10 +750,25 @@ def test_scheduler_request_finished():
 
 
 @contextlib.contextmanager
-def patch_worker_dependencies():
+def patch_worker_dependencies(*, pcp_rank: int = 0):
     """Helper to mock all distributed and network dependencies for Worker tests."""
 
     with (
+        patch("torch.accelerator.current_device_index", return_value=0),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.current_platform.set_device"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.MooncakeConnectorWorker."
+            "_sync_block_size_with_kernel"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_current_attn_backends",
+            return_value=[FlashAttentionBackend],
+        ),
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.TransferEngine",
             FakeMooncakeWrapper,
@@ -679,6 +789,9 @@ def patch_worker_dependencies():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_pp_group"
         ) as mock_pp,
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_pcp_group"
+        ) as mock_pcp,
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.should_launch_bootstrap_server",
             return_value=False,
         ),
@@ -691,6 +804,10 @@ def patch_worker_dependencies():
         mock_pp_group = MagicMock()
         mock_pp_group.rank_in_group = 0
         mock_pp.return_value = mock_pp_group
+
+        mock_pcp_group = MagicMock()
+        mock_pcp_group.rank_in_group = pcp_rank
+        mock_pcp.return_value = mock_pcp_group
 
         # Mock ZMQ socket
         mock_socket_object = AsyncMock()
@@ -709,6 +826,222 @@ def patch_worker_dependencies():
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
         }
+
+
+@pytest.mark.asyncio
+async def test_prefill_worker_registers_pcp_topology():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+    vllm_config.parallel_config.decode_context_parallel_size = 1
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch_worker_dependencies(pcp_rank=1) as mocks,
+    ):
+        prefill_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        prefill_worker = prefill_connector.connector_worker
+        prefill_worker.side_channel_port = 12345
+
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = MagicMock()
+        mocks[
+            "mock_http_client"
+        ].__aenter__.return_value.post.return_value = mock_response
+
+        await prefill_worker.register_worker_with_bootstrap()
+
+        post_call = mocks["mock_http_client"].__aenter__.return_value.post.call_args
+        assert post_call.kwargs["json"]["pcp_rank"] == 1
+        assert post_call.kwargs["json"]["pcp_size"] == 2
+        assert post_call.kwargs["json"]["dcp_size"] == 1
+        prefill_worker.shutdown()
+
+
+def test_worker_rejects_pcp_with_sharded_dcp():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+    vllm_config.parallel_config.decode_context_parallel_size = 2
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch_worker_dependencies(),
+        pytest.raises(ValueError, match="requires DCP1"),
+    ):
+        MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_receive_kv_selects_canonical_prefill_pcp_replica():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        decode_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        decode_worker = decode_connector.connector_worker
+        decode_worker._remote_agents = {
+            "p-engine": {
+                0: {
+                    0: {
+                        0: "tcp://producer-pcp0:1234",
+                        1: "tcp://producer-pcp1:1234",
+                    }
+                }
+            }
+        }
+        decode_worker._tp_size["p-engine"] = 1
+        decode_worker._pcp_size["p-engine"] = 2
+        decode_worker._dcp_size["p-engine"] = 1
+
+        pull_metas = {
+            "d-req-1": PullReqMeta(
+                d_req_id="d-req-1",
+                transfer_id="xfer-req-1",
+                local_block_ids=[[100, 101]],
+                remote_engine_id="p-engine",
+                remote_bootstrap_addr="http://bootstrap:33333",
+            )
+        }
+        seen_addrs: list[str] = []
+
+        async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
+            seen_addrs.append(worker_addr)
+            for meta in metas.values():
+                meta.pull_tasks_count -= 1
+
+        with patch.object(
+            decode_worker,
+            "receive_kv_from_single_worker",
+            side_effect=fake_receive,
+        ):
+            decode_worker.receive_kv("p-engine", pull_metas)
+            await asyncio.sleep(0)
+
+        assert seen_addrs == ["tcp://producer-pcp0:1234"]
+        assert pull_metas["d-req-1"].pull_tasks_count == 0
+        decode_worker.shutdown()
+
+
+def test_receive_kv_rejects_missing_canonical_prefill_pcp_replica():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        decode_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        decode_worker = decode_connector.connector_worker
+        decode_worker._remote_agents = {
+            "p-engine": {0: {0: {1: "tcp://producer-pcp1:1234"}}}
+        }
+        decode_worker._tp_size["p-engine"] = 1
+        decode_worker._pcp_size["p-engine"] = 2
+        decode_worker._dcp_size["p-engine"] = 1
+
+        pull_metas = {
+            "d-req-1": PullReqMeta(
+                d_req_id="d-req-1",
+                transfer_id="xfer-req-1",
+                local_block_ids=[[100, 101]],
+                remote_engine_id="p-engine",
+                remote_bootstrap_addr="http://bootstrap:33333",
+            )
+        }
+        with pytest.raises(ValueError, match="missing canonical PCP rank 0"):
+            decode_worker.receive_kv("p-engine", pull_metas)
+        decode_worker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_connect_to_prefiller_bootstrap_parses_pcp_topology():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch_worker_dependencies() as mocks,
+    ):
+        decode_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        decode_worker = decode_connector.connector_worker
+        bootstrap_addr = "http://bootstrap:33333"
+        decode_worker._pending_bootstrap_queries[bootstrap_addr] = asyncio.Event()
+
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(
+            return_value={
+                "0": {
+                    "engine_id": "p-engine",
+                    "pcp_size": 2,
+                    "dcp_size": 1,
+                    "worker_addr": {"0": {"0": "tcp://producer-pcp0:1234"}},
+                    "pcp_worker_addr": {
+                        "0": {
+                            "0": {
+                                "0": "tcp://producer-pcp0:1234",
+                                "1": "tcp://producer-pcp1:1234",
+                            }
+                        }
+                    },
+                }
+            }
+        )
+        mocks[
+            "mock_http_client"
+        ].__aenter__.return_value.get.return_value = mock_response
+
+        await decode_worker._connect_to_prefiller_bootstrap(bootstrap_addr)
+
+        assert decode_worker._remote_agents["p-engine"][0][0] == {
+            0: "tcp://producer-pcp0:1234",
+            1: "tcp://producer-pcp1:1234",
+        }
+        assert decode_worker._pcp_size["p-engine"] == 2
+        assert decode_worker._dcp_size["p-engine"] == 1
+
+        legacy_bootstrap_addr = "http://legacy-bootstrap:33333"
+        decode_worker._pending_bootstrap_queries[legacy_bootstrap_addr] = (
+            asyncio.Event()
+        )
+        mock_response.json.return_value = {
+            "0": {
+                "engine_id": "legacy-p-engine",
+                "worker_addr": {"0": {"0": "tcp://legacy-producer:1234"}},
+            }
+        }
+
+        await decode_worker._connect_to_prefiller_bootstrap(legacy_bootstrap_addr)
+
+        assert decode_worker._remote_agents["legacy-p-engine"] == {
+            0: {0: {0: "tcp://legacy-producer:1234"}}
+        }
+        assert decode_worker._pcp_size["legacy-p-engine"] == 1
+        assert decode_worker._dcp_size["legacy-p-engine"] == 1
+        decode_worker.shutdown()
 
 
 @pytest.mark.asyncio
@@ -743,12 +1076,14 @@ async def test_receive_kv_selects_remote_pp_workers(
         decode_worker._remote_agents = {
             "p-engine": {
                 0: {
-                    0: "tcp://producer-pp0:1234",
-                    1: "tcp://producer-pp1:1234",
+                    0: {0: "tcp://producer-pp0:1234"},
+                    1: {0: "tcp://producer-pp1:1234"},
                 }
             }
         }
         decode_worker._tp_size["p-engine"] = 1
+        decode_worker._pcp_size["p-engine"] = 1
+        decode_worker._dcp_size["p-engine"] = 1
 
         pull_metas = {
             "d-req-1": PullReqMeta(
@@ -1012,8 +1347,12 @@ async def test_kv_consumuer(monkeypatch):
                 pull_tasks_count=1,
             )
         }
-        decode_worker._remote_agents = {"p-engine": {0: {0: "tcp://producer:1234"}}}
+        decode_worker._remote_agents = {
+            "p-engine": {0: {0: {0: "tcp://producer:1234"}}}
+        }
         decode_worker._tp_size["p-engine"] = 1
+        decode_worker._pcp_size["p-engine"] = 1
+        decode_worker._dcp_size["p-engine"] = 1
 
         # Mock the response from the producer.
         mock_response = MooncakeXferResponse(
