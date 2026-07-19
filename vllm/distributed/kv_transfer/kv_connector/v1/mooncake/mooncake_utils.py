@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -31,14 +31,24 @@ class RegisterWorkerPayload(BaseModel):
     dp_rank: int
     tp_rank: int
     pp_rank: int
+    pcp_rank: int = 0
+    pcp_size: int = 1
+    dcp_size: int = 1
     addr: WorkerAddr
 
 
 @dataclass
 class EngineEntry:
     engine_id: EngineId
+    # Canonical PCP=0 workers, preserving the pre-PCP response shape.
     # {tp_rank: {pp_rank: worker_addr}}
     worker_addr: dict[int, dict[int, WorkerAddr]]
+    pcp_size: int
+    dcp_size: int
+    # {tp_rank: {pp_rank: {pcp_rank: worker_addr}}}
+    pcp_worker_addr: dict[int, dict[int, dict[int, WorkerAddr]]] = field(
+        default_factory=dict
+    )
 
 
 class MooncakeBootstrapServer:
@@ -89,9 +99,33 @@ class MooncakeBootstrapServer:
 
     async def register_worker(self, payload: RegisterWorkerPayload):
         """Handles registration of a prefiller worker."""
+        if payload.pcp_size < 1 or payload.dcp_size < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="PCP and DCP sizes must be positive.",
+            )
+        if payload.pcp_rank < 0 or payload.pcp_rank >= payload.pcp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PCP rank {payload.pcp_rank} must be less than PCP size "
+                    f"{payload.pcp_size}."
+                ),
+            )
+        if payload.pcp_size > 1 and payload.dcp_size != 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Mooncake canonical PCP replica transfer requires DCP size 1, "
+                    f"but got PCP size {payload.pcp_size} and DCP size "
+                    f"{payload.dcp_size}"
+                ),
+            )
         if payload.dp_rank not in self.workers:
             self.workers[payload.dp_rank] = EngineEntry(
                 engine_id=payload.engine_id,
+                pcp_size=payload.pcp_size,
+                dcp_size=payload.dcp_size,
                 worker_addr={},
             )
 
@@ -104,29 +138,56 @@ class MooncakeBootstrapServer:
                     f"expected {dp_entry.engine_id}, got {payload.engine_id}"
                 ),
             )
-        if payload.tp_rank not in dp_entry.worker_addr:
-            dp_entry.worker_addr[payload.tp_rank] = {}
+        if dp_entry.pcp_size != payload.pcp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PCP size mismatch for dp_rank={payload.dp_rank}: "
+                    f"expected {dp_entry.pcp_size}, got {payload.pcp_size}"
+                ),
+            )
+        if dp_entry.dcp_size != payload.dcp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"DCP size mismatch for dp_rank={payload.dp_rank}: "
+                    f"expected {dp_entry.dcp_size}, got {payload.dcp_size}"
+                ),
+            )
+        if payload.tp_rank not in dp_entry.pcp_worker_addr:
+            dp_entry.pcp_worker_addr[payload.tp_rank] = {}
 
-        tp_entry = dp_entry.worker_addr[payload.tp_rank]
-        if payload.pp_rank in tp_entry:
+        tp_entry = dp_entry.pcp_worker_addr[payload.tp_rank]
+        if payload.pp_rank not in tp_entry:
+            tp_entry[payload.pp_rank] = {}
+
+        pp_entry = tp_entry[payload.pp_rank]
+        if payload.pcp_rank in pp_entry:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Worker with dp_rank={payload.dp_rank}, "
-                    f"tp_rank={payload.tp_rank}, pp_rank={payload.pp_rank} "
+                    f"tp_rank={payload.tp_rank}, pp_rank={payload.pp_rank}, "
+                    f"pcp_rank={payload.pcp_rank} "
                     f"is already registered at "
-                    f"{tp_entry[payload.pp_rank]}, "
+                    f"{pp_entry[payload.pcp_rank]}, "
                     f"but still want to register at {payload.addr}"
                 ),
             )
 
-        tp_entry[payload.pp_rank] = payload.addr
+        pp_entry[payload.pcp_rank] = payload.addr
+        if payload.pcp_rank == 0:
+            dp_entry.worker_addr.setdefault(payload.tp_rank, {})[payload.pp_rank] = (
+                payload.addr
+            )
         logger.debug(
-            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, pp_rank=%d at %s",
+            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, "
+            "pp_rank=%d, pcp_rank=%d at %s",
             payload.engine_id,
             payload.dp_rank,
             payload.tp_rank,
             payload.pp_rank,
+            payload.pcp_rank,
             payload.addr,
         )
 

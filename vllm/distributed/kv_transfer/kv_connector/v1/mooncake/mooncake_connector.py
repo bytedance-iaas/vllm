@@ -39,6 +39,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -474,6 +475,17 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+
+        assert (parallel_config := vllm_config.parallel_config)
+        if (
+            parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.decode_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "Mooncake PCP producer transfer requires DCP1, but got "
+                f"PCP{parallel_config.prefill_context_parallel_size}/"
+                f"DCP{parallel_config.decode_context_parallel_size}."
+            )
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
@@ -948,7 +960,8 @@ class MooncakeConnectorWorker:
             self.rpc_port,
         )
 
-        self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = {}
+        # {engine_id: {tp_rank: {pp_rank: {pcp_rank: worker_addr}}}}
+        self._remote_agents: dict[EngineId, dict[int, dict[int, dict[int, str]]]] = {}
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
@@ -967,6 +980,9 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self.pcp_size = parallel_config.prefill_context_parallel_size
+        self.pcp_rank = get_pcp_group().rank_in_group
+        self.dcp_size = parallel_config.decode_context_parallel_size
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1031,6 +1047,8 @@ class MooncakeConnectorWorker:
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
+        self._pcp_size: dict[EngineId, int] = {self.engine_id: self.pcp_size}
+        self._dcp_size: dict[EngineId, int] = {self.engine_id: self.dcp_size}
         self._layer_specs: dict[str, KVCacheSpec] = {}
         for group in kv_cache_config.kv_cache_groups:
             group_spec = group.kv_cache_spec
@@ -1108,6 +1126,9 @@ class MooncakeConnectorWorker:
             dp_rank=self.dp_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
+            dcp_size=self.dcp_size,
             addr=worker_addr,
         )
         while True:
@@ -1911,14 +1932,28 @@ class MooncakeConnectorWorker:
                 data: dict = response.json()
                 for _, dp_entry in data.items():
                     remote_engine_id = dp_entry["engine_id"]
+                    pcp_worker_addr = dp_entry.get("pcp_worker_addr")
+                    if pcp_worker_addr is None:
+                        pcp_worker_addr = {
+                            tp_rank: {
+                                pp_rank: {0: worker_addr}
+                                for pp_rank, worker_addr in tp_entry.items()
+                            }
+                            for tp_rank, tp_entry in dp_entry["worker_addr"].items()
+                        }
                     self._remote_agents[remote_engine_id] = {
                         int(tp_rank): {
-                            int(pp_rank): worker_addr
-                            for pp_rank, worker_addr in tp_entry.items()
+                            int(pp_rank): {
+                                int(pcp_rank): worker_addr
+                                for pcp_rank, worker_addr in pp_entry.items()
+                            }
+                            for pp_rank, pp_entry in tp_entry.items()
                         }
-                        for tp_rank, tp_entry in dp_entry["worker_addr"].items()
+                        for tp_rank, tp_entry in pcp_worker_addr.items()
                     }
-                    self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
+                    self._tp_size[remote_engine_id] = len(pcp_worker_addr)
+                    self._pcp_size[remote_engine_id] = int(dp_entry.get("pcp_size", 1))
+                    self._dcp_size[remote_engine_id] = int(dp_entry.get("dcp_size", 1))
         except Exception as e:
             logger.error(
                 "Failed to connect to bootstrap server %s: %s",
@@ -1935,19 +1970,38 @@ class MooncakeConnectorWorker:
         remote_engine_id: EngineId,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        if self.pcp_size != 1 or self.dcp_size != 1:
+            raise ValueError(
+                "Mooncake PCP producer transfer currently requires a PCP1/DCP1 "
+                f"consumer, but got PCP{self.pcp_size}/DCP{self.dcp_size}."
+            )
+        if self._dcp_size[remote_engine_id] != 1:
+            raise ValueError(
+                "Mooncake canonical PCP replica transfer requires producer DCP1, "
+                f"but got DCP{self._dcp_size[remote_engine_id]}."
+            )
+
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
         for remote_tp_rank in remote_tp_ranks:
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
+            pp_to_pcp = self._remote_agents[remote_engine_id][remote_tp_rank]
+            if self.pp_size == len(pp_to_pcp) and self.pp_rank in pp_to_pcp:
                 pp_ranks = [self.pp_rank]
             else:
-                pp_ranks = sorted(pp_to_addr)
+                pp_ranks = sorted(pp_to_pcp)
             selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+            for pp_rank in pp_ranks:
+                pcp_to_addr = pp_to_pcp[pp_rank]
+                if 0 not in pcp_to_addr:
+                    raise ValueError(
+                        "Mooncake bootstrap response is missing canonical PCP rank 0 "
+                        f"for engine {remote_engine_id}, TP rank {remote_tp_rank}, "
+                        f"PP rank {pp_rank}."
+                    )
+                worker_addrs.append(pcp_to_addr[0])
 
         count = len(worker_addrs)
         logger.debug(
@@ -2143,10 +2197,12 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
-    # Only the TP=0, PP=0 worker of the designated engine should launch it.
+    # Only the TP=0, PP=0, PCP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    if get_pcp_group().rank_in_group != 0:
         return False
 
     # In hybrid or external LB mode,
