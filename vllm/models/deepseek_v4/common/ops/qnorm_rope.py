@@ -66,7 +66,11 @@ def _qnorm_rope_kv_kernel(
         kv_base = kv_ptr + token_idx * HEAD_DIM
         kv_out_base = kv_out_ptr + token_idx * HEAD_DIM
         offs = tl.arange(0, HEAD_DIM)
-        tl.store(kv_out_base + offs, tl.load(kv_base + offs))
+        tl.store(
+            kv_out_base + offs,
+            tl.load(kv_base + offs),
+            mask=offs < NOPE_DIM,
+        )
 
         even_offs = NOPE_DIM + rope_pair_idx * 2
         odd_offs = even_offs + 1
