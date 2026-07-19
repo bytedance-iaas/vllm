@@ -477,8 +477,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
 
         assert (parallel_config := vllm_config.parallel_config)
+        assert (kv_transfer_config := vllm_config.kv_transfer_config) is not None
         if (
-            parallel_config.prefill_context_parallel_size > 1
+            kv_transfer_config.kv_role == "kv_producer"
+            and parallel_config.prefill_context_parallel_size > 1
             and parallel_config.decode_context_parallel_size != 1
         ):
             raise ValueError(
@@ -486,10 +488,18 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                 f"PCP{parallel_config.prefill_context_parallel_size}/"
                 f"DCP{parallel_config.decode_context_parallel_size}."
             )
+        if kv_transfer_config.kv_role == "kv_consumer" and (
+            parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "Mooncake PCP producer transfer requires a PCP1/DCP1 consumer, "
+                f"but got PCP{parallel_config.prefill_context_parallel_size}/"
+                f"DCP{parallel_config.decode_context_parallel_size}."
+            )
 
-        assert vllm_config.kv_transfer_config is not None
-        assert vllm_config.kv_transfer_config.engine_id is not None
-        self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        assert kv_transfer_config.engine_id is not None
+        self.engine_id: EngineId = kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -565,6 +575,15 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def get_finished_count(self) -> int | None:
+        if self._kv_transfer_config.kv_role != "kv_producer":
+            return None
+
+        parallel_config = self._vllm_config.parallel_config
+        return (
+            parallel_config.world_size // parallel_config.prefill_context_parallel_size
+        )
 
     ############################################################
     # Worker Side Methods
@@ -1125,7 +1144,9 @@ class MooncakeConnectorWorker:
             engine_id=self.engine_id,
             dp_rank=self.dp_rank,
             tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
             pcp_rank=self.pcp_rank,
             pcp_size=self.pcp_size,
             dcp_size=self.dcp_size,
@@ -1927,8 +1948,16 @@ class MooncakeConnectorWorker:
         url = remote_bootstrap_addr + "/query"
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(url)
-                response.raise_for_status()
+                while True:
+                    response = await client.get(url)
+                    if response.status_code != 503:
+                        response.raise_for_status()
+                        break
+                    logger.debug(
+                        "Prefiller topology at %s is not ready; retrying.",
+                        remote_bootstrap_addr,
+                    )
+                    await asyncio.sleep(1)
                 data: dict = response.json()
                 for _, dp_entry in data.items():
                     remote_engine_id = dp_entry["engine_id"]
@@ -2052,6 +2081,9 @@ class MooncakeConnectorWorker:
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+        if self.pcp_rank != 0:
+            return
+
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
