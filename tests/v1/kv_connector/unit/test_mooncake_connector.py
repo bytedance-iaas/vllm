@@ -463,11 +463,12 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
 
     base_url = f"http://127.0.0.1:{bootstrap_server.port}"
 
-    # Query when empty
+    # The server can be reachable before the first worker registers. Do not let
+    # a decoder cache an empty topology as a successful response.
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{base_url}/query")
-        assert response.status_code == 200
-        assert response.json() == {}
+        assert response.status_code == 503
+        assert "not ready" in response.text
 
     # Register multiple PCP replicas for the same producer TP/PP worker.
     payload1 = {
