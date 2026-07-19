@@ -8,7 +8,16 @@ import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import PCPAttentionMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -52,9 +61,11 @@ class PCPManager:
         max_num_reqs: int | None = None,
         max_num_tokens: int | None = None,
         block_tables: BlockTables | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        requires_pure_prefill: bool = False,
     ) -> None:
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
@@ -62,10 +73,12 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self.requires_pure_prefill = requires_pure_prefill
 
         self._global_batch: InputBatch | None = None
         self._req_states = req_states
         self._block_tables = block_tables
+        self._kv_cache_config = kv_cache_config
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
@@ -97,6 +110,21 @@ class PCPManager:
         else:
             self._local_block_tables = None
             self._local_block_table_ptrs = None
+        self._global_block_tables: tuple[torch.Tensor, ...] | None
+        self._global_block_table_ptrs: torch.Tensor | None
+        if block_tables is not None and max_num_reqs is not None:
+            self._global_block_tables = tuple(
+                table.new_zeros((max_num_reqs, table.shape[1]))
+                for table in block_tables.input_block_tables
+            )
+            self._global_block_table_ptrs = torch.tensor(
+                [table.data_ptr() for table in self._global_block_tables],
+                dtype=torch.uint64,
+                device=device,
+            )
+        else:
+            self._global_block_tables = None
+            self._global_block_table_ptrs = None
         num_kv_cache_groups = (
             block_tables.num_kv_cache_groups if block_tables is not None else 0
         )
@@ -120,6 +148,44 @@ class PCPManager:
             if max_num_tokens is not None and num_kv_cache_groups > 0
             else None
         )
+        self._pcp_cache_slot_mappings = (
+            torch.empty(
+                num_kv_cache_groups,
+                max_num_tokens * pcp_world_size,
+                dtype=torch.int64,
+                device=device,
+            )
+            if max_num_tokens is not None and num_kv_cache_groups > 0
+            else None
+        )
+        self._global_compressed_slot_mapping = (
+            torch.empty(max_num_tokens, dtype=torch.int64, device=device)
+            if max_num_tokens is not None
+            else None
+        )
+        self._global_token_to_req_indices = (
+            torch.empty(max_num_tokens, dtype=torch.int32, device=device)
+            if max_num_tokens is not None
+            else None
+        )
+        self._expanded_token_to_req_indices = (
+            torch.empty(
+                max_num_tokens * pcp_world_size,
+                dtype=torch.int32,
+                device=device,
+            )
+            if max_num_tokens is not None
+            else None
+        )
+        self._expanded_positions = (
+            torch.empty(
+                max_num_tokens * pcp_world_size,
+                dtype=torch.int64,
+                device=device,
+            )
+            if max_num_tokens is not None
+            else None
+        )
 
     @staticmethod
     def validate_config(
@@ -131,6 +197,28 @@ class PCPManager:
         pcp_size = parallel_config.prefill_context_parallel_size
         if pcp_size <= 1:
             return
+
+        is_deepseek_v4 = (
+            getattr(model_config.hf_text_config, "model_type", None) == "deepseek_v4"
+        )
+        if is_deepseek_v4:
+            if parallel_config.decode_context_parallel_size != 1:
+                raise NotImplementedError(
+                    "DeepSeek-V4 MRV2 PCP currently requires DCP=1."
+                )
+            if getattr(parallel_config, "data_parallel_size", 1) != 1:
+                raise NotImplementedError(
+                    "DeepSeek-V4 MRV2 PCP currently requires DP=1."
+                )
+            if vllm_config.cache_config.cache_dtype != "fp8_ds_mla":
+                raise NotImplementedError(
+                    "DeepSeek-V4 MRV2 PCP currently supports only "
+                    "--kv-cache-dtype=fp8_ds_mla."
+                )
+            if vllm_config.cache_config.enable_prefix_caching:
+                raise NotImplementedError(
+                    "DeepSeek-V4 MRV2 PCP currently requires prefix caching off."
+                )
 
         if not model_config.use_mla:
             raise NotImplementedError("MRV2 PCP currently supports MLA models only.")
@@ -326,6 +414,12 @@ class PCPManager:
 
         global_batch = input_batch
         self._global_batch = global_batch
+
+        if self.requires_pure_prefill and not bool(global_batch.is_prefilling_np.all()):
+            raise NotImplementedError(
+                "DeepSeek-V4 MRV2 PCP supports pure prefill batches only. "
+                "Use PCP=1 on decode workers."
+            )
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
@@ -554,7 +648,159 @@ class PCPManager:
             out_ptrs=self._local_block_table_ptrs,
         )
         slot_mappings = self.prepare_slot_mappings()
+        if self.requires_pure_prefill:
+            input_batch.pcp_attn_metadata = self._prepare_attention_metadata(
+                slot_mappings
+            )
         return block_tables, slot_mappings
+
+    def prepare_dummy_attn(
+        self, input_batch: InputBatch
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        assert self._block_tables is not None
+        block_tables = self._block_tables.get_dummy_block_tables(input_batch.num_reqs)
+        slot_mappings = self.get_dummy_slot_mappings(input_batch.num_tokens)
+        if self.requires_pure_prefill:
+            input_batch.pcp_attn_metadata = self._prepare_dummy_attention_metadata(
+                input_batch.num_tokens,
+                block_tables,
+                slot_mappings,
+            )
+        return block_tables, slot_mappings
+
+    def _prepare_dummy_attention_metadata(
+        self,
+        num_local_tokens: int,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+    ) -> tuple[PCPAttentionMetadata, ...]:
+        assert self._expanded_token_to_req_indices is not None
+        assert self._expanded_positions is not None
+
+        num_expanded_tokens = num_local_tokens * self.pcp_world_size
+        expanded_positions = self._expanded_positions[:num_expanded_tokens]
+        expanded_positions.zero_()
+        expanded_token_to_req_indices = self._expanded_token_to_req_indices[
+            :num_expanded_tokens
+        ]
+        expanded_token_to_req_indices.zero_()
+
+        return tuple(
+            PCPAttentionMetadata(
+                rank=self.pcp_rank,
+                world_size=self.pcp_world_size,
+                local_num_tokens_padded=num_local_tokens,
+                positions=expanded_positions,
+                token_to_req_indices=expanded_token_to_req_indices,
+                block_table_tensor=block_tables[group_idx],
+                cache_slot_mapping=slot_mappings[group_idx],
+            )
+            for group_idx in range(len(block_tables))
+        )
+
+    def _prepare_attention_metadata(
+        self,
+        gathered_slot_mappings: torch.Tensor,
+    ) -> tuple[PCPAttentionMetadata, ...]:
+        assert self._block_tables is not None
+        assert self._kv_cache_config is not None
+        assert self._global_batch is not None
+        assert self._global_block_tables is not None
+        assert self._global_block_table_ptrs is not None
+        assert self._padded_gather_idx is not None
+        assert self._gathered_kv_write_mask is not None
+        assert self._pcp_cache_slot_mappings is not None
+        assert self._global_compressed_slot_mapping is not None
+        assert self._global_token_to_req_indices is not None
+        assert self._expanded_token_to_req_indices is not None
+        assert self._expanded_positions is not None
+
+        global_batch = self._global_batch
+        global_block_tables = self._block_tables.gather_block_tables(
+            global_batch.idx_mapping,
+            global_batch.num_reqs,
+            out=self._global_block_tables,
+            out_ptrs=self._global_block_table_ptrs,
+        )
+
+        padded_gather_idx = self._padded_gather_idx
+        write_mask = self._gathered_kv_write_mask
+        num_expanded_tokens = padded_gather_idx.shape[0]
+        local_num_tokens_padded = num_expanded_tokens // self.pcp_world_size
+
+        expanded_positions = self._expanded_positions[:num_expanded_tokens]
+        torch.index_select(
+            global_batch.positions,
+            0,
+            padded_gather_idx,
+            out=expanded_positions,
+        )
+        expanded_positions.masked_fill_(~write_mask, 0)
+
+        query_lens = np.diff(global_batch.query_start_loc_np).astype(
+            np.int32, copy=False
+        )
+        token_to_req_indices_np = np.repeat(
+            np.arange(global_batch.num_reqs, dtype=np.int32), query_lens
+        )
+        global_token_to_req_indices = self._global_token_to_req_indices[
+            : global_batch.num_tokens
+        ]
+        async_copy_to_gpu(token_to_req_indices_np, out=global_token_to_req_indices)
+        expanded_token_to_req_indices = self._expanded_token_to_req_indices[
+            :num_expanded_tokens
+        ]
+        torch.index_select(
+            global_token_to_req_indices,
+            0,
+            padded_gather_idx,
+            out=expanded_token_to_req_indices,
+        )
+        expanded_token_to_req_indices.masked_fill_(~write_mask, 0)
+
+        cache_slot_mappings = self._pcp_cache_slot_mappings[:, :num_expanded_tokens]
+        cache_slot_mappings.copy_(gathered_slot_mappings)
+        for group_idx, group in enumerate(self._kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, MLAAttentionSpec | SlidingWindowMLASpec):
+                continue
+            if spec.compress_ratio <= 1:
+                continue
+            global_compressed_slot_mapping = get_compressed_slot_mapping(
+                global_batch.num_tokens,
+                global_batch.query_start_loc,
+                global_batch.seq_lens,
+                global_block_tables[group_idx].clamp_(min=0),
+                int(spec.storage_block_size),
+                spec.compress_ratio,
+                out=self._global_compressed_slot_mapping,
+            )
+            group_cache_slot_mapping = cache_slot_mappings[group_idx]
+            torch.index_select(
+                global_compressed_slot_mapping,
+                0,
+                padded_gather_idx,
+                out=group_cache_slot_mapping,
+            )
+            torch.where(
+                write_mask,
+                group_cache_slot_mapping,
+                self._pad_slot_id,
+                out=group_cache_slot_mapping,
+            )
+
+        return tuple(
+            PCPAttentionMetadata(
+                rank=self.pcp_rank,
+                world_size=self.pcp_world_size,
+                local_num_tokens_padded=local_num_tokens_padded,
+                positions=expanded_positions,
+                token_to_req_indices=expanded_token_to_req_indices,
+                block_table_tensor=global_block_tables[group_idx],
+                cache_slot_mapping=cache_slot_mappings[group_idx],
+            )
+            for group_idx in range(len(global_block_tables))
+        )
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         assert self._block_tables is not None
@@ -654,6 +900,7 @@ def maybe_build_pcp_manager(
     supports_mm_inputs: bool,
     req_states: RequestState,
     block_tables: BlockTables,
+    kv_cache_config: KVCacheConfig,
 ) -> PCPManager | None:
     parallel_config = vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -674,7 +921,12 @@ def maybe_build_pcp_manager(
         max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
         max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         block_tables=block_tables,
+        kv_cache_config=kv_cache_config,
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+        requires_pure_prefill=(
+            getattr(vllm_config.model_config.hf_text_config, "model_type", None)
+            == "deepseek_v4"
+        ),
     )

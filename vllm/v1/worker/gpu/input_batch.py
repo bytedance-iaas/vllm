@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backend import PCPAttentionMetadata
 
 
 class InputBuffers:
@@ -98,6 +102,9 @@ class InputBatch:
 
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
+
+    # Per-KV-group cache-write metadata when MRV2 PCP replicates KV ownership.
+    pcp_attn_metadata: tuple["PCPAttentionMetadata", ...] | None = None
 
     @classmethod
     def make_dummy(

@@ -85,6 +85,10 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_sink(cls) -> bool:
         return True
 
@@ -204,7 +208,9 @@ class DeepseekV4FlashMLAMetadataBuilder(
         req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
 
         slot_mapping = cm.slot_mapping
-        if self.compress_ratio > 1:
+        if cm.pcp_metadata is not None:
+            slot_mapping = cm.pcp_metadata.cache_slot_mapping
+        elif self.compress_ratio > 1:
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
                 cm.query_start_loc,

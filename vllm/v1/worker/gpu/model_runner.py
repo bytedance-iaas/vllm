@@ -465,6 +465,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.supports_mm_inputs,
             self.req_states,
             self.block_tables,
+            self.kv_cache_config,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
@@ -1076,9 +1077,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_dummy_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if self.pcp_manager is not None:
+            return self.pcp_manager.prepare_dummy_attn(input_batch)
         block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
-        slot_mappings = pcp.maybe_get_pcp_dummy_slot_mappings(
-            self.pcp_manager, self.block_tables, input_batch.num_tokens
+        slot_mappings = self.block_tables.get_dummy_slot_mappings(
+            input_batch.num_tokens
         )
         return block_tables, slot_mappings
 

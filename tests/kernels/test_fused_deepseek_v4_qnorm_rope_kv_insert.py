@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
 )
+from vllm.models.deepseek_v4.common.ops.qnorm_rope import qnorm_rope_kv
 from vllm.platforms import current_platform
 
 # ── Constants matching the kernel ────────────────────────────────────────────
@@ -143,6 +144,30 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not _op_available(),
     reason="CUDA not available or fused DeepseekV4 op not built in",
 )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 2048])
+@pytest.mark.parametrize("n_heads", [8, 64])
+def test_pcp_qnorm_rope_split_matches_reference(num_tokens: int, n_heads: int) -> None:
+    torch.manual_seed(7)
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    max_pos = 4096
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(max_pos, ROPE_DIM, torch.float32, device)
+    q_ref = apply_rope_gptj_last_k(
+        rmsnorm_no_weight(q, eps), positions, cos_sin_cache
+    ).to(dtype)
+    kv_ref = apply_rope_gptj_last_k(kv, positions, cos_sin_cache)
+
+    kv_out = qnorm_rope_kv(q, kv, positions, cos_sin_cache, eps)
+
+    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(kv_out, kv_ref, rtol=1e-2, atol=1e-2)
 
 
 def _call_fused(

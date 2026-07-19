@@ -586,23 +586,28 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
         if self.compress_ratio > 1:
-            padded_num_tokens = num_tokens
-            if self.pcp_world_size > 1:
-                padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
-            compressed_slot_mapping = get_compressed_slot_mapping(
-                num_tokens,
-                query_start_loc,
-                seq_lens,
-                block_table,
-                self.kv_cache_spec.storage_block_size,
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-            )
-            if self.pcp_world_size > 1:
-                compressed_slot_mapping = get_pcp_group().all_gather(
-                    self.compressed_slot_mapping_buffer[:padded_num_tokens],
-                    dim=0,
+            if common_attn_metadata.pcp_metadata is not None:
+                compressed_slot_mapping = (
+                    common_attn_metadata.pcp_metadata.cache_slot_mapping
                 )
+            else:
+                padded_num_tokens = num_tokens
+                if self.pcp_world_size > 1:
+                    padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+                compressed_slot_mapping = get_compressed_slot_mapping(
+                    num_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    block_table,
+                    self.kv_cache_spec.storage_block_size,
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                )
+                if self.pcp_world_size > 1:
+                    compressed_slot_mapping = get_pcp_group().all_gather(
+                        self.compressed_slot_mapping_buffer[:padded_num_tokens],
+                        dim=0,
+                    )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
         prefill_metadata = None

@@ -107,6 +107,10 @@ class DeepseekSparseSWABackend(AttentionBackend):
     def get_name() -> str:
         return "DEEPSEEK_SPARSE_SWA"
 
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(64)]
@@ -159,6 +163,7 @@ class DeepseekSparseSWAMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     block_size: int
+    cache_slot_mapping: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None  # [num_seqs]
     query_start_loc: torch.Tensor | None = None  # [num_seqs + 1]
     query_start_loc_cpu: torch.Tensor | None = None  # [num_seqs + 1]
@@ -406,6 +411,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        cache_slot_mapping = slot_mapping
+        if common_attn_metadata.pcp_metadata is not None:
+            pcp_metadata = common_attn_metadata.pcp_metadata
+            slot_mapping = pcp_metadata.local_cache_slot_mapping()
+            cache_slot_mapping = pcp_metadata.cache_slot_mapping
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
@@ -518,6 +528,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc_cpu=query_start_loc_cpu,
             block_table=block_table,
             slot_mapping=slot_mapping,
+            cache_slot_mapping=cache_slot_mapping,
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
