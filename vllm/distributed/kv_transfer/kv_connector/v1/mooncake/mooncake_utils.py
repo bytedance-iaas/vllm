@@ -30,7 +30,9 @@ class RegisterWorkerPayload(BaseModel):
     engine_id: EngineId
     dp_rank: int
     tp_rank: int
+    tp_size: int = 1
     pp_rank: int
+    pp_size: int = 1
     pcp_rank: int = 0
     pcp_size: int = 1
     dcp_size: int = 1
@@ -45,10 +47,27 @@ class EngineEntry:
     worker_addr: dict[int, dict[int, WorkerAddr]]
     pcp_size: int
     dcp_size: int
+    tp_size: int = 1
+    pp_size: int = 1
     # {tp_rank: {pp_rank: {pcp_rank: worker_addr}}}
     pcp_worker_addr: dict[int, dict[int, dict[int, WorkerAddr]]] = field(
         default_factory=dict
     )
+
+    def is_complete(self) -> bool:
+        expected_tp_ranks = set(range(self.tp_size))
+        if set(self.pcp_worker_addr) != expected_tp_ranks:
+            return False
+
+        expected_pp_ranks = set(range(self.pp_size))
+        expected_pcp_ranks = set(range(self.pcp_size))
+        return all(
+            set(tp_entry) == expected_pp_ranks
+            and all(
+                set(pp_entry) == expected_pcp_ranks for pp_entry in tp_entry.values()
+            )
+            for tp_entry in self.pcp_worker_addr.values()
+        )
 
 
 class MooncakeBootstrapServer:
@@ -99,10 +118,31 @@ class MooncakeBootstrapServer:
 
     async def register_worker(self, payload: RegisterWorkerPayload):
         """Handles registration of a prefiller worker."""
-        if payload.pcp_size < 1 or payload.dcp_size < 1:
+        if (
+            payload.tp_size < 1
+            or payload.pp_size < 1
+            or payload.pcp_size < 1
+            or payload.dcp_size < 1
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="PCP and DCP sizes must be positive.",
+                detail="TP, PP, PCP, and DCP sizes must be positive.",
+            )
+        if payload.tp_rank < 0 or payload.tp_rank >= payload.tp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"TP rank {payload.tp_rank} must be less than TP size "
+                    f"{payload.tp_size}."
+                ),
+            )
+        if payload.pp_rank < 0 or payload.pp_rank >= payload.pp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PP rank {payload.pp_rank} must be less than PP size "
+                    f"{payload.pp_size}."
+                ),
             )
         if payload.pcp_rank < 0 or payload.pcp_rank >= payload.pcp_size:
             raise HTTPException(
@@ -124,6 +164,8 @@ class MooncakeBootstrapServer:
         if payload.dp_rank not in self.workers:
             self.workers[payload.dp_rank] = EngineEntry(
                 engine_id=payload.engine_id,
+                tp_size=payload.tp_size,
+                pp_size=payload.pp_size,
                 pcp_size=payload.pcp_size,
                 dcp_size=payload.dcp_size,
                 worker_addr={},
@@ -136,6 +178,22 @@ class MooncakeBootstrapServer:
                 detail=(
                     f"Engine ID mismatch for dp_rank={payload.dp_rank}: "
                     f"expected {dp_entry.engine_id}, got {payload.engine_id}"
+                ),
+            )
+        if dp_entry.tp_size != payload.tp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"TP size mismatch for dp_rank={payload.dp_rank}: "
+                    f"expected {dp_entry.tp_size}, got {payload.tp_size}"
+                ),
+            )
+        if dp_entry.pp_size != payload.pp_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PP size mismatch for dp_rank={payload.dp_rank}: "
+                    f"expected {dp_entry.pp_size}, got {payload.pp_size}"
                 ),
             )
         if dp_entry.pcp_size != payload.pcp_size:
@@ -194,4 +252,9 @@ class MooncakeBootstrapServer:
         return {"status": "ok"}
 
     async def query(self) -> dict[int, EngineEntry]:
+        if any(not entry.is_complete() for entry in self.workers.values()):
+            raise HTTPException(
+                status_code=503,
+                detail="Mooncake prefiller worker topology is not ready.",
+            )
         return self.workers
