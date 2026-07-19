@@ -456,7 +456,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # default stream: SWA KV, indexer compressor, then MLA compressor.
             # Running these on independent auxiliary streams can reorder NCCL
             # collectives across ranks and deadlock.
-            q = self.wq_b(qr)[0].view(-1, self.n_local_heads, self.head_dim)
+            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
             if self.indexer is not None:
                 self.indexer(
