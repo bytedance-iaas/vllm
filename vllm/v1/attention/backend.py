@@ -408,6 +408,29 @@ class AttentionMetadata:
 T = TypeVar("T", bound=AttentionMetadata)
 
 
+@dataclass(frozen=True)
+class PCPAttentionMetadata:
+    """Cache-write view shared by PCP-aware attention backends.
+
+    MRV2 PCP partitions query computation but replicates KV cache ownership.
+    The tensors below therefore follow rank-concatenated, equally padded token
+    order and describe every token whose cache entry must be written locally.
+    """
+
+    rank: int
+    world_size: int
+    local_num_tokens_padded: int
+    positions: torch.Tensor
+    token_to_req_indices: torch.Tensor
+    block_table_tensor: torch.Tensor
+    cache_slot_mapping: torch.Tensor
+
+    def local_cache_slot_mapping(self) -> torch.Tensor:
+        start = self.rank * self.local_num_tokens_padded
+        end = start + self.local_num_tokens_padded
+        return self.cache_slot_mapping[start:end]
+
+
 @dataclass
 class CommonAttentionMetadata:
     """
@@ -479,6 +502,9 @@ class CommonAttentionMetadata:
     this stay globally visible; later (generated) tokens additionally see a
     fixed sliding window. None disables R-SWA. The attention backend copies this
     into its own persistent buffer and reads ``rswa_window`` from model config."""
+
+    pcp_metadata: PCPAttentionMetadata | None = None
+    """Rank-concatenated cache-write metadata for PCP-aware backends."""
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
@@ -591,6 +617,7 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+            pcp_metadata=self.pcp_metadata,
         )
 
 

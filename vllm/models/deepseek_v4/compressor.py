@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -50,6 +51,10 @@ class CompressorBackend(AttentionBackend):
     def get_name() -> str:
         return "CompressorBackend"
 
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(1)]
@@ -90,6 +95,7 @@ class CompressorMetadata:
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     num_decode_tokens: int | None = None
+    positions: torch.Tensor | None = None
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -113,6 +119,16 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
+        pcp_metadata = common_attn_metadata.pcp_metadata
+        if pcp_metadata is not None:
+            return CompressorMetadata(
+                block_table=pcp_metadata.block_table_tensor,
+                slot_mapping=pcp_metadata.cache_slot_mapping,
+                block_size=self.block_size,
+                token_to_req_indices=pcp_metadata.token_to_req_indices,
+                positions=pcp_metadata.positions,
+            )
+
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
             self.token_to_req_indices
         )
@@ -310,12 +326,6 @@ class DeepseekCompressor(nn.Module):
         positions: torch.Tensor,
         rotary_emb,
     ) -> None:
-        # Each of shape [num_tokens, coff * self.head_dim]
-        # input bf16, output are fp32
-        kv, score = kv_score.split(
-            [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
-        )
-
         # Get the metadata and handle dummy profiling run.
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
@@ -323,6 +333,15 @@ class DeepseekCompressor(nn.Module):
 
         state_metadata = cast(
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
+        )
+        if state_metadata.positions is not None:
+            kv_score = get_pcp_group().all_gather(kv_score, dim=0)
+            positions = state_metadata.positions
+
+        # Each of shape [num_tokens, coff * self.head_dim]. Input is bf16 and
+        # outputs are fp32. Under PCP this split must happen after all-gather.
+        kv, score = kv_score.split(
+            [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
         )
         token_to_req_indices = state_metadata.token_to_req_indices
         slot_mapping = state_metadata.slot_mapping

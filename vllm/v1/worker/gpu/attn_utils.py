@@ -20,6 +20,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
+    PCPAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -584,6 +585,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    pcp_attn_metadata: tuple[PCPAttentionMetadata, ...] | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -628,6 +630,9 @@ def build_attn_metadata(
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            pcp_metadata=(
+                pcp_attn_metadata[i] if pcp_attn_metadata is not None else None
+            ),
             **common_attn_metadata_extra_kwargs,
         )
 

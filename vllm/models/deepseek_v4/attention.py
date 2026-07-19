@@ -26,6 +26,10 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    quantize_and_insert_k_cache,
+)
+from vllm.models.deepseek_v4.common.ops.qnorm_rope import qnorm_rope_kv
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -37,7 +41,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -169,6 +173,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         layer_id = extract_layer_index(prefix)
 
         self.prefix = prefix  # Alias for compatibility with compressor
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
         assert self.n_heads % tp_size == 0
@@ -256,7 +261,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
             # ROCm, where aux_stream_list is None.
             indexer_aux_stream = (
-                aux_stream_list[2] if aux_stream_list is not None else None
+                aux_stream_list[2]
+                if aux_stream_list is not None and self.pcp_world_size == 1
+                else None
             )
             self.indexer = DeepseekV4Indexer(
                 vllm_config,
@@ -444,6 +451,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
+        if self.pcp_world_size > 1:
+            # PCP cache replication issues collectives in a fixed order on the
+            # default stream: SWA KV, indexer compressor, then MLA compressor.
+            # Running these on independent auxiliary streams can reorder NCCL
+            # collectives across ranks and deadlock.
+            q = self.wq_b(qr)[0].view(-1, self.n_local_heads, self.head_dim)
+            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            if self.indexer is not None:
+                self.indexer(
+                    hidden_states,
+                    qr,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    self.indexer_rotary_emb,
+                )
+            if self.compressor is not None:
+                self.compressor(kv_score, positions, self.rotary_emb)
+            self.forward_mqa(q, kv, positions, out)
+            return
+
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
@@ -545,6 +573,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
+            if self.pcp_world_size > 1:
+                assert swa_metadata.cache_slot_mapping is not None
+                kv_roped = qnorm_rope_kv(
+                    q,
+                    kv,
+                    positions,
+                    cos_sin_cache,
+                    self.eps,
+                )
+                gathered_kv = get_pcp_group().all_gather(kv_roped, dim=0)
+                quantize_and_insert_k_cache(
+                    gathered_kv,
+                    swa_kv_cache.view(swa_kv_cache.shape[0], -1),
+                    swa_metadata.cache_slot_mapping,
+                    block_size=swa_metadata.block_size,
+                )
+                if self.n_local_heads < self.padded_heads:
+                    q = F.pad(
+                        q,
+                        (0, 0, 0, self.padded_heads - self.n_local_heads),
+                        value=0.0,
+                    )
+                return q
+
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
             #            the padding head slots; the kernel allocates and returns
