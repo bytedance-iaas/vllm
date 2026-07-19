@@ -252,7 +252,9 @@ class MooncakeBootstrapServer:
         return {"status": "ok"}
 
     async def query(self) -> dict[int, EngineEntry]:
-        if any(not entry.is_complete() for entry in self.workers.values()):
+        if not self.workers or any(
+            not entry.is_complete() for entry in self.workers.values()
+        ):
             raise HTTPException(
                 status_code=503,
                 detail="Mooncake prefiller worker topology is not ready.",
