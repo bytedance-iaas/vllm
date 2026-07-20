@@ -25,6 +25,11 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 logger = init_logger(__name__)
 
 
+def _requires_pure_prefill(model_runner: GPUModelRunner) -> bool:
+    pcp_manager = getattr(model_runner, "pcp_manager", None)
+    return bool(pcp_manager is not None and pcp_manager.requires_pure_prefill)
+
+
 def run_mixed_prefill_decode_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -38,8 +43,7 @@ def run_mixed_prefill_decode_warmup(
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
         return False
 
-    pcp_manager = getattr(model_runner, "pcp_manager", None)
-    if pcp_manager is not None and pcp_manager.requires_pure_prefill:
+    if _requires_pure_prefill(model_runner):
         logger.info(
             "Skipping V2 mixed prefill+decode warmup for a pure-prefill PCP worker."
         )
@@ -271,7 +275,7 @@ def warmup_kernels(
     model_runner.kv_connector.set_disabled(True)
     worker_execute_model(prefill_output)
 
-    if not model_runner.is_pooling_model:
+    if not model_runner.is_pooling_model and not _requires_pure_prefill(model_runner):
         # Warm up sampler and perform a decode step for non-pooling models.
 
         grammar_output = None
@@ -316,6 +320,8 @@ def warmup_kernels(
 
         worker_execute_model(decode_output)
         worker_sample_tokens(None)
+    elif _requires_pure_prefill(model_runner):
+        logger.info("Skipping V2 decode kernel warmup for a pure-prefill PCP worker.")
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()

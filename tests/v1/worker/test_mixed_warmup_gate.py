@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
+from vllm.v1.worker.gpu.warmup import (
+    run_mixed_prefill_decode_warmup,
+    warmup_kernels,
+)
 
 
 def _fail(*args, **kwargs):
@@ -47,3 +50,44 @@ def test_mixed_warmup_skipped_for_pure_prefill_pcp():
         )
         is False
     )
+
+
+def test_kernel_warmup_keeps_pure_prefill_pcp_batch_pure(monkeypatch):
+    class FakeConnector:
+        def __init__(self):
+            self.disabled = []
+
+        def set_disabled(self, disabled):
+            self.disabled.append(disabled)
+
+    connector = FakeConnector()
+    runner = SimpleNamespace(
+        num_speculative_steps=0,
+        decode_query_len=1,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ],
+            num_blocks=16,
+        ),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_encoder_decoder=False,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=2,
+            max_num_batched_tokens=128,
+        ),
+        is_pooling_model=False,
+        pcp_manager=SimpleNamespace(requires_pure_prefill=True),
+        kv_connector=connector,
+    )
+    execute_calls = []
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.warmup.torch.accelerator.synchronize", lambda: None
+    )
+
+    warmup_kernels(runner, execute_calls.append, _fail)
+
+    assert len(execute_calls) == 2
+    assert execute_calls[0].scheduled_new_reqs
+    assert execute_calls[1].finished_req_ids
+    assert connector.disabled == [True, False]
