@@ -34,6 +34,7 @@ from vllm.config.vllm import (
     OptimizationLevel,
 )
 from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -65,6 +66,36 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env_value)
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
+
+
+@pytest.mark.parametrize(
+    ("use_v2_model_runner", "expected_capture_sizes"),
+    [
+        (False, [4, 8, 12, 16]),
+        (True, list(range(1, 17))),
+    ],
+)
+def test_resolve_cudagraph_mode_adjusts_spec_decode_sizes_only_for_v1(
+    use_v2_model_runner,
+    expected_capture_sizes,
+):
+    compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=list(range(1, 17)),
+    )
+    compilation_config.max_cudagraph_capture_size = 16
+    compilation_config.post_init_cudagraph_sizes()
+
+    cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.ALWAYS,
+        "FakeAttentionBackend",
+        uniform_decode_query_len=4,
+        use_v2_model_runner=use_v2_model_runner,
+        tensor_parallel_size=1,
+    )
+
+    assert cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    assert compilation_config.cudagraph_capture_sizes == expected_capture_sizes
 
 
 @pytest.mark.parametrize(
@@ -1491,6 +1522,53 @@ def test_draft_sample_method_gumbel_is_rejected():
             num_speculative_tokens=1,
             draft_sample_method="gumbel",
         )
+
+
+@patch("vllm.config.speculative.ModelConfig")
+def test_mtp_draft_inherits_model_weights_from_object_storage(
+    mock_model_config_cls,
+):
+    """Regression test for https://github.com/vllm-project/vllm/issues/42060.
+
+    When the target model is resolved from object storage (e.g.
+    --load-format runai_streamer with an s3:// model),
+    target_model_config.model points at a local config-only cache dir
+    (it never contains safetensors) while target_model_config.model_weights
+    keeps the original object-storage URL. A draft that shares the target
+    checkpoint (e.g. MTP) must inherit that weight source, otherwise
+    drafter weight loading falls back to the config-only cache dir and
+    fails with "Cannot find any safetensors model weights".
+    """
+    from unittest.mock import MagicMock
+
+    s3_url = "s3://my-bucket/Qwen3.6-27B-FP8/"
+    local_cache = "/root/.cache/vllm/assets/model_streamer/abcd1234"
+
+    mock_draft = MagicMock()
+    mock_draft.model = local_cache
+    mock_draft.model_weights = ""  # not resolved from object storage itself
+    mock_draft.hf_config.model_type = "deepseek_mtp"
+    mock_draft.hf_config.n_predict = None
+    mock_draft.max_model_len = 4096
+    mock_model_config_cls.return_value = mock_draft
+
+    target_config = MagicMock()
+    target_config.model = local_cache
+    target_config.model_weights = s3_url
+    target_config.hf_text_config.model_type = "deepseek_v3"
+    target_config.quantization = None
+    target_config.max_model_len = 4096
+
+    SpeculativeConfig(
+        method="mtp",
+        num_speculative_tokens=1,
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    # The draft model config must load weights from the same object-storage
+    # source as the target, not from the local config-only cache dir.
+    assert mock_draft.model_weights == s3_url
 
 
 def test_ir_op_priority_default():

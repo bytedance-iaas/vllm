@@ -56,7 +56,11 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+    MLAAttentionSpec,
+    get_kv_quant_mode,
+)
 
 logger = init_logger(__name__)
 
@@ -81,8 +85,6 @@ def _resolve_dsv4_kv_cache_dtype(
             f"got {kv_cache_dtype}"
         )
         if kv_cache_dtype != "fp8_ds_mla":
-            if cache_config is not None:
-                cache_config.cache_dtype = "fp8_ds_mla"
             kv_cache_dtype = "fp8_ds_mla"
             logger.info_once("Using DeepSeek's fp8_ds_mla KV cache format.")
         return kv_cache_dtype, torch.uint8
@@ -92,6 +94,25 @@ def _resolve_dsv4_kv_cache_dtype(
         return kv_cache_dtype, torch.float8_e4m3fn
     # auto / bfloat16 -> plain bf16 KV row.
     return kv_cache_dtype, torch.bfloat16
+
+
+def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
+    """Resolve (operational_compress_ratio, use_unscaled_rope) for a layer.
+
+    NOTE(zyongye) Compress ratio can't be 0; historically every layer_id >=
+    num_hidden_layers (the MTP draft layer) was mapped to 1 because "MTP layer
+    is not included in the compress ratio list". Some checkpoints DO include
+    their MTP draft layer in compress_ratios, with an entry of 0 meaning
+    uncompressed KV and plain (unscaled) rope. The operational ratio stays
+    clamped to >= 1 (KV-cache specs treat 1 as "no compression" and divide by
+    it); a raw 0 only selects unscaled rope for that layer.
+    """
+    if layer_id < config.num_hidden_layers:
+        return max(1, config.compress_ratios[layer_id]), False
+    if layer_id < len(config.compress_ratios):
+        raw_compress_ratio = config.compress_ratios[layer_id]
+        return max(1, raw_compress_ratio), raw_compress_ratio == 0
+    return 1, False
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -177,13 +198,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
-        # NOTE(zyongye) Compress ratio can't be 0
-        # we do this for because MTP layer is not included
-        # in the compress ratio list
-        if layer_id < config.num_hidden_layers:
-            self.compress_ratio = max(1, config.compress_ratios[layer_id])
-        else:
-            self.compress_ratio = 1
+        self.compress_ratio, use_unscaled_rope = resolve_layer_compress_ratio(
+            config, layer_id
+        )
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
@@ -247,6 +264,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
+            use_unscaled_rope=use_unscaled_rope,
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
@@ -622,6 +640,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             cache_dtype_str=self.kv_cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else None,
             model_version="deepseek_v4",
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
 

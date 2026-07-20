@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -248,6 +249,19 @@ def _reshape_attention_kv_cache(
     return kv_cache.permute(*inv_order)
 
 
+def _layer_cache_dtype_str(kv_cache_spec: AttentionSpec, cache_dtype: str) -> str:
+    """Resolve the per-layer cache dtype used for backend KV shape/layout.
+
+    Layers with an unquantized spec (e.g. --kv-cache-dtype-skip-layers) must use
+    the "auto" shape; quantized layers use their own ``cache_dtype_str`` so
+    layouts like DeepSeek-V4 ``fp8_ds_mla`` (584B/token) are honored instead of
+    the global cache dtype. Mirrors the V1 runner reshape path.
+    """
+    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE:
+        return "auto"
+    return getattr(kv_cache_spec, "cache_dtype_str", None) or cache_dtype
+
+
 def _reshape_kv_cache(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -306,7 +320,7 @@ def _reshape_kv_cache(
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=_layer_cache_dtype_str(kv_cache_spec, cache_dtype),
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -382,7 +396,7 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=_layer_cache_dtype_str(kv_cache_spec, cache_dtype),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:
@@ -474,7 +488,7 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     skip_online_c128_plan: bool = False,
-    causal: bool = True,
+    causal: bool | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -495,6 +509,7 @@ def build_attn_metadata(
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -512,7 +527,7 @@ def build_attn_metadata(
             max_query_len=max_query_len,
             block_table_tensor=block_table,
             slot_mapping=slot_mapping,
-            causal=causal,
+            causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
             req_state_indices=req_state_indices,

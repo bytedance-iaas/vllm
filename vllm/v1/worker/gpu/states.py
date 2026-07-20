@@ -57,6 +57,9 @@ class RequestState:
         self.num_computed_tokens = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self.num_cached_tokens = StagedWriteTensor(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 
@@ -109,6 +112,7 @@ class RequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+        self.num_cached_tokens.stage_write_elem(req_idx, num_computed_tokens)
 
         if 0 < num_computed_tokens <= prefill_len:
             # For PD disagg or resumed requests: set last_sampled to the last
@@ -128,6 +132,7 @@ class RequestState:
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
+        self.num_cached_tokens.apply_write()
 
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""

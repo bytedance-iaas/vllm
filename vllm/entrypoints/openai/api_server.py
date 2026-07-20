@@ -674,16 +674,24 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
-    async with build_async_engine_client(
-        args,
-        client_config=client_config,
-    ) as engine_client:
-        shutdown_task = await build_and_serve(
-            engine_client, listen_address, sock, args, **uvicorn_kwargs
-        )
-    # NB: Await server shutdown only after the backend context is exited
+    phase = "engine-client creation"
     try:
+        async with build_async_engine_client(
+            args,
+            client_config=client_config,
+        ) as engine_client:
+            phase = "build_and_serve"
+            shutdown_task = await build_and_serve(
+                engine_client, listen_address, sock, args, **uvicorn_kwargs
+            )
+            phase = "engine-client shutdown"
+
+        # NB: Await server shutdown only after the backend context is exited
+        phase = "server shutdown"
         await shutdown_task
+    except BaseException:
+        logger.exception("API server worker failed during %s", phase)
+        raise
     finally:
         sock.close()
 

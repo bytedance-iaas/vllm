@@ -47,6 +47,89 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+_SLIDING_ATTENTION = "sliding_attention"
+
+
+def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
+    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
+    override = (getattr(config, "dflash_config", None) or {}).get("causal")
+    if override is not None:
+        return override
+    layer_types = getattr(config, "layer_types", None)
+    return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
+
+
+def dflash_has_any_noncausal(config: Qwen3Config) -> bool:
+    """Whether the draft needs a non-causal-capable backend, resolved from config
+    (config mirror of the model's ``get_draft_attn_causal``, usable pre-build)."""
+    return not all(
+        _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
+    )
+
+
+def _resolve_layer_attention(
+    config: Qwen3Config, layer_idx: int
+) -> tuple[int | None, bool]:
+    """Resolve ``(sliding_window, causal)`` for one DFlash draft layer.
+
+    +----------------------+-------------------------+--------------------------------+
+    | Config               | ``layer_type``          | *``causal``                    |
+    +======================+=========================+================================+
+    | ``layer_types``      | SWA if ``use_swa``      | True if ``layer_types[i]=SWA`` |
+    |                      | else ``layer_types[i]`` | else False                     |
+    +----------------------+-------------------------+--------------------------------+
+    | ``layer_types=None`` | SWA                     | False                          |
+    | + ``use_swa=True``   |                         |                                |
+    +----------------------+-------------------------+--------------------------------+
+    | ``layer_types=None`` | Full                    | False                          |
+    | + ``use_swa=False``  |                         |                                |
+    +----------------------+-------------------------+--------------------------------+
+    * If ``dflash_config.causal`` is set, its value overrides ``causal`` for all layers.
+
+    This is to support a varied ecosystem of checkpoints, including:
+    - XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash (sets "use_swa", assumes non-causal)
+    - z-lab/gemma-4-31B-it-DFlash (has mixed layer types, assumes causal only for SWA)
+    - z-lab/Qwen3.5-9B-DFlash ("standard" DFlash, all full attn, assumes non-causal)
+    """
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    layer_types = getattr(config, "layer_types", None)
+    use_swa = dflash_config.get("use_swa", False)
+
+    any_sliding = False
+    if layer_types is not None:
+        num_sliding = sum(lt == _SLIDING_ATTENTION for lt in layer_types)
+        any_sliding = num_sliding > 0
+        # Mixed sliding/full attention needs multiple KV groups (V2 runner only).
+        if (
+            0 < num_sliding < len(layer_types)
+            and not get_current_vllm_config().use_v2_model_runner
+        ):
+            raise NotImplementedError(
+                "DFlash drafters with mixed sliding/full attention require "
+                "the V2 model runner; relaunch with "
+                "VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+
+    # ``use_swa`` forces SWA on every layer, even an all-full ``layer_types``.
+    if layer_types is None or (use_swa and not any_sliding):
+        is_sliding = use_swa
+    else:
+        is_sliding = layer_types[layer_idx] == _SLIDING_ATTENTION
+
+    sliding_window = None
+    if is_sliding:
+        sliding_window = dflash_config.get(
+            "swa_window_size", getattr(config, "sliding_window", None)
+        )
+        if sliding_window is None:
+            raise ValueError(
+                "DFlash sliding attention requires a window size configured in "
+                "dflash_config.swa_window_size or the top-level sliding_window."
+            )
+
+    return sliding_window, _dflash_layer_causal(config, layer_idx)
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -64,6 +147,9 @@ class DFlashQwen3Attention(nn.Module):
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
+        add_swa_attention_sink_bias: bool = False,
+        sliding_window: int | None = None,
+        causal: bool = False,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -109,6 +195,13 @@ class DFlashQwen3Attention(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
+        self.attention_sink_bias = (
+            torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            if add_swa_attention_sink_bias
+            else None
+        )
+        self.sliding_window = sliding_window
+        self.causal = causal
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -116,8 +209,10 @@ class DFlashQwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            sinks=self.attention_sink_bias,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -156,6 +251,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         *,
         config: Qwen3Config,
+        layer_idx: int,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -164,6 +260,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
+        sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -172,6 +269,11 @@ class DFlashQwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
+            add_swa_attention_sink_bias=getattr(
+                config, "add_swa_attention_sink_bias", False
+            ),
+            sliding_window=sliding_window,
+            causal=causal,
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
@@ -248,6 +350,7 @@ class DFlashQwen3Model(nn.Module):
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
                     config=self.config,
+                    layer_idx=layer_idx,
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
@@ -345,7 +448,7 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | None = None,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -424,7 +527,13 @@ class DFlashQwen3Model(nn.Module):
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        per_layer = isinstance(context_slot_mapping, (list, tuple))
         for i in range(L):
+            slot_mapping = (
+                context_slot_mapping[i] if per_layer else context_slot_mapping
+            )
+            if slot_mapping is None:
+                continue  # dummy run: skip cache ops
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
@@ -432,7 +541,7 @@ class DFlashQwen3Model(nn.Module):
                 all_k_final[i],
                 all_v[i],
                 kv_cache,
-                context_slot_mapping,
+                slot_mapping,
             )
 
     def forward(
@@ -538,6 +647,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
 
+    def get_draft_kv_cache_layer_names(self) -> list[str]:
+        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        """Per-layer attention causality aligned with draft KV layer names."""
+        return [layer.self_attn.causal for layer in self.model.layers]
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -559,7 +675,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | None = None,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(

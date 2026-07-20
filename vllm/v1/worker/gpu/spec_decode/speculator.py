@@ -158,6 +158,12 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         self.draft_attn_layer_names = all_attn_layers - target_attn_layer_names
 
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        """Config for the draft's attention metadata builders. Overridden by
+        speculators whose attention mode differs from the target's."""
+        return self.vllm_config
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -166,9 +172,9 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
-        self.attn_groups, _, _ = init_attn_backend(
+        self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
-            self.vllm_config,
+            self.attn_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
         )
@@ -258,3 +264,7 @@ class DraftModelSpeculator(BaseSpeculator):
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         self.idx_mapping[:num_reqs].copy_(idx_mapping)
+        if self.draft_logits is not None:
+            # idx_mapping for CG padded requests points to -1, which is ignored
+            # during sampling to prevent writing stale values to draft logits.
+            self.idx_mapping[num_reqs:].fill_(-1)

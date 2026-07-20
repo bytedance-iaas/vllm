@@ -91,8 +91,11 @@ def gumbel_block_argmax(
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr = False,
 ):
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
+    is_valid_req = req_state_idx >= 0
+    temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
+        tl.float32
+    )
     if temp != 0.0 and APPLY_TEMPERATURE:
         # Apply temperature.
         # NOTE(woosuk): Match the behavior of _temperature_kernel.
@@ -114,7 +117,7 @@ def gumbel_block_argmax(
             + col * vocab_size
             + block,
             logits,
-            mask=mask,
+            mask=mask & is_valid_req,
         )
 
     # fp32 is the default reduction dtype; fp64 is ~1/32–1/64x the throughput
@@ -123,7 +126,7 @@ def gumbel_block_argmax(
         logits = logits.to(tl.float64)
     if temp != 0.0:
         # Calculate the seed for gumbel noise.
-        seed = tl.load(seeds_ptr + req_state_idx)
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
         pos = tl.load(pos_ptr + token_idx)
         gumbel_seed = tl.randint(seed, pos)
 
@@ -213,6 +216,11 @@ def gumbel_sample(
     output_processed_logits_col: torch.Tensor | None = None,
     use_fp64: bool = False,
 ) -> torch.Tensor:
+    # Enforce contiguity on non-strided input tensors
+    expanded_idx_mapping = expanded_idx_mapping.contiguous()
+    pos = pos.contiguous()
+    if output_processed_logits_col is not None:
+        output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)

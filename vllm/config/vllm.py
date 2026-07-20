@@ -522,7 +522,26 @@ class VllmConfig:
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
+            if (
+                not use_v2_model_runner
+                and self.speculative_config is not None
+                and self.speculative_config.method == "dspark"
+            ):
+                raise ValueError(
+                    "DSpark speculative decoding requires the V2 model runner, "
+                    "but VLLM_USE_V2_MODEL_RUNNER explicitly disables it."
+                )
             return use_v2_model_runner
+
+        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
+        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
+        # is unsupported for the rest of the config, _validate_v2_model_runner
+        # raises rather than silently falling back to V1 (which can't run dspark).
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+        ):
+            return True
 
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
@@ -761,13 +780,15 @@ class VllmConfig:
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            or self.use_v2_model_runner
         ):
             return
 
         logger.warning_once(
             "Dynamic speculative decoding changes the target verification "
             "length at runtime. Overriding cudagraph_mode from %s to "
-            "PIECEWISE for reliability.",
+            "PIECEWISE for reliability. Use VLLM_USE_V2_MODEL_RUNNER=1 "
+            "if you want to use full CUDA graphs.",
             self.compilation_config.cudagraph_mode.name,
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
@@ -895,6 +916,22 @@ class VllmConfig:
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
+        # DSpark's draft model wrapper does not implement the MixtureOfExperts
+        # protocol, so EPLB cannot register or rebalance its experts. Under EPLB
+        # the target model would be rebalanced while the draft keeps a stale
+        # expert map, silently diverging routing/weights. Fail closed instead.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+            and self.parallel_config.enable_eplb
+        ):
+            raise ValueError(
+                "DSpark speculative decoding is not compatible with EPLB "
+                "(--enable-eplb): the DSpark draft model is not EPLB-managed, "
+                "so its experts would not be rebalanced with the target. Use "
+                "static expert parallelism, or disable EPLB."
+            )
+
         if (
             self.mamba_config.enable_stochastic_rounding
             and self.cache_config.mamba_ssm_cache_dtype != "float16"
@@ -946,10 +983,11 @@ class VllmConfig:
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
+                    and self.speculative_config.method != "dspark"
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model/NGram GPU kind of "
+                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark kind of "
                         "speculative decoding"
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
@@ -977,6 +1015,7 @@ class VllmConfig:
                 self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
+                and self.speculative_config.method != "dspark"
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -2028,17 +2067,21 @@ class VllmConfig:
             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
             if speculative_config.method in ("ngram", "ngram_gpu"):
                 unsupported.append("ngram/ngram_gpu speculative decoding")
-            elif speculative_config.method not in ("eagle", "eagle3", "mtp", "dflash"):
+            elif speculative_config.method not in (
+                "eagle",
+                "eagle3",
+                "mtp",
+                "dflash",
+                "dspark",
+            ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
-            if speculative_config.uses_dynamic_speculative_decoding():
-                unsupported.append("dynamic speculative decoding")
-
-            # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle)
-            # DFlash uses parallel drafting natively in V2 via DFlashSpeculator.
+            # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
+            # DFlash and DSpark use parallel drafting natively in V2 via their
+            # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method != "dflash"
+                and speculative_config.method not in ("dflash", "dspark")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
@@ -2136,6 +2179,19 @@ class VllmConfig:
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
+            # The DFlash/DSpark draft path computes context slot mappings
+            # without DCP sharding (dcp-blind), so the draft reads wrong KV
+            # blocks and acceptance collapses to ~0%. Fail fast instead.
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.method in ("dflash", "dspark")
+            ):
+                raise NotImplementedError(
+                    "DFlash/DSpark speculative decoding does not support "
+                    "decode context parallelism (dcp-blind draft slot "
+                    "mapping); use decode_context_parallel_size=1 or a "
+                    "different speculative method (e.g. mtp)."
+                )
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":

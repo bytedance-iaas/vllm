@@ -189,17 +189,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
-            if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+            method = self.speculative_config.method
+            # Aux-hidden-state draft methods (dspark / dflash / eagle3) draft from
+            # the target's intermediate hidden states, which are only materialized
+            # whole on a single rank — hence PP-incompatible on a drafting
+            # instance. In PD-disaggregation, however, only the decode
+            # (kv_consumer) side drafts; the prefill (kv_producer) side just
+            # generates and transfers KV. So on a producer we skip speculator
+            # construction and aux-hidden-state emission entirely, keeping its
+            # forward identical to a plain target run and letting prefill keep
+            # pipeline parallelism even when handed the shared spec config. This
+            # is scoped to the aux-hidden-state methods; MTP/other methods keep
+            # their prior producer behavior unchanged.
+            is_aux_hidden_state_method = method in ("eagle3", "dflash", "dspark")
+            skip_draft_on_producer = (
+                is_aux_hidden_state_method and self._is_kv_producer_only_instance()
+            )
 
-            if self.speculative_config.method in ("eagle3", "dflash"):
-                # Drafting may require auxiliary hidden states from target model outputs
-                self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
+            if not skip_draft_on_producer:
+                if self.is_last_pp_rank:
+                    self.speculator = init_speculator(self.vllm_config, self.device)
+
+                if is_aux_hidden_state_method:
+                    # Drafting may require auxiliary hidden states from target
+                    # model outputs.
+                    self.use_aux_hidden_state_outputs = True
+                    if self.use_pp:
+                        raise ValueError(
+                            f"{method} with pipeline parallel is not supported."
+                        )
 
         # Online C128 MTP uses transactional candidate banks.
         import vllm.envs as envs
@@ -281,6 +299,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+    def _is_kv_producer_only_instance(self) -> bool:
+        """True when this engine is a pure PD-disaggregation prefill producer.
+
+        A producer instance transfers KV to the decode side and never runs the
+        speculator, so speculative-method restrictions that only concern the
+        drafting path (e.g. the aux-hidden-state / pipeline-parallel guard) do
+        not apply to it. A kv_both instance is decode-capable and still drafts.
+        """
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        return (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+            and not kv_transfer_config.is_kv_consumer
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -494,9 +527,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,
             self.decode_query_len,
-            self.parallel_config.tensor_parallel_size,
-            self.kv_cache_config,
-            self.max_num_reqs,
+            use_v2_model_runner=True,
+            tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+            kv_cache_config=self.kv_cache_config,
+            max_num_reqs=self.max_num_reqs,
         )
         # Online C128 keeps FULL graphs for uniform decode; mixed/prefill need PW.
         from vllm.models.deepseek_v4.online_c128 import online_c128_compress_enabled
@@ -526,15 +560,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
         )
-        if self.speculator is not None:
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
-
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
             )
+            if hasattr(self.speculator, "set_num_cached_tokens"):
+                self.speculator.set_num_cached_tokens(
+                    self.req_states.num_cached_tokens.gpu
+                )
+        if self.speculator is not None:
+            # After set_attn, so the speculator can size its cudagraph mode
+            # to its own attention support.
+            self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(

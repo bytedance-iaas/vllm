@@ -2621,14 +2621,28 @@ class MooncakeConnectorWorker:
             layer_index = extract_layer_index(layer_name)
             speculative_config = self.vllm_config.speculative_config
             speculative_method = getattr(speculative_config, "method", None)
-            is_mtp_speculative = speculative_method == "mtp" or (
-                isinstance(speculative_method, str)
-                and speculative_method.endswith("_mtp")
+            # Draft models append decode-local KV layers at indices
+            # >= total_num_hidden_layers. These are never transferred over P/D:
+            # MTP appends its next-token layers, while aux-hidden-state methods
+            # (DSpark/DFlash) register a decode-local draft SWA cache. Skipping
+            # them keeps the producer/consumer registered target-KV layer sets
+            # symmetric so Mooncake region alignment is not polluted by
+            # draft-only regions that exist on the decode side.
+            is_draft_kv_speculative = (
+                speculative_method in ("mtp", "dspark", "dflash")
+                or (
+                    isinstance(speculative_method, str)
+                    and speculative_method.endswith("_mtp")
+                )
             )
-            if is_mtp_speculative and layer_index >= total_num_hidden_layers:
+            if (
+                is_draft_kv_speculative
+                and layer_index >= total_num_hidden_layers
+            ):
                 logger.debug(
-                    "Skipping MTP speculative KV cache layer %s outside the "
-                    "base model layer range [0, %d)",
+                    "Skipping %s speculative draft KV cache layer %s outside "
+                    "the base model layer range [0, %d)",
+                    speculative_method,
                     layer_name,
                     total_num_hidden_layers,
                 )
