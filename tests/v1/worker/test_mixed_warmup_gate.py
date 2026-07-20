@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.warmup import (
     run_mixed_prefill_decode_warmup,
     warmup_kernels,
@@ -80,7 +81,7 @@ def test_kernel_warmup_keeps_pure_prefill_pcp_batch_pure(monkeypatch):
         pcp_manager=SimpleNamespace(requires_pure_prefill=True),
         kv_connector=connector,
     )
-    execute_calls = []
+    execute_calls: list[SchedulerOutput] = []
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.warmup.torch.accelerator.synchronize", lambda: None
     )
