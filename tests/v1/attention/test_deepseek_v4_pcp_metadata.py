@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
@@ -99,7 +100,9 @@ def test_compressor_builder_uses_complete_pcp_cache_write_view() -> None:
     assert metadata.positions.data_ptr() == pcp_metadata.positions.data_ptr()
 
 
-def test_flashmla_builder_uses_precomputed_pcp_compressed_cache_mapping() -> None:
+def test_flashmla_builder_derives_compressed_mapping_from_pcp_logical_view(
+    monkeypatch,
+) -> None:
     pcp_metadata = _make_pcp_metadata()
     common = _make_common_metadata(
         slot_mapping=torch.tensor([1, 2, 3, 4, 5, 6]),
@@ -110,6 +113,7 @@ def test_flashmla_builder_uses_precomputed_pcp_compressed_cache_mapping() -> Non
     builder.compress_ratio = 4
     builder.topk_tokens = 16
     builder.req_id_per_token_buffer = torch.empty(8, dtype=torch.int32)
+    builder.compressed_slot_mapping_buffer = torch.empty(8, dtype=torch.int64)
     builder.kv_cache_spec = MLAAttentionSpec(
         block_size=256,
         num_kv_heads=1,
@@ -118,14 +122,53 @@ def test_flashmla_builder_uses_precomputed_pcp_compressed_cache_mapping() -> Non
         compress_ratio=4,
     )
 
-    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    calls = []
 
-    assert (
-        metadata.slot_mapping.data_ptr() == pcp_metadata.cache_slot_mapping.data_ptr()
+    def fake_pcp_compressed_slot_mapping(
+        logical_slot_mapping,
+        positions,
+        block_size,
+        storage_block_size,
+        compress_ratio,
+        *,
+        out,
+    ):
+        calls.append(
+            (
+                logical_slot_mapping.data_ptr(),
+                positions.data_ptr(),
+                block_size,
+                storage_block_size,
+                compress_ratio,
+            )
+        )
+        result = torch.tensor([-1, -1, -1, -1, 5, -1], dtype=torch.int64)
+        out[: result.numel()].copy_(result)
+        return out[: result.numel()]
+
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.sparse_mla.get_pcp_compressed_slot_mapping",
+        fake_pcp_compressed_slot_mapping,
+        raising=False,
     )
 
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
 
-def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
+    torch.testing.assert_close(
+        metadata.slot_mapping, torch.tensor([-1, -1, -1, -1, 5, -1])
+    )
+    assert calls == [
+        (
+            pcp_metadata.cache_slot_mapping.data_ptr(),
+            pcp_metadata.positions.data_ptr(),
+            256,
+            64,
+            4,
+        )
+    ]
+
+
+def test_pcp_manager_keeps_rank_concatenated_logical_view_for_uniform_groups(
     monkeypatch,
 ) -> None:
     class FakeBlockTables:
@@ -149,30 +192,8 @@ def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
             return source.to(device=device)
         return out.copy_(source)
 
-    compressed_calls = []
-
-    def fake_compressed_slot_mapping(
-        num_tokens,
-        query_start_loc,
-        seq_lens,
-        block_table,
-        storage_block_size,
-        compress_ratio,
-        *,
-        out,
-    ):
-        compressed_calls.append((storage_block_size, compress_ratio))
-        out.fill_(-1)
-        base = compress_ratio * 100
-        out[:4].copy_(torch.arange(base, base + 4))
-        return out[:4]
-
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.pcp_manager.async_copy_to_gpu", fake_async_copy
-    )
-    monkeypatch.setattr(
-        "vllm.v1.worker.gpu.pcp_manager.get_compressed_slot_mapping",
-        fake_compressed_slot_mapping,
     )
 
     manager = object.__new__(PCPManager)
@@ -184,33 +205,40 @@ def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
+                layer_names=["c4", "c128"],
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=256,
+                    kv_cache_specs={
+                        "c4": MLAAttentionSpec(
+                            block_size=256,
+                            num_kv_heads=1,
+                            head_size=512,
+                            dtype=torch.uint8,
+                            compress_ratio=4,
+                        ),
+                        "c128": MLAAttentionSpec(
+                            block_size=256,
+                            num_kv_heads=1,
+                            head_size=512,
+                            dtype=torch.uint8,
+                            compress_ratio=128,
+                        ),
+                    },
+                ),
+            ),
+            KVCacheGroupSpec(
                 layer_names=["swa"],
-                kv_cache_spec=SlidingWindowMLASpec(
+                kv_cache_spec=UniformTypeKVCacheSpecs(
                     block_size=256,
-                    num_kv_heads=1,
-                    head_size=512,
-                    dtype=torch.uint8,
-                    sliding_window=128,
-                ),
-            ),
-            KVCacheGroupSpec(
-                layer_names=["c4"],
-                kv_cache_spec=MLAAttentionSpec(
-                    block_size=256,
-                    num_kv_heads=1,
-                    head_size=512,
-                    dtype=torch.uint8,
-                    compress_ratio=4,
-                ),
-            ),
-            KVCacheGroupSpec(
-                layer_names=["c128"],
-                kv_cache_spec=MLAAttentionSpec(
-                    block_size=256,
-                    num_kv_heads=1,
-                    head_size=512,
-                    dtype=torch.uint8,
-                    compress_ratio=128,
+                    kv_cache_specs={
+                        "swa": SlidingWindowMLASpec(
+                            block_size=256,
+                            num_kv_heads=1,
+                            head_size=512,
+                            dtype=torch.uint8,
+                            sliding_window=128,
+                        )
+                    },
                 ),
             ),
         ],
@@ -229,13 +257,12 @@ def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
         },
     )()
     manager._global_block_tables = tuple(
-        torch.zeros((1, 2), dtype=torch.int32) for _ in range(3)
+        torch.zeros((1, 2), dtype=torch.int32) for _ in range(2)
     )
-    manager._global_block_table_ptrs = torch.zeros(3, dtype=torch.uint64)
+    manager._global_block_table_ptrs = torch.zeros(2, dtype=torch.uint64)
     manager._padded_gather_idx = torch.tensor([0, 3, 1, 0])
     manager._gathered_kv_write_mask = torch.tensor([True, True, True, False])
-    manager._pcp_cache_slot_mappings = torch.empty((3, 4), dtype=torch.int64)
-    manager._global_compressed_slot_mapping = torch.empty(4, dtype=torch.int64)
+    manager._pcp_cache_slot_mappings = torch.empty((2, 4), dtype=torch.int64)
     manager._global_token_to_req_indices = torch.empty(4, dtype=torch.int32)
     manager._expanded_token_to_req_indices = torch.empty(4, dtype=torch.int32)
     manager._expanded_positions = torch.empty(4, dtype=torch.int64)
@@ -246,7 +273,6 @@ def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
             [
                 [10, 13, 11, -1],
                 [20, 23, 21, -1],
-                [30, 33, 31, -1],
             ],
             dtype=torch.int64,
         )
@@ -257,10 +283,7 @@ def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
         metadata[0].cache_slot_mapping, torch.tensor([10, 13, 11, -1])
     )
     torch.testing.assert_close(
-        metadata[1].cache_slot_mapping, torch.tensor([400, 403, 401, -1])
-    )
-    torch.testing.assert_close(
-        metadata[2].cache_slot_mapping, torch.tensor([12800, 12803, 12801, -1])
+        metadata[1].cache_slot_mapping, torch.tensor([20, 23, 21, -1])
     )
     torch.testing.assert_close(
         metadata[0].local_cache_slot_mapping(), torch.tensor([11, -1])
@@ -268,7 +291,6 @@ def test_pcp_manager_builds_rank_concatenated_compressed_cache_view(
     torch.testing.assert_close(
         metadata[1].block_table_tensor, torch.tensor([[8, 10]], dtype=torch.int32)
     )
-    assert compressed_calls == [(64, 4), (2, 128)]
 
 
 def test_pcp_manager_dual_chunk_layout_keeps_position_jumps_in_separate_rows(

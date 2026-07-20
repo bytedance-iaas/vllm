@@ -415,6 +415,9 @@ class PCPAttentionMetadata:
     MRV2 PCP partitions query computation but replicates KV cache ownership.
     The tensors below therefore follow rank-concatenated, equally padded token
     order and describe every token whose cache entry must be written locally.
+    ``cache_slot_mapping`` is the shared logical group mapping. A per-layer
+    metadata builder must project it into physical slots when its inner cache
+    spec uses compressed storage.
     """
 
     rank: int

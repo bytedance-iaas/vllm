@@ -23,7 +23,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+    get_pcp_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
@@ -377,7 +380,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # compress_ratio > 1 (DeepseekV4)
             # Compressed slot mapping output buffer
             self.compressed_slot_mapping_buffer = torch.zeros(
-                (scheduler_config.max_num_batched_tokens,),
+                (scheduler_config.max_num_batched_tokens * self.pcp_world_size,),
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -587,8 +590,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_seq_lens = seq_lens
         if self.compress_ratio > 1:
             if common_attn_metadata.pcp_metadata is not None:
-                compressed_slot_mapping = (
-                    common_attn_metadata.pcp_metadata.cache_slot_mapping
+                pcp_metadata = common_attn_metadata.pcp_metadata
+                compressed_slot_mapping = get_pcp_compressed_slot_mapping(
+                    pcp_metadata.cache_slot_mapping,
+                    pcp_metadata.positions,
+                    self.kv_cache_spec.block_size,
+                    int(self.kv_cache_spec.storage_block_size),
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
                 )
             else:
                 padded_num_tokens = num_tokens

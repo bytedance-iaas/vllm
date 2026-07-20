@@ -9,15 +9,8 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import PCPAttentionMetadata
-from vllm.v1.attention.backends.mla.compressor_utils import (
-    get_compressed_slot_mapping,
-)
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -156,11 +149,6 @@ class PCPManager:
                 device=device,
             )
             if max_num_tokens is not None and num_kv_cache_groups > 0
-            else None
-        )
-        self._global_compressed_slot_mapping = (
-            torch.empty(max_num_tokens, dtype=torch.int64, device=device)
-            if max_num_tokens is not None
             else None
         )
         self._global_token_to_req_indices = (
@@ -710,7 +698,6 @@ class PCPManager:
         assert self._padded_gather_idx is not None
         assert self._gathered_kv_write_mask is not None
         assert self._pcp_cache_slot_mappings is not None
-        assert self._global_compressed_slot_mapping is not None
         assert self._global_token_to_req_indices is not None
         assert self._expanded_token_to_req_indices is not None
         assert self._expanded_positions is not None
@@ -760,35 +747,6 @@ class PCPManager:
 
         cache_slot_mappings = self._pcp_cache_slot_mappings[:, :num_expanded_tokens]
         cache_slot_mappings.copy_(gathered_slot_mappings)
-        for group_idx, group in enumerate(self._kv_cache_config.kv_cache_groups):
-            spec = group.kv_cache_spec
-            if not isinstance(spec, MLAAttentionSpec | SlidingWindowMLASpec):
-                continue
-            if spec.compress_ratio <= 1:
-                continue
-            global_compressed_slot_mapping = get_compressed_slot_mapping(
-                global_batch.num_tokens,
-                global_batch.query_start_loc,
-                global_batch.seq_lens,
-                global_block_tables[group_idx].clamp_(min=0),
-                int(spec.storage_block_size),
-                spec.compress_ratio,
-                out=self._global_compressed_slot_mapping,
-            )
-            group_cache_slot_mapping = cache_slot_mappings[group_idx]
-            torch.index_select(
-                global_compressed_slot_mapping,
-                0,
-                padded_gather_idx,
-                out=group_cache_slot_mapping,
-            )
-            torch.where(
-                write_mask,
-                group_cache_slot_mapping,
-                self._pad_slot_id,
-                out=group_cache_slot_mapping,
-            )
-
         return tuple(
             PCPAttentionMetadata(
                 rank=self.pcp_rank,

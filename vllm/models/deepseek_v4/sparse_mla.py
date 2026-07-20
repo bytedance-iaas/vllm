@@ -20,7 +20,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+    get_pcp_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -165,8 +168,12 @@ class DeepseekV4FlashMLAMetadataBuilder(
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when compress_ratio > 1.
         if self.compress_ratio > 1:
+            max_slot_mapping_tokens = (
+                max_num_batched_tokens
+                * vllm_config.parallel_config.prefill_context_parallel_size
+            )
             self.compressed_slot_mapping_buffer = torch.empty(
-                max_num_batched_tokens, dtype=torch.int64, device=device
+                max_slot_mapping_tokens, dtype=torch.int64, device=device
             )
 
         # Pre-allocate C128A topk buffers for CUDA graph address stability.
@@ -209,7 +216,17 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         slot_mapping = cm.slot_mapping
         if cm.pcp_metadata is not None:
-            slot_mapping = cm.pcp_metadata.cache_slot_mapping
+            if self.compress_ratio > 1:
+                slot_mapping = get_pcp_compressed_slot_mapping(
+                    cm.pcp_metadata.cache_slot_mapping,
+                    cm.pcp_metadata.positions,
+                    self.kv_cache_spec.block_size,
+                    int(self.kv_cache_spec.storage_block_size),
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                )
+            else:
+                slot_mapping = cm.pcp_metadata.cache_slot_mapping
         elif self.compress_ratio > 1:
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,

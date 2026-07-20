@@ -50,6 +50,36 @@ def _compressed_slot_mapping_kernel(
         tl.store(slot_mapping_ptr + query_start + offset, slot_ids, mask=mask)
 
 
+@triton.jit
+def _pcp_compressed_slot_mapping_kernel(
+    # [num_tokens]
+    logical_slot_mapping_ptr,
+    # [num_tokens]
+    positions_ptr,
+    # [num_tokens]
+    compressed_slot_mapping_ptr,
+    num_tokens,
+    storage_block_size,
+    LOGICAL_BLOCK_SIZE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * TRITON_BLOCK_SIZE + tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = offsets < num_tokens
+    logical_slots = tl.load(logical_slot_mapping_ptr + offsets, mask=mask)
+    positions = tl.load(positions_ptr + offsets, mask=mask)
+
+    is_valid = mask & (logical_slots >= 0) & ((positions + 1) % COMPRESS_RATIO == 0)
+    logical_block_ids = logical_slots // LOGICAL_BLOCK_SIZE
+    logical_block_offsets = logical_slots % LOGICAL_BLOCK_SIZE
+    compressed_slots = (
+        logical_block_ids * storage_block_size + logical_block_offsets // COMPRESS_RATIO
+    )
+    compressed_slots = tl.where(is_valid, compressed_slots, PAD_ID)
+    tl.store(compressed_slot_mapping_ptr + offsets, compressed_slots, mask=mask)
+
+
 def get_compressed_slot_mapping(
     num_tokens: int,
     query_start_loc: torch.Tensor,
@@ -84,3 +114,46 @@ def get_compressed_slot_mapping(
         TRITON_BLOCK_SIZE=1024,
     )
     return slot_mapping
+
+
+def get_pcp_compressed_slot_mapping(
+    logical_slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    logical_block_size: int,
+    storage_block_size: int,
+    compress_ratio: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project a rank-concatenated PCP logical cache view into one layer.
+
+    A uniform KV cache group may contain layers with different compression
+    ratios. PCP therefore gathers the shared logical slot mapping once, while
+    each layer maps it into its own physical storage layout here.
+    """
+    num_tokens = logical_slot_mapping.numel()
+    assert positions.numel() == num_tokens
+    assert logical_block_size % compress_ratio == 0
+    assert storage_block_size == logical_block_size // compress_ratio
+
+    if out is None:
+        compressed_slot_mapping = torch.empty_like(logical_slot_mapping)
+    else:
+        assert out.numel() >= num_tokens
+        compressed_slot_mapping = out[:num_tokens]
+
+    if num_tokens == 0:
+        return compressed_slot_mapping
+
+    triton_block_size = 256
+    _pcp_compressed_slot_mapping_kernel[(triton.cdiv(num_tokens, triton_block_size),)](
+        logical_slot_mapping,
+        positions,
+        compressed_slot_mapping,
+        num_tokens,
+        storage_block_size,
+        LOGICAL_BLOCK_SIZE=logical_block_size,
+        COMPRESS_RATIO=compress_ratio,
+        PAD_ID=-1,
+        TRITON_BLOCK_SIZE=triton_block_size,
+    )
+    return compressed_slot_mapping

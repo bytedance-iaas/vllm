@@ -5,9 +5,123 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import create_vllm_config
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import CommonAttentionMetadata, PCPAttentionMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_pcp_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def test_pcp_compressed_slot_mapping_accepts_empty_input():
+    logical_slots = torch.empty(0, dtype=torch.int64)
+    positions = torch.empty(0, dtype=torch.int64)
+
+    physical_slots = get_pcp_compressed_slot_mapping(
+        logical_slots,
+        positions,
+        logical_block_size=256,
+        storage_block_size=64,
+        compress_ratio=4,
+    )
+
+    assert physical_slots.shape == (0,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_pcp_compressed_slot_mapping_stays_within_physical_capacity(
+    compress_ratio: int,
+):
+    device = torch.device("cuda")
+    logical_block_size = 256
+    storage_block_size = logical_block_size // compress_ratio
+    num_blocks = 46820
+    block_ids = torch.tensor([1, 13441, num_blocks - 1], device=device)
+    block_offsets = torch.tensor(
+        [compress_ratio - 1, 2 * compress_ratio - 1, 255], device=device
+    )
+    logical_slots = block_ids * logical_block_size + block_offsets
+    positions = torch.tensor(
+        [
+            compress_ratio - 1,
+            32768 + 2 * compress_ratio - 1,
+            131072 + 255,
+        ],
+        device=device,
+    )
+    logical_slots = torch.cat((logical_slots, torch.tensor([-1], device=device)))
+    positions = torch.cat((positions, torch.tensor([0], device=device)))
+
+    physical_slots = get_pcp_compressed_slot_mapping(
+        logical_slots,
+        positions,
+        logical_block_size,
+        storage_block_size,
+        compress_ratio,
+    )
+
+    expected = torch.cat(
+        (
+            block_ids * storage_block_size + block_offsets // compress_ratio,
+            torch.tensor([-1], device=device),
+        )
+    )
+    torch.testing.assert_close(physical_slots, expected)
+    assert int(physical_slots[:-1].max()) < num_blocks * storage_block_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_indexer_builder_projects_pcp_logical_slots_per_layer():
+    device = torch.device("cuda")
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+    )
+    vllm_config = create_vllm_config(max_model_len=1024, max_num_batched_tokens=8)
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+
+    positions = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], device=device)
+    logical_slots = 256 + positions
+    pcp_metadata = PCPAttentionMetadata(
+        rank=0,
+        world_size=2,
+        local_num_tokens_padded=4,
+        positions=positions,
+        token_to_req_indices=torch.zeros(8, dtype=torch.int32, device=device),
+        block_table_tensor=torch.tensor([[1]], dtype=torch.int32, device=device),
+        cache_slot_mapping=logical_slots,
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor([4], dtype=torch.int32),
+        num_reqs=1,
+        num_actual_tokens=4,
+        max_query_len=4,
+        max_seq_len=4,
+        block_table_tensor=torch.tensor([[1]], dtype=torch.int32, device=device),
+        slot_mapping=torch.arange(256, 260, dtype=torch.int64, device=device),
+        causal=True,
+        pcp_metadata=pcp_metadata,
+    )
+
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    torch.testing.assert_close(
+        metadata.slot_mapping,
+        torch.tensor([-1, -1, -1, 65, -1, 64, -1, -1], device=device),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
