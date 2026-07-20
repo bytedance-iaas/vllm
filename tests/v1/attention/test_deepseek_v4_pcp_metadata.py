@@ -313,6 +313,57 @@ def test_pcp_manager_dual_chunk_layout_keeps_position_jumps_in_separate_rows(
     )
 
 
+def test_pcp_manager_continued_prefill_layout_at_160k_boundary(
+    monkeypatch,
+) -> None:
+    def fake_async_copy(x, out=None, device=None):
+        source = torch.as_tensor(x)
+        if out is None:
+            return source.to(device=device)
+        return out.copy_(source)
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.pcp_manager.async_copy_to_gpu", fake_async_copy
+    )
+    manager = object.__new__(PCPManager)
+    manager.pcp_world_size = 2
+    manager.device = torch.device("cpu")
+
+    segments_by_rank, per_rank_num_tokens = manager._build_batch_layout(
+        num_scheduled_tokens=np.array([32768], dtype=np.int32),
+        num_computed_tokens=np.array([131072], dtype=np.int32),
+        is_prefilling=np.array([True]),
+        query_start_loc_np=np.array([0, 32768], dtype=np.int32),
+    )
+
+    assert per_rank_num_tokens == [16384, 16384]
+    assert [segment.global_batch_slice for segment in segments_by_rank[0]] == [
+        slice(0, 8192),
+        slice(24576, 32768),
+    ]
+    assert [segment.global_batch_slice for segment in segments_by_rank[1]] == [
+        slice(8192, 16384),
+        slice(16384, 24576),
+    ]
+    starts_by_rank = [
+        [131072 + segment.global_batch_slice.start for segment in rank_segments]
+        for rank_segments in segments_by_rank
+    ]
+    assert starts_by_rank == [[131072, 155648], [139264, 147456]]
+    expected_gather_idx = torch.cat(
+        (
+            torch.arange(0, 8192),
+            torch.arange(24576, 32768),
+            torch.arange(8192, 24576),
+        )
+    )
+    torch.testing.assert_close(manager._padded_gather_idx, expected_gather_idx)
+    torch.testing.assert_close(
+        manager._gathered_kv_write_mask,
+        torch.ones(32768, dtype=torch.bool),
+    )
+
+
 def test_pcp_manager_builds_complete_padding_only_dummy_cache_view() -> None:
     manager = object.__new__(PCPManager)
     manager.pcp_rank = 1
