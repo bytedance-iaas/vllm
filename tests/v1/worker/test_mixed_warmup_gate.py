@@ -28,3 +28,22 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
         )
         is False
     )
+
+
+def test_mixed_warmup_skipped_for_pure_prefill_pcp():
+    """A pure-prefill PCP worker must not synthesize a decode request."""
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        max_num_reqs=2,
+        pcp_manager=SimpleNamespace(requires_pure_prefill=True),
+    )
+
+    assert (
+        run_mixed_prefill_decode_warmup(
+            runner,
+            worker_execute_model=_fail,
+            worker_sample_tokens=_fail,
+            num_tokens=128,
+        )
+        is False
+    )

@@ -38,6 +38,13 @@ def run_mixed_prefill_decode_warmup(
     if model_runner.is_pooling_model or model_runner.max_num_reqs < 2 or num_tokens < 3:
         return False
 
+    pcp_manager = getattr(model_runner, "pcp_manager", None)
+    if pcp_manager is not None and pcp_manager.requires_pure_prefill:
+        logger.info(
+            "Skipping V2 mixed prefill+decode warmup for a pure-prefill PCP worker."
+        )
+        return False
+
     decode_req_id = f"{req_id_prefix}_decode_"
     prefill_req_id = f"{req_id_prefix}_prefill_"
     decode_prompt_len = 2
