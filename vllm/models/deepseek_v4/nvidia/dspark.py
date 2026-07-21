@@ -15,6 +15,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -51,6 +52,10 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+
+
+def _decode_opt_bundle_enabled() -> bool:
+    return envs.VLLM_DSV4_DECODE_OPT_BUNDLE
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -214,14 +219,25 @@ def _insert_context_kv(
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
-    dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
-        dtype=kv.dtype,
-        device=kv.device,
-    )
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)
+        if _decode_opt_bundle_enabled():
+            torch.ops._C.fused_deepseek_v4_kv_rope_quant_insert(
+                kv,
+                swa_2d,
+                slot_mapping,
+                positions,
+                cos_sin_cache,
+                attn.eps,
+                block_size,
+            )
+            return
+        dummy_q = torch.zeros(
+            (n_ctx, attn.n_local_heads, attn.head_dim),
+            dtype=kv.dtype,
+            device=kv.device,
+        )
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             dummy_q,
             kv,
@@ -234,6 +250,11 @@ def _insert_context_kv(
             block_size,
         )
     elif cache_dtype == torch.bfloat16:
+        dummy_q = torch.zeros(
+            (n_ctx, attn.n_local_heads, attn.head_dim),
+            dtype=kv.dtype,
+            device=kv.device,
+        )
         swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
             dummy_q,
@@ -247,6 +268,11 @@ def _insert_context_kv(
         )
     else:  # per-tensor fp8 (torch.float8_e4m3fn)
         # TODO(ben): double-check if this is being dispatched correctly for FI backend
+        dummy_q = torch.zeros(
+            (n_ctx, attn.n_local_heads, attn.head_dim),
+            dtype=kv.dtype,
+            device=kv.device,
+        )
         swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
         dummy_q_fp8 = torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(

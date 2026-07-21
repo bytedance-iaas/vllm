@@ -685,6 +685,95 @@ void launchFusedDeepseekV4QNormRopeKVRopeQuantInsert(
 #undef DISPATCH
 }
 
+template <typename scalar_t_in>
+__global__ void fusedDeepseekV4KVRopeQuantInsertKernel(
+    scalar_t_in const* __restrict__ kv_in,
+    uint8_t* __restrict__ k_cache,
+    int64_t const* __restrict__ slot_mapping,
+    int64_t const* __restrict__ position_ids,
+    float const* __restrict__ cos_sin_cache,
+    float const eps,
+    int const num_tokens_insert,
+    int const cache_block_size,
+    int const kv_block_stride) {
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  if constexpr (std::is_same_v<scalar_t_in, c10::BFloat16>) {
+    return;
+  } else {
+#endif
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const tokenIdx = blockIdx.x * warpsPerBlock + warpId;
+    if (tokenIdx >= num_tokens_insert) return;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+
+    int const dim_base = laneId * kElemsPerLane;
+    scalar_t_in const* src_ptr =
+        kv_in + static_cast<int64_t>(tokenIdx) * kHeadDim + dim_base;
+    uint4 const v0 = *reinterpret_cast<uint4 const*>(src_ptr);
+    uint4 const v1 = *reinterpret_cast<uint4 const*>(src_ptr + 8);
+
+    // kNumHeadsQPadded is only used as the KV sentinel in this path.
+    constexpr int kKVOnlySentinel = 8;
+    processDeepseekV4Slot<scalar_t_in, kKVOnlySentinel>(
+        v0, v1, tokenIdx, kKVOnlySentinel, dim_base, laneId, 0, eps,
+        nullptr, k_cache, slot_mapping, position_ids, cos_sin_cache,
+        cache_block_size, kv_block_stride);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  }
+#endif
+}
+
+template <typename scalar_t_in>
+void launchFusedDeepseekV4KVRopeQuantInsert(
+    scalar_t_in const* kv_in, uint8_t* k_cache,
+    int64_t const* slot_mapping, int64_t const* position_ids,
+    float const* cos_sin_cache, float const eps,
+    int const num_tokens_insert, int const cache_block_size,
+    int const kv_block_stride, cudaStream_t stream) {
+  constexpr int kBlockSize = 256;
+  constexpr int kWarpsPerBlock = kBlockSize / 32;
+  int const grid =
+      (num_tokens_insert + kWarpsPerBlock - 1) / kWarpsPerBlock;
+
+#ifndef USE_ROCM
+  static int const sm_version = getSMVersion();
+  STD_TORCH_CHECK(
+      sm_version >= 80,
+      "fused_deepseek_v4_kv_rope_quant_insert requires sm_80+ "
+      "(Ampere or newer); got sm_",
+      sm_version);
+  cudaLaunchConfig_t config;
+  config.gridDim = dim3(grid);
+  config.blockDim = dim3(kBlockSize);
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  cudaLaunchKernelEx(
+      &config,
+      fusedDeepseekV4KVRopeQuantInsertKernel<scalar_t_in>,
+      kv_in, k_cache, slot_mapping, position_ids, cos_sin_cache, eps,
+      num_tokens_insert, cache_block_size, kv_block_stride);
+#else
+  fusedDeepseekV4KVRopeQuantInsertKernel<scalar_t_in>
+      <<<grid, kBlockSize, 0, stream>>>(
+          kv_in, k_cache, slot_mapping, position_ids, cos_sin_cache, eps,
+          num_tokens_insert, cache_block_size, kv_block_stride);
+#endif
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // FlashInfer full-cache kernel
 // ────────────────────────────────────────────────────────────────────────────
@@ -1021,6 +1110,65 @@ torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 stream);
       });
   return q_out;
+}
+
+void fused_deepseek_v4_kv_rope_quant_insert(
+    torch::stable::Tensor const& kv,             // [N, 512] bf16 (read-only)
+    torch::stable::Tensor& k_cache,              // [num_blocks, block_bytes] uint8
+    torch::stable::Tensor const& slot_mapping,   // [num_tokens_insert] int64
+    torch::stable::Tensor const& position_ids,   // [N] int64
+    torch::stable::Tensor const& cos_sin_cache,  // [max_pos, rope_dim] float32
+    double eps, int64_t cache_block_size) {
+  STD_TORCH_CHECK(kv.device().is_cuda() && kv.is_contiguous(),
+                  "kv must be contiguous CUDA");
+  STD_TORCH_CHECK(k_cache.device().is_cuda(), "k_cache must be CUDA");
+  STD_TORCH_CHECK(slot_mapping.device().is_cuda() &&
+                      slot_mapping.scalar_type() ==
+                          torch::headeronly::ScalarType::Long,
+                  "slot_mapping must be int64 CUDA");
+  STD_TORCH_CHECK(position_ids.device().is_cuda() &&
+                      position_ids.scalar_type() ==
+                          torch::headeronly::ScalarType::Long,
+                  "position_ids must be int64 CUDA");
+  STD_TORCH_CHECK(cos_sin_cache.device().is_cuda(), "cos_sin_cache must be CUDA");
+  STD_TORCH_CHECK(kv.dim() == 2 && kv.size(1) == 512, "kv shape [N, 512]");
+  STD_TORCH_CHECK(k_cache.scalar_type() == torch::headeronly::ScalarType::Byte,
+                  "k_cache must be uint8");
+  STD_TORCH_CHECK(cos_sin_cache.dim() == 2 && cos_sin_cache.size(1) == 64,
+                  "cos_sin_cache shape [max_pos, 64]");
+  STD_TORCH_CHECK(cos_sin_cache.scalar_type() ==
+                      torch::headeronly::ScalarType::Float,
+                  "cos_sin_cache must be float32");
+
+  int const num_tokens_full = static_cast<int>(kv.size(0));
+  int const num_tokens_insert = static_cast<int>(slot_mapping.size(0));
+  STD_TORCH_CHECK(static_cast<int>(position_ids.size(0)) == num_tokens_full,
+                  "kv/position_ids row counts must match");
+  STD_TORCH_CHECK(num_tokens_insert <= num_tokens_full,
+                  "slot_mapping must not exceed kv row count");
+  if (num_tokens_insert == 0) {
+    return;
+  }
+  int const cache_block_size_i = static_cast<int>(cache_block_size);
+  int const kv_block_stride = static_cast<int>(k_cache.stride(0));
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      kv.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(kv.get_device_index());
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      kv.scalar_type(), "fused_deepseek_v4_kv_rope_quant_insert", [&] {
+        using qkv_scalar_t = scalar_t;
+        vllm::deepseek_v4_fused_ops::
+            launchFusedDeepseekV4KVRopeQuantInsert<qkv_scalar_t>(
+                reinterpret_cast<qkv_scalar_t const*>(kv.const_data_ptr()),
+                reinterpret_cast<uint8_t*>(k_cache.mutable_data_ptr()),
+                slot_mapping.const_data_ptr<int64_t>(),
+                position_ids.const_data_ptr<int64_t>(),
+                cos_sin_cache.const_data_ptr<float>(), static_cast<float>(eps),
+                num_tokens_insert, cache_block_size_i, kv_block_stride,
+                stream);
+      });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
