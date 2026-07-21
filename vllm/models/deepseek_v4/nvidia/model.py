@@ -691,6 +691,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 f"stride={tuple(t.stride())} dtype={t.dtype}"
             )
 
+        if self._use_sm90_fp8_mega_moe:
+            assert isinstance(self._transformed_l1_weights, torch.Tensor)
+            assert isinstance(self._transformed_l2_weights, torch.Tensor)
+            return [
+                _to_eplb_view("l1_weight", self._transformed_l1_weights),
+                _to_eplb_view("l2_weight", self._transformed_l2_weights),
+            ]
+
         return [
             _to_eplb_view("l1_packed", self._transformed_l1_weights[0]),
             _to_eplb_view("l1_scale", self._transformed_l1_weights[1]),
