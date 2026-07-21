@@ -1396,7 +1396,11 @@ def test_register_kv_caches_skips_speculative_layers_outside_base_model():
         speculative_config=SimpleNamespace(method="mtp"),
     )
     worker.kv_cache_config = _make_test_kv_cache_config()
-    worker.transfer_topo = SimpleNamespace(split_k_and_v=False)
+    worker.transfer_topo = SimpleNamespace(
+        split_k_and_v=False,
+        virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
+    )
     worker.engine = MagicMock()
     worker.engine.batch_register_memory.return_value = 0
     worker.async_zmq_ctx = MagicMock()
@@ -1414,6 +1418,16 @@ def test_register_kv_caches_skips_speculative_layers_outside_base_model():
         "model.layers.0.self_attn": normal_cache,
         f"model.layers.{num_hidden_layers}.attn.swa_cache": mtp_cache,
     }
+    worker._layer_specs = {
+        "model.layers.0.self_attn": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+        ),
+    }
+    worker._layer_group_indices = {"model.layers.0.self_attn": 0}
+    worker._layer_logical_group_indices = {"model.layers.0.self_attn": [0]}
 
     worker.register_kv_caches(kv_caches)
 
@@ -1438,7 +1452,11 @@ def test_register_kv_caches_keeps_non_mtp_speculative_layers_outside_base_model(
         speculative_config=SimpleNamespace(method="eagle"),
     )
     worker.kv_cache_config = _make_test_kv_cache_config()
-    worker.transfer_topo = SimpleNamespace(split_k_and_v=False)
+    worker.transfer_topo = SimpleNamespace(
+        split_k_and_v=False,
+        virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
+    )
     worker.engine = MagicMock()
     worker.engine.batch_register_memory.return_value = 0
     worker.async_zmq_ctx = MagicMock()
@@ -1455,6 +1473,19 @@ def test_register_kv_caches_keeps_non_mtp_speculative_layers_outside_base_model(
     kv_caches = {
         "model.layers.0.self_attn": normal_cache,
         f"model.layers.{num_hidden_layers}.attn.swa_cache": eagle_cache,
+    }
+    worker._layer_specs = {
+        name: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+        )
+        for name in kv_caches
+    }
+    worker._layer_group_indices = {name: idx for idx, name in enumerate(kv_caches)}
+    worker._layer_logical_group_indices = {
+        name: [idx] for idx, name in enumerate(kv_caches)
     }
 
     worker.register_kv_caches(kv_caches)
@@ -1509,6 +1540,7 @@ def test_register_kv_caches_preserves_dsv4_shared_region_group_aliases():
     worker.transfer_topo = SimpleNamespace(
         split_k_and_v=False,
         virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
     )
     worker.engine = MagicMock()
     worker.engine.batch_register_memory.return_value = 0
@@ -1523,6 +1555,16 @@ def test_register_kv_caches_preserves_dsv4_shared_region_group_aliases():
         "model.layers.4.attn": shared_cache,
         "model.layers.4.attn.swa_cache": shared_cache,
         "model.layers.4.attn.compressor.state_cache": shared_cache,
+    }
+    worker._layer_specs = {
+        group.layer_names[0]: group.kv_cache_spec
+        for group in worker.kv_cache_config.kv_cache_groups
+    }
+    worker._layer_group_indices = {
+        name: idx for idx, name in enumerate(kv_caches)
+    }
+    worker._layer_logical_group_indices = {
+        name: [idx] for idx, name in enumerate(kv_caches)
     }
 
     worker.register_kv_caches(kv_caches)

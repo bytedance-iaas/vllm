@@ -634,7 +634,9 @@ def _common_group_indices_for_regions(
             for group_idx in common_group_indices
             if 0 <= group_idx < num_groups
         )
-    if not local_region.logical_group_indices or not remote_region.logical_group_indices:
+    if bool(local_region.logical_group_indices) != bool(
+        remote_region.logical_group_indices
+    ):
         # Legacy peers/regions did not carry group ownership metadata.
         return tuple(range(num_groups))
     if local_region.group_index == remote_region.group_index:
@@ -2088,18 +2090,18 @@ class MooncakeConnectorWorker:
         self.registered_layer_index_aliases = []
         self.registered_logical_group_indices = []
         self.registered_alias_group_indices = []
-        overlay_key_to_region_idx: dict[tuple[int, int, int, int, int], int] = {}
+        overlay_key_to_region_idx: dict[tuple[int, int, int, int], int] = {}
         region_aliases_by_key: dict[
-            tuple[int, int, int, int, int], list[str]
+            tuple[int, int, int, int], list[str]
         ] = defaultdict(list)
         region_index_aliases_by_key: dict[
-            tuple[int, int, int, int, int], list[int]
+            tuple[int, int, int, int], list[int]
         ] = defaultdict(list)
         region_logical_groups_by_key: dict[
-            tuple[int, int, int, int, int], list[int]
+            tuple[int, int, int, int], list[int]
         ] = defaultdict(list)
         region_alias_groups_by_key: dict[
-            tuple[int, int, int, int, int], list[list[int]]
+            tuple[int, int, int, int], list[list[int]]
         ] = defaultdict(list)
         speculative_config = self.vllm_config.speculative_config
         speculative_method = getattr(speculative_config, "method", None)
@@ -2164,7 +2166,6 @@ class MooncakeConnectorWorker:
                     base_addr,
                     block_len,
                     kv_block_len,
-                    layer_index,
                 )
                 logical_groups = list(
                     self._layer_logical_group_indices.get(layer_name, [])
