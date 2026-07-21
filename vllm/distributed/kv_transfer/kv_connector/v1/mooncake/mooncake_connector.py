@@ -433,6 +433,7 @@ def _align_transfer_regions_by_occurrence(
     local_keyed = keyed_regions(local_regions)
     remote_keyed = keyed_regions(remote_regions)
     remote_by_key = dict(remote_keyed)
+    local_keys = {key for key, _ in local_keyed}
     aligned_local: list[TransferRegion] = []
     aligned_remote: list[TransferRegion] = []
     for key, local_region in local_keyed:
@@ -471,6 +472,17 @@ def _align_transfer_regions_by_occurrence(
         aligned_local.append(local_region)
         aligned_remote.append(remote_region)
 
+    for key, _ in remote_keyed:
+        if key not in local_keys:
+            return (
+                [],
+                [],
+                (
+                    "Mooncake consumer registered layer has no matching "
+                    f"producer occurrence: {key[0]} occurrence {key[1]}."
+                ),
+            )
+
     return aligned_local, aligned_remote, None
 
 
@@ -501,6 +513,24 @@ def _align_transfer_regions(
         legacy_remote_regions = [
             region for region in remote_regions if not _region_has_aliases(region)
         ]
+        if any(
+            _regions_share_layer_identity(alias_region, legacy_region)
+            for alias_region in alias_local_regions
+            for legacy_region in legacy_remote_regions
+        ) or any(
+            _regions_share_layer_identity(legacy_region, alias_region)
+            for legacy_region in legacy_local_regions
+            for alias_region in alias_remote_regions
+        ):
+            return (
+                [],
+                [],
+                (
+                    "Mooncake alias metadata is present on only one side of "
+                    "matching transfer regions. Producer and consumer must use "
+                    "the same Mooncake metadata schema."
+                ),
+            )
         has_alias_group_metadata = all(
             bool(region.alias_group_indices)
             for region in alias_local_regions + alias_remote_regions
@@ -523,11 +553,14 @@ def _align_transfer_regions(
         alias_group_aligned_local: list[TransferRegion] = []
         alias_group_aligned_remote: list[TransferRegion] = []
         matched_local_indices: set[int] = set()
-        matched_alias_group_keys: set[tuple[str, int, int]] = set()
+        matched_remote_indices: set[int] = set()
 
         for local_idx, local_region in enumerate(alias_local_regions):
             alias_group_index_mismatch_region: TransferRegion | None = None
-            for candidate_remote_region in alias_remote_regions:
+            matched_local_alias_group_keys: set[tuple[str, int, int]] = set()
+            for remote_idx, candidate_remote_region in enumerate(alias_remote_regions):
+                if remote_idx in matched_remote_indices:
+                    continue
                 if not _regions_share_layer_identity(
                     local_region, candidate_remote_region
                 ):
@@ -546,7 +579,7 @@ def _align_transfer_regions(
                 duplicate_alias_group_keys = [
                     alias_group_key
                     for alias_group_key in shared_alias_group_keys
-                    if alias_group_key in matched_alias_group_keys
+                    if alias_group_key in matched_local_alias_group_keys
                 ]
                 if duplicate_alias_group_keys:
                     return (
@@ -558,10 +591,11 @@ def _align_transfer_regions(
                             f"groups={duplicate_alias_group_keys}."
                         ),
                     )
-                matched_alias_group_keys.update(shared_alias_group_keys)
+                matched_local_alias_group_keys.update(shared_alias_group_keys)
                 alias_group_aligned_local.append(local_region)
                 alias_group_aligned_remote.append(candidate_remote_region)
                 matched_local_indices.add(local_idx)
+                matched_remote_indices.add(remote_idx)
 
             if (
                 local_idx not in matched_local_indices
@@ -592,6 +626,22 @@ def _align_transfer_regions(
                         "Mooncake producer registered layer aliases have no "
                         "matching consumer alias groups: "
                         f"{sorted(local_region.match_layer_names)}."
+                    ),
+                )
+
+        for remote_idx, remote_region in enumerate(alias_remote_regions):
+            if remote_idx in matched_remote_indices:
+                continue
+            if any(
+                _regions_share_layer_identity(local_region, remote_region)
+                for local_region in alias_local_regions
+            ):
+                return (
+                    [],
+                    [],
+                    (
+                        "Mooncake duplicate alias group match for "
+                        f"{remote_region.match_layer_names}."
                     ),
                 )
 
