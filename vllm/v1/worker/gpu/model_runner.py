@@ -208,12 +208,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             online_c128_uses_mtp,
         )
 
+        self._online_c128_enabled = bool(envs.VLLM_USE_ONLINE_C128_COMPRESS)
         self._online_c128_uses_mtp = online_c128_uses_mtp(vllm_config)
         self._online_c128_verify_ctx: tuple | None = None
         # Runner hooks for online C128 state snapshot/restore; connector gates by role.
-        self._online_c128_pd_transfer = bool(
-            envs.VLLM_USE_ONLINE_C128_COMPRESS
-        ) and bool(envs.VLLM_USE_ONLINE_C128_PD_TRANSFER)
+        self._online_c128_pd_transfer = self._online_c128_enabled and bool(
+            envs.VLLM_USE_ONLINE_C128_PD_TRANSFER
+        )
         if self._online_c128_uses_mtp:
             if self.speculative_config is None or (
                 self.speculative_config.method != "mtp"
@@ -301,7 +302,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
-        if self._online_c128_uses_mtp:
+        if self._online_c128_enabled:
             # DeepSeek-V4 C128 online: clear the module-level state registry +
             # shared scratch before (re)loading so a reload does not accumulate
             # stale per-layer states from a prior model. The new model's
