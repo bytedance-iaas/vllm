@@ -262,6 +262,8 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            rm -rf /opt/venv "${UV_PYTHON_INSTALL_DIR}/.temp" "${UV_CACHE_DIR:?}"/*; \
            sleep $((attempt * 30)); \
        done \
+    && /opt/venv/bin/python3 -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+    && ln -sf /opt/venv/bin/uv "${UV_INSTALL_DIR}/uv" \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
