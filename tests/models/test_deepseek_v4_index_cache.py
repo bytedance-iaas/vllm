@@ -317,6 +317,10 @@ def test_skipped_indexer_weight_filter_matches_only_omitted_indexers():
         "model.layers.6.attn.indexer.wk_weights_proj.weight",
         skipped_layer_ids,
     )
+    assert dsv4_nvidia_model._is_dsv4_skipped_indexer_weight(
+        "model.layers.6.self_attn.indexer.wk_weights_proj.weight",
+        skipped_layer_ids,
+    )
     assert not dsv4_nvidia_model._is_dsv4_skipped_indexer_weight(
         "model.layers.6.attn.compressor.fused_wkv_wgate.weight",
         skipped_layer_ids,

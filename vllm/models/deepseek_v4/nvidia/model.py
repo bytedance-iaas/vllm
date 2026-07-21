@@ -819,8 +819,9 @@ def _is_dsv4_skipped_indexer_weight(
     weight_name: str, skipped_layer_ids: frozenset[int]
 ) -> bool:
     return any(
-        f"layers.{layer_id}.attn.indexer." in weight_name
+        f"layers.{layer_id}.{attn_name}.indexer." in weight_name
         for layer_id in skipped_layer_ids
+        for attn_name in ("attn", "self_attn")
     )
 
 
