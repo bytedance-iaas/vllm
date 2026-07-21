@@ -486,12 +486,14 @@ class Scheduler(SchedulerInterface):
                 and num_new_tokens > token_budget
             ):
                 # Do not split a speculative decode group across scheduler
-                # steps. The async GPU runner prepares input_ids by placing
-                # the previous sampled token immediately before the scheduled
-                # draft tokens; scheduling only the tail draft tokens breaks
-                # that invariant.
-                req_index += 1
-                continue
+                # steps. Fall back to a normal decode token instead of skipping
+                # forever when the whole draft group cannot fit this step.
+                request.spec_token_ids = []
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
 
             num_new_tokens = min(num_new_tokens, token_budget)
 

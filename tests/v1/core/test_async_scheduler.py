@@ -61,8 +61,9 @@ def test_async_spec_decode_does_not_split_draft_group(monkeypatch):
 
     first_req_id, second_req_id = req_ids
     assert decode_output.num_scheduled_tokens[first_req_id] == 4
-    assert second_req_id not in decode_output.num_scheduled_tokens
+    assert decode_output.num_scheduled_tokens[second_req_id] == 1
     assert decode_output.scheduled_spec_decode_tokens[first_req_id] == [1, 2, 3]
+    assert second_req_id not in decode_output.scheduled_spec_decode_tokens
 
 
 def test_async_spec_decode_rejects_group_truncated_by_model_length(monkeypatch):
