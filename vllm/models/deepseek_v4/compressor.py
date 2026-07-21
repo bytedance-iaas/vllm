@@ -621,6 +621,10 @@ class DeepseekCompressor(nn.Module):
         online_state = self.online_c128_state
         assert online_state is not None
         run_state = online_state.state
+        if kv.dtype != torch.float32:
+            kv = kv.float()
+        if score.dtype != torch.float32:
+            score = score.float()
 
         forward_context = get_forward_context()
         cg_mode = forward_context.cudagraph_runtime_mode
