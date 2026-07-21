@@ -1518,6 +1518,7 @@ def test_c128_pull_failure_reports_invalid_blocks_after_all_tasks_quiesce():
         remote_engine_id="engine",
         remote_bootstrap_addr="http://bootstrap",
     )
+    pull_meta.pull_tasks_count = 2
     pull_meta.c128_import_slot = 0
     pull_meta.c128_pull_pending = 2
     pull_metas = {"req": pull_meta}
