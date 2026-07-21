@@ -72,6 +72,7 @@ class DSparkDeepseekV4Model(nn.Module):
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
 
         self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
+        self.decode_opt_bundle = _decode_opt_bundle_enabled()
 
         # Shared with the target (aliased by the speculator's loading utility).
         self.embed_tokens = VocabParallelEmbedding(
@@ -100,6 +101,19 @@ class DSparkDeepseekV4Model(nn.Module):
                 for i in range(self.num_dspark_layers)
             ]
         )
+        if self.decode_opt_bundle:
+            for i, layer in enumerate(self.layers):
+                layer_prefix = maybe_prefix(
+                    prefix, f"layers.{self.num_hidden_layers + i}"
+                )
+                layer.attn.context_wkv = ReplicatedLinear(
+                    config.hidden_size,
+                    config.head_dim,
+                    bias=False,
+                    return_bias=False,
+                    quant_config=vllm_config.quant_config,
+                    prefix=maybe_prefix(layer_prefix, "attn.context_wkv"),
+                )
 
         # Heads: final norm + hc_head, and the Markov head
         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
@@ -161,8 +175,12 @@ class DSparkDeepseekV4Model(nn.Module):
             attn = layer.attn
             # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
             # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
+            context_wkv = getattr(attn, "context_wkv", None)
+            if self.decode_opt_bundle and context_wkv is not None:
+                kv = context_wkv(main_x)
+            else:
+                qr_kv, _ = attn.fused_wqa_wkv(main_x)
+                kv = qr_kv[..., attn.q_lora_rank :]
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
@@ -455,6 +473,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
                 if not is_layer_param or weight_name not in name:
                     continue
+                if weight_name == "attn.wkv":
+                    self._load_context_wkv_param(
+                        params_dict, name, loaded_weight, loaded_params
+                    )
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, stacked_shard_id)
@@ -482,6 +504,21 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self._finalize_moe()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
+
+    def _load_context_wkv_param(
+        self,
+        params_dict: dict[str, nn.Parameter],
+        name: str,
+        loaded_weight: torch.Tensor,
+        loaded_params: set[str],
+    ) -> None:
+        context_name = name.replace(".attn.wkv", ".attn.context_wkv")
+        param = params_dict.get(context_name)
+        if param is None:
+            return
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, loaded_weight)
+        loaded_params.add(context_name)
 
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
