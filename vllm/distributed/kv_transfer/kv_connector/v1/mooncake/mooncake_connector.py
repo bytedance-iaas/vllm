@@ -2944,6 +2944,10 @@ class MooncakeConnectorWorker:
             restore_bank0_from_slot(
                 self._c128_states, self._c128_import_pool, slot, d_req_state_idx
             )
+            if self._c128_import_pool.buffer.is_cuda:
+                torch.cuda.current_stream(
+                    self._c128_import_pool.buffer.device
+                ).synchronize()
         else:
             reset_bank0(self._c128_states, d_req_state_idx)
         self._c128_import_pool.release(transfer_id)
