@@ -438,14 +438,7 @@ def _align_transfer_regions_by_occurrence(
     for key, local_region in local_keyed:
         remote_region = remote_by_key.get(key)
         if remote_region is None:
-            return (
-                [],
-                [],
-                (
-                    "Mooncake producer registered layer has no matching "
-                    f"consumer occurrence: {key[0]} occurrence {key[1]}."
-                ),
-            )
+            continue
         if local_region.layer_index != remote_region.layer_index:
             return (
                 [],
