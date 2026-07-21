@@ -433,7 +433,6 @@ def _align_transfer_regions_by_occurrence(
     local_keyed = keyed_regions(local_regions)
     remote_keyed = keyed_regions(remote_regions)
     remote_by_key = dict(remote_keyed)
-    local_keys = {key for key, _ in local_keyed}
     aligned_local: list[TransferRegion] = []
     aligned_remote: list[TransferRegion] = []
     for key, local_region in local_keyed:
@@ -471,17 +470,6 @@ def _align_transfer_regions_by_occurrence(
             )
         aligned_local.append(local_region)
         aligned_remote.append(remote_region)
-
-    for key, _ in remote_keyed:
-        if key not in local_keys:
-            return (
-                [],
-                [],
-                (
-                    "Mooncake consumer registered layer has no matching "
-                    f"producer occurrence: {key[0]} occurrence {key[1]}."
-                ),
-            )
 
     return aligned_local, aligned_remote, None
 

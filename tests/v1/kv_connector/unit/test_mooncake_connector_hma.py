@@ -594,7 +594,7 @@ def test_align_transfer_regions_rejects_duplicate_remote_alias_group():
     assert local_regions == []
     assert remote_regions == []
     assert err is not None
-    assert "duplicate alias group" in err
+    assert "no matching consumer alias groups" in err
 
 
 @pytest.mark.asyncio
@@ -633,6 +633,7 @@ async def test_build_transfer_params_filters_groups_per_shared_tensor_alias():
         },
         kv_caches_base_addr=[0x2000, 0x3000],
         block_lens=[block_len, block_len],
+        kv_block_lens=[block_len, block_len],
     )
 
     local_region = TransferRegion(
@@ -757,6 +758,7 @@ async def test_build_transfer_params_filters_groups_per_shared_region():
         },
         kv_caches_base_addr=[0x2000, 0x3000],
         block_lens=[block_len, block_len],
+        kv_block_lens=[block_len, block_len],
     )
 
     local_regions = [
