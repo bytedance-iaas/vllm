@@ -553,14 +553,12 @@ def _align_transfer_regions(
         alias_group_aligned_local: list[TransferRegion] = []
         alias_group_aligned_remote: list[TransferRegion] = []
         matched_local_indices: set[int] = set()
-        matched_remote_indices: set[int] = set()
+        matched_remote_alias_group_keys: set[tuple[int, tuple[str, int, int]]] = set()
 
         for local_idx, local_region in enumerate(alias_local_regions):
             alias_group_index_mismatch_region: TransferRegion | None = None
             matched_local_alias_group_keys: set[tuple[str, int, int]] = set()
             for remote_idx, candidate_remote_region in enumerate(alias_remote_regions):
-                if remote_idx in matched_remote_indices:
-                    continue
                 if not _regions_share_layer_identity(
                     local_region, candidate_remote_region
                 ):
@@ -576,26 +574,27 @@ def _align_transfer_regions(
                 )
                 if shared_alias_group_keys is None or not shared_alias_group_keys:
                     continue
-                duplicate_alias_group_keys = [
+                available_alias_group_keys = [
                     alias_group_key
                     for alias_group_key in shared_alias_group_keys
-                    if alias_group_key in matched_local_alias_group_keys
+                    if (remote_idx, alias_group_key)
+                    not in matched_remote_alias_group_keys
                 ]
-                if duplicate_alias_group_keys:
-                    return (
-                        [],
-                        [],
-                        (
-                            "Mooncake duplicate alias group match for "
-                            f"{candidate_remote_region.match_layer_names}: "
-                            f"groups={duplicate_alias_group_keys}."
-                        ),
-                    )
-                matched_local_alias_group_keys.update(shared_alias_group_keys)
+                available_alias_group_keys = [
+                    alias_group_key
+                    for alias_group_key in available_alias_group_keys
+                    if alias_group_key not in matched_local_alias_group_keys
+                ]
+                if not available_alias_group_keys:
+                    continue
+                matched_local_alias_group_keys.update(available_alias_group_keys)
+                matched_remote_alias_group_keys.update(
+                    (remote_idx, alias_group_key)
+                    for alias_group_key in available_alias_group_keys
+                )
                 alias_group_aligned_local.append(local_region)
                 alias_group_aligned_remote.append(candidate_remote_region)
                 matched_local_indices.add(local_idx)
-                matched_remote_indices.add(remote_idx)
 
             if (
                 local_idx not in matched_local_indices
@@ -630,20 +629,30 @@ def _align_transfer_regions(
                 )
 
         for remote_idx, remote_region in enumerate(alias_remote_regions):
-            if remote_idx in matched_remote_indices:
-                continue
-            if any(
-                _regions_share_layer_identity(local_region, remote_region)
-                for local_region in alias_local_regions
-            ):
-                return (
-                    [],
-                    [],
-                    (
-                        "Mooncake duplicate alias group match for "
-                        f"{remote_region.match_layer_names}."
-                    ),
+            for local_region in alias_local_regions:
+                if not _regions_share_layer_identity(local_region, remote_region):
+                    continue
+                shared_alias_group_keys = _shared_alias_group_keys(
+                    local_region, remote_region
                 )
+                if not shared_alias_group_keys:
+                    continue
+                unmatched_alias_group_keys = [
+                    alias_group_key
+                    for alias_group_key in shared_alias_group_keys
+                    if (remote_idx, alias_group_key)
+                    not in matched_remote_alias_group_keys
+                ]
+                if unmatched_alias_group_keys:
+                    return (
+                        [],
+                        [],
+                        (
+                            "Mooncake duplicate alias group match for "
+                            f"{remote_region.match_layer_names}: "
+                            f"groups={unmatched_alias_group_keys}."
+                        ),
+                    )
 
         legacy_aligned_local, legacy_aligned_remote, legacy_err = (
             _align_transfer_regions_by_occurrence(
