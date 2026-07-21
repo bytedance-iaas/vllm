@@ -415,117 +415,10 @@ def _regions_share_layer_identity(
     )
 
 
-def _align_transfer_regions(
+def _align_transfer_regions_by_occurrence(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
-    """Align KV transfer regions by vLLM cache identity.
-
-    wrong once producer and consumer have different PP layouts. For shared
-    physical tensors, alias metadata carries the KVCacheTensor.shared_by layer
-    names and logical group metadata carries KVCacheGroupSpec ownership across
-    the Mooncake wire boundary.
-    """
-    has_aliases = any(
-        _region_has_aliases(region) for region in local_regions + remote_regions
-    )
-    if has_aliases:
-        has_alias_group_metadata = all(
-            not _region_has_aliases(region) or bool(region.alias_group_indices)
-            for region in local_regions + remote_regions
-        )
-        if not has_alias_group_metadata:
-            return (
-                [],
-                [],
-                (
-                    "Mooncake alias metadata is missing alias-group ownership. "
-                    "Producer and consumer must use the same Mooncake metadata "
-                    "schema."
-                ),
-            )
-
-        # DeepSeek V4 shared-cache regions bind each alias to the layer
-        # index and cache groups that own that view of the shared tensor.
-        # Matching the bound identity avoids transferring unrelated groups
-        # when one physical region backs multiple logical cache entries.
-        alias_group_aligned_local: list[TransferRegion] = []
-        alias_group_aligned_remote: list[TransferRegion] = []
-        matched_local_indices: set[int] = set()
-        matched_alias_group_keys: set[tuple[str, int, int]] = set()
-
-        for local_idx, local_region in enumerate(local_regions):
-            alias_group_index_mismatch_region: TransferRegion | None = None
-            for candidate_remote_region in remote_regions:
-                if not _regions_share_layer_identity(
-                    local_region, candidate_remote_region
-                ):
-                    continue
-                if not _regions_have_bound_alias_layer_indices(
-                    local_region, candidate_remote_region
-                ):
-                    if alias_group_index_mismatch_region is None:
-                        alias_group_index_mismatch_region = candidate_remote_region
-                    continue
-                shared_alias_group_keys = _shared_alias_group_keys(
-                    local_region, candidate_remote_region
-                )
-                if shared_alias_group_keys is None or not shared_alias_group_keys:
-                    continue
-                duplicate_alias_group_keys = [
-                    alias_group_key
-                    for alias_group_key in shared_alias_group_keys
-                    if alias_group_key in matched_alias_group_keys
-                ]
-                if duplicate_alias_group_keys:
-                    return (
-                        [],
-                        [],
-                        (
-                            "Mooncake duplicate alias group match for "
-                            f"{candidate_remote_region.match_layer_names}: "
-                            f"groups={duplicate_alias_group_keys}."
-                        ),
-                    )
-                matched_alias_group_keys.update(shared_alias_group_keys)
-                alias_group_aligned_local.append(local_region)
-                alias_group_aligned_remote.append(candidate_remote_region)
-                matched_local_indices.add(local_idx)
-
-            if (
-                local_idx not in matched_local_indices
-                and alias_group_index_mismatch_region is not None
-            ):
-                return (
-                    [],
-                    [],
-                    (
-                        "Mooncake registered layer index mismatch for "
-                        f"{local_region.match_layer_names}: producer="
-                        f"{local_region.match_layer_indices}, consumer="
-                        f"{alias_group_index_mismatch_region.match_layer_indices}."
-                    ),
-                )
-
-        for local_idx, local_region in enumerate(local_regions):
-            if local_idx in matched_local_indices:
-                continue
-            if any(
-                _regions_share_layer_identity(local_region, remote_region)
-                for remote_region in remote_regions
-            ):
-                return (
-                    [],
-                    [],
-                    (
-                        "Mooncake producer registered layer aliases have no "
-                        "matching consumer alias groups: "
-                        f"{sorted(local_region.match_layer_names)}."
-                    ),
-                )
-
-        return alias_group_aligned_local, alias_group_aligned_remote, None
-
     def keyed_regions(
         regions: list[TransferRegion],
     ) -> list[tuple[tuple[str, int], TransferRegion]]:
@@ -581,6 +474,144 @@ def _align_transfer_regions(
     return aligned_local, aligned_remote, None
 
 
+def _align_transfer_regions(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
+    """Align KV transfer regions by vLLM cache identity.
+
+    wrong once producer and consumer have different PP layouts. For shared
+    physical tensors, alias metadata carries the KVCacheTensor.shared_by layer
+    names and logical group metadata carries KVCacheGroupSpec ownership across
+    the Mooncake wire boundary.
+    """
+    has_aliases = any(
+        _region_has_aliases(region) for region in local_regions + remote_regions
+    )
+    if has_aliases:
+        alias_local_regions = [
+            region for region in local_regions if _region_has_aliases(region)
+        ]
+        alias_remote_regions = [
+            region for region in remote_regions if _region_has_aliases(region)
+        ]
+        legacy_local_regions = [
+            region for region in local_regions if not _region_has_aliases(region)
+        ]
+        legacy_remote_regions = [
+            region for region in remote_regions if not _region_has_aliases(region)
+        ]
+        has_alias_group_metadata = all(
+            bool(region.alias_group_indices)
+            for region in alias_local_regions + alias_remote_regions
+        )
+        if not has_alias_group_metadata:
+            return (
+                [],
+                [],
+                (
+                    "Mooncake alias metadata is missing alias-group ownership. "
+                    "Producer and consumer must use the same Mooncake metadata "
+                    "schema."
+                ),
+            )
+
+        # DeepSeek V4 shared-cache regions bind each alias to the layer
+        # index and cache groups that own that view of the shared tensor.
+        # Matching the bound identity avoids transferring unrelated groups
+        # when one physical region backs multiple logical cache entries.
+        alias_group_aligned_local: list[TransferRegion] = []
+        alias_group_aligned_remote: list[TransferRegion] = []
+        matched_local_indices: set[int] = set()
+        matched_alias_group_keys: set[tuple[str, int, int]] = set()
+
+        for local_idx, local_region in enumerate(alias_local_regions):
+            alias_group_index_mismatch_region: TransferRegion | None = None
+            for candidate_remote_region in alias_remote_regions:
+                if not _regions_share_layer_identity(
+                    local_region, candidate_remote_region
+                ):
+                    continue
+                if not _regions_have_bound_alias_layer_indices(
+                    local_region, candidate_remote_region
+                ):
+                    if alias_group_index_mismatch_region is None:
+                        alias_group_index_mismatch_region = candidate_remote_region
+                    continue
+                shared_alias_group_keys = _shared_alias_group_keys(
+                    local_region, candidate_remote_region
+                )
+                if shared_alias_group_keys is None or not shared_alias_group_keys:
+                    continue
+                duplicate_alias_group_keys = [
+                    alias_group_key
+                    for alias_group_key in shared_alias_group_keys
+                    if alias_group_key in matched_alias_group_keys
+                ]
+                if duplicate_alias_group_keys:
+                    return (
+                        [],
+                        [],
+                        (
+                            "Mooncake duplicate alias group match for "
+                            f"{candidate_remote_region.match_layer_names}: "
+                            f"groups={duplicate_alias_group_keys}."
+                        ),
+                    )
+                matched_alias_group_keys.update(shared_alias_group_keys)
+                alias_group_aligned_local.append(local_region)
+                alias_group_aligned_remote.append(candidate_remote_region)
+                matched_local_indices.add(local_idx)
+
+            if (
+                local_idx not in matched_local_indices
+                and alias_group_index_mismatch_region is not None
+            ):
+                return (
+                    [],
+                    [],
+                    (
+                        "Mooncake registered layer index mismatch for "
+                        f"{local_region.match_layer_names}: producer="
+                        f"{local_region.match_layer_indices}, consumer="
+                        f"{alias_group_index_mismatch_region.match_layer_indices}."
+                    ),
+                )
+
+        for local_idx, local_region in enumerate(alias_local_regions):
+            if local_idx in matched_local_indices:
+                continue
+            if any(
+                _regions_share_layer_identity(local_region, remote_region)
+                for remote_region in alias_remote_regions
+            ):
+                return (
+                    [],
+                    [],
+                    (
+                        "Mooncake producer registered layer aliases have no "
+                        "matching consumer alias groups: "
+                        f"{sorted(local_region.match_layer_names)}."
+                    ),
+                )
+
+        legacy_aligned_local, legacy_aligned_remote, legacy_err = (
+            _align_transfer_regions_by_occurrence(
+                legacy_local_regions,
+                legacy_remote_regions,
+            )
+        )
+        if legacy_err is not None:
+            return [], [], legacy_err
+        return (
+            alias_group_aligned_local + legacy_aligned_local,
+            alias_group_aligned_remote + legacy_aligned_remote,
+            None,
+        )
+
+    return _align_transfer_regions_by_occurrence(local_regions, remote_regions)
+
+
 def _common_group_indices_for_regions(
     local_region: TransferRegion, remote_region: TransferRegion, num_groups: int
 ) -> tuple[int, ...]:
@@ -603,6 +634,9 @@ def _common_group_indices_for_regions(
             for group_idx in common_group_indices
             if 0 <= group_idx < num_groups
         )
+    if not local_region.logical_group_indices or not remote_region.logical_group_indices:
+        # Legacy peers/regions did not carry group ownership metadata.
+        return tuple(range(num_groups))
     if local_region.group_index == remote_region.group_index:
         return (local_region.group_index,) if local_region.group_index < num_groups else ()
     return ()
