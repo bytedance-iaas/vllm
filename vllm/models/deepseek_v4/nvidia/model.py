@@ -8,6 +8,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -82,6 +83,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+
+def _decode_opt_bundle_enabled() -> bool:
+    return envs.VLLM_DSV4_DECODE_OPT_BUNDLE
 
 
 class DeepseekV4MLP(nn.Module):
@@ -1518,6 +1523,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        mtp_buffer_written = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1532,26 +1538,50 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
+                mtp_out = None
+                if (
+                    _decode_opt_bundle_enabled()
+                    and get_pp_group().is_last_rank
+                    and idx + 1 == self.end_layer
+                    and self._mtp_hidden_buffer is not None
+                ):
+                    num_tokens = hidden_states.shape[0]
+                    mtp_out = self._mtp_hidden_buffer[:num_tokens].view(
+                        num_tokens, self.hc_mult, self.config.hidden_size
+                    )
                 aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                    hidden_states, residual, post_mix, res_mix, out=mtp_out
                 )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+                mtp_buffer_written = mtp_out is not None
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
                 hidden_states = final_aux_recon
             else:
+                mtp_out = None
+                if (
+                    _decode_opt_bundle_enabled()
+                    and get_pp_group().is_last_rank
+                    and self._mtp_hidden_buffer is not None
+                ):
+                    num_tokens = hidden_states.shape[0]
+                    mtp_out = self._mtp_hidden_buffer[:num_tokens].view(
+                        num_tokens, self.hc_mult, self.config.hidden_size
+                    )
                 hidden_states = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                    hidden_states, residual, post_mix, res_mix, out=mtp_out
                 )
+                mtp_buffer_written = mtp_out is not None
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        if not mtp_buffer_written:
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = hc_head_fused_kernel_tilelang(
             hidden_states,

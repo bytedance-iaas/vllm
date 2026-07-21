@@ -300,17 +300,36 @@ def _mhc_pre_tilelang_fake(
     return post_mix, comb_mix, layer_input
 
 
-def mhc_post_tilelang(
+def _check_mhc_post_out(out: torch.Tensor, residual: torch.Tensor) -> None:
+    assert out.shape == residual.shape
+    assert out.dtype == residual.dtype
+    assert out.device == residual.device
+    assert out.is_contiguous()
+
+
+def _mhc_post_tilelang_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    out = torch.empty_like(residual)
+    _mhc_post_tilelang_out_impl(x, residual, post_layer_mix, comb_res_mix, out)
+    return out
+
+
+def _mhc_post_tilelang_out_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         mhc_post_tilelang as _mhc_post_kernel,
     )
 
-    out = torch.empty_like(residual)
+    _check_mhc_post_out(out, residual)
     _mhc_post_kernel(
         comb_res_mix,
         residual,
@@ -319,6 +338,20 @@ def mhc_post_tilelang(
         out,
         residual.shape[-2],
         residual.shape[-1],
+    )
+
+
+def mhc_post_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out is None:
+        return _mhc_post_tilelang_impl(x, residual, post_layer_mix, comb_res_mix)
+    torch.ops.vllm.mhc_post_tilelang_out(
+        x, residual, post_layer_mix, comb_res_mix, out
     )
     return out
 
@@ -610,6 +643,16 @@ def _mhc_post_tilelang_fake(
     return torch.empty_like(residual)
 
 
+def _mhc_post_tilelang_out_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    return None
+
+
 def hc_head_fused_kernel_tilelang(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -663,9 +706,15 @@ direct_register_custom_op(
 )
 direct_register_custom_op(
     op_name="mhc_post_tilelang",
-    op_func=mhc_post_tilelang,
+    op_func=_mhc_post_tilelang_impl,
     mutates_args=[],
     fake_impl=_mhc_post_tilelang_fake,
+)
+direct_register_custom_op(
+    op_name="mhc_post_tilelang_out",
+    op_func=_mhc_post_tilelang_out_impl,
+    mutates_args=["out"],
+    fake_impl=_mhc_post_tilelang_out_fake,
 )
 
 direct_register_custom_op(
