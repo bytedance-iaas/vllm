@@ -717,7 +717,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 f"{self.max_num_batched_tokens}."
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
-        if hidden_states.shape[0] == 0:
+        if (
+            hidden_states.shape[0] == 0
+            and self._get_max_num_tokens_across_dp(0) == 0
+        ):
             return y
         torch.ops.vllm.deepseek_v4_mega_moe_experts(
             hidden_states,
