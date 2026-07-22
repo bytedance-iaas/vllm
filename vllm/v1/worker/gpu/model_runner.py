@@ -312,6 +312,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         return (
             kv_transfer_config is not None
+            and kv_transfer_config.is_kv_transfer_instance
             and kv_transfer_config.is_kv_producer
             and not kv_transfer_config.is_kv_consumer
         )
