@@ -5,6 +5,14 @@
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
@@ -173,6 +181,175 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
 
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_scheduler_uses_dsd_batch_size_override():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 4, 3), (5, 16, 1)],
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        runtime_num_speculative_tokens=3,
+    )
+    scheduler.set_dynamic_sd_batch_size_override(8)
+    output = _add_requests_and_schedule(scheduler, 2)
+
+    assert len(output.num_scheduled_tokens) == 2
+    assert output.num_spec_tokens_to_schedule == 1
+
+
+def test_scheduler_reports_dynamic_sd_local_decode_pressure():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 4, 3), (5, 16, 1)],
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        runtime_num_speculative_tokens=3,
+    )
+    _add_requests_and_schedule(scheduler, 3)
+
+    assert scheduler.get_dynamic_sd_local_batch_pressure() == 3
+
+
+def test_dynamic_sd_dp_requires_explicit_global_policy():
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        create_scheduler(
+            max_num_seqs=16,
+            max_num_batched_tokens=160,
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+            data_parallel_size=2,
+        )
+
+
+def test_dynamic_sd_dp_requires_policy_from_vllm_config_parallel_config():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+    )
+
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16,
+                max_num_batched_tokens=160,
+                max_model_len=160,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+            ),
+            model_config=model_config,
+            cache_config=CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.9,
+                cache_dtype="auto",
+            ),
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            speculative_config=speculative_config,
+        )
+
+
+def test_dynamic_sd_dp_global_policy_allows_data_parallel():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        data_parallel_size=2,
+    )
+
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    assert speculative_config.uses_dynamic_sd_dp_global_max_policy()
+
+
+def test_dynamic_sd_dp_rejects_non_global_policy_from_vllm_config():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+    )
+    speculative_config.dynamic_sd_dp_batch_policy = "stale_non_global"  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16,
+                max_num_batched_tokens=160,
+                max_model_len=160,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+            ),
+            model_config=model_config,
+            cache_config=CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.9,
+                cache_dtype="auto",
+            ),
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            speculative_config=speculative_config,
+        )
+
+
+def test_dspark_dynamic_sd_dp_requires_async_scheduling():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(data_parallel_size=2),
+    )
+
+    with pytest.raises(ValueError, match="requires async_scheduling"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16,
+                max_num_batched_tokens=160,
+                max_model_len=160,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+                async_scheduling=False,
+            ),
+            model_config=model_config,
+            cache_config=CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.9,
+                cache_dtype="auto",
+            ),
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            speculative_config=speculative_config,
+        )
+
+
+def test_dynamic_sd_dp_global_policy_requires_non_increasing_schedule():
+    with pytest.raises(ValueError, match="non-increasing"):
+        create_scheduler(
+            max_num_seqs=16,
+            max_num_batched_tokens=160,
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 4, 1), (5, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            data_parallel_size=2,
+        )
 
 
 def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():

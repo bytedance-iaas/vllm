@@ -265,6 +265,7 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self._dynamic_sd_batch_size_override: int | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1249,12 +1250,21 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
-        # Dynamic speculative decoding: compute optimal K
+        # Dynamic speculative decoding: compute optimal K. Under DP, the
+        # engine may provide a synchronized global batch pressure so every rank
+        # chooses the same K and enters the same collective/control-flow path.
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+            dynamic_sd_batch_size = (
+                self._dynamic_sd_batch_size_override
+                if self._dynamic_sd_batch_size_override is not None
+                else len(num_scheduled_tokens)
+            )
+            dynamic_sd_batch_size = min(
+                dynamic_sd_batch_size, len(self.dynamic_sd_lookup) - 1
+            )
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[dynamic_sd_batch_size]
+        self._dynamic_sd_batch_size_override = None
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -2030,6 +2040,23 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def set_dynamic_sd_batch_size_override(self, batch_size: int | None) -> None:
+        self._dynamic_sd_batch_size_override = batch_size
+
+    def get_dynamic_sd_local_batch_pressure(self) -> int:
+        """Return a cheap local decode pressure estimate for DP Dynamic SD.
+
+        This intentionally ignores newly admitted prefills. The first DP-safe
+        Dynamic SD policy targets decode-side verification width, and the
+        scheduler still keeps the static maximum lookahead/KV allocation.
+        """
+        if self.dynamic_sd_lookup is None:
+            return 0
+        num_decode_reqs = sum(
+            1 for request in self.running if not request.is_prefill_chunk
+        )
+        return min(num_decode_reqs, self.scheduler_config.max_num_seqs)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:

@@ -1922,6 +1922,20 @@ class DPEngineCoreProc(EngineCoreProc):
             and self.step_counter % self.prefill_schedule_interval != 0
         )
 
+    def _sync_dynamic_sd_batch_size_override(self) -> None:
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is None
+            or not speculative_config.uses_dynamic_sd_dp_global_max_policy()
+        ):
+            return
+
+        local_batch_pressure = self.scheduler.get_dynamic_sd_local_batch_pressure()
+        global_batch_pressure = ParallelConfig.sync_dynamic_sd_batch_pressure(
+            self.dp_group, local_batch_pressure
+        )
+        self.scheduler.set_dynamic_sd_batch_size_override(global_batch_pressure)
+
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
 
@@ -1940,6 +1954,9 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
 
+            local_unfinished_before_step = self.scheduler.has_unfinished_requests()
+            if local_unfinished_before_step or self.engines_running:
+                self._sync_dynamic_sd_batch_size_override()
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
