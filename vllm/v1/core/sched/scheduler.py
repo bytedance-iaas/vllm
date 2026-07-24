@@ -1314,12 +1314,15 @@ class Scheduler(SchedulerInterface):
         # engine may provide a synchronized global batch pressure so every rank
         # chooses the same K and enters the same collective/control-flow path.
         num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = (
-                dynamic_sd_early_k
-                if dynamic_sd_early_k is not None
-                else self._get_dynamic_sd_k_for_batch_size(len(num_scheduled_tokens))
-            )
+        if self.dynamic_sd_lookup is not None:
+            if dynamic_sd_early_k is not None:
+                num_spec_tokens_to_schedule = dynamic_sd_early_k
+            elif len(num_scheduled_tokens) > 0:
+                num_spec_tokens_to_schedule = (
+                    self._get_dynamic_sd_k_for_batch_size(
+                        len(num_scheduled_tokens)
+                    )
+                )
         self._dynamic_sd_batch_size_override = None
 
         scheduler_output = SchedulerOutput(

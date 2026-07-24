@@ -1741,6 +1741,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             if num_spec_tokens_to_schedule > 0:
+                draft_tokens = draft_tokens[:, :num_spec_tokens_to_schedule]
                 self.req_states.draft_tokens[
                     input_batch.idx_mapping, :num_spec_tokens_to_schedule
                 ] = draft_tokens

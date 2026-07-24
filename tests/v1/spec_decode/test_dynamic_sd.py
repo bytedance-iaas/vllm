@@ -584,6 +584,19 @@ def test_scheduler_uses_static_k_when_no_requests_are_scheduled():
     assert output.num_spec_tokens_to_schedule == 3
 
 
+def test_scheduler_uses_dsd_override_when_no_requests_are_scheduled():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3), (64, 128, 2), (256, 4096, 0)],
+        max_num_seqs=256,
+        runtime_num_speculative_tokens=3,
+    )
+    scheduler.set_dynamic_sd_batch_size_override(256)
+    output = scheduler.schedule()
+
+    assert len(output.num_scheduled_tokens) == 0
+    assert output.num_spec_tokens_to_schedule == 0
+
+
 def test_scheduler_rejects_bad_dsd_config_at_construction():
     with pytest.raises(ValueError, match="must start at 1"):
         _make_scheduler_with_dynamic_sd([(2, 16, 3)])
