@@ -266,6 +266,7 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        self.last_num_spec_tokens_to_schedule = self.num_spec_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
         self._dynamic_sd_batch_size_override: int | None = None
@@ -1323,6 +1324,7 @@ class Scheduler(SchedulerInterface):
                         len(num_scheduled_tokens)
                     )
                 )
+        self.last_num_spec_tokens_to_schedule = num_spec_tokens_to_schedule
         self._dynamic_sd_batch_size_override = None
 
         scheduler_output = SchedulerOutput(
@@ -2102,6 +2104,10 @@ class Scheduler(SchedulerInterface):
 
     def set_dynamic_sd_batch_size_override(self, batch_size: int | None) -> None:
         self._dynamic_sd_batch_size_override = batch_size
+        if self.dynamic_sd_lookup is not None and batch_size is not None:
+            self.last_num_spec_tokens_to_schedule = (
+                self._get_dynamic_sd_k_for_batch_size(batch_size)
+            )
 
     def get_dynamic_sd_local_batch_pressure(self) -> int:
         """Return a cheap local decode pressure estimate for DP Dynamic SD.

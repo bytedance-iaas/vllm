@@ -819,7 +819,10 @@ class EngineCore:
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
     def execute_dummy_batch(self):
-        self.model_executor.execute_dummy_batch()
+        num_spec_tokens_to_schedule = getattr(
+            self.scheduler, "last_num_spec_tokens_to_schedule", None
+        )
+        self.model_executor.execute_dummy_batch(num_spec_tokens_to_schedule)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)
