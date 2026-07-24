@@ -633,6 +633,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output = SchedulerOutput.make_empty()
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+        dummy_scheduler_output.num_spec_tokens_to_schedule = self.num_speculative_steps
 
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
@@ -671,6 +672,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
@@ -711,7 +715,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 next_prefill_tokens=self.req_states.next_prefill_tokens,
                 temperature=self.sampler.sampling_states.temperature.gpu,
                 seeds=self.sampler.sampling_states.seeds.gpu,
-                runtime_num_speculative_tokens=None,
+                runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 mm_inputs=mm_inputs,

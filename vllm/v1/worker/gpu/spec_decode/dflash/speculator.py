@@ -87,6 +87,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_col = torch.arange(
             self.num_speculative_steps, dtype=torch.int32, device=device
         ).repeat(self.max_num_reqs)
+        self._sample_col_steps = torch.arange(
+            self.num_speculative_steps, dtype=torch.int32, device=device
+        )
+        self._runtime_sample_col = torch.empty(
+            max_num_sampled_tokens, dtype=torch.int32, device=device
+        )
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
@@ -116,6 +122,25 @@ class DFlashSpeculator(DraftModelSpeculator):
         if self.sample_from_anchor:
             return num_query_per_req
         return max(num_query_per_req - 1, 0)
+
+    def _get_sample_col_for_k(
+        self, num_reqs: int, num_speculative_tokens: int
+    ) -> torch.Tensor:
+        num_sample = num_reqs * num_speculative_tokens
+        if num_speculative_tokens == self.num_speculative_steps:
+            return self.sample_col[:num_sample]
+        if num_sample == 0:
+            return self._runtime_sample_col[:0]
+
+        sample_col = self._runtime_sample_col[:num_sample].view(
+            num_reqs, num_speculative_tokens
+        )
+        sample_col.copy_(
+            self._sample_col_steps[:num_speculative_tokens].expand(
+                num_reqs, num_speculative_tokens
+            )
+        )
+        return self._runtime_sample_col[:num_sample]
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -292,6 +317,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_sample = num_reqs * num_speculative_tokens
         if num_sample == 0:
             return
+        sample_col = self._get_sample_col_for_k(num_reqs, num_speculative_tokens)
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
@@ -301,7 +327,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_idx_mapping[:num_sample],
             self.temperature,
             self.seeds,
-            self.sample_col[:num_sample],
+            sample_col,
             self.draft_logits,
         )
         self.draft_tokens[:num_reqs, :num_speculative_tokens] = draft_tokens.view(
@@ -361,8 +387,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_speculative_tokens = self._get_runtime_num_speculative_tokens(
             runtime_num_speculative_tokens
         )
-        if num_speculative_tokens == 0:
-            return self.draft_tokens[:num_reqs, :0]
         num_query_per_req = self._get_num_query_per_req_for_k(
             num_speculative_tokens
         )
@@ -403,6 +427,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             # DFlash processes all speculative tokens in one forward pass,
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)
+            if num_query_tokens == 0:
+                return self.draft_tokens[:num_reqs, :0]
             self._generate_draft(
                 num_reqs,
                 num_query_tokens,
@@ -483,6 +509,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             dp_rank=self.dp_rank,
             need_eager=is_profile,
         )
+
+        if num_query_tokens == 0:
+            return self.draft_tokens[:num_reqs, :0]
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens

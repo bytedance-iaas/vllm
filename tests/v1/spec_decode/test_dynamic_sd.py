@@ -3,6 +3,7 @@
 """Regression tests for the Dynamic SD batch-size schedule helpers."""
 
 import pytest
+import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.config import (
@@ -200,6 +201,38 @@ def test_dflash_runtime_k_maps_to_bonus_query_width():
 
     with pytest.raises(ValueError, match="runtime_num_speculative_tokens"):
         speculator._get_runtime_num_speculative_tokens(8)
+
+
+def test_dflash_runtime_sample_col_uses_runtime_k_stride():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.device = torch.device("cpu")
+    speculator.sample_col = torch.arange(7, dtype=torch.int32).repeat(4)
+    speculator._sample_col_steps = torch.arange(7, dtype=torch.int32)
+    speculator._runtime_sample_col = torch.empty(4 * 7, dtype=torch.int32)
+
+    sample_col = speculator._get_sample_col_for_k(
+        num_reqs=3, num_speculative_tokens=3
+    )
+
+    assert sample_col.tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    assert speculator._get_sample_col_for_k(2, 0).numel() == 0
+    assert speculator._get_sample_col_for_k(2, 7).tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
 
 
 def test_dspark_runtime_k_maps_to_anchor_query_width():

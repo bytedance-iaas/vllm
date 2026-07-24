@@ -83,6 +83,19 @@ def _create_vllm_config_for_dsd(
     return vllm_config
 
 
+def _patch_cudagraph_test_runtime(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+
+
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):
     """Dynamic SD should create FULL decode candidates for every k in [1, K+1].
 
@@ -95,13 +108,9 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
     max_spec_tokens = 7
     max_decode_query_len = max_spec_tokens + 1
 
-    # CudaGraphManager consults PP rank helpers during initialization even
-    # though this test only exercises CPU-side candidate generation.
-    monkeypatch.setattr(
-        gpu_cudagraph_utils,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
+    # CudaGraphManager consults platform and PP helpers during initialization
+    # even though this test only exercises CPU-side candidate generation.
+    _patch_cudagraph_test_runtime(monkeypatch)
 
     vllm_config = _create_vllm_config_for_dsd(
         max_num_seqs=max_num_seqs,
@@ -160,11 +169,7 @@ def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
 
     max_spec_tokens = 4
 
-    monkeypatch.setattr(
-        gpu_cudagraph_utils,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
+    _patch_cudagraph_test_runtime(monkeypatch)
 
     vllm_config = _create_vllm_config_for_dsd(
         max_num_seqs=512,
@@ -208,11 +213,7 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
     max_spec_tokens = 7
     max_decode_query_len = max_spec_tokens + 1
 
-    monkeypatch.setattr(
-        gpu_cudagraph_utils,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
+    _patch_cudagraph_test_runtime(monkeypatch)
 
     vllm_config = _create_vllm_config_for_dsd(
         max_num_seqs=max_num_seqs,
@@ -257,7 +258,7 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
 def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
     """DSD should only capture FULL graphs for query lengths in the schedule.
 
-    With a partial schedule of ``(1, 32, 4)`` and ``(32, 128, 3)``, only the
+    With a partial schedule of ``(1, 32, 4)`` and ``(33, 128, 3)``, only the
     scheduled speculative-token counts (K = 4 and K = 3) become decode query
     lengths (K + 1 = 5 and 4). Uniform batches at those query lengths should get
     FULL graphs, while every other query length (e.g. the lower values 1, 2, 3)
@@ -271,14 +272,10 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
     # (range_start, range_end, num_speculative_tokens): K = 4 and K = 3 are
     # scheduled, so FULL decode graphs should exist for query lengths K + 1,
     # i.e. exactly {5, 4}.
-    num_spec_per_batch_size = [(1, 32, 4), (32, 128, 3)]
+    num_spec_per_batch_size = [(1, 32, 4), (33, 128, 3)]
     scheduled_query_lens = {entry[2] + 1 for entry in num_spec_per_batch_size}
 
-    monkeypatch.setattr(
-        gpu_cudagraph_utils,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
+    _patch_cudagraph_test_runtime(monkeypatch)
 
     vllm_config = _create_vllm_config_for_dsd(
         max_num_seqs=max_num_seqs,
