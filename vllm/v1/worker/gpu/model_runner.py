@@ -189,6 +189,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        self.last_num_spec_tokens_to_schedule = self.num_speculative_steps
         if self.speculative_config is not None:
             method = self.speculative_config.method
             # Aux-hidden-state draft methods (dspark / dflash / eagle3) draft from
@@ -606,6 +607,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        num_spec_tokens_to_schedule: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -633,7 +635,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output = SchedulerOutput.make_empty()
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
-        dummy_scheduler_output.num_spec_tokens_to_schedule = self.num_speculative_steps
+        dummy_scheduler_output.num_spec_tokens_to_schedule = (
+            self.num_speculative_steps
+            if num_spec_tokens_to_schedule is None
+            else num_spec_tokens_to_schedule
+        )
 
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
@@ -1261,6 +1267,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self.last_num_spec_tokens_to_schedule = (
+            scheduler_output.num_spec_tokens_to_schedule
+        )
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()

@@ -1100,7 +1100,14 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        num_spec_tokens_to_schedule = getattr(
+            self.model_runner, "last_num_spec_tokens_to_schedule", None
+        )
+        self.model_runner._dummy_run(
+            num_tokens,
+            uniform_decode=True,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
