@@ -91,6 +91,32 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+    def _get_runtime_num_speculative_tokens(
+        self, runtime_num_speculative_tokens: int | None
+    ) -> int:
+        if runtime_num_speculative_tokens is None:
+            return self.num_speculative_steps
+        runtime_num_speculative_tokens = int(runtime_num_speculative_tokens)
+        if not 0 <= runtime_num_speculative_tokens <= self.num_speculative_steps:
+            raise ValueError(
+                "runtime_num_speculative_tokens must be in [0, "
+                f"{self.num_speculative_steps}], got "
+                f"{runtime_num_speculative_tokens}."
+            )
+        return runtime_num_speculative_tokens
+
+    def _get_num_query_per_req_for_k(self, num_speculative_tokens: int) -> int:
+        return num_speculative_tokens if self.sample_from_anchor else (
+            num_speculative_tokens + 1
+        )
+
+    def _get_num_speculative_tokens_for_query_len(
+        self, num_query_per_req: int
+    ) -> int:
+        if self.sample_from_anchor:
+            return num_query_per_req
+        return max(num_query_per_req - 1, 0)
+
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
@@ -248,7 +274,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_query_per_req: int | None = None,
     ) -> None:
+        num_speculative_tokens = (
+            self.num_speculative_steps
+            if num_query_per_req is None
+            else self._get_num_speculative_tokens_for_query_len(num_query_per_req)
+        )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -257,7 +289,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_runtime_mode,
         )
 
-        num_sample = num_reqs * self.num_speculative_steps
+        num_sample = num_reqs * num_speculative_tokens
+        if num_sample == 0:
+            return
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
@@ -270,8 +304,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_col[:num_sample],
             self.draft_logits,
         )
-        self.draft_tokens[:num_reqs] = draft_tokens.view(
-            num_reqs, self.num_speculative_steps
+        self.draft_tokens[:num_reqs, :num_speculative_tokens] = draft_tokens.view(
+            num_reqs, num_speculative_tokens
         )
 
     def _build_draft_attn_metadata(
@@ -284,12 +318,13 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
-        assert num_query_per_req is None  # Omitted for DFlash, read from self instead
+        if num_query_per_req is None:
+            num_query_per_req = self.num_query_per_req
         return super()._build_draft_attn_metadata(
             num_reqs,
             num_reqs_padded,
             num_tokens_padded,
-            num_query_per_req=self.num_query_per_req,
+            num_query_per_req=num_query_per_req,
             causal=causal,
         )
 
@@ -315,6 +350,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        runtime_num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
@@ -322,11 +358,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        num_speculative_tokens = self._get_runtime_num_speculative_tokens(
+            runtime_num_speculative_tokens
+        )
+        if num_speculative_tokens == 0:
+            return self.draft_tokens[:num_reqs, :0]
+        num_query_per_req = self._get_num_query_per_req_for_k(
+            num_speculative_tokens
+        )
         num_target_tokens = input_batch.num_tokens
-        num_query_tokens = num_reqs * self.num_query_per_req
+        num_query_tokens = num_reqs * num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_query_per_req, self.max_model_len
+            max_seq_len + num_query_per_req, self.max_model_len
         )
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
@@ -366,8 +410,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 slot_mappings=None,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                num_query_per_req=num_query_per_req,
             )
-            return self.draft_tokens[:num_reqs]
+            return self.draft_tokens[:num_reqs, :num_speculative_tokens]
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
@@ -391,8 +436,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.block_tables.block_sizes[gid],
                 self.num_cached_tokens,
                 self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
+                num_query_per_req,
+                num_speculative_tokens,
                 self.max_num_reqs,
                 self.max_num_tokens,
                 self.max_model_len,
@@ -433,7 +478,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.query_cudagraph_manager,
             num_reqs,
             num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
+            uniform_token_count=num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
@@ -448,6 +493,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs=num_reqs,
             num_reqs_padded=num_reqs_padded,
             num_tokens_padded=num_tokens_padded,
+            num_query_per_req=num_query_per_req,
             causal=self._group_causal,
         )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -470,9 +516,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 draft_slot_mappings_by_layer,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
+                num_query_per_req=num_query_per_req,
             )
 
-        return self.draft_tokens[:num_reqs]
+        return self.draft_tokens[:num_reqs, :num_speculative_tokens]
 
 
 @triton.jit

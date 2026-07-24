@@ -711,6 +711,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 next_prefill_tokens=self.req_states.next_prefill_tokens,
                 temperature=self.sampler.sampling_states.temperature.gpu,
                 seeds=self.sampler.sampling_states.seeds.gpu,
+                runtime_num_speculative_tokens=None,
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 mm_inputs=mm_inputs,
@@ -1575,6 +1576,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         if not self.is_last_pp_rank:
@@ -1597,6 +1599,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        num_spec_tokens_to_schedule = getattr(
+            self.execute_model_state,
+            "num_spec_tokens_to_schedule",
+            self.num_speculative_steps,
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1726,16 +1733,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.next_prefill_tokens,
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
+                runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
                 mm_inputs=mm_inputs,
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if num_spec_tokens_to_schedule > 0:
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :num_spec_tokens_to_schedule
+                ] = draft_tokens
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :num_spec_tokens_to_schedule
+                ],
             )
 
         # Post-step KV connector related operations.
@@ -1857,3 +1870,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    num_spec_tokens_to_schedule: int = 0

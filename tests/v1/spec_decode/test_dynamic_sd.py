@@ -15,6 +15,8 @@ from vllm.config import (
 )
 from vllm.config.utils import replace
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -182,6 +184,34 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
 
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_dflash_runtime_k_maps_to_bonus_query_width():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = False
+
+    assert speculator._get_runtime_num_speculative_tokens(None) == 7
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 4
+    assert speculator._get_num_speculative_tokens_for_query_len(4) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 1
+    assert speculator._get_num_speculative_tokens_for_query_len(1) == 0
+
+    with pytest.raises(ValueError, match="runtime_num_speculative_tokens"):
+        speculator._get_runtime_num_speculative_tokens(8)
+
+
+def test_dspark_runtime_k_maps_to_anchor_query_width():
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = True
+
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 3
+    assert speculator._get_num_speculative_tokens_for_query_len(3) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 0
+    assert speculator._get_num_speculative_tokens_for_query_len(0) == 0
 
 
 def test_scheduler_uses_dsd_batch_size_override():
