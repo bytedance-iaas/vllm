@@ -116,6 +116,9 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
         )
+        self._dynamic_sd_auto_max_num_scheduled_tokens: int | None = None
+        self._dynamic_sd_max_num_new_slots_per_req = 0
+        self._dynamic_sd_reclaim_parallel_drafting_slots = False
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -267,6 +270,17 @@ class Scheduler(SchedulerInterface):
         self.dynamic_sd_lookup: list[int] | None = None
         self._dynamic_sd_batch_size_override: int | None = None
         if speculative_config is not None:
+            self._dynamic_sd_max_num_new_slots_per_req = (
+                speculative_config.max_num_new_slots_for_drafting
+            )
+            self._dynamic_sd_auto_max_num_scheduled_tokens = (
+                self.scheduler_config.max_num_batched_tokens
+                - self._dynamic_sd_max_num_new_slots_per_req
+                * self.scheduler_config.max_num_seqs
+            )
+            self._dynamic_sd_reclaim_parallel_drafting_slots = (
+                speculative_config.use_dflash() or speculative_config.use_dspark()
+            )
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -293,6 +307,15 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens + int(
                     dspark_bonus_anchor
                 )
+
+        self._dynamic_sd_can_reclaim_token_budget = (
+            self.dynamic_sd_lookup is not None
+            and self._dynamic_sd_auto_max_num_scheduled_tokens is not None
+            and self.scheduler_config.max_num_scheduled_tokens_auto_derived
+            and self._dynamic_sd_reclaim_parallel_drafting_slots
+            and self.max_num_scheduled_tokens
+            == self._dynamic_sd_auto_max_num_scheduled_tokens
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -431,6 +454,38 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = num_new_tokens // block_size * block_size
         return num_new_tokens
 
+    def _get_dynamic_sd_k_for_batch_size(self, batch_size: int) -> int:
+        assert self.dynamic_sd_lookup is not None
+        batch_size = min(batch_size, len(self.dynamic_sd_lookup) - 1)
+        return self.dynamic_sd_lookup[batch_size]
+
+    def _get_dynamic_sd_early_k(self) -> int | None:
+        if (
+            self.dynamic_sd_lookup is None
+            or self._dynamic_sd_batch_size_override is None
+        ):
+            return None
+        return self._get_dynamic_sd_k_for_batch_size(
+            self._dynamic_sd_batch_size_override
+        )
+
+    def _get_num_new_slots_for_dynamic_sd_k(self, num_spec_tokens: int) -> int:
+        if not self._dynamic_sd_reclaim_parallel_drafting_slots:
+            return 0
+        return max(num_spec_tokens - 1, 0)
+
+    def _get_effective_max_num_scheduled_tokens(
+        self, dynamic_sd_k: int | None
+    ) -> int:
+        if dynamic_sd_k is None or not self._dynamic_sd_can_reclaim_token_budget:
+            return self.max_num_scheduled_tokens
+
+        num_extra_slots = self._get_num_new_slots_for_dynamic_sd_k(dynamic_sd_k)
+        return (
+            self.scheduler_config.max_num_batched_tokens
+            - num_extra_slots * self.scheduler_config.max_num_seqs
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -451,7 +506,10 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        dynamic_sd_early_k = self._get_dynamic_sd_early_k()
+        token_budget = self._get_effective_max_num_scheduled_tokens(
+            dynamic_sd_early_k
+        )
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -1189,7 +1247,9 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= self._get_effective_max_num_scheduled_tokens(
+            dynamic_sd_early_k
+        )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -1255,15 +1315,11 @@ class Scheduler(SchedulerInterface):
         # chooses the same K and enters the same collective/control-flow path.
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            dynamic_sd_batch_size = (
-                self._dynamic_sd_batch_size_override
-                if self._dynamic_sd_batch_size_override is not None
-                else len(num_scheduled_tokens)
+            num_spec_tokens_to_schedule = (
+                dynamic_sd_early_k
+                if dynamic_sd_early_k is not None
+                else self._get_dynamic_sd_k_for_batch_size(len(num_scheduled_tokens))
             )
-            dynamic_sd_batch_size = min(
-                dynamic_sd_batch_size, len(self.dynamic_sd_lookup) - 1
-            )
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[dynamic_sd_batch_size]
         self._dynamic_sd_batch_size_override = None
 
         scheduler_output = SchedulerOutput(

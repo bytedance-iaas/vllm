@@ -13,6 +13,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.utils import replace
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
@@ -195,6 +196,151 @@ def test_scheduler_uses_dsd_batch_size_override():
 
     assert len(output.num_scheduled_tokens) == 2
     assert output.num_spec_tokens_to_schedule == 1
+
+
+def _enable_parallel_drafting_budget_reclaim(
+    scheduler: Scheduler,
+    *,
+    auto_derived: bool,
+    reclaim_parallel_drafting_slots: bool = True,
+) -> None:
+    scheduler.max_num_scheduled_tokens = 2048 - 6 * 96
+    scheduler._dynamic_sd_auto_max_num_scheduled_tokens = (
+        scheduler.max_num_scheduled_tokens
+    )
+    scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived = auto_derived
+    scheduler._dynamic_sd_max_num_new_slots_per_req = 6
+    scheduler._dynamic_sd_reclaim_parallel_drafting_slots = (
+        reclaim_parallel_drafting_slots
+    )
+    scheduler._dynamic_sd_can_reclaim_token_budget = (
+        scheduler.dynamic_sd_lookup is not None
+        and scheduler._dynamic_sd_auto_max_num_scheduled_tokens is not None
+        and scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived
+        and scheduler._dynamic_sd_reclaim_parallel_drafting_slots
+        and scheduler.max_num_scheduled_tokens
+        == scheduler._dynamic_sd_auto_max_num_scheduled_tokens
+    )
+
+
+def test_scheduler_reclaims_dynamic_sd_auto_token_budget_with_override():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=True)
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 2 * 96
+
+
+def test_scheduler_does_not_reclaim_dynamic_sd_explicit_equal_token_budget():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=False)
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 6 * 96
+
+
+def test_scheduler_does_not_reclaim_dynamic_sd_explicit_lower_token_budget():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=False)
+    scheduler.max_num_scheduled_tokens = 1024
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 1024
+
+
+def test_scheduler_dynamic_sd_budget_reclaim_handles_kmax_and_kzero():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 0)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=True)
+
+    assert scheduler._get_effective_max_num_scheduled_tokens(7) == 2048 - 6 * 96
+    assert scheduler._get_effective_max_num_scheduled_tokens(0) == 2048
+
+
+def test_scheduler_dynamic_sd_budget_reclaim_ignores_fixed_slot_methods():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(
+        scheduler,
+        auto_derived=True,
+        reclaim_parallel_drafting_slots=False,
+    )
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 6 * 96
+
+
+def test_dynamic_sd_auto_token_budget_provenance_survives_config_replace():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    vllm_config = scheduler.vllm_config
+    assert vllm_config.speculative_config is not None
+    vllm_config.speculative_config.parallel_drafting = True
+    vllm_config.scheduler_config.max_num_scheduled_tokens = 2048 - 6 * 96
+    vllm_config.scheduler_config.max_num_scheduled_tokens_auto_derived = True
+
+    replaced_config = replace(vllm_config, cache_config=vllm_config.cache_config)
+
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens == 2048 - 6 * 96
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens_auto_derived
+
+
+def test_dynamic_sd_explicit_equal_token_budget_provenance_survives_config_replace():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    vllm_config = scheduler.vllm_config
+    assert vllm_config.speculative_config is not None
+    vllm_config.speculative_config.parallel_drafting = True
+    vllm_config.scheduler_config.max_num_scheduled_tokens = 2048 - 6 * 96
+    vllm_config.scheduler_config.max_num_scheduled_tokens_auto_derived = False
+
+    replaced_config = replace(vllm_config, cache_config=vllm_config.cache_config)
+
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens == 2048 - 6 * 96
+    assert not replaced_config.scheduler_config.max_num_scheduled_tokens_auto_derived
 
 
 def test_scheduler_reports_dynamic_sd_local_decode_pressure():
