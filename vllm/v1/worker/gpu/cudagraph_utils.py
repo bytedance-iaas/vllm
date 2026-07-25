@@ -441,6 +441,8 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
+        if uniform_token_count is not None:
+            uniform_token_count = int(uniform_token_count)
         if (
             self._graphs_captured
             and num_tokens > 0

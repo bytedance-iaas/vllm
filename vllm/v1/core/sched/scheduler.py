@@ -1065,6 +1065,8 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = 0
+                unpadded_num_new_tokens = 0
+                padded_num_new_tokens = 0
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -1080,6 +1082,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    unpadded_num_new_tokens = num_new_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1097,6 +1100,7 @@ class Scheduler(SchedulerInterface):
                             self.num_sampled_tokens_per_step
                             + candidate_pad_spec_decode
                         )
+                        padded_num_new_tokens = num_new_tokens
                         if (
                             num_new_tokens > token_budget
                             or num_computed_tokens + num_new_tokens > self.max_model_len
@@ -1151,6 +1155,10 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
+
+                if pad_spec_decode and num_new_tokens != padded_num_new_tokens:
+                    num_new_tokens = unpadded_num_new_tokens
+                    pad_spec_decode = 0
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid

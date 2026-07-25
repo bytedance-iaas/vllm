@@ -314,6 +314,84 @@ def test_dynamic_sd_pads_first_decode_with_verification_k():
     assert output.num_spec_tokens_to_schedule == 7
 
 
+def test_dynamic_sd_async_pads_first_decode_with_verification_k():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        speculative_model="ngram_gpu",
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[r1.request_id] == 33
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
+    )
+    scheduler.add_request(r2)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r2.request_id] == [-1] * 5
+
+
+def test_dynamic_sd_clears_padding_when_later_constraint_changes_width():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]])
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
+    )
+
+    original_split = scheduler._mamba_block_aligned_split
+
+    def fake_split(request, num_new_tokens, *args):
+        if request.request_id == r2.request_id and num_new_tokens == 6:
+            return 4
+        return original_split(request, num_new_tokens, *args)
+
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler._mamba_block_aligned_split = fake_split  # type: ignore[method-assign]
+
+    scheduler.add_request(r2)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 1
+    assert r2.request_id not in output.scheduled_spec_decode_tokens
+
+
 def _enable_parallel_drafting_budget_reclaim(
     scheduler: Scheduler,
     *,

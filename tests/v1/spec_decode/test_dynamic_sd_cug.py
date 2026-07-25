@@ -15,6 +15,7 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.v1.worker.gpu import dp_utils as gpu_dp_utils
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 
 pytestmark = pytest.mark.cpu_test
@@ -403,3 +404,95 @@ def test_dynamic_sd_sparse_capture_grid_dispatches_by_query_length(monkeypatch):
     assert desc.uniform_token_count == 5
     assert desc.num_tokens == 140
     assert desc.num_reqs == 28
+
+
+def test_dynamic_sd_sparse_grid_dispatch_survives_dp_sync(monkeypatch):
+    max_num_seqs = 96
+    max_spec_tokens = 7
+    capture_sizes = [1, 2, 4]
+    capture_sizes.extend(range(8, 256, 8))
+    capture_sizes.extend(range(256, 513, 16))
+    num_spec_per_batch_size = [(1, 16, 7), (17, 60, 5), (61, 96, 3)]
+
+    _patch_cudagraph_test_runtime(monkeypatch)
+    monkeypatch.setattr(
+        gpu_dp_utils,
+        "get_dp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    def _make_manager(decode_query_len: int):
+        config = _create_vllm_config_for_dsd(
+            max_num_seqs=max_num_seqs,
+            max_spec_tokens=max_spec_tokens,
+            cudagraph_mode="FULL_DECODE_ONLY",
+            use_dynamic_sd=True,
+            num_spec_per_batch_size=num_spec_per_batch_size,
+            cudagraph_capture_sizes=capture_sizes,
+            max_cudagraph_capture_size=512,
+        )
+        manager = gpu_cudagraph_utils.CudaGraphManager(
+            vllm_config=config,
+            device=torch.device("cpu"),
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            decode_query_len=decode_query_len,
+        )
+        manager._graphs_captured = True
+        return manager
+
+    def _sync_dispatch(
+        manager,
+        *,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int,
+        other_rank_num_tokens: int,
+    ):
+        def fake_all_reduce(tensor, group):
+            tensor[0][1] = other_rank_num_tokens
+            tensor[1][1] = CUDAGraphMode.FULL.value
+            tensor[2][1] = uniform_token_count
+
+        monkeypatch.setattr(gpu_dp_utils.dist, "all_reduce", fake_all_reduce)
+        desired_desc = manager.dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras=0,
+        )
+        assert desired_desc.cg_mode == CUDAGraphMode.FULL
+        synced_desc, _ = gpu_dp_utils.sync_cudagraph_and_dp_padding(
+            manager,
+            desired_desc,
+            num_tokens,
+            num_reqs,
+            uniform_token_count,
+            dp_size=2,
+            dp_rank=0,
+        )
+        return synced_desc
+
+    # Target verification K=5: local qlen=6 remains FULL after DP sync even
+    # when the DP max token count needs a qlen=6-specific padded descriptor.
+    target_desc = _sync_dispatch(
+        _make_manager(max_spec_tokens + 1),
+        num_reqs=12,
+        num_tokens=12 * 6,
+        uniform_token_count=6,
+        other_rank_num_tokens=13 * 6,
+    )
+    assert target_desc.cg_mode == CUDAGraphMode.FULL
+    assert target_desc.uniform_token_count == 6
+    assert target_desc.num_tokens == 84
+
+    # DSpark proposer K=5 uses qlen=5 and must also survive the DP re-dispatch.
+    proposer_desc = _sync_dispatch(
+        _make_manager(max_spec_tokens),
+        num_reqs=26,
+        num_tokens=26 * 5,
+        uniform_token_count=5,
+        other_rank_num_tokens=27 * 5,
+    )
+    assert proposer_desc.cg_mode == CUDAGraphMode.FULL
+    assert proposer_desc.uniform_token_count == 5
+    assert proposer_desc.num_tokens == 140
