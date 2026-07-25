@@ -27,6 +27,8 @@ def _create_vllm_config_for_dsd(
     cudagraph_mode: str = "FULL_AND_PIECEWISE",
     use_dynamic_sd: bool = True,
     num_spec_per_batch_size: list[tuple[int, int, int]] | None = None,
+    cudagraph_capture_sizes: list[int] | None = None,
+    max_cudagraph_capture_size: int | None = None,
 ) -> MagicMock:
     """Create a minimal config that exercises DSD cudagraph dispatch.
 
@@ -42,11 +44,16 @@ def _create_vllm_config_for_dsd(
     max_decode_query_len = max_spec_tokens + 1
     max_capture_tokens = max_num_seqs * max_decode_query_len
 
+    if cudagraph_capture_sizes is None:
+        cudagraph_capture_sizes = list(range(1, max_capture_tokens + 1))
+    if max_cudagraph_capture_size is None:
+        max_cudagraph_capture_size = max_capture_tokens
+
     compilation_config = CompilationConfig(
         cudagraph_mode=cudagraph_mode,
-        cudagraph_capture_sizes=list(range(1, max_capture_tokens + 1)),
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
     )
-    compilation_config.max_cudagraph_capture_size = max_capture_tokens
+    compilation_config.max_cudagraph_capture_size = max_cudagraph_capture_size
     compilation_config.post_init_cudagraph_sizes()
 
     vllm_config = MagicMock(spec=VllmConfig)
@@ -323,3 +330,76 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 assert desc.num_tokens == num_tokens
                 assert desc.num_reqs is None
             assert desc.num_active_loras == 0
+
+
+def test_dynamic_sd_sparse_capture_grid_dispatches_by_query_length(monkeypatch):
+    """Sparse capture grids must dispatch FULL graphs per query-length family.
+
+    Production capture sizes are sparse, while Dynamic SD can capture multiple
+    uniform query lengths. A token-count bucket can contain a graph for one
+    query length but not another; dispatch must select the next compatible graph
+    for the requested query length instead of falling back to NONE/PIECEWISE.
+    """
+
+    max_num_seqs = 96
+    max_spec_tokens = 7
+    capture_sizes = [1, 2, 4]
+    capture_sizes.extend(range(8, 256, 8))
+    capture_sizes.extend(range(256, 513, 16))
+    num_spec_per_batch_size = [(1, 16, 7), (17, 60, 5), (61, 96, 3)]
+
+    _patch_cudagraph_test_runtime(monkeypatch)
+
+    target_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        cudagraph_mode="FULL_DECODE_ONLY",
+        use_dynamic_sd=True,
+        num_spec_per_batch_size=num_spec_per_batch_size,
+        cudagraph_capture_sizes=capture_sizes,
+        max_cudagraph_capture_size=512,
+    )
+    target_manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=target_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=max_spec_tokens + 1,
+    )
+    target_manager._graphs_captured = True
+
+    # Target verification for K=5 uses qlen=6. With sparse capture sizes,
+    # 78 tokens used to bucket to 80, which has qlen=8/4 descriptors but not
+    # qlen=6. It should now dispatch to the qlen=6 descriptor padded to 84.
+    desc = target_manager.dispatch(
+        num_reqs=13,
+        num_tokens=13 * 6,
+        uniform_token_count=6,
+        num_active_loras=0,
+    )
+
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.uniform_token_count == 6
+    assert desc.num_tokens == 84
+    assert desc.num_reqs == 14
+
+    proposer_manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=target_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=max_spec_tokens,
+    )
+    proposer_manager._graphs_captured = True
+
+    # DSpark proposer for runtime K=5 uses qlen=5. 135 tokens used to bucket
+    # to a qlen=3-only descriptor. It should now pick the qlen=5 descriptor.
+    desc = proposer_manager.dispatch(
+        num_reqs=27,
+        num_tokens=27 * 5,
+        uniform_token_count=5,
+        num_active_loras=0,
+    )
+
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.uniform_token_count == 5
+    assert desc.num_tokens == 140
+    assert desc.num_reqs == 28

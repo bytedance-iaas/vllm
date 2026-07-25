@@ -157,6 +157,9 @@ class CudaGraphManager:
         self._graphs_captured = False
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        self._uniform_candidates: dict[
+            tuple[int, int, int], BatchExecutionDescriptor
+        ] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
 
         self._init_candidates()
@@ -210,6 +213,9 @@ class CudaGraphManager:
         descs_by_token_lora: dict[tuple[int, int], list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
+        uniform_descs: defaultdict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = defaultdict(list)
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
@@ -278,6 +284,9 @@ class CudaGraphManager:
                     # avoid duplicate graphs
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
+                        uniform_descs[
+                            (decode_query_len, num_active_loras)
+                        ].append(desc)
                         descs_by_token_lora[
                             (rounded_num_tokens, num_active_loras)
                         ].append(desc)
@@ -314,6 +323,15 @@ class CudaGraphManager:
                             staging_key
                         ]
             current_range_start = token_cg_size + 1
+
+        for (uniform_token_count, num_active_loras), descs in uniform_descs.items():
+            current_range_start = 0
+            for desc in sorted(descs, key=lambda d: d.num_tokens):
+                for i in range(current_range_start, desc.num_tokens + 1):
+                    self._uniform_candidates[
+                        (i, num_active_loras, uniform_token_count)
+                    ] = desc
+                current_range_start = desc.num_tokens + 1
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
@@ -423,6 +441,22 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
+        if (
+            self._graphs_captured
+            and num_tokens > 0
+            and uniform_token_count is not None
+        ):
+            uniform_key = (num_tokens, effective_loras, uniform_token_count)
+            desc = self._uniform_candidates.get(uniform_key)
+            if desc is not None and _is_compatible(
+                desc,
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                effective_loras,
+            ):
+                return desc
+
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:
