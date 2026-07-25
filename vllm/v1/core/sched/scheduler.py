@@ -475,6 +475,44 @@ class Scheduler(SchedulerInterface):
             return 0
         return max(num_spec_tokens - 1, 0)
 
+    def _get_uniform_verification_k(
+        self,
+        scheduled_running_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+        prefill_scheduled: bool,
+    ) -> int | None:
+        if (
+            not scheduled_running_reqs
+            or prefill_scheduled
+            or self.num_sampled_tokens_per_step <= 0
+        ):
+            return None
+
+        verification_k: int | None = None
+        for request in scheduled_running_reqs:
+            if request.is_prefill_chunk:
+                return None
+
+            spec_token_ids = scheduled_spec_decode_tokens.get(request.request_id)
+            if not spec_token_ids:
+                return None
+
+            num_spec_tokens = len(spec_token_ids)
+            if num_spec_tokens <= 0 or num_spec_tokens > self.num_spec_tokens:
+                return None
+            if (
+                num_scheduled_tokens[request.request_id]
+                != num_spec_tokens + self.num_sampled_tokens_per_step
+            ):
+                return None
+            if verification_k is None:
+                verification_k = num_spec_tokens
+            elif verification_k != num_spec_tokens:
+                return None
+
+        return verification_k
+
     def _get_effective_max_num_scheduled_tokens(
         self, dynamic_sd_k: int | None
     ) -> int:
@@ -766,6 +804,13 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        verification_k = self._get_uniform_verification_k(
+            scheduled_running_reqs,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            prefill_scheduled,
+        )
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -1019,7 +1064,7 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
-                pad_spec_decode = False
+                pad_spec_decode = 0
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -1038,19 +1083,27 @@ class Scheduler(SchedulerInterface):
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
+                    candidate_pad_spec_decode = (
+                        self.num_spec_tokens
+                        if self.dynamic_sd_lookup is None
+                        else (verification_k or 0)
+                    )
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        candidate_pad_spec_decode > 0
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                        num_new_tokens = (
+                            self.num_sampled_tokens_per_step
+                            + candidate_pad_spec_decode
+                        )
                         if (
                             num_new_tokens > token_budget
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
                             break
-                        pad_spec_decode = True
+                        pad_spec_decode = candidate_pad_spec_decode
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
@@ -1217,7 +1270,7 @@ class Scheduler(SchedulerInterface):
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
-                    ] * self.num_spec_tokens
+                    ] * pad_spec_decode
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)

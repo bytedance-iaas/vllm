@@ -16,6 +16,7 @@ from vllm.config import (
 )
 from vllm.config.utils import replace
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -68,6 +69,21 @@ def _add_requests_and_schedule(
     for request in requests:
         scheduler.add_request(request)
     return scheduler.schedule()
+
+
+def _model_output(scheduler: Scheduler, output, sampled: list[list[int]]) -> None:
+    req_ids = list(output.num_scheduled_tokens.keys())
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={request_id: i for i, request_id in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
 
 
 def test_dynamic_sd_uses_batch_size_schedule():
@@ -259,6 +275,43 @@ def test_scheduler_uses_dsd_batch_size_override():
 
     assert len(output.num_scheduled_tokens) == 2
     assert output.num_spec_tokens_to_schedule == 1
+
+
+def test_dynamic_sd_pads_first_decode_with_verification_k():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[r1.request_id] == 33
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
+    )
+    scheduler.add_request(r2)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r2.request_id] == [-1] * 5
+    # The next proposal K is selected independently from the current
+    # verification K. Padding must use the current draft width, not this value.
+    assert output.num_spec_tokens_to_schedule == 7
 
 
 def _enable_parallel_drafting_budget_reclaim(
