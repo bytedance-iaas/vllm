@@ -36,4 +36,8 @@ RUN CUDA_VERSION_DASH="$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr "." "-")" \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
+# The published Mooncake wheel is linked against libcudart.so.12. Keep that
+# runtime alongside CUDA 13 until Mooncake publishes a CUDA 13 wheel.
+RUN python3 -m pip install --no-cache-dir nvidia-cuda-runtime-cu12==12.9.79
+
 WORKDIR /workspace
