@@ -337,6 +337,7 @@ class ElasticEPScalingState:
             self.engine_core.engines_running = bool(data[0])
             self.engine_core.current_wave = int(data[1])
             self.engine_core.step_counter = int(data[2])
+            self.engine_core._reset_dynamic_sd_batch_pressure_cache()
             self.state = ScaleUpNewEngineState.EPLB_RESHUFFLE
             self.new_dp_store.add("eep_barrier_engine_count", 1)
             return True
@@ -528,6 +529,7 @@ class ElasticEPScalingState:
         self.engine_core.engines_running = bool(data[0])
         self.engine_core.current_wave = int(data[1])
         self.engine_core.step_counter = int(data[2])
+        self.engine_core._reset_dynamic_sd_batch_pressure_cache()
         if new_dp_group.rank() == 0:
             self.engine_core._eep_send_engine_core_notification(
                 EEPNotificationType.RECONFIGURE_FINISHED

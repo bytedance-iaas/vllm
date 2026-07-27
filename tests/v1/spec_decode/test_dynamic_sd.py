@@ -608,6 +608,48 @@ def test_dynamic_sd_dp_global_policy_allows_data_parallel():
     assert speculative_config.uses_dynamic_sd_dp_global_max_policy()
 
 
+def test_dynamic_sd_dp_sync_interval_defaults_and_validates():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(data_parallel_size=2),
+    )
+    assert speculative_config.dynamic_sd_dp_sync_interval == 8
+
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        dynamic_sd_dp_sync_interval=1,
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(data_parallel_size=2),
+    )
+    assert speculative_config.dynamic_sd_dp_sync_interval == 1
+
+    with pytest.raises(ValueError):
+        SpeculativeConfig(
+            method="dspark",
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            dynamic_sd_dp_sync_interval=0,
+            target_model_config=model_config,
+            target_parallel_config=ParallelConfig(data_parallel_size=2),
+        )
+
+
 def test_dynamic_sd_dp_rejects_non_global_policy_from_vllm_config():
     model_config = ModelConfig(
         model="facebook/opt-125m",

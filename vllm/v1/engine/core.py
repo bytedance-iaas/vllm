@@ -1771,6 +1771,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter = 0
         self.current_wave = 0
         self.last_counts = (0, 0)
+        self._dynamic_sd_cached_global_batch_pressure: int | None = None
 
         # Two-phase pause protocol state. When pending_pause is True, the
         # engine keeps stepping (dummy batches) while waiting for all DP
@@ -1925,6 +1926,9 @@ class DPEngineCoreProc(EngineCoreProc):
             and self.step_counter % self.prefill_schedule_interval != 0
         )
 
+    def _reset_dynamic_sd_batch_pressure_cache(self) -> None:
+        self._dynamic_sd_cached_global_batch_pressure = None
+
     def _sync_dynamic_sd_batch_size_override(self) -> None:
         speculative_config = self.vllm_config.speculative_config
         if (
@@ -1933,11 +1937,20 @@ class DPEngineCoreProc(EngineCoreProc):
         ):
             return
 
-        local_batch_pressure = self.scheduler.get_dynamic_sd_local_batch_pressure()
-        global_batch_pressure = ParallelConfig.sync_dynamic_sd_batch_pressure(
-            self.dp_group, local_batch_pressure
+        cached_pressure = self._dynamic_sd_cached_global_batch_pressure
+        sync_interval = speculative_config.dynamic_sd_dp_sync_interval
+        sync_due = (
+            cached_pressure is None
+            or cached_pressure == 0
+            or self.step_counter % sync_interval == 0
         )
-        self.scheduler.set_dynamic_sd_batch_size_override(global_batch_pressure)
+        if sync_due:
+            local_batch_pressure = self.scheduler.get_dynamic_sd_local_batch_pressure()
+            cached_pressure = ParallelConfig.sync_dynamic_sd_batch_pressure(
+                self.dp_group, local_batch_pressure
+            )
+            self._dynamic_sd_cached_global_batch_pressure = cached_pressure
+        self.scheduler.set_dynamic_sd_batch_size_override(cached_pressure)
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""

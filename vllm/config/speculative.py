@@ -181,8 +181,15 @@ class SpeculativeConfig:
     """Opt-in policy for DP-safe Dynamic SD when DP > 1.
 
     Dynamic SD stays fail-closed under DP > 1 unless this is explicitly set.
-    ``global_max`` synchronizes one DP-global batch-pressure estimate and uses
-    the same K on every DP rank for that scheduling step.
+    ``global_max`` uses one DP-global batch-pressure estimate so every DP rank
+    uses the same K. The synchronized pressure may be cached between refreshes
+    according to ``dynamic_sd_dp_sync_interval``.
+    """
+    dynamic_sd_dp_sync_interval: int = Field(default=8, ge=1)
+    """Number of DP engine steps between Dynamic SD global pressure syncs.
+
+    This only applies to ``dynamic_sd_dp_batch_policy='global_max'``. A value
+    of 1 restores per-step synchronization.
     """
 
     # params generated in the post-init stage
