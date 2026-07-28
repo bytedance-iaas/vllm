@@ -45,7 +45,7 @@ RUN python3 -m pip uninstall -y mooncake-transfer-engine \
     && python3 -c "from importlib.metadata import version; from pathlib import Path; assert version('mooncake-transfer-engine-cuda13') == '0.3.12.post1'; assert Path('/usr/local/lib/python3.12/dist-packages/mooncake/engine.so').is_file()" \
     && ldd /usr/local/lib/python3.12/dist-packages/mooncake/engine.so \
         | tee /tmp/mooncake-engine-ldd.txt \
-    && grep -q 'libcudart\\.so\\.13 =>' /tmp/mooncake-engine-ldd.txt \
-    && ! grep -q 'libcudart\\.so\\.12' /tmp/mooncake-engine-ldd.txt
+    && grep -Fq 'libcudart.so.13 =>' /tmp/mooncake-engine-ldd.txt \
+    && ! grep -Fq 'libcudart.so.12' /tmp/mooncake-engine-ldd.txt
 
 WORKDIR /workspace
