@@ -222,9 +222,9 @@ class CudaGraphManager:
 
         # When using Dynamic SD, num_speculative_tokens is the max number of
         # draft tokens. Runtime only needs the scheduled K families plus the
-        # no-draft (K=0) and max-K families; keep the manager-specific query-len
-        # offset so target/proposer managers capture the correct widths without
-        # materializing every intermediate K.
+        # max-K family; keep the manager-specific query-len offset so
+        # target/proposer managers capture the correct widths without
+        # materializing every intermediate K. Runtime K=0 falls back to NONE.
         speculative_config = self.vllm_config.speculative_config
         if (
             speculative_config
@@ -243,7 +243,7 @@ class CudaGraphManager:
             max_runtime_k = self.vllm_config.num_speculative_tokens
             manager_query_len_offset = self.decode_query_len - max_runtime_k
             scheduled_runtime_ks = set(schedule_lookup[1:])
-            scheduled_runtime_ks.update((0, max_runtime_k))
+            scheduled_runtime_ks.add(max_runtime_k)
             decode_query_lens = sorted(
                 {
                     runtime_k + manager_query_len_offset

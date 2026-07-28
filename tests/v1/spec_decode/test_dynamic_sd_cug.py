@@ -78,7 +78,8 @@ def _create_vllm_config_for_dsd(
         # speculative tokens maps to decode query length K + 1. By default
         # provide every query length in [1, max_decode_query_len] (i.e. K in
         # [0, max_spec_tokens]) so the manager captures a FULL decode graph for
-        # each uniform shape.
+        # each scheduled uniform shape. K=0 is only captured when explicitly
+        # present in the schedule.
         if num_spec_per_batch_size is None:
             num_spec_per_batch_size = [
                 (qlen, qlen, qlen - 1) for qlen in range(1, max_decode_query_len + 1)
@@ -187,7 +188,7 @@ def _make_dynamic_sd_dummy_runner() -> tuple[object, dict[str, int]]:
     return runner, recorded
 
 
-def test_dynamic_sd_target_capture_includes_prev_and_max_k_families(monkeypatch):
+def test_dynamic_sd_target_capture_includes_scheduled_and_max_k_families(monkeypatch):
     max_num_seqs = 96
     max_spec_tokens = 7
     num_spec_per_batch_size = [(1, 16, 7), (17, 60, 5), (61, 96, 3)]
@@ -211,11 +212,7 @@ def test_dynamic_sd_target_capture_includes_prev_and_max_k_families(monkeypatch)
     )
     manager._graphs_captured = True
 
-    expected_full_shapes = {
-        1: (1, 1),
-        6: (84, 14),
-        8: (80, 10),
-    }
+    expected_full_shapes = {6: (84, 14), 8: (80, 10)}
     for qlen, (expected_tokens, expected_reqs) in expected_full_shapes.items():
         num_reqs = expected_tokens // qlen if qlen != 6 else 13
         num_tokens = num_reqs * qlen
@@ -229,6 +226,14 @@ def test_dynamic_sd_target_capture_includes_prev_and_max_k_families(monkeypatch)
         assert desc.uniform_token_count == qlen
         assert desc.num_tokens == expected_tokens
         assert desc.num_reqs == expected_reqs
+
+    k0_desc = manager.dispatch(
+        num_reqs=96,
+        num_tokens=96,
+        uniform_token_count=1,
+        num_active_loras=0,
+    )
+    assert k0_desc.cg_mode == CUDAGraphMode.NONE
 
     unscheduled_desc = manager.dispatch(
         num_reqs=14,
@@ -470,13 +475,14 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
 
 
 def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
-    """DSD should capture scheduled query lengths plus K=0 and K=max families.
+    """DSD should capture scheduled query lengths plus the K=max family.
 
     With a partial schedule of ``(1, 32, 4)`` and ``(33, 128, 3)``, only the
     scheduled speculative-token counts (K = 4 and K = 3) become decode query
-    lengths (K + 1 = 5 and 4). Dynamic SD also retains the K=0 and K=max
-    families, which map to query lengths 1 and 8 for the target manager.
-    Uniform batches at exactly {1, 4, 5, 8} should get FULL graphs, while other
+    lengths (K + 1 = 5 and 4). Dynamic SD also retains the K=max family, which
+    maps to query length 8 for the target manager. Runtime K=0 is not captured
+    unless it is explicitly scheduled.
+    Uniform batches at exactly {4, 5, 8} should get FULL graphs, while other
     intermediate query lengths must fall back to the mixed-batch PIECEWISE
     graph.
     """
@@ -486,10 +492,10 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
     max_decode_query_len = max_spec_tokens + 1
 
     # (range_start, range_end, num_speculative_tokens): K = 4 and K = 3 are
-    # scheduled. The target manager also captures K = 0 and K = Kmax, so FULL
-    # decode graphs should exist for query lengths {1, 5, 4, 8}.
+    # scheduled. The target manager also captures K = Kmax, so FULL decode
+    # graphs should exist for query lengths {5, 4, 8}. K=0 should fall back.
     num_spec_per_batch_size = [(1, 32, 4), (33, 128, 3)]
-    scheduled_query_lens = {1, max_decode_query_len}
+    scheduled_query_lens = {max_decode_query_len}
     scheduled_query_lens.update(entry[2] + 1 for entry in num_spec_per_batch_size)
 
     _patch_cudagraph_test_runtime(monkeypatch)
