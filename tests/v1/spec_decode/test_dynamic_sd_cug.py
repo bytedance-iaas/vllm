@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,6 +18,7 @@ from vllm.config import (
 )
 from vllm.v1.worker.gpu import dp_utils as gpu_dp_utils
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm.v1.worker.gpu import model_runner as gpu_model_runner
 
 pytestmark = pytest.mark.cpu_test
 
@@ -102,6 +104,210 @@ def _patch_cudagraph_test_runtime(monkeypatch):
         "get_global_graph_pool",
         lambda: None,
     )
+
+
+def _make_sparse_capture_sizes() -> list[int]:
+    capture_sizes = [1, 2, 4]
+    capture_sizes.extend(range(8, 256, 8))
+    capture_sizes.extend(range(256, 513, 16))
+    return capture_sizes
+
+
+def _make_dynamic_sd_dummy_runner() -> tuple[object, dict[str, int]]:
+    runner = object.__new__(gpu_model_runner.GPUModelRunner)
+    runner.max_num_reqs = 8
+    runner.num_speculative_steps = 7
+    runner.decode_query_len = 8
+    runner.retained_runtime_num_spec_tokens = 0
+    runner.speculative_config = MagicMock()
+    runner.speculative_config.uses_dynamic_speculative_decoding.return_value = True
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    runner.kv_connector = SimpleNamespace(set_disabled=lambda *_: None)
+    runner.is_first_pp_rank = True
+    runner.is_last_pp_rank = True
+    runner.intermediate_tensors = None
+    runner.lora_config = None
+    runner.execute_model_state = None
+    runner.device = torch.device("cpu")
+    runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
+    runner.req_states = SimpleNamespace(
+        last_sampled_tokens=torch.zeros(runner.max_num_reqs, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(runner.max_num_reqs, dtype=torch.int64),
+    )
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(
+                gpu=torch.zeros(runner.max_num_reqs, dtype=torch.float32)
+            ),
+            seeds=SimpleNamespace(
+                gpu=torch.zeros(runner.max_num_reqs, dtype=torch.int64)
+            ),
+        )
+    )
+    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: nullcontext()
+
+    recorded: dict[str, int] = {}
+
+    def fake_execute_model(self, scheduler_output, **kwargs):
+        scheduled_tokens = list(scheduler_output.num_scheduled_tokens.values())
+        recorded["target_query_len"] = scheduled_tokens[0]
+        recorded["target_total_tokens"] = scheduler_output.total_num_scheduled_tokens
+        recorded["target_runtime_k"] = scheduler_output.num_spec_tokens_to_schedule
+        self.execute_model_state = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                num_reqs=len(scheduled_tokens),
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                logits_indices=torch.tensor([0], dtype=torch.int64),
+            ),
+            attn_metadata=None,
+            slot_mappings_by_layer=None,
+            hidden_states=torch.zeros(
+                scheduler_output.total_num_scheduled_tokens, 4, dtype=torch.float32
+            ),
+            aux_hidden_states=None,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            finished_req_ids=set(),
+        )
+
+    class FakeSpeculator:
+        supports_mm_inputs = False
+
+        def propose(self, *args, runtime_num_speculative_tokens, **kwargs):
+            recorded["proposer_runtime_k"] = int(runtime_num_speculative_tokens)
+            input_batch = kwargs["input_batch"] if "input_batch" in kwargs else args[0]
+            return torch.zeros(
+                input_batch.num_reqs,
+                runtime_num_speculative_tokens,
+                dtype=torch.int64,
+            )
+
+    runner.execute_model = fake_execute_model.__get__(runner, type(runner))
+    runner.speculator = FakeSpeculator()
+    runner.model = SimpleNamespace()
+    return runner, recorded
+
+
+def test_dynamic_sd_target_capture_includes_prev_and_max_k_families(monkeypatch):
+    max_num_seqs = 96
+    max_spec_tokens = 7
+    num_spec_per_batch_size = [(1, 16, 7), (17, 60, 5), (61, 96, 3)]
+
+    _patch_cudagraph_test_runtime(monkeypatch)
+
+    target_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        cudagraph_mode="FULL_DECODE_ONLY",
+        use_dynamic_sd=True,
+        num_spec_per_batch_size=num_spec_per_batch_size,
+        cudagraph_capture_sizes=_make_sparse_capture_sizes(),
+        max_cudagraph_capture_size=512,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=target_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=max_spec_tokens + 1,
+    )
+    manager._graphs_captured = True
+
+    expected_full_shapes = {
+        1: (1, 1),
+        6: (84, 14),
+        8: (80, 10),
+    }
+    for qlen, (expected_tokens, expected_reqs) in expected_full_shapes.items():
+        num_reqs = expected_tokens // qlen if qlen != 6 else 13
+        num_tokens = num_reqs * qlen
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=qlen,
+            num_active_loras=0,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.uniform_token_count == qlen
+        assert desc.num_tokens == expected_tokens
+        assert desc.num_reqs == expected_reqs
+
+    unscheduled_desc = manager.dispatch(
+        num_reqs=14,
+        num_tokens=14 * 7,
+        uniform_token_count=7,
+        num_active_loras=0,
+    )
+    assert unscheduled_desc.cg_mode == CUDAGraphMode.NONE
+
+
+def test_dynamic_sd_dspark_proposer_captures_only_runtime_k_families(monkeypatch):
+    max_num_seqs = 96
+    max_spec_tokens = 7
+    num_spec_per_batch_size = [(1, 16, 7), (17, 60, 5), (61, 96, 3)]
+
+    _patch_cudagraph_test_runtime(monkeypatch)
+
+    proposer_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        cudagraph_mode="FULL_DECODE_ONLY",
+        use_dynamic_sd=True,
+        num_spec_per_batch_size=num_spec_per_batch_size,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=proposer_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=max_spec_tokens,
+    )
+    manager._graphs_captured = True
+
+    for qlen, num_reqs in ((5, 9), (7, 8)):
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_reqs * qlen,
+            uniform_token_count=qlen,
+            num_active_loras=0,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.uniform_token_count == qlen
+        assert desc.num_tokens == num_reqs * qlen
+        assert desc.num_reqs == num_reqs
+
+    unscheduled_desc = manager.dispatch(
+        num_reqs=9,
+        num_tokens=9 * 6,
+        uniform_token_count=6,
+        num_active_loras=0,
+    )
+    assert unscheduled_desc.cg_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.parametrize(
+    ("previous_k", "current_k", "expected_target_qlen", "expected_proposer_k"),
+    [(5, 7, 6, 7), (7, 5, 8, 5), (0, 5, 1, 5)],
+)
+def test_dynamic_sd_dummy_run_uses_previous_target_k_and_current_proposer_k(
+    previous_k: int,
+    current_k: int,
+    expected_target_qlen: int,
+    expected_proposer_k: int,
+):
+    runner, recorded = _make_dynamic_sd_dummy_runner()
+    runner.retained_runtime_num_spec_tokens = previous_k
+
+    gpu_model_runner.GPUModelRunner._dummy_run(
+        runner,
+        1,
+        uniform_decode=True,
+        num_spec_tokens_to_schedule=current_k,
+        skip_eplb=True,
+    )
+
+    assert recorded["target_query_len"] == expected_target_qlen
+    assert recorded["target_total_tokens"] == expected_target_qlen
+    assert recorded["target_runtime_k"] == current_k
+    assert recorded["proposer_runtime_k"] == expected_proposer_k
+    assert runner.retained_runtime_num_spec_tokens == current_k
 
 
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):
@@ -264,13 +470,15 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
 
 
 def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
-    """DSD should only capture FULL graphs for query lengths in the schedule.
+    """DSD should capture scheduled query lengths plus K=0 and K=max families.
 
     With a partial schedule of ``(1, 32, 4)`` and ``(33, 128, 3)``, only the
     scheduled speculative-token counts (K = 4 and K = 3) become decode query
-    lengths (K + 1 = 5 and 4). Uniform batches at those query lengths should get
-    FULL graphs, while every other query length (e.g. the lower values 1, 2, 3)
-    must fall back to the mixed-batch PIECEWISE graph.
+    lengths (K + 1 = 5 and 4). Dynamic SD also retains the K=0 and K=max
+    families, which map to query lengths 1 and 8 for the target manager.
+    Uniform batches at exactly {1, 4, 5, 8} should get FULL graphs, while other
+    intermediate query lengths must fall back to the mixed-batch PIECEWISE
+    graph.
     """
 
     max_num_seqs = 128
@@ -278,10 +486,11 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
     max_decode_query_len = max_spec_tokens + 1
 
     # (range_start, range_end, num_speculative_tokens): K = 4 and K = 3 are
-    # scheduled, so FULL decode graphs should exist for query lengths K + 1,
-    # i.e. exactly {5, 4}.
+    # scheduled. The target manager also captures K = 0 and K = Kmax, so FULL
+    # decode graphs should exist for query lengths {1, 5, 4, 8}.
     num_spec_per_batch_size = [(1, 32, 4), (33, 128, 3)]
-    scheduled_query_lens = {entry[2] + 1 for entry in num_spec_per_batch_size}
+    scheduled_query_lens = {1, max_decode_query_len}
+    scheduled_query_lens.update(entry[2] + 1 for entry in num_spec_per_batch_size)
 
     _patch_cudagraph_test_runtime(monkeypatch)
 

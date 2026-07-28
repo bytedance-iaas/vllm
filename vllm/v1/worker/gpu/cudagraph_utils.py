@@ -221,8 +221,10 @@ class CudaGraphManager:
         )
 
         # When using Dynamic SD, num_speculative_tokens is the max number of
-        # draft tokens. The scheduler might use a smaller number so we need
-        # to capture graphs for all possible values during decode.
+        # draft tokens. Runtime only needs the scheduled K families plus the
+        # no-draft (K=0) and max-K families; keep the manager-specific query-len
+        # offset so target/proposer managers capture the correct widths without
+        # materializing every intermediate K.
         speculative_config = self.vllm_config.speculative_config
         if (
             speculative_config
@@ -233,24 +235,20 @@ class CudaGraphManager:
             )
             # uses_dynamic_speculative_decoding() guarantees this is set.
             assert num_spec_per_batch_size is not None
-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
-            # _per_step. Recover num_new_sampled_tokens_per_step
-            # from the values the manager already has.
-            num_new_sampled_tokens_per_step = (
-                self.decode_query_len - self.vllm_config.num_speculative_tokens
-            )
             schedule_lookup = build_dynamic_sd_schedule_lookup(
                 num_spec_per_batch_size,
                 self.max_num_reqs,
                 self.vllm_config.num_speculative_tokens,
             )
-            # K=0 disables drafting at that concurrency; skip it here since no
-            # uniform decode graph is needed (and qlen=0 would divide by zero).
+            max_runtime_k = self.vllm_config.num_speculative_tokens
+            manager_query_len_offset = self.decode_query_len - max_runtime_k
+            scheduled_runtime_ks = set(schedule_lookup[1:])
+            scheduled_runtime_ks.update((0, max_runtime_k))
             decode_query_lens = sorted(
                 {
-                    k + num_new_sampled_tokens_per_step
-                    for k in schedule_lookup[1:]
-                    if k + num_new_sampled_tokens_per_step > 0
+                    runtime_k + manager_query_len_offset
+                    for runtime_k in scheduled_runtime_ks
+                    if runtime_k + manager_query_len_offset > 0
                 }
             )
         else:
