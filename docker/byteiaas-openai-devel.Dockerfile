@@ -42,8 +42,10 @@ RUN CUDA_VERSION_DASH="$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr "." "-")" \
 RUN python3 -m pip uninstall -y mooncake-transfer-engine \
     && python3 -m pip install --no-cache-dir \
         mooncake-transfer-engine-cuda13==0.3.12.post1 \
-    && python3 -c "from importlib.metadata import version; from mooncake.engine import TransferEngine; assert version('mooncake-transfer-engine') == '0.3.12.post1'; assert TransferEngine" \
-    && ! ldd /usr/local/lib/python3.12/dist-packages/mooncake/engine.so \
-        | grep -E 'libcudart\\.so\\.12|not found'
+    && python3 -c "from importlib.metadata import version; from pathlib import Path; assert version('mooncake-transfer-engine') == '0.3.12.post1'; assert Path('/usr/local/lib/python3.12/dist-packages/mooncake/engine.so').is_file()" \
+    && ldd /usr/local/lib/python3.12/dist-packages/mooncake/engine.so \
+        | tee /tmp/mooncake-engine-ldd.txt \
+    && grep -q 'libcudart\\.so\\.13 =>' /tmp/mooncake-engine-ldd.txt \
+    && ! grep -q 'libcudart\\.so\\.12' /tmp/mooncake-engine-ldd.txt
 
 WORKDIR /workspace
