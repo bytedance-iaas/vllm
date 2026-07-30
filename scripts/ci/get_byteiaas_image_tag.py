@@ -119,7 +119,7 @@ def build_tag(
             raise SystemExit("--tag-value is required when --mode=release")
         if not is_tag_safe_suffix(tag_value):
             raise SystemExit("--tag-value must be a Docker tag-safe suffix")
-        tag = f"v{vllm_version}.byted.{tag_value}.{timestamp}"
+        tag = f"v{tag_value}.byted.{timestamp}"
     else:
         raise SystemExit(f"unsupported mode: {mode}")
 
