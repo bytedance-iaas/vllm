@@ -15,12 +15,12 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.utils import replace
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
 def _make_lookup(
@@ -166,7 +166,7 @@ def test_scheduler_initializes_dynamic_sd_lookup_from_speculative_config():
         runtime_num_speculative_tokens=3,
     )
 
-    assert scheduler.dynamic_sd_lookup is not None
+    assert scheduler._dynamic_sd is not None
     assert scheduler.num_spec_tokens == 3
 
 
@@ -227,9 +227,7 @@ def test_dflash_runtime_sample_col_uses_runtime_k_stride():
     speculator._sample_col_steps = torch.arange(7, dtype=torch.int32)
     speculator._runtime_sample_col = torch.empty(4 * 7, dtype=torch.int32)
 
-    sample_col = speculator._get_sample_col_for_k(
-        num_reqs=3, num_speculative_tokens=3
-    )
+    sample_col = speculator._get_sample_col_for_k(num_reqs=3, num_speculative_tokens=3)
 
     assert sample_col.tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 2]
     assert speculator._get_sample_col_for_k(2, 0).numel() == 0
@@ -298,9 +296,7 @@ def test_dynamic_sd_pads_first_decode_with_verification_k():
     assert output.num_scheduled_tokens[r1.request_id] == 33
     _model_output(scheduler, output, [[100]])
 
-    scheduler.update_draft_token_ids(
-        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
-    )
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]]))
     scheduler.add_request(r2)
 
     output = scheduler.schedule()
@@ -337,9 +333,7 @@ def test_dynamic_sd_async_pads_first_decode_with_verification_k():
     assert output.num_scheduled_tokens[r1.request_id] == 33
     _model_output(scheduler, output, [[100]])
 
-    scheduler.update_draft_token_ids(
-        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
-    )
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]]))
     scheduler.add_request(r2)
 
     output = scheduler.schedule()
@@ -369,9 +363,7 @@ def test_dynamic_sd_clears_padding_when_later_constraint_changes_width():
     scheduler.add_request(r1)
     output = scheduler.schedule()
     _model_output(scheduler, output, [[100]])
-    scheduler.update_draft_token_ids(
-        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
-    )
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]]))
 
     original_split = scheduler._mamba_block_aligned_split
 
@@ -399,21 +391,17 @@ def _enable_parallel_drafting_budget_reclaim(
     reclaim_parallel_drafting_slots: bool = True,
 ) -> None:
     scheduler.max_num_scheduled_tokens = 2048 - 6 * 96
-    scheduler._dynamic_sd_auto_max_num_scheduled_tokens = (
-        scheduler.max_num_scheduled_tokens
-    )
     scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived = auto_derived
-    scheduler._dynamic_sd_max_num_new_slots_per_req = 6
-    scheduler._dynamic_sd_reclaim_parallel_drafting_slots = (
-        reclaim_parallel_drafting_slots
+    assert scheduler._dynamic_sd is not None
+    can_reclaim_token_budget = (
+        scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived
+        and reclaim_parallel_drafting_slots
+        and scheduler.max_num_scheduled_tokens == 2048 - 6 * 96
     )
-    scheduler._dynamic_sd_can_reclaim_token_budget = (
-        scheduler.dynamic_sd_lookup is not None
-        and scheduler._dynamic_sd_auto_max_num_scheduled_tokens is not None
-        and scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived
-        and scheduler._dynamic_sd_reclaim_parallel_drafting_slots
-        and scheduler.max_num_scheduled_tokens
-        == scheduler._dynamic_sd_auto_max_num_scheduled_tokens
+    scheduler._dynamic_sd.budget_policy = (
+        _DynamicSDBudgetPolicy(max_num_batched_tokens=2048, max_num_seqs=96)
+        if can_reclaim_token_budget
+        else None
     )
 
 
@@ -742,7 +730,7 @@ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     )
     output = _add_requests_and_schedule(scheduler, 4)
 
-    assert scheduler.dynamic_sd_lookup is None
+    assert scheduler._dynamic_sd is None
     assert output.num_spec_tokens_to_schedule == 3
 
 
@@ -784,7 +772,7 @@ def test_scheduler_passes_max_num_seqs_as_dsd_runtime_batch_limit():
     )
     output = _add_requests_and_schedule(scheduler, 16)
 
-    assert scheduler.dynamic_sd_lookup is not None
-    assert len(scheduler.dynamic_sd_lookup) == 17
+    assert scheduler._dynamic_sd is not None
+    assert len(scheduler._dynamic_sd.lookup) == 17
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3

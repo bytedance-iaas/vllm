@@ -1239,7 +1239,6 @@ class VllmConfig:
                 "optimization level defaults."
             )
 
-        self._verify_dynamic_sd_dp_config()
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (

@@ -1210,19 +1210,6 @@ class SpeculativeConfig:
                     )
                 last_k = current_k
 
-        if (
-            self.uses_dynamic_speculative_decoding()
-            and self.target_parallel_config is not None
-            and self.target_parallel_config.data_parallel_size > 1
-            and self.dynamic_sd_dp_batch_policy is None
-        ):
-            raise ValueError(
-                "num_speculative_tokens_per_batch_size with data_parallel_size > 1 "
-                "requires explicit opt-in via "
-                "dynamic_sd_dp_batch_policy='global_max'. Rank-local Dynamic SD "
-                "remains disabled under DP > 1."
-            )
-
         if self.use_heterogeneous_vocab and not self.uses_draft_model():
             raise ValueError(
                 "use_heterogeneous_vocab only works with method='draft_model'"

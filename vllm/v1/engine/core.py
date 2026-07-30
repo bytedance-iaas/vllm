@@ -819,8 +819,8 @@ class EngineCore:
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
     def execute_dummy_batch(self):
-        num_spec_tokens_to_schedule = getattr(
-            self.scheduler, "last_num_spec_tokens_to_schedule", None
+        num_spec_tokens_to_schedule = (
+            self.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch()
         )
         self.model_executor.execute_dummy_batch(num_spec_tokens_to_schedule)
 

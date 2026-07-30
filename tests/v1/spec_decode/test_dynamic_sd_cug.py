@@ -16,8 +16,8 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
-from vllm.v1.worker.gpu import dp_utils as gpu_dp_utils
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm.v1.worker.gpu import dp_utils as gpu_dp_utils
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner
 
 pytestmark = pytest.mark.cpu_test
@@ -119,7 +119,7 @@ def _make_dynamic_sd_dummy_runner() -> tuple[object, dict[str, int]]:
     runner.max_num_reqs = 8
     runner.num_speculative_steps = 7
     runner.decode_query_len = 8
-    runner.retained_runtime_num_spec_tokens = 0
+    runner.last_completed_num_spec_tokens_to_schedule = 0
     runner.speculative_config = MagicMock()
     runner.speculative_config.uses_dynamic_speculative_decoding.return_value = True
     runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
@@ -298,7 +298,7 @@ def test_dynamic_sd_dummy_run_uses_previous_target_k_and_current_proposer_k(
     expected_proposer_k: int,
 ):
     runner, recorded = _make_dynamic_sd_dummy_runner()
-    runner.retained_runtime_num_spec_tokens = previous_k
+    runner.last_completed_num_spec_tokens_to_schedule = previous_k
 
     gpu_model_runner.GPUModelRunner._dummy_run(
         runner,
@@ -312,7 +312,7 @@ def test_dynamic_sd_dummy_run_uses_previous_target_k_and_current_proposer_k(
     assert recorded["target_total_tokens"] == expected_target_qlen
     assert recorded["target_runtime_k"] == current_k
     assert recorded["proposer_runtime_k"] == expected_proposer_k
-    assert runner.retained_runtime_num_spec_tokens == current_k
+    assert runner.last_completed_num_spec_tokens_to_schedule == current_k
 
 
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):

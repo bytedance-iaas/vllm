@@ -189,8 +189,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
-        self.last_num_spec_tokens_to_schedule = self.num_speculative_steps
-        self.retained_runtime_num_spec_tokens = 0
+        self.scheduled_num_spec_tokens_to_schedule = self.num_speculative_steps
+        self.last_completed_num_spec_tokens_to_schedule = 0
         if self.speculative_config is not None:
             method = self.speculative_config.method
             # Aux-hidden-state draft methods (dspark / dflash / eagle3) draft from
@@ -325,9 +325,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.speculative_config.uses_dynamic_speculative_decoding()
         )
 
-    def _retain_runtime_num_spec_tokens(self, num_spec_tokens_to_schedule: int) -> None:
+    def _retain_completed_num_spec_tokens(
+        self, num_spec_tokens_to_schedule: int
+    ) -> None:
         if self._uses_dynamic_sd():
-            self.retained_runtime_num_spec_tokens = int(num_spec_tokens_to_schedule)
+            self.last_completed_num_spec_tokens_to_schedule = int(
+                num_spec_tokens_to_schedule
+            )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -628,17 +632,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
-        current_num_spec_tokens_to_schedule = (
+        scheduled_num_spec_tokens_to_schedule = (
             self.num_speculative_steps
             if num_spec_tokens_to_schedule is None
             else int(num_spec_tokens_to_schedule)
         )
-        previous_runtime_num_spec_tokens = self.retained_runtime_num_spec_tokens
+        last_completed_num_spec_tokens = self.last_completed_num_spec_tokens_to_schedule
         if uniform_decode:
             target_query_len = self.decode_query_len
             if self._uses_dynamic_sd() and not is_profile:
                 target_query_len = (
-                    previous_runtime_num_spec_tokens
+                    last_completed_num_spec_tokens
                     + self.model_state.num_new_sampled_tokens_per_step
                 )
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
@@ -658,7 +662,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
         dummy_scheduler_output.num_spec_tokens_to_schedule = (
-            current_num_spec_tokens_to_schedule
+            scheduled_num_spec_tokens_to_schedule
         )
 
         # Disable any use of KVConnector for dummy runs.
@@ -691,7 +695,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
             if uniform_decode and not is_profile:
-                self._retain_runtime_num_spec_tokens(current_num_spec_tokens_to_schedule)
+                self._retain_completed_num_spec_tokens(
+                    scheduled_num_spec_tokens_to_schedule
+                )
             return None, None
 
         assert self.execute_model_state is not None
@@ -751,7 +757,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         if uniform_decode and not is_profile:
-            self._retain_runtime_num_spec_tokens(current_num_spec_tokens_to_schedule)
+            self._retain_completed_num_spec_tokens(
+                scheduled_num_spec_tokens_to_schedule
+            )
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
@@ -1292,7 +1300,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        self.last_num_spec_tokens_to_schedule = (
+        self.scheduled_num_spec_tokens_to_schedule = (
             scheduler_output.num_spec_tokens_to_schedule
         )
         if not dummy_run:
@@ -1637,10 +1645,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
-        num_spec_tokens_to_schedule = getattr(
-            self.execute_model_state,
-            "num_spec_tokens_to_schedule",
-            self.num_speculative_steps,
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
         )
         self.execute_model_state = None
 
@@ -1660,7 +1666,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            self._retain_runtime_num_spec_tokens(num_spec_tokens_to_schedule)
+            self._retain_completed_num_spec_tokens(num_spec_tokens_to_schedule)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
@@ -1794,7 +1800,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
-        self._retain_runtime_num_spec_tokens(num_spec_tokens_to_schedule)
+        self._retain_completed_num_spec_tokens(num_spec_tokens_to_schedule)
 
         return async_output
 

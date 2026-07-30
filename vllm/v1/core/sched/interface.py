@@ -86,6 +86,12 @@ class SchedulerInterface(ABC):
             "Dynamic SD DP batch-size override is not supported by this scheduler."
         )
 
+    def get_num_spec_tokens_to_schedule_for_dummy_batch(self) -> int | None:
+        """Return the runtime K to use for a dummy decode batch."""
+        raise NotImplementedError(
+            "Dynamic SD dummy-batch runtime K is not supported by this scheduler."
+        )
+
     def get_dynamic_sd_local_batch_pressure(self) -> int:
         """Return a cheap local decode-pressure estimate for DP Dynamic SD."""
         raise NotImplementedError(

@@ -1104,8 +1104,8 @@ class Worker(WorkerBase):
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
         if self.use_v2_model_runner:
             if num_spec_tokens_to_schedule is None:
-                num_spec_tokens_to_schedule = getattr(
-                    self.model_runner, "last_num_spec_tokens_to_schedule", None
+                num_spec_tokens_to_schedule = (
+                    self.model_runner.scheduled_num_spec_tokens_to_schedule
                 )
             self.model_runner._dummy_run(
                 num_tokens,

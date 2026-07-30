@@ -197,6 +197,37 @@ class CudaGraphManager:
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
 
+    def _get_decode_query_lens(self) -> list[int]:
+        """Return uniform decode query lengths that need CUDA graph candidates."""
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            not speculative_config
+            or not speculative_config.uses_dynamic_speculative_decoding()
+        ):
+            return [self.decode_query_len]
+
+        num_spec_per_batch_size = (
+            speculative_config.num_speculative_tokens_per_batch_size
+        )
+        # uses_dynamic_speculative_decoding() guarantees this is set.
+        assert num_spec_per_batch_size is not None
+        schedule_lookup = build_dynamic_sd_schedule_lookup(
+            num_spec_per_batch_size,
+            self.max_num_reqs,
+            self.vllm_config.num_speculative_tokens,
+        )
+        max_runtime_k = self.vllm_config.num_speculative_tokens
+        fixed_query_tokens_per_request = self.decode_query_len - max_runtime_k
+        scheduled_runtime_ks = set(schedule_lookup[1:])
+        scheduled_runtime_ks.add(max_runtime_k)
+        return sorted(
+            {
+                runtime_k + fixed_query_tokens_per_request
+                for runtime_k in scheduled_runtime_ks
+                if runtime_k + fixed_query_tokens_per_request > 0
+            }
+        )
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
@@ -213,46 +244,14 @@ class CudaGraphManager:
         descs_by_token_lora: dict[tuple[int, int], list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
-        uniform_descs: defaultdict[
-            tuple[int, int], list[BatchExecutionDescriptor]
-        ] = defaultdict(list)
+        uniform_descs: defaultdict[tuple[int, int], list[BatchExecutionDescriptor]] = (
+            defaultdict(list)
+        )
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
 
-        # When using Dynamic SD, num_speculative_tokens is the max number of
-        # draft tokens. Runtime only needs the scheduled K families plus the
-        # max-K family; keep the manager-specific query-len offset so
-        # target/proposer managers capture the correct widths without
-        # materializing every intermediate K. Runtime K=0 falls back to NONE.
-        speculative_config = self.vllm_config.speculative_config
-        if (
-            speculative_config
-            and speculative_config.uses_dynamic_speculative_decoding()
-        ):
-            num_spec_per_batch_size = (
-                speculative_config.num_speculative_tokens_per_batch_size
-            )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
-            assert num_spec_per_batch_size is not None
-            schedule_lookup = build_dynamic_sd_schedule_lookup(
-                num_spec_per_batch_size,
-                self.max_num_reqs,
-                self.vllm_config.num_speculative_tokens,
-            )
-            max_runtime_k = self.vllm_config.num_speculative_tokens
-            manager_query_len_offset = self.decode_query_len - max_runtime_k
-            scheduled_runtime_ks = set(schedule_lookup[1:])
-            scheduled_runtime_ks.add(max_runtime_k)
-            decode_query_lens = sorted(
-                {
-                    runtime_k + manager_query_len_offset
-                    for runtime_k in scheduled_runtime_ks
-                    if runtime_k + manager_query_len_offset > 0
-                }
-            )
-        else:
-            decode_query_lens = [self.decode_query_len]
+        decode_query_lens = self._get_decode_query_lens()
 
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
@@ -282,9 +281,7 @@ class CudaGraphManager:
                     # avoid duplicate graphs
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
-                        uniform_descs[
-                            (decode_query_len, num_active_loras)
-                        ].append(desc)
+                        uniform_descs[(decode_query_len, num_active_loras)].append(desc)
                         descs_by_token_lora[
                             (rounded_num_tokens, num_active_loras)
                         ].append(desc)
@@ -441,11 +438,7 @@ class CudaGraphManager:
         effective_loras = self._resolve_effective_loras(num_active_loras)
         if uniform_token_count is not None:
             uniform_token_count = int(uniform_token_count)
-        if (
-            self._graphs_captured
-            and num_tokens > 0
-            and uniform_token_count is not None
-        ):
+        if self._graphs_captured and num_tokens > 0 and uniform_token_count is not None:
             uniform_key = (num_tokens, effective_loras, uniform_token_count)
             desc = self._uniform_candidates.get(uniform_key)
             if desc is not None and _is_compatible(
