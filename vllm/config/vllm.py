@@ -903,6 +903,54 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _verify_attention_context_parallel(self) -> None:
+        attn_cp_size = self.parallel_config.attention_context_parallel_size
+        if attn_cp_size == 1:
+            return
+
+        from vllm.platforms import current_platform
+
+        if self.model_config is None:
+            raise ValueError(
+                "Attention context parallelism requires a model configuration."
+            )
+        model_type = getattr(self.model_config.hf_config, "model_type", None)
+        if model_type != "deepseek_v4" or not self.model_config.use_mla:
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only "
+                "DeepSeek-V4 MLA models."
+            )
+        if not current_platform.is_cuda():
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only CUDA."
+            )
+        if not self.model_config.enforce_eager:
+            raise NotImplementedError(
+                "Attention context parallelism currently requires eager mode."
+            )
+
+        backend = self.attention_config.backend
+        supported_backends = {
+            "FLASHMLA_SPARSE",
+            "FLASHMLA_SPARSE_DSV4",
+            "FLASHINFER_MLA_SPARSE_DSV4",
+        }
+        if backend is not None and backend.name not in supported_backends:
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only "
+                "DeepSeek-V4 CUDA sparse MLA attention backends."
+            )
+
+        if self.kv_transfer_config is not None and self.kv_transfer_config.kv_role in (
+            "kv_consumer",
+            "kv_both",
+        ):
+            raise NotImplementedError(
+                "Attention context parallelism is prefill-only; KV consumers "
+                "and kv_both instances must use "
+                "attention_context_parallel_size=1."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1530,6 +1578,7 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        self._verify_attention_context_parallel()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
@@ -2068,6 +2117,7 @@ class VllmConfig:
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size}, "  # noqa
             f"pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"data_parallel_size={self.parallel_config.data_parallel_size}, "  # noqa
+            f"attention_context_parallel_size={self.parallel_config.attention_context_parallel_size}, "  # noqa
             f"decode_context_parallel_size={self.parallel_config.decode_context_parallel_size}, "  # noqa
             f"dcp_comm_backend={self.parallel_config.dcp_comm_backend}, "  # noqa
             f"disable_custom_all_reduce={self.parallel_config.disable_custom_all_reduce}, "  # noqa
@@ -2096,6 +2146,9 @@ class VllmConfig:
 
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallelism")
+
+        if self.parallel_config.attention_context_parallel_size > 1:
+            unsupported.append("attention context parallelism")
 
         if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
             unsupported.append("stock torch.compile")

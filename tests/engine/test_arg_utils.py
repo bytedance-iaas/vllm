@@ -214,6 +214,18 @@ def test_jit_monitor_verbose_arg():
     assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
 
 
+@pytest.mark.parametrize(
+    "flag",
+    ["--attention-context-parallel-size", "--attn-cp-size"],
+)
+def test_attention_context_parallel_cli_aliases(flag: str):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args([flag, "2"])
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.attention_context_parallel_size == 2
+
+
 @pytest.mark.parametrize("mode", ["warn", "error"])
 def test_jit_monitor_mode_arg(mode):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())

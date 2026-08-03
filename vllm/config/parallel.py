@@ -123,6 +123,9 @@ class ParallelConfig:
     """Number of tensor parallel groups."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of prefill context parallel groups."""
+    attention_context_parallel_size: int = Field(default=1, ge=1)
+    """Number of attention-only context parallel ranks carved out of each
+    tensor-parallel group. This does not increase the physical world size."""
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
@@ -504,6 +507,31 @@ class ParallelConfig:
             raise ValueError(
                 f"tp_size={self.tensor_parallel_size} must be divisible by"
                 f"dcp_size={self.decode_context_parallel_size}."
+            )
+
+        if self.tensor_parallel_size % self.attention_context_parallel_size != 0:
+            raise ValueError(
+                f"tp_size={self.tensor_parallel_size} must be divisible by "
+                "attention_context_parallel_size="
+                f"{self.attention_context_parallel_size}."
+            )
+
+        if (
+            self.attention_context_parallel_size > 1
+            and self.prefill_context_parallel_size > 1
+        ):
+            raise ValueError(
+                "Attention context parallelism cannot be combined with prefill "
+                "context parallelism."
+            )
+
+        if (
+            self.attention_context_parallel_size > 1
+            and self.decode_context_parallel_size > 1
+        ):
+            raise ValueError(
+                "Attention context parallelism cannot be combined with decode "
+                "context parallelism."
             )
 
         if self.dcp_comm_backend == "a2a" and self.decode_context_parallel_size <= 1:
