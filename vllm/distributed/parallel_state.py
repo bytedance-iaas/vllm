@@ -1374,8 +1374,8 @@ _ATTN_TP: GroupCoordinator | None = None
 
 
 def get_attn_tp_group() -> GroupCoordinator:
-    assert _ATTN_TP is not None, "attention tensor parallel group is not initialized"
-    return _ATTN_TP
+    # Attention TP is identical to model TP when attention CP is disabled.
+    return _ATTN_TP if _ATTN_TP is not None else get_tp_group()
 
 
 _ATTN_CP: GroupCoordinator | None = None

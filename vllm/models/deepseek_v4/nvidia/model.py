@@ -68,6 +68,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import (
     DeepseekV4Attention,
     compute_dsv4_index_cache_skip_flags,
+    get_attention_tp_head_range,
 )
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -1644,12 +1645,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
 
         # TP for attention
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
         n_head = self.config.num_attention_heads
-        n_local_head = n_head // tp_size
-        head_rank_start = n_local_head * tp_rank
-        head_rank_end = n_local_head * (tp_rank + 1)
+        head_rank_start, head_rank_end = get_attention_tp_head_range(n_head)
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()

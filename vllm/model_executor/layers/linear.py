@@ -4,7 +4,7 @@
 import itertools
 from abc import abstractmethod
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn.parameter import Parameter
@@ -43,6 +43,9 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
 logger = init_logger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
@@ -62,6 +65,19 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptNvFp4W4A16LinearMethod",
     "HummingLinearMethod",
 ]
+
+
+def _resolve_tp_rank_and_size(
+    disable_tp: bool,
+    tp_group: "GroupCoordinator | None",
+) -> tuple[int, int]:
+    if disable_tp:
+        if tp_group is not None:
+            raise ValueError("tp_group cannot be set when disable_tp=True")
+        return 0, 1
+    if tp_group is not None:
+        return tp_group.rank_in_group, tp_group.world_size
+    return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
 
 
 def register_weight_loader_v2_supported_method(cls):
@@ -240,6 +256,7 @@ class LinearBase(PluggableLayer):
         prefix: Prefix for parameter names.
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, tensor parallelism will be disabled for this layer.
+        tp_group: Optional process group overriding the global tensor-parallel group.
     """
 
     def __init__(
@@ -254,6 +271,7 @@ class LinearBase(PluggableLayer):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_group: "GroupCoordinator | None" = None,
     ):
         super().__init__()
 
@@ -277,8 +295,8 @@ class LinearBase(PluggableLayer):
             raise ValueError("All linear layers should support quant method.")
         self.return_bias = return_bias
         self.disable_tp = disable_tp
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.tp_group = tp_group
+        self.tp_rank, self.tp_size = _resolve_tp_rank_and_size(disable_tp, tp_group)
 
     def update_param_tp_status(self):
         for param in self.parameters():
@@ -416,6 +434,7 @@ class ColumnParallelLinear(LinearBase):
                         (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        tp_group: Optional process group overriding the global tensor-parallel group.
     """
 
     # --8<-- [end:column_parallel_linear]
@@ -433,10 +452,10 @@ class ColumnParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_group: "GroupCoordinator | None" = None,
     ):
         # Divide the weight matrix along the last dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.tp_rank, self.tp_size = _resolve_tp_rank_and_size(disable_tp, tp_group)
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -456,6 +475,7 @@ class ColumnParallelLinear(LinearBase):
             prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            tp_group=tp_group,
         )
 
         self._maybe_allow_fp8_block_shape_mismatch()
@@ -559,7 +579,11 @@ class ColumnParallelLinear(LinearBase):
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(output_parallel)
+            output = (
+                self.tp_group.all_gather(output_parallel)
+                if self.tp_group is not None
+                else tensor_model_parallel_all_gather(output_parallel)
+            )
         else:
             output = output_parallel
 
@@ -965,6 +989,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                         (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        tp_group: Optional process group overriding the global tensor-parallel group.
     """
 
     def __init__(
@@ -1583,10 +1608,10 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_group: "GroupCoordinator | None" = None,
     ):
         # Divide the weight matrix along the first dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        self.tp_rank, self.tp_size = _resolve_tp_rank_and_size(disable_tp, tp_group)
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1601,6 +1626,7 @@ class RowParallelLinear(LinearBase):
             prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            tp_group=tp_group,
         )
 
         self.input_is_parallel = input_is_parallel
@@ -1688,7 +1714,11 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            output = (
+                self.tp_group.all_reduce(output_parallel)
+                if self.tp_group is not None
+                else tensor_model_parallel_all_reduce(output_parallel)
+            )
         else:
             output = output_parallel
 
