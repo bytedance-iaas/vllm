@@ -74,6 +74,7 @@ class FakeMooncakeWrapper:
 
     def __init__(self, *args, **kwargs):
         self.initialize_calls = []
+        self.register_calls = []
 
     def initialize(self, local_hostname, metadata_server, protocol, device_name) -> int:
         self.initialize_calls.append(
@@ -90,6 +91,7 @@ class FakeMooncakeWrapper:
         return 0
 
     def batch_register_memory(self, buffer_addresses, capacities) -> int:
+        self.register_calls.append((buffer_addresses, capacities))
         return 0
 
 
@@ -694,6 +696,7 @@ def _make_bootstrap_vllm_config(
     data_parallel_rank_local: int = 0,
     data_parallel_index: int = 0,
     nnodes_within_dp: int = 1,
+    attention_context_parallel_size: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -701,6 +704,7 @@ def _make_bootstrap_vllm_config(
             data_parallel_rank_local=data_parallel_rank_local,
             data_parallel_index=data_parallel_index,
             nnodes_within_dp=nnodes_within_dp,
+            attention_context_parallel_size=attention_context_parallel_size,
             master_addr="model-parallel-master",
             data_parallel_master_ip="data-parallel-master",
         )
@@ -711,22 +715,28 @@ def _make_bootstrap_vllm_config(
     (
         "tp_rank",
         "pp_rank",
+        "attn_cp_size",
+        "attn_cp_rank",
         "local_engines_only",
         "data_parallel_rank_local",
         "data_parallel_index",
         "expected",
     ),
     [
-        (1, 0, False, 0, 0, False),
-        (0, 1, False, 0, 0, False),
-        (0, 0, True, 0, 1, True),
-        (0, 0, True, 1, 0, False),
-        (0, 0, False, 0, 0, True),
-        (0, 0, False, 0, 1, False),
+        (1, 0, 1, 0, False, 0, 0, False),
+        (0, 1, 1, 0, False, 0, 0, False),
+        (0, 0, 2, 1, False, 0, 0, False),
+        (0, 0, 2, 0, False, 0, 0, True),
+        (0, 0, 1, 0, True, 0, 1, True),
+        (0, 0, 1, 0, True, 1, 0, False),
+        (0, 0, 1, 0, False, 0, 0, True),
+        (0, 0, 1, 0, False, 0, 1, False),
     ],
     ids=[
         "nonzero_tp_rank",
         "nonzero_pp_rank",
+        "noncanonical_attn_cp_rank",
+        "canonical_attn_cp_rank",
         "local_engine_rank_zero",
         "local_engine_nonzero_rank",
         "internal_lb_first_dp_engine",
@@ -736,6 +746,8 @@ def _make_bootstrap_vllm_config(
 def test_should_launch_bootstrap_server_selects_single_owner(
     tp_rank: int,
     pp_rank: int,
+    attn_cp_size: int,
+    attn_cp_rank: int,
     local_engines_only: bool,
     data_parallel_rank_local: int,
     data_parallel_index: int,
@@ -745,6 +757,7 @@ def test_should_launch_bootstrap_server_selects_single_owner(
         local_engines_only=local_engines_only,
         data_parallel_rank_local=data_parallel_rank_local,
         data_parallel_index=data_parallel_index,
+        attention_context_parallel_size=attn_cp_size,
     )
     with (
         patch(
@@ -756,8 +769,13 @@ def test_should_launch_bootstrap_server_selects_single_owner(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.get_pp_group"
         ) as mock_pp_group,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_attn_cp_group"
+        ) as mock_attn_cp_group,
     ):
         mock_pp_group.return_value.rank_in_group = pp_rank
+        mock_attn_cp_group.return_value.rank_in_group = attn_cp_rank
         assert should_launch_bootstrap_server(vllm_config) is expected
 
 
@@ -784,6 +802,48 @@ def test_get_mooncake_bootstrap_addr_selects_expected_host(
         expected_host,
         envs.VLLM_MOONCAKE_BOOTSTRAP_PORT,
     )
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "world_size", "attn_cp_size", "expected"),
+    [
+        ("kv_producer", 8, 2, 4),
+        ("kv_producer", 8, 1, 8),
+        ("kv_consumer", 8, 1, None),
+    ],
+)
+def test_mooncake_finished_count_uses_canonical_attention_cp_workers(
+    kv_role: str,
+    world_size: int,
+    attn_cp_size: int,
+    expected: int | None,
+):
+    connector = object.__new__(MooncakeConnector)
+    connector._kv_transfer_config = SimpleNamespace(kv_role=kv_role)
+    connector._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            world_size=world_size,
+            attention_context_parallel_size=attn_cp_size,
+        )
+    )
+
+    assert connector.get_finished_count() == expected
+
+
+@pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both"])
+def test_mooncake_attention_cp_rejects_non_producer_roles(kv_role: str):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role=kv_role,
+    )
+    vllm_config.parallel_config.attention_context_parallel_size = 2
+
+    with pytest.raises(NotImplementedError, match="pure kv_producer"):
+        MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.SCHEDULER,
+            _make_test_kv_cache_config(),
+        )
 
 
 def test_scheduler_request_finished():
@@ -858,6 +918,14 @@ def patch_worker_dependencies():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_pp_group"
         ) as mock_pp,
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_attn_tp_group"
+        ) as mock_attn_tp,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_attn_cp_group"
+        ) as mock_attn_cp,
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.should_launch_bootstrap_server",
             return_value=False,
         ),
@@ -889,6 +957,8 @@ def patch_worker_dependencies():
         mock_pp_group = MagicMock()
         mock_pp_group.rank_in_group = 0
         mock_pp.return_value = mock_pp_group
+        mock_attn_tp.return_value = SimpleNamespace(rank_in_group=0, world_size=1)
+        mock_attn_cp.return_value = SimpleNamespace(rank_in_group=0, world_size=1)
 
         # Mock ZMQ socket
         mock_socket_object = AsyncMock()
@@ -906,6 +976,8 @@ def patch_worker_dependencies():
             "mock_socket_object": mock_socket_object,
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
+            "mock_attn_tp": mock_attn_tp,
+            "mock_attn_cp": mock_attn_cp,
         }
 
 
@@ -938,6 +1010,42 @@ def test_worker_initializes_mooncake_with_configured_device(
     assert worker.engine.initialize_calls == [
         ("127.0.0.1", "P2PHANDSHAKE", "rdma", expected_device)
     ]
+
+
+def test_noncanonical_attention_cp_producer_does_not_start_sender():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+    )
+    vllm_config.parallel_config.attention_context_parallel_size = 2
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies() as mocks:
+        mocks["mock_attn_tp"].return_value = SimpleNamespace(
+            rank_in_group=1, world_size=2
+        )
+        mocks["mock_attn_cp"].return_value = SimpleNamespace(
+            rank_in_group=1, world_size=2
+        )
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+
+    worker = connector.connector_worker
+    assert worker.tp_rank == 1
+    assert worker.tp_size == 2
+    assert worker.attn_cp_rank == 1
+    assert worker.is_sender_worker is False
+    assert not hasattr(worker, "sender_loop")
+    worker.register_kv_caches({"layer": torch.zeros(1)})
+    assert worker.engine.register_calls == []
+
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_to_send["p-req-1"] = ("xfer-req-1", [])
+    with patch("asyncio.run_coroutine_threadsafe") as mock_run_coroutine:
+        worker.start_load_kv(metadata)
+    mock_run_coroutine.assert_not_called()
 
 
 @pytest.mark.asyncio

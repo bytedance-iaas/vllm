@@ -955,6 +955,15 @@ class VllmConfig:
                 "and kv_both instances must use "
                 "attention_context_parallel_size=1."
             )
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector == "MultiConnector"
+        ):
+            raise NotImplementedError(
+                "Attention context parallelism does not support MultiConnector "
+                "because nested connectors may require different completion "
+                "fan-in counts."
+            )
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
