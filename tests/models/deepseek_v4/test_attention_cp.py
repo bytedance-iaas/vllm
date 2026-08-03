@@ -9,6 +9,7 @@ import torch
 
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.deepseek_v4.attention as attention_module
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -25,6 +26,20 @@ class FakeGroup:
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         self.all_reduce_calls += 1
         return tensor + self.all_reduce_offset
+
+
+def make_forward_context_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            fast_moe_cold_start=False,
+            static_forward_context={},
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            use_sequence_parallel_moe=False,
+            is_moe_model=False,
+        ),
+    )
 
 
 @pytest.fixture
@@ -193,3 +208,52 @@ def test_attention_cp_plan_rejects_decode_rows():
             alignment=256,
             device=torch.device("cpu"),
         )
+
+
+def test_forward_context_exposes_profile_runs():
+    with set_forward_context({}, make_forward_context_config(), is_profile=True):
+        assert get_forward_context().is_profile is True
+
+
+def test_attention_cp_plan_bypasses_profile_mixed_metadata():
+    metadata = SimpleNamespace(num_decodes=1, num_decode_tokens=1)
+    layer = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        attn_cp_alignment=256,
+    )
+
+    with set_forward_context(
+        {"swa": metadata},
+        make_forward_context_config(),
+        is_profile=True,
+    ):
+        assert (
+            attention_module.DeepseekV4Attention._build_attention_cp_plan(
+                layer, torch.device("cpu")
+            )
+            is None
+        )
+
+
+def test_attention_cp_plan_rejects_production_mixed_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    metadata = SimpleNamespace(num_decodes=1, num_decode_tokens=1)
+    layer = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        attn_cp_alignment=256,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attn_cp_group",
+        lambda: FakeGroup(rank_in_group=0, world_size=2),
+    )
+
+    with set_forward_context({"swa": metadata}, make_forward_context_config()):
+        assert get_forward_context().is_profile is False
+        with pytest.raises(NotImplementedError, match="pure prefill"):
+            attention_module.DeepseekV4Attention._build_attention_cp_plan(
+                layer, torch.device("cpu")
+            )

@@ -353,6 +353,7 @@ class UBatchWrapper:
         dp_metadata,
         batch_descriptor,
         cudagraph_runtime_mode,
+        is_profile,
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
@@ -368,6 +369,7 @@ class UBatchWrapper:
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     slot_mapping=slot_mapping[i] if has_slot_mapping else None,
+                    is_profile=is_profile,
                 )
             )
 
@@ -506,6 +508,7 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                is_profile=forward_context.is_profile,
             )
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.runnable)
@@ -532,6 +535,7 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                is_profile=forward_context.is_profile,
             )
             with self.sm_control:
                 return self._run_ubatches(ubatch_metadata, self.runnable)

@@ -645,9 +645,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if self.attn_cp_size == 1:
             return None
 
-        attn_metadata = get_forward_context().attn_metadata
+        forward_context = get_forward_context()
+        if forward_context.is_profile:
+            return None
+
+        attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            # Profile and dummy runs do not carry real request metadata.
+            # Dummy runs without forced attention do not carry request metadata.
             return None
         if not isinstance(attn_metadata, dict):
             raise NotImplementedError(
