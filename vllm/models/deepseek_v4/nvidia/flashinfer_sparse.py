@@ -8,7 +8,7 @@ import torch
 
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.attention import AttentionCPPlan, DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     build_flashinfer_mixed_sparse_indices,
     compute_global_topk_indices_and_lens,
@@ -223,11 +223,13 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        cp_plan: AttentionCPPlan | None = None,
     ) -> None:
         # The TRTLLM-gen kernel requires h_q in {64, 128}, so the output buffer
         # is allocated at the padded head count while q arrives at the local
         # head count; _forward pads q to match before the launcher.
-        assert output.shape[0] == q.shape[0] and output.shape[-1] == q.shape[-1], (
+        expected_tokens = q.shape[0] if cp_plan is None else cp_plan.num_local_tokens
+        assert output.shape[0] == expected_tokens and output.shape[-1] == q.shape[-1], (
             f"output buffer shape {output.shape} incompatible with q shape {q.shape}"
         )
         assert output.shape[1] >= q.shape[1], (
@@ -273,6 +275,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             attn_metadata=flashmla_metadata,
             swa_only=swa_only,
             output=output,
+            cp_plan=cp_plan,
         )
 
     def _build_sparse_index_metadata(
@@ -423,6 +426,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_only: bool,
         output: torch.Tensor,
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         assert self.kv_cache_torch_dtype in (torch.bfloat16, torch.float8_e4m3fn)
         num_decodes = swa_metadata.num_decodes
@@ -446,6 +450,23 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             attn_metadata=attn_metadata,
             swa_only=swa_only,
         )
+
+        if cp_plan is not None:
+            if num_decodes > 0:
+                raise NotImplementedError(
+                    "Attention context parallelism does not support mixed "
+                    "decode and prefill batches."
+                )
+            self._forward_attention_cp_prefill(
+                q=q,
+                output=output,
+                cp_plan=cp_plan,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_indices=sparse_indices,
+                sparse_topk_lens=sparse_topk_lens,
+                swa_k_cache=swa_k_cache,
+            )
+            return
 
         # CUDA graph execution can pad q/output past the scheduled token count;
         # restrict to the real tokens (the launcher validates sparse indices).
@@ -523,6 +544,74 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 cum_seq_lens_q=prefill_cu,
                 max_q_len=int(prefill_lens_cpu.max().item()),
             )
+
+    def _forward_attention_cp_prefill(
+        self,
+        q: torch.Tensor,
+        output: torch.Tensor,
+        cp_plan: AttentionCPPlan,
+        compressed_kv_cache: torch.Tensor,
+        sparse_indices: torch.Tensor,
+        sparse_topk_lens: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+    ) -> None:
+        if cp_plan.num_local_tokens == 0:
+            return
+
+        token_indices = cp_plan.token_indices
+        query = q.index_select(0, token_indices)
+        local_sparse_indices = sparse_indices.index_select(0, token_indices)
+        local_sparse_topk_lens = sparse_topk_lens.index_select(0, token_indices)
+
+        active_reqs_cpu = torch.nonzero(
+            cp_plan.local_query_lens_cpu > 0, as_tuple=False
+        ).flatten()
+        active_reqs = active_reqs_cpu.to(device=q.device)
+        active_query_lens_cpu = cp_plan.local_query_lens_cpu.index_select(
+            0, active_reqs_cpu
+        )
+        query_start_loc_cpu = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(active_query_lens_cpu, dim=0),
+            )
+        )
+        query_start_loc = query_start_loc_cpu.to(device=q.device)
+        seq_lens = cp_plan.effective_seq_lens.index_select(0, active_reqs)
+
+        bmm1_scale: float | torch.Tensor = self.scale
+        bmm2_scale: float | torch.Tensor = 1.0
+        if self.kv_cache_torch_dtype == torch.float8_e4m3fn:
+            assert query.dtype == torch.float8_e4m3fn
+            bmm1_scale = self._flashinfer_fp8_bmm1_scale
+            bmm2_scale = self._flashinfer_fp8_bmm2_scale
+        else:
+            assert query.dtype == torch.bfloat16
+            query = query.contiguous()
+
+        padded_heads = output.shape[1]
+        if query.shape[1] < padded_heads:
+            padded_query = query.new_zeros(
+                (query.shape[0], padded_heads, query.shape[2])
+            )
+            padded_query[:, : query.shape[1], :] = query
+            query = padded_query
+
+        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            query=query,
+            swa_kv_cache=swa_k_cache,
+            workspace_buffer=_get_flashinfer_dsv4_workspace(q.device),
+            sparse_indices=local_sparse_indices,
+            compressed_kv_cache=compressed_kv_cache,
+            sparse_topk_lens=local_sparse_topk_lens,
+            seq_lens=seq_lens,
+            out=output,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=self.attn_sink,
+            cum_seq_lens_q=query_start_loc,
+            max_q_len=int(active_query_lens_cpu.max().item()),
+        )
 
 
 class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
@@ -622,16 +711,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self_kv_cache: torch.Tensor | None,
         swa_kv_cache: torch.Tensor,
         swa_only: bool,
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         num_decode_tokens = swa_metadata.num_decode_tokens
+        if cp_plan is not None and swa_metadata.num_decodes > 0:
+            raise NotImplementedError(
+                "Attention context parallelism does not support mixed decode "
+                "and prefill batches."
+            )
         if swa_metadata.num_prefills > 0:
             self._forward_prefill(
                 q=q[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
                 swa_k_cache=swa_kv_cache,
-                output=output[num_decode_tokens:],
+                output=output if cp_plan is not None else output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
+                cp_plan=cp_plan,
             )
         if swa_metadata.num_decodes > 0:
             self._forward_decode(
@@ -649,9 +745,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        cp_plan: AttentionCPPlan | None = None,
     ) -> None:
         # Output may be padded to backend-supported head counts.
-        assert output.shape[0] == q.shape[0] and output.shape[-1] == q.shape[-1], (
+        expected_tokens = q.shape[0] if cp_plan is None else cp_plan.num_local_tokens
+        assert output.shape[0] == expected_tokens and output.shape[-1] == q.shape[-1], (
             f"output buffer shape {output.shape} incompatible with q shape {q.shape}"
         )
         assert output.shape[1] >= q.shape[1], (
@@ -696,6 +794,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             self_kv_cache=self_kv_cache,
             swa_kv_cache=swa_kv_cache,
             swa_only=swa_only,
+            cp_plan=cp_plan,
         )
 
     def _prepare_query(self, q: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
@@ -789,6 +888,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         output: torch.Tensor,
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         swa_only = self.compress_ratio <= 1
 
@@ -867,20 +967,41 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
+            if cp_plan is not None:
+                local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
+                local_end = int(cp_plan.local_query_start_loc_cpu[chunk_end].item())
+                if local_start == local_end:
+                    continue
+                global_token_indices = cp_plan.token_indices[local_start:local_end]
+                query_indices = global_token_indices - prefill_token_base
+                output_chunk = output[local_start:local_end]
+            else:
+                query_indices = torch.arange(
+                    query_start,
+                    query_end,
+                    dtype=torch.int64,
+                    device=q.device,
+                )
+                output_chunk = output[query_start:query_end]
+
             extra_sparse_indices_chunk = (
-                extra_sparse_indices[query_start:query_end]
+                extra_sparse_indices.index_select(0, query_indices)
                 if extra_sparse_indices is not None
                 else None
             )
             extra_sparse_lengths_chunk = (
-                extra_sparse_lengths[query_start:query_end]
+                extra_sparse_lengths.index_select(0, query_indices)
                 if extra_sparse_lengths is not None
                 else None
             )
 
-            q_chunk = q[query_start:query_end]
-            swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
-            swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
+            q_chunk = q.index_select(0, query_indices)
+            swa_indices_chunk = swa_metadata.prefill_swa_indices.index_select(
+                0, query_indices
+            )
+            swa_lens_chunk = swa_metadata.prefill_swa_lens.index_select(
+                0, query_indices
+            )
             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
@@ -891,7 +1012,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 workspace_buffer=self._get_workspace(q.device),
                 sparse_indices=swa_indices_chunk,
                 compressed_kv_cache=extra_kv_paged,
-                out=output[query_start:query_end],
+                out=output_chunk,
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,
                 kv_layout="NHD",

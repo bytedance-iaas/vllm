@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,10 +20,11 @@ class FakeGroup:
     rank_in_group: int
     world_size: int
     all_reduce_calls: int = 0
+    all_reduce_offset: float = 7
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         self.all_reduce_calls += 1
-        return tensor + 7
+        return tensor + self.all_reduce_offset
 
 
 @pytest.fixture
@@ -87,3 +89,107 @@ def test_attention_tp_head_range_replicates_by_attn_tp_rank(
     monkeypatch.setattr(attention_module, "get_attn_tp_group", lambda: group)
 
     assert attention_module.get_attention_tp_head_range(16) == expected
+
+
+@pytest.mark.parametrize(
+    ("cp_rank", "expected_lens", "expected_effective_lens", "expected_indices"),
+    [
+        (
+            0,
+            [256, 128],
+            [956, 128],
+            [*range(0, 256), *range(300, 428)],
+        ),
+        (1, [44, 0], [1000, 128], [*range(256, 300)]),
+    ],
+)
+def test_attention_cp_plan_splits_each_request_on_aligned_blocks(
+    cp_rank: int,
+    expected_lens: list[int],
+    expected_effective_lens: list[int],
+    expected_indices: list[int],
+):
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=2,
+        query_start_loc_cpu=torch.tensor([0, 300, 428], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([1000, 128], dtype=torch.int32),
+    )
+
+    plan = attention_module.AttentionCPPlan.build(
+        metadata,
+        cp_rank=cp_rank,
+        cp_size=2,
+        alignment=256,
+        device=torch.device("cpu"),
+    )
+
+    assert plan.local_query_lens_cpu.tolist() == expected_lens
+    assert plan.effective_seq_lens.tolist() == expected_effective_lens
+    assert plan.token_indices.tolist() == expected_indices
+
+
+def test_attention_cp_plan_restores_original_packed_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    plan = attention_module.AttentionCPPlan(
+        token_indices=torch.tensor([1, 3]),
+        local_query_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
+        local_query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        local_query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        effective_seq_lens=torch.tensor([2, 4], dtype=torch.int32),
+    )
+    group = FakeGroup(rank_in_group=0, world_size=2, all_reduce_offset=0)
+    monkeypatch.setattr(attention_module, "get_attn_cp_group", lambda: group)
+    local_output = torch.tensor([[10.0, 11.0], [30.0, 31.0]])
+
+    restored = plan.restore_output(local_output, num_global_tokens=4)
+
+    torch.testing.assert_close(
+        restored,
+        torch.tensor(
+            [
+                [0.0, 0.0],
+                [10.0, 11.0],
+                [0.0, 0.0],
+                [30.0, 31.0],
+            ]
+        ),
+    )
+    assert group.all_reduce_calls == 1
+
+
+def test_attention_cp_plan_supports_empty_shard():
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        query_start_loc_cpu=torch.tensor([0, 128], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([128], dtype=torch.int32),
+    )
+
+    plan = attention_module.AttentionCPPlan.build(
+        metadata,
+        cp_rank=1,
+        cp_size=2,
+        alignment=256,
+        device=torch.device("cpu"),
+    )
+
+    assert plan.num_local_tokens == 0
+    assert plan.local_query_lens_cpu.tolist() == [0]
+    assert plan.token_indices.numel() == 0
+
+
+def test_attention_cp_plan_rejects_decode_rows():
+    metadata = SimpleNamespace(num_decodes=1, num_decode_tokens=1)
+
+    with pytest.raises(NotImplementedError, match="pure prefill"):
+        attention_module.AttentionCPPlan.build(
+            metadata,
+            cp_rank=0,
+            cp_size=2,
+            alignment=256,
+            device=torch.device("cpu"),
+        )

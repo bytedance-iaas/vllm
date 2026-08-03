@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.attention import AttentionCPPlan, DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
@@ -109,7 +109,9 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        cp_plan: AttentionCPPlan | None = None,
     ) -> None:
+        assert cp_plan is None
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
         )

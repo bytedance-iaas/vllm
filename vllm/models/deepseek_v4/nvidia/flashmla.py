@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.forward_context import get_forward_context
-from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.attention import AttentionCPPlan, DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
@@ -71,9 +71,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        cp_plan: AttentionCPPlan | None = None,
     ) -> None:
-        assert output.shape == q.shape, (
-            f"output buffer shape {output.shape} must match q shape {q.shape}"
+        expected_tokens = q.shape[0] if cp_plan is None else cp_plan.num_local_tokens
+        assert output.shape == (expected_tokens, q.shape[1], q.shape[2]), (
+            f"output buffer shape {output.shape} must match expected "
+            f"shape {(expected_tokens, q.shape[1], q.shape[2])}"
         )
         assert output.dtype == q.dtype, (
             f"output buffer dtype {output.dtype} must match q dtype {q.dtype}"
@@ -121,6 +124,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
         num_decode_tokens = swa_metadata.num_decode_tokens
+        if cp_plan is not None and num_decodes > 0:
+            raise NotImplementedError(
+                "Attention context parallelism does not support mixed decode "
+                "and prefill batches."
+            )
 
         if num_prefills > 0:
             self._forward_prefill(
@@ -128,9 +136,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 positions=positions[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
                 swa_k_cache=swa_kv_cache,
-                output=output[num_decode_tokens:],
+                output=output if cp_plan is not None else output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
+                cp_plan=cp_plan,
             )
         if num_decodes > 0:
             self._forward_decode(
@@ -243,6 +252,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         output: torch.Tensor,
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         swa_only = attn_metadata is None
 
@@ -336,12 +346,29 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_M,
                 chunk_N,
             )
+            if cp_plan is not None:
+                local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
+                local_end = int(cp_plan.local_query_start_loc_cpu[chunk_end].item())
+                if local_start == local_end:
+                    continue
+                global_token_indices = cp_plan.token_indices[local_start:local_end]
+                query_indices = global_token_indices - prefill_token_base
+                chunk_indices = query_indices - query_start
+                q_chunk = q.index_select(0, query_indices)
+                indices_chunk = combined_indices.index_select(0, chunk_indices)
+                lens_chunk = combined_lens.index_select(0, chunk_indices)
+                output_chunk = output[local_start:local_end]
+            else:
+                q_chunk = q[query_start:query_end]
+                indices_chunk = combined_indices
+                lens_chunk = combined_lens
+                output_chunk = output[query_start:query_end]
             flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
+                q=q_chunk,
                 kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
+                indices=indices_chunk.unsqueeze(1),
                 sm_scale=self.scale,
                 attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
+                topk_length=lens_chunk,
+                out=output_chunk,
             )

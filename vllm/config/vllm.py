@@ -928,6 +928,11 @@ class VllmConfig:
             raise NotImplementedError(
                 "Attention context parallelism currently requires eager mode."
             )
+        if self.parallel_config.use_ubatching:
+            raise NotImplementedError(
+                "Attention context parallelism currently does not support "
+                "ubatching or dual batch overlap."
+            )
 
         backend = self.attention_config.backend
         supported_backends = {
