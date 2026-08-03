@@ -59,6 +59,8 @@ class SchedulerConfig:
     This is usually equal to max_num_batched_tokens, but can be smaller in cases
     when the model might append tokens into the batch (such as speculative decoding).
     Defaults to max_num_batched_tokens."""
+    max_num_scheduled_tokens_auto_derived: bool = False
+    """Whether max_num_scheduled_tokens was derived by vLLM rather than user-set."""
 
     max_num_seqs: int = Field(default=DEFAULT_MAX_NUM_SEQS, ge=1)
     """Maximum number of sequences to be processed in a single iteration.

@@ -723,6 +723,15 @@ class ParallelConfig:
         return has_unfinished_global, pause_count == dp_size
 
     @staticmethod
+    def sync_dynamic_sd_batch_pressure(
+        dp_group: ProcessGroup, local_batch_pressure: int
+    ) -> int:
+        """Synchronize the Dynamic SD batch-pressure estimate across DP ranks."""
+        tensor = torch.tensor([local_batch_pressure], dtype=torch.int32, device="cpu")
+        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
+        return int(tensor.item())
+
+    @staticmethod
     def sync_kv_cache_memory_size(dp_group: ProcessGroup, kv_cache_memory: int) -> int:
         if kv_cache_memory == -1:
             kv_cache_memory = torch.iinfo(torch.int64).max

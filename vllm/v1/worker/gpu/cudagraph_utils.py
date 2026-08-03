@@ -157,6 +157,9 @@ class CudaGraphManager:
         self._graphs_captured = False
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        self._uniform_candidates: dict[
+            tuple[int, int, int], BatchExecutionDescriptor
+        ] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
 
         self._init_candidates()
@@ -194,6 +197,37 @@ class CudaGraphManager:
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
 
+    def _get_decode_query_lens(self) -> list[int]:
+        """Return uniform decode query lengths that need CUDA graph candidates."""
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            not speculative_config
+            or not speculative_config.uses_dynamic_speculative_decoding()
+        ):
+            return [self.decode_query_len]
+
+        num_spec_per_batch_size = (
+            speculative_config.num_speculative_tokens_per_batch_size
+        )
+        # uses_dynamic_speculative_decoding() guarantees this is set.
+        assert num_spec_per_batch_size is not None
+        schedule_lookup = build_dynamic_sd_schedule_lookup(
+            num_spec_per_batch_size,
+            self.max_num_reqs,
+            self.vllm_config.num_speculative_tokens,
+        )
+        max_runtime_k = self.vllm_config.num_speculative_tokens
+        fixed_query_tokens_per_request = self.decode_query_len - max_runtime_k
+        scheduled_runtime_ks = set(schedule_lookup[1:])
+        scheduled_runtime_ks.add(max_runtime_k)
+        return sorted(
+            {
+                runtime_k + fixed_query_tokens_per_request
+                for runtime_k in scheduled_runtime_ks
+                if runtime_k + fixed_query_tokens_per_request > 0
+            }
+        )
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
@@ -210,45 +244,14 @@ class CudaGraphManager:
         descs_by_token_lora: dict[tuple[int, int], list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
+        uniform_descs: defaultdict[tuple[int, int], list[BatchExecutionDescriptor]] = (
+            defaultdict(list)
+        )
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
 
-        # When using Dynamic SD, num_speculative_tokens is the max number of
-        # draft tokens. The scheduler might use a smaller number so we need
-        # to capture graphs for all possible values during decode.
-        speculative_config = self.vllm_config.speculative_config
-        if (
-            speculative_config
-            and speculative_config.uses_dynamic_speculative_decoding()
-        ):
-            num_spec_per_batch_size = (
-                speculative_config.num_speculative_tokens_per_batch_size
-            )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
-            assert num_spec_per_batch_size is not None
-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
-            # _per_step. Recover num_new_sampled_tokens_per_step
-            # from the values the manager already has.
-            num_new_sampled_tokens_per_step = (
-                self.decode_query_len - self.vllm_config.num_speculative_tokens
-            )
-            schedule_lookup = build_dynamic_sd_schedule_lookup(
-                num_spec_per_batch_size,
-                self.max_num_reqs,
-                self.vllm_config.num_speculative_tokens,
-            )
-            # K=0 disables drafting at that concurrency; skip it here since no
-            # uniform decode graph is needed (and qlen=0 would divide by zero).
-            decode_query_lens = sorted(
-                {
-                    k + num_new_sampled_tokens_per_step
-                    for k in schedule_lookup[1:]
-                    if k + num_new_sampled_tokens_per_step > 0
-                }
-            )
-        else:
-            decode_query_lens = [self.decode_query_len]
+        decode_query_lens = self._get_decode_query_lens()
 
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
@@ -278,6 +281,7 @@ class CudaGraphManager:
                     # avoid duplicate graphs
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
+                        uniform_descs[(decode_query_len, num_active_loras)].append(desc)
                         descs_by_token_lora[
                             (rounded_num_tokens, num_active_loras)
                         ].append(desc)
@@ -314,6 +318,15 @@ class CudaGraphManager:
                             staging_key
                         ]
             current_range_start = token_cg_size + 1
+
+        for (uniform_token_count, num_active_loras), descs in uniform_descs.items():
+            current_range_start = 0
+            for desc in sorted(descs, key=lambda d: d.num_tokens):
+                for i in range(current_range_start, desc.num_tokens + 1):
+                    self._uniform_candidates[
+                        (i, num_active_loras, uniform_token_count)
+                    ] = desc
+                current_range_start = desc.num_tokens + 1
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
@@ -423,6 +436,20 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
+        if uniform_token_count is not None:
+            uniform_token_count = int(uniform_token_count)
+        if self._graphs_captured and num_tokens > 0 and uniform_token_count is not None:
+            uniform_key = (num_tokens, effective_loras, uniform_token_count)
+            desc = self._uniform_candidates.get(uniform_key)
+            if desc is not None and _is_compatible(
+                desc,
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                effective_loras,
+            ):
+                return desc
+
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:

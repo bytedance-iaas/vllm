@@ -3,11 +3,24 @@
 """Regression tests for the Dynamic SD batch-size schedule helpers."""
 
 import pytest
+import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
+from vllm.config.utils import replace
+from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
 def _make_lookup(
@@ -56,6 +69,21 @@ def _add_requests_and_schedule(
     for request in requests:
         scheduler.add_request(request)
     return scheduler.schedule()
+
+
+def _model_output(scheduler: Scheduler, output, sampled: list[list[int]]) -> None:
+    req_ids = list(output.num_scheduled_tokens.keys())
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={request_id: i for i, request_id in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
 
 
 def test_dynamic_sd_uses_batch_size_schedule():
@@ -138,7 +166,7 @@ def test_scheduler_initializes_dynamic_sd_lookup_from_speculative_config():
         runtime_num_speculative_tokens=3,
     )
 
-    assert scheduler.dynamic_sd_lookup is not None
+    assert scheduler._dynamic_sd is not None
     assert scheduler.num_spec_tokens == 3
 
 
@@ -175,6 +203,525 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
     assert output.num_spec_tokens_to_schedule == 3
 
 
+def test_dflash_runtime_k_maps_to_bonus_query_width():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = False
+
+    assert speculator._get_runtime_num_speculative_tokens(None) == 7
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 4
+    assert speculator._get_num_speculative_tokens_for_query_len(4) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 1
+    assert speculator._get_num_speculative_tokens_for_query_len(1) == 0
+
+    with pytest.raises(ValueError, match="runtime_num_speculative_tokens"):
+        speculator._get_runtime_num_speculative_tokens(8)
+
+
+def test_dflash_runtime_sample_col_uses_runtime_k_stride():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.device = torch.device("cpu")
+    speculator.sample_col = torch.arange(7, dtype=torch.int32).repeat(4)
+    speculator._sample_col_steps = torch.arange(7, dtype=torch.int32)
+    speculator._runtime_sample_col = torch.empty(4 * 7, dtype=torch.int32)
+
+    sample_col = speculator._get_sample_col_for_k(num_reqs=3, num_speculative_tokens=3)
+
+    assert sample_col.tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    assert speculator._get_sample_col_for_k(2, 0).numel() == 0
+    assert speculator._get_sample_col_for_k(2, 7).tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+
+
+def test_dspark_runtime_k_maps_to_anchor_query_width():
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = True
+
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 3
+    assert speculator._get_num_speculative_tokens_for_query_len(3) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 0
+    assert speculator._get_num_speculative_tokens_for_query_len(0) == 0
+
+
+def test_scheduler_uses_dsd_batch_size_override():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 4, 3), (5, 16, 1)],
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        runtime_num_speculative_tokens=3,
+    )
+    scheduler.set_dynamic_sd_batch_size_override(8)
+    output = _add_requests_and_schedule(scheduler, 2)
+
+    assert len(output.num_scheduled_tokens) == 2
+    assert output.num_spec_tokens_to_schedule == 1
+
+
+def test_dynamic_sd_pads_first_decode_with_verification_k():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[r1.request_id] == 33
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]]))
+    scheduler.add_request(r2)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r2.request_id] == [-1] * 5
+    # The next proposal K is selected independently from the current
+    # verification K. Padding must use the current draft width, not this value.
+    assert output.num_spec_tokens_to_schedule == 7
+
+
+def test_dynamic_sd_async_pads_first_decode_with_verification_k():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        speculative_model="ngram_gpu",
+        async_scheduling=True,
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[r1.request_id] == 33
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]]))
+    scheduler.add_request(r2)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r2.request_id] == [-1] * 5
+
+
+def test_dynamic_sd_clears_padding_when_later_constraint_changes_width():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]])
+    scheduler.update_draft_token_ids(DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]]))
+
+    original_split = scheduler._mamba_block_aligned_split
+
+    def fake_split(request, num_new_tokens, *args):
+        if request.request_id == r2.request_id and num_new_tokens == 6:
+            return 4
+        return original_split(request, num_new_tokens, *args)
+
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler._mamba_block_aligned_split = fake_split  # type: ignore[method-assign]
+
+    scheduler.add_request(r2)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 1
+    assert r2.request_id not in output.scheduled_spec_decode_tokens
+
+
+def _enable_parallel_drafting_budget_reclaim(
+    scheduler: Scheduler,
+    *,
+    auto_derived: bool,
+    reclaim_parallel_drafting_slots: bool = True,
+) -> None:
+    scheduler.max_num_scheduled_tokens = 2048 - 6 * 96
+    scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived = auto_derived
+    assert scheduler._dynamic_sd is not None
+    can_reclaim_token_budget = (
+        scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived
+        and reclaim_parallel_drafting_slots
+        and scheduler.max_num_scheduled_tokens == 2048 - 6 * 96
+    )
+    scheduler._dynamic_sd.budget_policy = (
+        _DynamicSDBudgetPolicy(max_num_batched_tokens=2048, max_num_seqs=96)
+        if can_reclaim_token_budget
+        else None
+    )
+
+
+def test_scheduler_reclaims_dynamic_sd_auto_token_budget_with_override():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=True)
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 2 * 96
+
+
+def test_scheduler_does_not_reclaim_dynamic_sd_explicit_equal_token_budget():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=False)
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 6 * 96
+
+
+def test_scheduler_does_not_reclaim_dynamic_sd_explicit_lower_token_budget():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=False)
+    scheduler.max_num_scheduled_tokens = 1024
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 1024
+
+
+def test_scheduler_dynamic_sd_budget_reclaim_handles_kmax_and_kzero():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 0)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(scheduler, auto_derived=True)
+
+    assert scheduler._get_effective_max_num_scheduled_tokens(7) == 2048 - 6 * 96
+    assert scheduler._get_effective_max_num_scheduled_tokens(0) == 2048
+
+
+def test_scheduler_dynamic_sd_budget_reclaim_ignores_fixed_slot_methods():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _enable_parallel_drafting_budget_reclaim(
+        scheduler,
+        auto_derived=True,
+        reclaim_parallel_drafting_slots=False,
+    )
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 6 * 96
+
+
+def test_dynamic_sd_auto_token_budget_provenance_survives_config_replace():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    vllm_config = scheduler.vllm_config
+    assert vllm_config.speculative_config is not None
+    vllm_config.speculative_config.parallel_drafting = True
+    vllm_config.scheduler_config.max_num_scheduled_tokens = 2048 - 6 * 96
+    vllm_config.scheduler_config.max_num_scheduled_tokens_auto_derived = True
+
+    replaced_config = replace(vllm_config, cache_config=vllm_config.cache_config)
+
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens == 2048 - 6 * 96
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens_auto_derived
+
+
+def test_dynamic_sd_explicit_equal_token_budget_provenance_survives_config_replace():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    vllm_config = scheduler.vllm_config
+    assert vllm_config.speculative_config is not None
+    vllm_config.speculative_config.parallel_drafting = True
+    vllm_config.scheduler_config.max_num_scheduled_tokens = 2048 - 6 * 96
+    vllm_config.scheduler_config.max_num_scheduled_tokens_auto_derived = False
+
+    replaced_config = replace(vllm_config, cache_config=vllm_config.cache_config)
+
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens == 2048 - 6 * 96
+    assert not replaced_config.scheduler_config.max_num_scheduled_tokens_auto_derived
+
+
+def test_scheduler_reports_dynamic_sd_local_decode_pressure():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 4, 3), (5, 16, 1)],
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        runtime_num_speculative_tokens=3,
+    )
+    _add_requests_and_schedule(scheduler, 3)
+
+    assert scheduler.get_dynamic_sd_local_batch_pressure() == 3
+
+
+def test_dynamic_sd_dp_requires_explicit_global_policy():
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        create_scheduler(
+            max_num_seqs=16,
+            max_num_batched_tokens=160,
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+            data_parallel_size=2,
+        )
+
+
+def test_dynamic_sd_dp_requires_policy_from_vllm_config_parallel_config():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+    )
+
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16,
+                max_num_batched_tokens=160,
+                max_model_len=160,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+            ),
+            model_config=model_config,
+            cache_config=CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.9,
+                cache_dtype="auto",
+            ),
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            speculative_config=speculative_config,
+        )
+
+
+def test_dynamic_sd_dp_global_policy_allows_data_parallel():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        data_parallel_size=2,
+    )
+
+    speculative_config = scheduler.vllm_config.speculative_config
+    assert speculative_config is not None
+    assert speculative_config.uses_dynamic_sd_dp_global_max_policy()
+
+
+def test_dynamic_sd_dp_sync_interval_defaults_and_validates():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(data_parallel_size=2),
+    )
+    assert speculative_config.dynamic_sd_dp_sync_interval == 8
+
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        dynamic_sd_dp_sync_interval=1,
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(data_parallel_size=2),
+    )
+    assert speculative_config.dynamic_sd_dp_sync_interval == 1
+
+    with pytest.raises(ValueError):
+        SpeculativeConfig(
+            method="dspark",
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            dynamic_sd_dp_sync_interval=0,
+            target_model_config=model_config,
+            target_parallel_config=ParallelConfig(data_parallel_size=2),
+        )
+
+
+def test_dynamic_sd_dp_rejects_non_global_policy_from_vllm_config():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+    )
+    speculative_config.dynamic_sd_dp_batch_policy = "stale_non_global"  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16,
+                max_num_batched_tokens=160,
+                max_model_len=160,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+            ),
+            model_config=model_config,
+            cache_config=CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.9,
+                cache_dtype="auto",
+            ),
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            speculative_config=speculative_config,
+        )
+
+
+def test_dspark_dynamic_sd_dp_requires_async_scheduling():
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(data_parallel_size=2),
+    )
+
+    with pytest.raises(ValueError, match="requires async_scheduling"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=16,
+                max_num_batched_tokens=160,
+                max_model_len=160,
+                is_encoder_decoder=model_config.is_encoder_decoder,
+                async_scheduling=False,
+            ),
+            model_config=model_config,
+            cache_config=CacheConfig(
+                block_size=16,
+                gpu_memory_utilization=0.9,
+                cache_dtype="auto",
+            ),
+            parallel_config=ParallelConfig(data_parallel_size=2),
+            speculative_config=speculative_config,
+        )
+
+
+def test_dynamic_sd_dp_global_policy_requires_non_increasing_schedule():
+    with pytest.raises(ValueError, match="non-increasing"):
+        create_scheduler(
+            max_num_seqs=16,
+            max_num_batched_tokens=160,
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 4, 1), (5, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            data_parallel_size=2,
+        )
+
+
 def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     scheduler = create_scheduler(
         max_num_seqs=4,
@@ -183,7 +730,7 @@ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     )
     output = _add_requests_and_schedule(scheduler, 4)
 
-    assert scheduler.dynamic_sd_lookup is None
+    assert scheduler._dynamic_sd is None
     assert output.num_spec_tokens_to_schedule == 3
 
 
@@ -196,6 +743,19 @@ def test_scheduler_uses_static_k_when_no_requests_are_scheduled():
 
     assert len(output.num_scheduled_tokens) == 0
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_scheduler_uses_dsd_override_when_no_requests_are_scheduled():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3), (64, 128, 2), (256, 4096, 0)],
+        max_num_seqs=256,
+        runtime_num_speculative_tokens=3,
+    )
+    scheduler.set_dynamic_sd_batch_size_override(256)
+    output = scheduler.schedule()
+
+    assert len(output.num_scheduled_tokens) == 0
+    assert output.num_spec_tokens_to_schedule == 0
 
 
 def test_scheduler_rejects_bad_dsd_config_at_construction():
@@ -212,7 +772,7 @@ def test_scheduler_passes_max_num_seqs_as_dsd_runtime_batch_limit():
     )
     output = _add_requests_and_schedule(scheduler, 16)
 
-    assert scheduler.dynamic_sd_lookup is not None
-    assert len(scheduler.dynamic_sd_lookup) == 17
+    assert scheduler._dynamic_sd is not None
+    assert len(scheduler._dynamic_sd.lookup) == 17
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
