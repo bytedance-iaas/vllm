@@ -50,6 +50,17 @@ class HPCExperts(mk.FusedMoEExpertsModular):
         self.tp_rank = moe_config.moe_parallel_config.tp_rank
         self.tp_size = moe_config.moe_parallel_config.tp_size
         self.out_dtype = moe_config.in_dtype
+        self.activation_clamp = quant_config.gemm1_clamp_limit
+
+        logger.info_once(
+            "Using HPC FP8 MoE backend: tp_size=%s ep_size=%s dp_size=%s "
+            "sp_size=%s activation_clamp=%s",
+            self.tp_size,
+            self.ep_size,
+            moe_config.moe_parallel_config.dp_size,
+            moe_config.moe_parallel_config.sp_size,
+            self.activation_clamp,
+        )
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -101,7 +112,12 @@ class HPCExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return True
+        return (
+            moe_parallel_config.dp_size == 1
+            and moe_parallel_config.ep_size == 1
+            and moe_parallel_config.sp_size == 1
+            and not moe_parallel_config.use_ep
+        )
 
     def supports_expert_map(self) -> bool:
         return False
@@ -188,6 +204,7 @@ class HPCExperts(mk.FusedMoEExpertsModular):
                 rank_ep=self.ep_rank,
                 num_expert_total=global_num_experts,
                 output=output,
+                activation_clamp=self.activation_clamp,
             )
         else:
             assert self.quant_config.a1_scale is not None, (
