@@ -197,6 +197,167 @@ def test_attention_cp_plan_supports_empty_shard():
     assert plan.token_indices.numel() == 0
 
 
+def test_attention_cp_projects_only_local_queries_before_full_kv_insert():
+    plan = attention_module.AttentionCPPlan(
+        token_indices=torch.tensor([1, 3]),
+        local_query_lens_cpu=torch.tensor([2], dtype=torch.int32),
+        local_query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        local_query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        effective_seq_lens=torch.tensor([4], dtype=torch.int32),
+    )
+    qr = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    kv = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    positions = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    observed: dict[str, object] = {}
+
+    def wq_b(local_qr: torch.Tensor) -> torch.Tensor:
+        observed["wq_b_input"] = local_qr.clone()
+        return local_qr[:, :2]
+
+    def fused_insert(
+        q: torch.Tensor,
+        full_kv: torch.Tensor,
+        q_positions: torch.Tensor,
+        kv_positions: torch.Tensor,
+        attn_metadata: object,
+        *,
+        split_q: bool,
+    ) -> torch.Tensor:
+        observed["q_positions"] = q_positions.clone()
+        observed["kv"] = full_kv
+        observed["kv_positions"] = kv_positions
+        observed["split_q"] = split_q
+        return q
+
+    def forward_mqa(
+        q: torch.Tensor,
+        full_kv: torch.Tensor,
+        full_positions: torch.Tensor,
+        output: torch.Tensor,
+        cp_plan: attention_module.AttentionCPPlan,
+    ) -> None:
+        observed["forward_q"] = q
+        observed["forward_kv"] = full_kv
+        observed["forward_positions"] = full_positions
+        observed["forward_plan"] = cp_plan
+
+    layer = SimpleNamespace(
+        indexer=None,
+        compressor=None,
+        wq_b=wq_b,
+        n_local_heads=1,
+        head_dim=2,
+        _fused_qnorm_rope_kv_insert=fused_insert,
+        forward_mqa=forward_mqa,
+    )
+    output = torch.empty(2, 1, 2)
+
+    with set_forward_context({}, make_forward_context_config()):
+        attention_module.DeepseekV4Attention.attention_impl(
+            layer,
+            hidden_states=torch.empty(4, 1),
+            qr=qr,
+            kv=kv,
+            kv_score=torch.empty(4, 1),
+            indexer_kv_score=None,
+            indexer_weights=None,
+            positions=positions,
+            out=output,
+            cp_plan=plan,
+        )
+
+    torch.testing.assert_close(
+        observed["wq_b_input"],
+        qr.index_select(0, plan.token_indices),
+    )
+    torch.testing.assert_close(
+        observed["q_positions"],
+        positions.index_select(0, plan.token_indices),
+    )
+    assert observed["kv"] is kv
+    assert observed["kv_positions"] is positions
+    assert observed["split_q"] is True
+    assert observed["forward_kv"] is kv
+    assert observed["forward_positions"] is positions
+    assert observed["forward_plan"] is plan
+
+
+def test_attention_cp_empty_shard_skips_projection_but_inserts_full_kv():
+    plan = attention_module.AttentionCPPlan(
+        token_indices=torch.empty(0, dtype=torch.int64),
+        local_query_lens_cpu=torch.tensor([0], dtype=torch.int32),
+        local_query_start_loc_cpu=torch.tensor([0, 0], dtype=torch.int32),
+        local_query_start_loc=torch.tensor([0, 0], dtype=torch.int32),
+        effective_seq_lens=torch.tensor([4], dtype=torch.int32),
+    )
+    kv = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    positions = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    observed: dict[str, object] = {}
+
+    def wq_b(local_qr: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("wq_b must not run for an empty CP shard")
+
+    def fused_insert(
+        q: torch.Tensor,
+        full_kv: torch.Tensor,
+        q_positions: torch.Tensor,
+        kv_positions: torch.Tensor,
+        attn_metadata: object,
+        *,
+        split_q: bool,
+    ) -> torch.Tensor:
+        observed["q"] = q
+        observed["kv"] = full_kv
+        observed["q_positions"] = q_positions
+        observed["kv_positions"] = kv_positions
+        observed["split_q"] = split_q
+        return q
+
+    def forward_mqa(
+        q: torch.Tensor,
+        full_kv: torch.Tensor,
+        full_positions: torch.Tensor,
+        output: torch.Tensor,
+        cp_plan: attention_module.AttentionCPPlan,
+    ) -> None:
+        observed["forward_q"] = q
+
+    layer = SimpleNamespace(
+        indexer=None,
+        compressor=None,
+        wq_b=wq_b,
+        n_local_heads=1,
+        head_dim=2,
+        _fused_qnorm_rope_kv_insert=fused_insert,
+        forward_mqa=forward_mqa,
+    )
+
+    with set_forward_context({}, make_forward_context_config()):
+        attention_module.DeepseekV4Attention.attention_impl(
+            layer,
+            hidden_states=torch.empty(4, 1),
+            qr=torch.empty(4, 3),
+            kv=kv,
+            kv_score=torch.empty(4, 1),
+            indexer_kv_score=None,
+            indexer_weights=None,
+            positions=positions,
+            out=torch.empty(0, 1, 2),
+            cp_plan=plan,
+        )
+
+    q = observed["q"]
+    assert isinstance(q, torch.Tensor)
+    assert q.shape == (0, 1, 2)
+    assert observed["kv"] is kv
+    q_positions = observed["q_positions"]
+    assert isinstance(q_positions, torch.Tensor)
+    assert q_positions.numel() == 0
+    assert observed["kv_positions"] is positions
+    assert observed["split_q"] is True
+    assert observed["forward_q"] is q
+
+
 def test_attention_cp_plan_rejects_decode_rows():
     metadata = SimpleNamespace(num_decodes=1, num_decode_tokens=1)
 

@@ -55,9 +55,21 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         finally:
             torch.cuda.Event = _orig_event  # type: ignore[misc]
 
-    def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
+    def _fused_qnorm_rope_kv_insert(
+        self,
+        q,
+        kv,
+        q_positions,
+        kv_positions,
+        attn_metadata,
+        *,
+        split_q: bool,
+    ):
         from typing import cast
 
+        if split_q:
+            raise NotImplementedError("Attention context parallelism requires CUDA.")
+        assert q_positions is kv_positions
         if not isinstance(attn_metadata, dict):
             # Profile run: no-op, just return q (no padding needed on XPU).
             return q
@@ -77,7 +89,7 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             kv,
             self.swa_cache_layer.kv_cache,
             swa_metadata.slot_mapping,
-            positions,
+            q_positions,
             self.rotary_emb.cos_sin_cache,
             self.eps,
             swa_metadata.block_size,

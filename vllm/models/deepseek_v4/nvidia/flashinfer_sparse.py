@@ -559,7 +559,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             return
 
         token_indices = cp_plan.token_indices
-        query = q.index_select(0, token_indices)
+        query = q
         local_sparse_indices = sparse_indices.index_select(0, token_indices)
         local_sparse_topk_lens = sparse_topk_lens.index_select(0, token_indices)
 
@@ -974,6 +974,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     continue
                 global_token_indices = cp_plan.token_indices[local_start:local_end]
                 query_indices = global_token_indices - prefill_token_base
+                q_chunk = q[local_start:local_end]
                 output_chunk = output[local_start:local_end]
             else:
                 query_indices = torch.arange(
@@ -982,6 +983,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     dtype=torch.int64,
                     device=q.device,
                 )
+                q_chunk = q.index_select(0, query_indices)
                 output_chunk = output[query_start:query_end]
 
             extra_sparse_indices_chunk = (
@@ -995,7 +997,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 else None
             )
 
-            q_chunk = q.index_select(0, query_indices)
             swa_indices_chunk = swa_metadata.prefill_swa_indices.index_select(
                 0, query_indices
             )

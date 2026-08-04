@@ -432,6 +432,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor q_in, Tensor kv, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
       "int q_head_padded, float eps, int cache_block_size) -> Tensor");
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_split_q("
+      "Tensor q_in, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
+      "Tensor q_position_ids, Tensor kv_position_ids, Tensor cos_sin_cache, "
+      "int q_head_padded, float eps, int cache_block_size) -> Tensor");
 
   // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
   // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
@@ -441,11 +446,22 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor position_ids, Tensor cos_sin_cache, float eps, "
       "int cache_block_size) -> ()");
   ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert_split_q("
+      "Tensor! q, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
+      "Tensor q_position_ids, Tensor kv_position_ids, Tensor cos_sin_cache, "
+      "float eps, int cache_block_size) -> ()");
+  ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert("
       "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
       "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
       "int cache_block_size) -> ()");
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert_split_q("
+      "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor q_position_ids, Tensor kv_position_ids, "
+      "Tensor cos_sin_cache, Tensor fp8_scale, Tensor q_fp8_scale_inv, "
+      "float eps, int cache_block_size) -> ()");
 
 #ifndef USE_ROCM
   ops.def(
@@ -667,11 +683,22 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
   ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_split_q",
+      TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_split_q));
+  ops.impl(
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
       TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert));
   ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert_split_q",
+      TORCH_BOX(
+          &fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert_split_q));
+  ops.impl(
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
       TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert));
+  ops.impl(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert_split_q",
+      TORCH_BOX(
+          &fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert_split_q));
 #ifndef USE_ROCM
   ops.impl("minimax_allreduce_rms_qk", TORCH_BOX(&minimax_allreduce_rms_qk));
 #endif

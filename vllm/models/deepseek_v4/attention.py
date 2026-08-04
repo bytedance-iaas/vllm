@@ -77,6 +77,10 @@ _ATTENTION_CP_PURE_PREFILL_ONLY_ERROR = (
 )
 
 
+def _get_deepseek_v4_op(name: str) -> Any:
+    return getattr(torch.ops._C, name)
+
+
 def _raise_for_attention_cp_decode_metadata(
     swa_metadata: "DeepseekSparseSWAMetadata",
 ) -> None:
@@ -840,6 +844,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+        if cp_plan is None:
+            local_qr = qr
+            q_positions = positions
+        else:
+            local_qr = qr.index_select(0, cp_plan.token_indices)
+            q_positions = positions.index_select(0, cp_plan.token_indices)
+
+        def wq_b_kv_insert() -> torch.Tensor:
+            if local_qr.shape[0] == 0:
+                q = local_qr.new_empty((0, self.n_local_heads, self.head_dim))
+            else:
+                q = self.wq_b(local_qr).view(
+                    -1, self.n_local_heads, self.head_dim
+                )
+            return self._fused_qnorm_rope_kv_insert(
+                q,
+                kv,
+                q_positions,
+                positions,
+                attn_metadata,
+                split_q=cp_plan is not None,
+            )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (forward_mqa
@@ -853,11 +879,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
             compressor = self.compressor
-
-            def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                return q
 
             # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
@@ -888,11 +909,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
             compressor = self.compressor
 
-            def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                return q
-
             q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
                 lambda: compressor(kv_score, positions, self.rotary_emb),
@@ -902,8 +918,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
         else:
             # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            q = wq_b_kv_insert()
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
@@ -913,10 +928,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
-        positions: torch.Tensor,
+        q_positions: torch.Tensor,
+        kv_positions: torch.Tensor,
         attn_metadata: (
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
         ),
+        *,
+        split_q: bool,
     ) -> torch.Tensor:
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
@@ -936,9 +954,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert swa_metadata is not None
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
-        # The fused insert ops require int64 position_ids; the runner's positions
-        # buffer is already int64, so no cast is needed.
-        assert positions.dtype == torch.int64
+        # The fused insert ops require int64 position ids; the runner's buffer
+        # and the local index_select output already use that dtype.
+        assert q_positions.dtype == torch.int64
+        assert kv_positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
 
@@ -950,12 +969,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            if split_q:
+                split_op = _get_deepseek_v4_op(
+                    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_split_q"
+                )
+                return split_op(
+                    q,
+                    kv,
+                    swa_kv_cache_2d,
+                    swa_metadata.slot_mapping,
+                    q_positions,
+                    kv_positions,
+                    cos_sin_cache,
+                    self.padded_heads,
+                    self.eps,
+                    swa_metadata.block_size,
+                )
             return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
                 swa_metadata.slot_mapping,
-                positions,
+                kv_positions,
                 cos_sin_cache,
                 self.padded_heads,
                 self.eps,
@@ -969,33 +1004,69 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         block_size = swa_metadata.block_size
         swa_kv_cache_3d = swa_kv_cache.view(-1, block_size, self.head_dim)
         if cache_dtype == torch.bfloat16:
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
-                q,
-                kv,
-                swa_kv_cache_3d,
-                swa_metadata.slot_mapping,
-                positions,
-                cos_sin_cache,
-                self.eps,
-                block_size,
-            )
+            if split_q:
+                split_op = _get_deepseek_v4_op(
+                    "fused_deepseek_v4_qnorm_rope_kv_rope_"
+                    "full_cache_bf16_insert_split_q"
+                )
+                split_op(
+                    q,
+                    kv,
+                    swa_kv_cache_3d,
+                    swa_metadata.slot_mapping,
+                    q_positions,
+                    kv_positions,
+                    cos_sin_cache,
+                    self.eps,
+                    block_size,
+                )
+            else:
+                torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                    q,
+                    kv,
+                    swa_kv_cache_3d,
+                    swa_metadata.slot_mapping,
+                    kv_positions,
+                    cos_sin_cache,
+                    self.eps,
+                    block_size,
+                )
             return q
 
         # per-tensor fp8 (torch.float8_e4m3fn)
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
-            q,
-            kv,
-            q_fp8,
-            swa_kv_cache_3d,
-            swa_metadata.slot_mapping,
-            positions,
-            cos_sin_cache,
-            self._flashinfer_fp8_kv_scale,
-            self._flashinfer_fp8_q_scale_inv,
-            self.eps,
-            block_size,
-        )
+        if split_q:
+            split_op = _get_deepseek_v4_op(
+                "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert_split_q"
+            )
+            split_op(
+                q,
+                kv,
+                q_fp8,
+                swa_kv_cache_3d,
+                swa_metadata.slot_mapping,
+                q_positions,
+                kv_positions,
+                cos_sin_cache,
+                self._flashinfer_fp8_kv_scale,
+                self._flashinfer_fp8_q_scale_inv,
+                self.eps,
+                block_size,
+            )
+        else:
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+                q,
+                kv,
+                q_fp8,
+                swa_kv_cache_3d,
+                swa_metadata.slot_mapping,
+                kv_positions,
+                cos_sin_cache,
+                self._flashinfer_fp8_kv_scale,
+                self._flashinfer_fp8_q_scale_inv,
+                self.eps,
+                block_size,
+            )
         return q_fp8
 
     def get_attn_backend(self) -> type[AttentionBackend]:

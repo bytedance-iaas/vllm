@@ -354,7 +354,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 global_token_indices = cp_plan.token_indices[local_start:local_end]
                 query_indices = global_token_indices - prefill_token_base
                 chunk_indices = query_indices - query_start
-                q_chunk = q.index_select(0, query_indices)
+                q_chunk = q[local_start:local_end]
                 indices_chunk = combined_indices.index_select(0, chunk_indices)
                 lens_chunk = combined_lens.index_select(0, chunk_indices)
                 output_chunk = output[local_start:local_end]
