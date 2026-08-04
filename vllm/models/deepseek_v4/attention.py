@@ -146,6 +146,8 @@ def _build_attention_cp_plan_uncached(
 @dataclass
 class AttentionCPPlan:
     token_indices: torch.Tensor
+    output_gather_sizes: list[int]
+    gathered_token_indices: torch.Tensor
     local_query_lens_cpu: torch.Tensor
     local_query_start_loc_cpu: torch.Tensor
     local_query_start_loc: torch.Tensor
@@ -181,31 +183,45 @@ class AttentionCPPlan:
         global_query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         prefix_lens = seq_lens_cpu[:num_reqs].to(torch.int64) - global_query_lens
 
-        local_indices: list[torch.Tensor] = []
+        rank_indices: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
         local_lens: list[int] = []
         effective_seq_lens: list[int] = []
         for req_idx in range(num_reqs):
             query_len = int(global_query_lens[req_idx].item())
             num_blocks = (query_len + alignment - 1) // alignment
-            start_block = (num_blocks * cp_rank + cp_size - 1) // cp_size
-            end_block = (num_blocks * (cp_rank + 1) + cp_size - 1) // cp_size
-            local_start = min(start_block * alignment, query_len)
-            local_end = min(end_block * alignment, query_len)
-            global_start = int(query_start_loc_cpu[req_idx].item()) + local_start
-            global_end = int(query_start_loc_cpu[req_idx].item()) + local_end
+            global_query_start = int(query_start_loc_cpu[req_idx].item())
+            for rank in range(cp_size):
+                start_block = (num_blocks * rank + cp_size - 1) // cp_size
+                end_block = (num_blocks * (rank + 1) + cp_size - 1) // cp_size
+                local_start = min(start_block * alignment, query_len)
+                local_end = min(end_block * alignment, query_len)
+                global_start = global_query_start + local_start
+                global_end = global_query_start + local_end
+                if global_end > global_start:
+                    rank_indices[rank].append(
+                        torch.arange(global_start, global_end, dtype=torch.int64)
+                    )
+                if rank == cp_rank:
+                    local_lens.append(global_end - global_start)
+                    effective_seq_lens.append(
+                        int(prefix_lens[req_idx].item()) + local_end
+                    )
 
-            if global_end > global_start:
-                local_indices.append(
-                    torch.arange(global_start, global_end, dtype=torch.int64)
-                )
-            local_lens.append(global_end - global_start)
-            effective_seq_lens.append(int(prefix_lens[req_idx].item()) + local_end)
-
-        indices_cpu = (
-            torch.cat(local_indices)
-            if local_indices
-            else torch.empty(0, dtype=torch.int64)
-        )
+        indices_cpu_by_rank = [
+            torch.cat(indices) if indices else torch.empty(0, dtype=torch.int64)
+            for indices in rank_indices
+        ]
+        output_gather_sizes = [
+            int(indices.numel()) for indices in indices_cpu_by_rank
+        ]
+        num_global_tokens = int(query_start_loc_cpu[-1].item())
+        if sum(output_gather_sizes) != num_global_tokens:
+            raise RuntimeError(
+                "Attention CP output plan does not cover all query tokens: "
+                f"{output_gather_sizes=} {num_global_tokens=}"
+            )
+        indices_cpu = indices_cpu_by_rank[cp_rank]
+        gathered_indices_cpu = torch.cat(indices_cpu_by_rank)
         local_query_lens_cpu = torch.tensor(local_lens, dtype=torch.int32)
         local_query_start_loc_cpu = torch.cat(
             (
@@ -215,6 +231,8 @@ class AttentionCPPlan:
         )
         return cls(
             token_indices=indices_cpu.to(device=device),
+            output_gather_sizes=output_gather_sizes,
+            gathered_token_indices=gathered_indices_cpu.to(device=device),
             local_query_lens_cpu=local_query_lens_cpu,
             local_query_start_loc_cpu=local_query_start_loc_cpu,
             local_query_start_loc=local_query_start_loc_cpu.to(device=device),
@@ -230,10 +248,30 @@ class AttentionCPPlan:
         local_output: torch.Tensor,
         num_global_tokens: int,
     ) -> torch.Tensor:
-        output = local_output.new_zeros((num_global_tokens, local_output.shape[-1]))
-        if self.num_local_tokens > 0:
-            output.index_copy_(0, self.token_indices, local_output)
-        return get_attn_cp_group().all_reduce(output)
+        if local_output.shape[0] != self.num_local_tokens:
+            raise ValueError(
+                "Local attention output token count does not match the CP plan: "
+                f"{local_output.shape[0]} != {self.num_local_tokens}"
+            )
+        if self.gathered_token_indices.numel() != num_global_tokens:
+            raise ValueError(
+                "Global attention output token count does not match the CP plan: "
+                f"{num_global_tokens} != {self.gathered_token_indices.numel()}"
+            )
+
+        gathered_output = get_attn_cp_group().all_gatherv(
+            local_output,
+            dim=0,
+            sizes=self.output_gather_sizes,
+        )
+        output = local_output.new_empty((num_global_tokens, local_output.shape[-1]))
+        if num_global_tokens > 0:
+            output.index_copy_(
+                0,
+                self.gathered_token_indices,
+                gathered_output,
+            )
+        return output
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import typing
+from unittest.mock import patch
 
 import multiprocess as mp
 import numpy as np
@@ -12,6 +14,9 @@ import torch.distributed
 import vllm.envs as envs
 from tests.utils import ensure_current_vllm_config
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce  # noqa
+from vllm.distributed.device_communicators.cuda_communicator import (
+    CudaCommunicator,
+)
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
 from vllm.distributed.parallel_state import (
@@ -232,6 +237,63 @@ def all_gatherv_worker_fn():
 )
 def test_pynccl_all_gatherv():
     distributed_run(all_gatherv_worker_fn, 2)
+
+
+@worker_fn_wrapper
+def cuda_all_gatherv_fallback_worker_fn():
+    cuda_communicator = typing.cast(
+        CudaCommunicator,
+        get_world_group().device_communicator,
+    )
+    pynccl_comm = cuda_communicator.pynccl_comm
+    assert pynccl_comm is not None
+    pynccl_comm.disabled = True
+
+    rank = cuda_communicator.rank
+    device = cuda_communicator.device
+
+    def check_sizes(sizes: list[int]):
+        input_tensor = (
+            torch.arange(
+                sizes[rank] * 2,
+                dtype=torch.float32,
+                device=device,
+            ).reshape(sizes[rank], 2)
+            + rank * 100
+        )
+        output = cuda_communicator.all_gatherv(
+            input_tensor,
+            dim=0,
+            sizes=sizes,
+        )
+        expected = torch.cat(
+            [
+                torch.arange(
+                    size * 2,
+                    dtype=torch.float32,
+                    device=device,
+                ).reshape(size, 2)
+                + source_rank * 100
+                for source_rank, size in enumerate(sizes)
+            ]
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    check_sizes([3, 1])
+    check_sizes([3, 0])
+    with patch(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "should_nccl_symm_mem_ag_rs",
+        return_value=True,
+    ):
+        check_sizes([2, 2])
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+)
+def test_cuda_all_gatherv_falls_back_without_pynccl():
+    distributed_run(cuda_all_gatherv_fallback_worker_fn, 2)
 
 
 @worker_fn_wrapper

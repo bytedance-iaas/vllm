@@ -22,10 +22,24 @@ class FakeGroup:
     world_size: int
     all_reduce_calls: int = 0
     all_reduce_offset: float = 7
+    all_gatherv_calls: int = 0
+    all_gatherv_result: torch.Tensor | None = None
+    all_gatherv_sizes: list[int] | None = None
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
         self.all_reduce_calls += 1
         return tensor + self.all_reduce_offset
+
+    def all_gatherv(
+        self,
+        tensor: torch.Tensor,
+        dim: int = 0,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        assert dim == 0
+        self.all_gatherv_calls += 1
+        self.all_gatherv_sizes = sizes
+        return tensor if self.all_gatherv_result is None else self.all_gatherv_result
 
 
 def make_forward_context_config() -> SimpleNamespace:
@@ -143,6 +157,12 @@ def test_attention_cp_plan_splits_each_request_on_aligned_blocks(
     assert plan.local_query_lens_cpu.tolist() == expected_lens
     assert plan.effective_seq_lens.tolist() == expected_effective_lens
     assert plan.token_indices.tolist() == expected_indices
+    assert plan.output_gather_sizes == [384, 44]
+    assert plan.gathered_token_indices.tolist() == [
+        *range(0, 256),
+        *range(300, 428),
+        *range(256, 300),
+    ]
 
 
 def test_attention_cp_plan_restores_original_packed_order(
@@ -150,12 +170,25 @@ def test_attention_cp_plan_restores_original_packed_order(
 ):
     plan = attention_module.AttentionCPPlan(
         token_indices=torch.tensor([1, 3]),
+        output_gather_sizes=[2, 2],
+        gathered_token_indices=torch.tensor([0, 2, 1, 3]),
         local_query_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         local_query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
         local_query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         effective_seq_lens=torch.tensor([2, 4], dtype=torch.int32),
     )
-    group = FakeGroup(rank_in_group=0, world_size=2, all_reduce_offset=0)
+    group = FakeGroup(
+        rank_in_group=1,
+        world_size=2,
+        all_gatherv_result=torch.tensor(
+            [
+                [0.0, 1.0],
+                [20.0, 21.0],
+                [10.0, 11.0],
+                [30.0, 31.0],
+            ]
+        ),
+    )
     monkeypatch.setattr(attention_module, "get_attn_cp_group", lambda: group)
     local_output = torch.tensor([[10.0, 11.0], [30.0, 31.0]])
 
@@ -165,17 +198,21 @@ def test_attention_cp_plan_restores_original_packed_order(
         restored,
         torch.tensor(
             [
-                [0.0, 0.0],
+                [0.0, 1.0],
                 [10.0, 11.0],
-                [0.0, 0.0],
+                [20.0, 21.0],
                 [30.0, 31.0],
             ]
         ),
     )
-    assert group.all_reduce_calls == 1
+    assert group.all_reduce_calls == 0
+    assert group.all_gatherv_calls == 1
+    assert group.all_gatherv_sizes == [2, 2]
 
 
-def test_attention_cp_plan_supports_empty_shard():
+def test_attention_cp_plan_supports_empty_shard(
+    monkeypatch: pytest.MonkeyPatch,
+):
     metadata = SimpleNamespace(
         num_decodes=0,
         num_decode_tokens=0,
@@ -195,11 +232,27 @@ def test_attention_cp_plan_supports_empty_shard():
     assert plan.num_local_tokens == 0
     assert plan.local_query_lens_cpu.tolist() == [0]
     assert plan.token_indices.numel() == 0
+    assert plan.output_gather_sizes == [128, 0]
+
+    gathered_output = torch.arange(256, dtype=torch.float32).reshape(128, 2)
+    group = FakeGroup(
+        rank_in_group=1,
+        world_size=2,
+        all_gatherv_result=gathered_output,
+    )
+    monkeypatch.setattr(attention_module, "get_attn_cp_group", lambda: group)
+
+    restored = plan.restore_output(torch.empty(0, 2), num_global_tokens=128)
+
+    torch.testing.assert_close(restored, gathered_output)
+    assert group.all_gatherv_sizes == [128, 0]
 
 
 def test_attention_cp_projects_only_local_queries_before_full_kv_insert():
     plan = attention_module.AttentionCPPlan(
         token_indices=torch.tensor([1, 3]),
+        output_gather_sizes=[2, 2],
+        gathered_token_indices=torch.tensor([0, 2, 1, 3]),
         local_query_lens_cpu=torch.tensor([2], dtype=torch.int32),
         local_query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
         local_query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
@@ -285,6 +338,8 @@ def test_attention_cp_projects_only_local_queries_before_full_kv_insert():
 def test_attention_cp_empty_shard_skips_projection_but_inserts_full_kv():
     plan = attention_module.AttentionCPPlan(
         token_indices=torch.empty(0, dtype=torch.int64),
+        output_gather_sizes=[4, 0],
+        gathered_token_indices=torch.tensor([0, 1, 2, 3]),
         local_query_lens_cpu=torch.tensor([0], dtype=torch.int32),
         local_query_start_loc_cpu=torch.tensor([0, 0], dtype=torch.int32),
         local_query_start_loc=torch.tensor([0, 0], dtype=torch.int32),
