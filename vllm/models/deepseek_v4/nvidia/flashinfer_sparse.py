@@ -968,8 +968,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             if cp_plan is not None:
-                local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
-                local_end = int(cp_plan.local_query_start_loc_cpu[chunk_end].item())
+                local_start = int(
+                    cp_plan.local_query_start_loc_cpu[chunk_start].item()
+                )
+                local_end = int(
+                    cp_plan.local_query_start_loc_cpu[chunk_end].item()
+                )
                 if local_start == local_end:
                     continue
                 global_token_indices = cp_plan.token_indices[local_start:local_end]
