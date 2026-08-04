@@ -69,6 +69,75 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+_ATTENTION_CP_PLAN_CACHE_KEY = (
+    "vllm.models.deepseek_v4.attention:attention_cp_plan_cache_entry"
+)
+_ATTENTION_CP_PURE_PREFILL_ONLY_ERROR = (
+    "Attention context parallelism currently supports pure prefill batches only."
+)
+
+
+def _raise_for_attention_cp_decode_metadata(
+    swa_metadata: "DeepseekSparseSWAMetadata",
+) -> None:
+    if swa_metadata.num_decodes != 0 or swa_metadata.num_decode_tokens != 0:
+        raise NotImplementedError(_ATTENTION_CP_PURE_PREFILL_ONLY_ERROR)
+
+
+def _attention_cp_plan_tensor_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+    return (
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+    )
+
+
+def _attention_cp_plan_cache_signature(
+    swa_metadata: "DeepseekSparseSWAMetadata",
+    *,
+    cp_rank: int,
+    cp_size: int,
+    alignment: int,
+    device: torch.device,
+) -> tuple[Any, ...]:
+    query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+    seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+    assert query_start_loc_cpu is not None
+    assert seq_lens_cpu is not None
+
+    return (
+        cp_rank,
+        cp_size,
+        alignment,
+        device.type,
+        device.index,
+        swa_metadata.num_decodes,
+        swa_metadata.num_decode_tokens,
+        swa_metadata.num_prefills,
+        _attention_cp_plan_tensor_signature(query_start_loc_cpu),
+        _attention_cp_plan_tensor_signature(seq_lens_cpu),
+    )
+
+
+def _build_attention_cp_plan_uncached(
+    swa_metadata: "DeepseekSparseSWAMetadata",
+    *,
+    cp_rank: int,
+    cp_size: int,
+    alignment: int,
+    device: torch.device,
+) -> "AttentionCPPlan":
+    _raise_for_attention_cp_decode_metadata(swa_metadata)
+    return AttentionCPPlan.build(
+        swa_metadata,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        alignment=alignment,
+        device=device,
+    )
+
 
 @dataclass
 class AttentionCPPlan:
@@ -92,11 +161,7 @@ class AttentionCPPlan:
         alignment: int,
         device: torch.device,
     ) -> "AttentionCPPlan":
-        if swa_metadata.num_decodes != 0 or swa_metadata.num_decode_tokens != 0:
-            raise NotImplementedError(
-                "Attention context parallelism currently supports pure prefill "
-                "batches only."
-            )
+        _raise_for_attention_cp_decode_metadata(swa_metadata)
         if alignment <= 0:
             raise ValueError(f"alignment must be positive, got {alignment}")
         if cp_size <= 0 or not 0 <= cp_rank < cp_size:
@@ -165,6 +230,12 @@ class AttentionCPPlan:
         if self.num_local_tokens > 0:
             output.index_copy_(0, self.token_indices, local_output)
         return get_attn_cp_group().all_reduce(output)
+
+
+@dataclass(frozen=True)
+class AttentionCPPlanCacheEntry:
+    signature: tuple[Any, ...]
+    plan: AttentionCPPlan
 
 
 class _AttentionColumnParallelLinear(ColumnParallelLinear):
@@ -663,14 +734,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+        _raise_for_attention_cp_decode_metadata(swa_metadata)
         cp_group = get_attn_cp_group()
-        return AttentionCPPlan.build(
+        additional_kwargs = forward_context.additional_kwargs
+        cache_entry = additional_kwargs.get(_ATTENTION_CP_PLAN_CACHE_KEY)
+        # ForwardContext attention metadata is built before model execution and
+        # stays immutable for one forward. In-place mutation inside the same
+        # context is unsupported; a new forward gets a new ForwardContext/cache.
+        cache_signature = _attention_cp_plan_cache_signature(
             swa_metadata,
             cp_rank=cp_group.rank_in_group,
             cp_size=cp_group.world_size,
             alignment=self.attn_cp_alignment,
             device=device,
         )
+        if isinstance(cache_entry, AttentionCPPlanCacheEntry):
+            if cache_entry.signature == cache_signature:
+                return cache_entry.plan
+
+        cp_plan = _build_attention_cp_plan_uncached(
+            swa_metadata,
+            cp_rank=cp_group.rank_in_group,
+            cp_size=cp_group.world_size,
+            alignment=self.attn_cp_alignment,
+            device=device,
+        )
+        additional_kwargs[_ATTENTION_CP_PLAN_CACHE_KEY] = AttentionCPPlanCacheEntry(
+            signature=cache_signature,
+            plan=cp_plan,
+        )
+        return cp_plan
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list

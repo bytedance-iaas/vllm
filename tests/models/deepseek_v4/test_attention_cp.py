@@ -239,7 +239,19 @@ def test_attention_cp_plan_bypasses_profile_mixed_metadata():
 def test_attention_cp_plan_rejects_production_mixed_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    metadata = SimpleNamespace(num_decodes=1, num_decode_tokens=1)
+    class ProductionMixedMetadata:
+        num_decodes = 1
+        num_decode_tokens = 1
+
+        @property
+        def query_start_loc_cpu(self):
+            raise AssertionError("query_start_loc_cpu should not be accessed")
+
+        @property
+        def prefill_seq_lens_cpu(self):
+            raise AssertionError("prefill_seq_lens_cpu should not be accessed")
+
+    metadata = ProductionMixedMetadata()
     layer = SimpleNamespace(
         attn_cp_size=2,
         swa_cache_layer=SimpleNamespace(prefix="swa"),
@@ -257,3 +269,267 @@ def test_attention_cp_plan_rejects_production_mixed_metadata(
             attention_module.DeepseekV4Attention._build_attention_cp_plan(
                 layer, torch.device("cpu")
             )
+
+
+def test_attention_cp_plan_reuses_cached_plan_within_forward_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    query_start_loc_cpu = torch.tensor([0, 300, 428], dtype=torch.int32)
+    prefill_seq_lens_cpu = torch.tensor([1000, 128], dtype=torch.int32)
+    metadata_a = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=2,
+        query_start_loc_cpu=query_start_loc_cpu,
+        prefill_seq_lens_cpu=prefill_seq_lens_cpu,
+    )
+    metadata_b = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=2,
+        query_start_loc_cpu=query_start_loc_cpu,
+        prefill_seq_lens_cpu=prefill_seq_lens_cpu,
+    )
+    layer_a = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa_a"),
+        attn_cp_alignment=256,
+    )
+    layer_b = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa_b"),
+        attn_cp_alignment=256,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attn_cp_group",
+        lambda: FakeGroup(rank_in_group=0, world_size=2),
+    )
+
+    build_calls = 0
+    original_build = attention_module.AttentionCPPlan.build
+
+    def counting_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module.AttentionCPPlan, "build", counting_build)
+
+    with set_forward_context(
+        {"swa_a": metadata_a, "swa_b": metadata_b},
+        make_forward_context_config(),
+    ):
+        plan_a = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer_a, torch.device("cpu")
+        )
+        plan_b = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer_b, torch.device("cpu")
+        )
+
+    assert plan_a is plan_b
+    assert build_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replace_tensor"),
+    [
+        (
+            "query_start_loc_cpu",
+            lambda: torch.tensor([0, 300, 428], dtype=torch.int32),
+        ),
+        (
+            "prefill_seq_lens_cpu",
+            lambda: torch.tensor([1000, 0, 128], dtype=torch.int32).as_strided(
+                (2,), (2,), 0
+            ),
+        ),
+    ],
+)
+def test_attention_cp_plan_invalidates_cache_on_metadata_tensor_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    replace_tensor,
+):
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=2,
+        query_start_loc_cpu=torch.tensor([0, 300, 428], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([1000, 128], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        attn_cp_alignment=256,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attn_cp_group",
+        lambda: FakeGroup(rank_in_group=0, world_size=2),
+    )
+
+    build_calls = 0
+    original_build = attention_module.AttentionCPPlan.build
+
+    def counting_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module.AttentionCPPlan, "build", counting_build)
+
+    with set_forward_context({"swa": metadata}, make_forward_context_config()):
+        first_plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer, torch.device("cpu")
+        )
+        first_signature = attention_module._attention_cp_plan_cache_signature(
+            metadata,
+            cp_rank=0,
+            cp_size=2,
+            alignment=256,
+            device=torch.device("cpu"),
+        )
+        setattr(metadata, field_name, replace_tensor())
+        second_plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer, torch.device("cpu")
+        )
+        second_signature = attention_module._attention_cp_plan_cache_signature(
+            metadata,
+            cp_rank=0,
+            cp_size=2,
+            alignment=256,
+            device=torch.device("cpu"),
+        )
+
+    assert first_plan is not second_plan
+    assert first_signature != second_signature
+    assert build_calls == 2, field_name
+
+
+def test_attention_cp_plan_reuses_cached_plan_in_inference_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    layer = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        attn_cp_alignment=256,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attn_cp_group",
+        lambda: FakeGroup(rank_in_group=0, world_size=2),
+    )
+
+    build_calls = 0
+    original_build = attention_module.AttentionCPPlan.build
+
+    def counting_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module.AttentionCPPlan, "build", counting_build)
+
+    with torch.inference_mode():
+        metadata = SimpleNamespace(
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_prefills=2,
+            query_start_loc_cpu=torch.tensor([0, 300, 428], dtype=torch.int32),
+            prefill_seq_lens_cpu=torch.tensor([1000, 128], dtype=torch.int32),
+        )
+
+        with set_forward_context({"swa": metadata}, make_forward_context_config()):
+            first_plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+                layer, torch.device("cpu")
+            )
+            second_plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+                layer, torch.device("cpu")
+            )
+
+    assert first_plan is second_plan
+    assert build_calls == 1
+
+
+def test_attention_cp_plan_replaces_foreign_cache_entry(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        query_start_loc_cpu=torch.tensor([0, 128], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([256], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        attn_cp_alignment=256,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attn_cp_group",
+        lambda: FakeGroup(rank_in_group=0, world_size=2),
+    )
+
+    with set_forward_context({"swa": metadata}, make_forward_context_config()):
+        forward_context = get_forward_context()
+        forward_context.additional_kwargs[
+            attention_module._ATTENTION_CP_PLAN_CACHE_KEY
+        ] = "foreign-value"
+
+        plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer, torch.device("cpu")
+        )
+
+        cache_entry = forward_context.additional_kwargs[
+            attention_module._ATTENTION_CP_PLAN_CACHE_KEY
+        ]
+
+    assert isinstance(cache_entry, attention_module.AttentionCPPlanCacheEntry)
+    assert cache_entry.plan is plan
+
+
+def test_attention_cp_plan_does_not_reuse_across_forward_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        query_start_loc_cpu=torch.tensor([0, 128], dtype=torch.int32),
+        prefill_seq_lens_cpu=torch.tensor([256], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        attn_cp_size=2,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        attn_cp_alignment=256,
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attn_cp_group",
+        lambda: FakeGroup(rank_in_group=0, world_size=2),
+    )
+
+    build_calls = 0
+    original_build = attention_module.AttentionCPPlan.build
+
+    def counting_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(attention_module.AttentionCPPlan, "build", counting_build)
+
+    with set_forward_context({"swa": metadata}, make_forward_context_config()):
+        first_plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer, torch.device("cpu")
+        )
+    with set_forward_context({"swa": metadata}, make_forward_context_config()):
+        second_plan = attention_module.DeepseekV4Attention._build_attention_cp_plan(
+            layer, torch.device("cpu")
+        )
+
+    assert first_plan is not second_plan
+    assert build_calls == 2
