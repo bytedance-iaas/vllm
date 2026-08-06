@@ -190,6 +190,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        self.scheduled_num_spec_tokens_to_schedule = self.num_speculative_steps
+        self.last_completed_num_spec_tokens_to_schedule = 0
         if self.speculative_config is not None:
             method = self.speculative_config.method
             is_aux_hidden_state_method = method in ("eagle3", "dflash", "dspark")
@@ -273,6 +275,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and kv_transfer_config.is_kv_producer
             and not kv_transfer_config.is_kv_consumer
         )
+
+    def _uses_dynamic_sd(self) -> bool:
+        return bool(
+            self.speculative_config is not None
+            and self.speculative_config.uses_dynamic_speculative_decoding()
+        )
+
+    def _get_target_decode_query_len(self, scheduler_output: SchedulerOutput) -> int:
+        if not self._uses_dynamic_sd():
+            return self.decode_query_len
+        current_draft_k = max(
+            map(len, scheduler_output.scheduled_spec_decode_tokens.values()),
+            default=0,
+        )
+        return current_draft_k + self.model_state.num_new_sampled_tokens_per_step
+
+    def _retain_completed_num_spec_tokens(
+        self, num_spec_tokens_to_schedule: int
+    ) -> None:
+        if self._uses_dynamic_sd():
+            self.last_completed_num_spec_tokens_to_schedule = int(
+                num_spec_tokens_to_schedule
+            )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -555,6 +580,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        num_spec_tokens_to_schedule: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -564,14 +590,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
+        scheduled_num_spec_tokens_to_schedule = (
+            self.num_speculative_steps
+            if num_spec_tokens_to_schedule is None
+            else int(num_spec_tokens_to_schedule)
+        )
+        last_completed_num_spec_tokens = self.last_completed_num_spec_tokens_to_schedule
         if uniform_decode:
+            target_query_len = self.decode_query_len
+            if self._uses_dynamic_sd() and not is_profile:
+                target_query_len = (
+                    last_completed_num_spec_tokens
+                    + self.model_state.num_new_sampled_tokens_per_step
+                )
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
             # and for spec-decode with MTP we want to make sure the dummy runs use
-            # 1+num_speculative_tokens we use max here, this will likely be eventually
-            # changed in the worker: https://github.com/vllm-project/vllm/pull/35243
-            num_tokens = max(num_tokens, self.decode_query_len)
-            num_reqs = num_tokens // self.decode_query_len
-            assert num_tokens % self.decode_query_len == 0
+            # the target decode width.
+            num_tokens = max(num_tokens, target_query_len)
+            num_reqs = num_tokens // target_query_len
+            assert num_tokens % target_query_len == 0
         num_tokens_per_request = [num_tokens // num_reqs] * num_reqs
         num_tokens_per_request[-1] += num_tokens % num_reqs
 
@@ -582,6 +619,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output = SchedulerOutput.make_empty()
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+        dummy_scheduler_output.num_spec_tokens_to_schedule = (
+            scheduled_num_spec_tokens_to_schedule
+        )
 
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
@@ -612,6 +652,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
+            if uniform_decode and not is_profile:
+                self._retain_completed_num_spec_tokens(
+                    scheduled_num_spec_tokens_to_schedule
+                )
             return None, None
 
         assert self.execute_model_state is not None
@@ -620,6 +664,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
@@ -660,10 +707,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 next_prefill_tokens=self.req_states.next_prefill_tokens,
                 temperature=self.sampler.sampling_states.temperature.gpu,
                 seeds=self.sampler.sampling_states.seeds.gpu,
+                runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 mm_inputs=mm_inputs,
                 is_profile=is_profile,
+            )
+
+        if uniform_decode and not is_profile:
+            self._retain_completed_num_spec_tokens(
+                scheduled_num_spec_tokens_to_schedule
             )
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
@@ -907,8 +960,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_per_req = scheduler_output.num_scheduled_tokens
         num_reqs = len(num_tokens_per_req)
 
+        decode_query_len = self._get_target_decode_query_len(scheduler_output)
+        is_prefilling = {
+            req_id: (
+                self.req_states.num_computed_prefill_tokens[
+                    self.req_states.req_id_to_index[req_id]
+                ]
+                < self.req_states.prefill_len.np[
+                    self.req_states.req_id_to_index[req_id]
+                ]
+            )
+            for req_id in num_tokens_per_req
+        }
+
         # batch_idx -> req_id
-        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+        req_ids = sort_batch_req_ids(
+            num_tokens_per_req,
+            decode_query_len,
+            is_prefilling=is_prefilling,
+        )
         numtoks_iter = map(num_tokens_per_req.get, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
 
@@ -1176,6 +1246,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self.scheduled_num_spec_tokens_to_schedule = (
+            scheduler_output.num_spec_tokens_to_schedule
+        )
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1403,6 +1476,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         if not self.is_last_pp_rank:
@@ -1425,6 +1499,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1443,6 +1520,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._retain_completed_num_spec_tokens(num_spec_tokens_to_schedule)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
@@ -1536,21 +1614,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.next_prefill_tokens,
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
+                runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
                 mm_inputs=mm_inputs,
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if num_spec_tokens_to_schedule > 0:
+                draft_tokens = draft_tokens[:, :num_spec_tokens_to_schedule]
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :num_spec_tokens_to_schedule
+                ] = draft_tokens
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :num_spec_tokens_to_schedule
+                ],
             )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        self._retain_completed_num_spec_tokens(num_spec_tokens_to_schedule)
 
         return async_output
 
@@ -1667,12 +1753,31 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    num_spec_tokens_to_schedule: int = 0
 
 
 def sort_batch_req_ids(
-    num_tokens_per_req: dict[str, int], decode_query_len: int
+    num_tokens_per_req: dict[str, int],
+    decode_query_len: int,
+    *,
+    is_prefilling: dict[str, bool] | None = None,
 ) -> list[str]:
     # Order decode -> short_extend -> prefill; split_decodes_and_prefills
     # relies on uniform decodes (query_len == decode_query_len) leading.
-    key = lambda r: ((num := num_tokens_per_req[r]) != decode_query_len, num)
+    if is_prefilling is None:
+        key = lambda r: ((num := num_tokens_per_req[r]) != decode_query_len, num)
+        return sorted(num_tokens_per_req, key=key)
+
+    def key(req_id: str) -> tuple[int, int]:
+        num_tokens = num_tokens_per_req[req_id]
+        if not is_prefilling[req_id] and num_tokens == decode_query_len:
+            category = 0
+        elif not is_prefilling[req_id]:
+            category = 1
+        elif num_tokens <= decode_query_len:
+            category = 2
+        else:
+            category = 3
+        return category, num_tokens
+
     return sorted(num_tokens_per_req, key=key)
