@@ -33,6 +33,8 @@ jobs:
       ALL_PROXY: http://100.68.162.211:3128
       NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-wheel-cache
+      BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
+      BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
     steps:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
@@ -70,6 +72,7 @@ jobs:
 
           echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}, effective_cuda_jobs=$((build_max_jobs / build_nvcc_threads))"
           echo "DeepGEMM Python versions: ${DEEPGEMM_PYTHON_VERSIONS:-default}"
+          echo "DeepGEMM source: ${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}@${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
           echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
           df -h /data /data/docker /data/buildkit || true
           mkdir -p "${cache_root}"
@@ -114,6 +117,9 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
             --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${{ inputs.cuda_version }}-devel-ubuntu22.04" \
+            --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
+            --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
+            --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON \
             --build-arg max_jobs="${build_max_jobs}" \
             --build-arg nvcc_threads="${build_nvcc_threads}" \
             --build-arg HTTP_PROXY="${HTTP_PROXY}" \

@@ -48,6 +48,8 @@ jobs:
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
+      BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
+      BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
       BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0%2Blocal-260630mega_moe-cp312-cp312-linux_x86_64.whl
       BYTEIAAS_DEEPGEMM_WHEEL_X86_64_SHA256: ba77537585ab41aa5d075d8db84545ab38e9e717f7b413fcfd6c7dbcda45c47b
       BYTEIAAS_HPC_OPS_REPO: https://github.com/wangyicong52/hpc-ops.git
@@ -149,6 +151,7 @@ jobs:
 
           echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}, effective_cuda_jobs=$((build_max_jobs / build_nvcc_threads))"
           echo "DeepGEMM Python versions: ${DEEPGEMM_PYTHON_VERSIONS:-default}"
+          echo "DeepGEMM source: ${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}@${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
           echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
           df -h /data /data/docker /data/buildkit || true
           mkdir -p "${cache_root}"
@@ -196,6 +199,9 @@ jobs:
               -f docker/Dockerfile \
               --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
               --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
+              --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
+              --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
+              --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON \
               --build-arg INSTALL_KV_CONNECTORS=true \
               --build-arg INSTALL_VLLM_ROUTER=true \
               --build-arg INSTALL_HPC_OPS=true \

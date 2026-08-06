@@ -19,6 +19,15 @@
     "BUILD_OS": {
       "default": "ubuntu"
     },
+    "DEEPGEMM_GIT_REPOSITORY": {
+      "default": "https://github.com/deepseek-ai/DeepGEMM.git"
+    },
+    "DEEPGEMM_GIT_COMMIT": {
+      "default": "a6b593d2826719dcf4892609af7b84ee23aaf32a"
+    },
+    "DEEPGEMM_REQUIRE_SM90_MEGA_MOE": {
+      "default": "OFF"
+    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },

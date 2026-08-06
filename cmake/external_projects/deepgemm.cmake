@@ -1,11 +1,57 @@
 include(FetchContent)
 
+# Keep these defaults in sync with tools/install_deepgemm.sh and
+# docker/Dockerfile. Ordinary builds use upstream for SM120 compatibility.
+set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/deepseek-ai/DeepGEMM.git")
+set(_DEEPGEMM_UPSTREAM_COMMIT
+  "a6b593d2826719dcf4892609af7b84ee23aaf32a")
+
 # If DEEPGEMM_SRC_DIR is set, DeepGEMM is built from that directory
 # instead of downloading.
 # It can be set as an environment variable or passed as a cmake argument.
 # The environment variable takes precedence.
-if (DEFINED ENV{DEEPGEMM_SRC_DIR})
-  set(DEEPGEMM_SRC_DIR $ENV{DEEPGEMM_SRC_DIR})
+if(DEFINED ENV{DEEPGEMM_SRC_DIR} AND
+   NOT "$ENV{DEEPGEMM_SRC_DIR}" STREQUAL "")
+  set(DEEPGEMM_SRC_DIR "$ENV{DEEPGEMM_SRC_DIR}")
+endif()
+
+# The git override is intentionally a repository plus an exact commit. A
+# branch or tag is rejected so source builds cannot silently move.
+set(DEEPGEMM_GIT_REPOSITORY "" CACHE STRING
+  "Override DeepGEMM git repository (requires DEEPGEMM_GIT_COMMIT)")
+set(DEEPGEMM_GIT_COMMIT "" CACHE STRING
+  "Override DeepGEMM exact 40-character git commit")
+set(DEEPGEMM_REQUIRE_SM90_MEGA_MOE OFF CACHE BOOL
+  "Require DeepGEMM's SM90 MegaMoE source API contract")
+foreach(_deepgemm_env_var IN ITEMS
+    DEEPGEMM_GIT_REPOSITORY
+    DEEPGEMM_GIT_COMMIT
+    DEEPGEMM_REQUIRE_SM90_MEGA_MOE)
+  if(DEFINED ENV{${_deepgemm_env_var}} AND
+     NOT "$ENV{${_deepgemm_env_var}}" STREQUAL "")
+    set(${_deepgemm_env_var} "$ENV{${_deepgemm_env_var}}")
+  endif()
+endforeach()
+
+if((DEEPGEMM_GIT_REPOSITORY AND NOT DEEPGEMM_GIT_COMMIT) OR
+   (DEEPGEMM_GIT_COMMIT AND NOT DEEPGEMM_GIT_REPOSITORY))
+  message(FATAL_ERROR
+    "DEEPGEMM_GIT_REPOSITORY and DEEPGEMM_GIT_COMMIT must be set together")
+endif()
+if(DEEPGEMM_GIT_COMMIT)
+  string(LENGTH "${DEEPGEMM_GIT_COMMIT}" _deepgemm_commit_length)
+  if(NOT _deepgemm_commit_length EQUAL 40 OR
+     NOT DEEPGEMM_GIT_COMMIT MATCHES "^[0-9a-fA-F]+$")
+    message(FATAL_ERROR
+      "DEEPGEMM_GIT_COMMIT must be an exact 40-character hexadecimal commit, "
+      "got '${DEEPGEMM_GIT_COMMIT}'")
+  endif()
+  string(TOLOWER "${DEEPGEMM_GIT_COMMIT}" DEEPGEMM_GIT_COMMIT)
+  set(_deepgemm_git_repo "${DEEPGEMM_GIT_REPOSITORY}")
+  set(_deepgemm_git_commit "${DEEPGEMM_GIT_COMMIT}")
+else()
+  set(_deepgemm_git_repo "${_DEEPGEMM_UPSTREAM_REPO}")
+  set(_deepgemm_git_commit "${_DEEPGEMM_UPSTREAM_COMMIT}")
 endif()
 
 # Local tree: set deepgemm_SOURCE_DIR directly (no FetchContent download).
@@ -27,11 +73,6 @@ if(DEEPGEMM_SRC_DIR)
   set(deepgemm_SOURCE_DIR "${DEEPGEMM_SRC_DIR}")
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
-  # Keep in sync with tools/install_deepgemm.sh
-  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/deepseek-ai/DeepGEMM.git")
-  # NOTE: This is currently targeting nv-dev branch due to sm120 support
-  set(_DEEPGEMM_UPSTREAM_TAG "a6b593d2826719dcf4892609af7b84ee23aaf32a")
-
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
     set(_deepgemm_fc_root "${CMAKE_BINARY_DIR}/_deps")
@@ -40,7 +81,50 @@ else()
   set(_deepgemm_bin "${_deepgemm_fc_root}/deepgemm-build")
   set(_deepgemm_sub "${_deepgemm_fc_root}/deepgemm-subbuild")
 
-  if(EXISTS "${_deepgemm_src}/csrc/python_api.cpp")
+  find_package(Git REQUIRED)
+  set(_deepgemm_reuse_checkout FALSE)
+  if(EXISTS "${_deepgemm_src}")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${_deepgemm_src}" rev-parse HEAD
+      RESULT_VARIABLE _deepgemm_head_result
+      OUTPUT_VARIABLE _deepgemm_existing_head
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${_deepgemm_src}"
+              remote get-url origin
+      RESULT_VARIABLE _deepgemm_remote_result
+      OUTPUT_VARIABLE _deepgemm_existing_remote
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    execute_process(
+      COMMAND "${Python_EXECUTABLE}"
+              "${CMAKE_SOURCE_DIR}/tools/check_deepgemm_checkout.py"
+              "${_deepgemm_src}"
+              --git-executable "${GIT_EXECUTABLE}"
+      RESULT_VARIABLE _deepgemm_checkout_result
+      OUTPUT_QUIET
+      ERROR_VARIABLE _deepgemm_checkout_error
+      ERROR_STRIP_TRAILING_WHITESPACE)
+    string(TOLOWER "${_deepgemm_existing_head}" _deepgemm_existing_head)
+    if(_deepgemm_head_result EQUAL 0 AND
+       _deepgemm_remote_result EQUAL 0 AND
+       _deepgemm_checkout_result EQUAL 0 AND
+       EXISTS "${_deepgemm_src}/csrc/python_api.cpp" AND
+       _deepgemm_existing_head STREQUAL _deepgemm_git_commit AND
+       _deepgemm_existing_remote STREQUAL _deepgemm_git_repo)
+      set(_deepgemm_reuse_checkout TRUE)
+    else()
+      message(STATUS
+        "Removing stale DeepGEMM checkout before selecting "
+        "${_deepgemm_git_repo}@${_deepgemm_git_commit}. "
+        "${_deepgemm_checkout_error}")
+      file(REMOVE_RECURSE
+        "${_deepgemm_src}" "${_deepgemm_bin}" "${_deepgemm_sub}")
+    endif()
+  endif()
+
+  if(_deepgemm_reuse_checkout)
     set(deepgemm_SOURCE_DIR "${_deepgemm_src}")
     set(deepgemm_BINARY_DIR "${_deepgemm_bin}")
   else()
@@ -49,13 +133,44 @@ else()
       SUBBUILD_DIR "${_deepgemm_sub}"
       SOURCE_DIR "${_deepgemm_src}"
       BINARY_DIR "${_deepgemm_bin}"
-      GIT_REPOSITORY "${_DEEPGEMM_UPSTREAM_REPO}"
-      GIT_TAG "${_DEEPGEMM_UPSTREAM_TAG}"
+      GIT_REPOSITORY "${_deepgemm_git_repo}"
+      GIT_TAG "${_deepgemm_git_commit}"
       GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
       GIT_PROGRESS TRUE
     )
   endif()
-  message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}" rev-parse HEAD
+    OUTPUT_VARIABLE _deepgemm_checked_out_commit
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  string(TOLOWER "${_deepgemm_checked_out_commit}" _deepgemm_checked_out_commit)
+  if(NOT _deepgemm_checked_out_commit STREQUAL _deepgemm_git_commit)
+    message(FATAL_ERROR
+      "DeepGEMM checkout mismatch: expected ${_deepgemm_git_commit}, "
+      "got ${_deepgemm_checked_out_commit}")
+  endif()
+  message(STATUS
+    "DeepGEMM is available at ${deepgemm_SOURCE_DIR} "
+    "(${_deepgemm_git_repo}@${_deepgemm_checked_out_commit})")
+endif()
+
+if(DEEPGEMM_REQUIRE_SM90_MEGA_MOE)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tools/check_deepgemm_source.py"
+            "${deepgemm_SOURCE_DIR}"
+    RESULT_VARIABLE _deepgemm_source_check_result
+    OUTPUT_VARIABLE _deepgemm_source_check_stdout
+    ERROR_VARIABLE _deepgemm_source_check_stderr
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE)
+  if(NOT _deepgemm_source_check_result EQUAL 0)
+    message(FATAL_ERROR
+      "Selected DeepGEMM source does not satisfy the SM90 MegaMoE contract:\n"
+      "${_deepgemm_source_check_stdout}\n${_deepgemm_source_check_stderr}")
+  endif()
+  message(STATUS "${_deepgemm_source_check_stdout}")
 endif()
 
 # DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100 (official upstream),
