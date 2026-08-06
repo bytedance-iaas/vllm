@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import msgspec
 import pytest
 import torch
 import zmq.asyncio
@@ -37,10 +38,13 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.request import RequestStatus
 
 from .utils import create_request, create_scheduler, create_vllm_config
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -70,9 +74,12 @@ class FakeMooncakeWrapper:
     """Mock Mooncake TransferEngine for unit testing environments."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self.initialize_calls = []
 
     def initialize(self, local_hostname, metadata_server, protocol, device_name) -> int:
+        self.initialize_calls.append(
+            (local_hostname, metadata_server, protocol, device_name)
+        )
         return 0
 
     def get_rpc_port(self) -> int:
@@ -137,6 +144,237 @@ def test_align_transfer_regions_uses_layer_name_occurrences():
     assert err is None
     assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
     assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+
+@pytest.mark.parametrize(
+    ("local_count", "remote_count"),
+    [(2, 1), (1, 2)],
+    ids=["producer_has_more", "consumer_has_more"],
+)
+def test_align_transfer_regions_rejects_shared_name_occurrence_count_mismatch(
+    local_count: int,
+    remote_count: int,
+):
+    layer_name = "model.layers.1.self_attn"
+
+    def make_regions(count: int, base_addr: int):
+        return [
+            TransferRegion(
+                layer_name=layer_name,
+                layer_index=1,
+                base_addr=base_addr + occurrence * 0x100,
+                block_len=256,
+                kv_block_len=128,
+            )
+            for occurrence in range(count)
+        ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        make_regions(local_count, 0x1000),
+        make_regions(remote_count, 0xA000),
+    )
+
+    assert aligned_local == []
+    assert aligned_remote == []
+    assert err == (
+        "Mooncake registered layer occurrence count mismatch for "
+        f"{layer_name}: producer={local_count}, consumer={remote_count}."
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_layers", "remote_layers"),
+    [
+        ([0, 1], [1, 2]),
+        ([1, 2], [0, 1]),
+    ],
+    ids=["producer_subset", "consumer_subset"],
+)
+def test_align_transfer_regions_uses_legacy_pp_intersection(
+    local_layers: list[int],
+    remote_layers: list[int],
+):
+    def make_regions(layer_indices: list[int], base_addr: int):
+        return [
+            TransferRegion(
+                layer_name=f"model.layers.{layer_index}.self_attn",
+                layer_index=layer_index,
+                base_addr=base_addr + layer_index * 0x100,
+                block_len=256,
+                kv_block_len=256,
+            )
+            for layer_index in layer_indices
+        ]
+
+    local_regions = make_regions(local_layers, 0x1000)
+    remote_regions = make_regions(remote_layers, 0xA000)
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert err is None
+    assert [region.layer_index for region in aligned_local] == [1]
+    assert [region.layer_index for region in aligned_remote] == [1]
+
+
+def test_align_transfer_regions_matches_shared_physical_region_aliases():
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.self_attn",
+                "model.layers.4.swa_attn",
+            ),
+            layer_indices=(4, 4),
+            logical_group_indices=(0, 1),
+            alias_group_indices=((0,), (1,)),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.swa_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.swa_attn",
+                "model.layers.4.self_attn",
+            ),
+            layer_indices=(4, 4),
+            logical_group_indices=(1, 0),
+            alias_group_indices=((1,), (0,)),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert err is None
+    assert aligned_local == local_regions
+    assert aligned_remote == remote_regions
+
+
+def test_align_transfer_regions_fans_out_shared_region_to_split_aliases():
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=(
+                "model.layers.4.self_attn",
+                "model.layers.4.swa_attn",
+            ),
+            layer_indices=(4, 4),
+            logical_group_indices=(0, 1),
+            alias_group_indices=((0,), (1,)),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x2000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            logical_group_indices=(0,),
+            alias_group_indices=((0,),),
+        ),
+        TransferRegion(
+            layer_name="model.layers.4.swa_attn",
+            layer_index=4,
+            base_addr=0x3000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.swa_attn",),
+            layer_indices=(4,),
+            logical_group_indices=(1,),
+            alias_group_indices=((1,),),
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert err is None
+    assert aligned_local == [local_regions[0], local_regions[0]]
+    assert aligned_remote == remote_regions
+
+
+def test_align_transfer_regions_rejects_single_alias_occurrence_mismatch():
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=0x1000,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            logical_group_indices=(0,),
+            alias_group_indices=((0,),),
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.4.self_attn",
+            layer_index=4,
+            base_addr=base_addr,
+            block_len=4096,
+            kv_block_len=4096,
+            layer_aliases=("model.layers.4.self_attn",),
+            layer_indices=(4,),
+            logical_group_indices=(0,),
+            alias_group_indices=((0,),),
+        )
+        for base_addr in (0x2000, 0x3000)
+    ]
+
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert aligned_local == []
+    assert aligned_remote == []
+    assert err is not None
+    assert "duplicate alias group match" in err
+
+
+def test_xfer_metadata_decodes_legacy_payload_with_alias_defaults():
+    payload = msgspec.msgpack.encode(
+        {
+            "remote_hostname": "consumer-host",
+            "remote_port": 54321,
+            "remote_tp_size": 1,
+            "remote_tp_rank": 0,
+            "req_blocks": {"d-req": ("xfer", [[1]])},
+            "kv_caches_base_addr": [0x1000],
+            "block_lens": [4096],
+            "kv_block_lens": [4096],
+            "registered_layer_names": ["model.layers.0.self_attn"],
+            "registered_layer_indices": [0],
+            "registered_group_indices": [0],
+        }
+    )
+
+    metadata = msgspec.msgpack.decode(payload, type=MooncakeXferMetadata)
+
+    assert metadata.registered_layer_names == ["model.layers.0.self_attn"]
+    assert metadata.registered_layer_aliases == []
+    assert metadata.registered_layer_index_aliases == []
+    assert metadata.registered_logical_group_indices == []
+    assert metadata.registered_alias_group_indices == []
 
 
 @pytest.mark.asyncio
@@ -683,6 +921,20 @@ def patch_worker_dependencies():
             return_value=False,
         ),
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.current_platform.set_device"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_current_attn_backends",
+            return_value=[FlashAttentionBackend],
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_kv_cache_layout",
+            return_value="NHD",
+        ),
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.make_zmq_socket"
         ) as mock_make_zmq,
         patch("httpx.AsyncClient") as mock_async_client,
@@ -709,6 +961,38 @@ def patch_worker_dependencies():
             "mock_async_client": mock_async_client,
             "mock_http_client": mock_http_client_instance,
         }
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "expected_device"),
+    [
+        ({"device_name": "mlx5_2"}, "mlx5_2"),
+        ({}, ""),
+    ],
+    ids=["extra_config_device_name", "default_empty_device"],
+)
+def test_worker_initializes_mooncake_with_configured_device(
+    extra_config: dict[str, str],
+    expected_device: str,
+):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config=extra_config,
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+
+    worker = connector.connector_worker
+    assert worker.engine.initialize_calls == [
+        ("127.0.0.1", "P2PHANDSHAKE", "rdma", expected_device)
+    ]
+    worker.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1145,6 +1429,233 @@ def test_register_kv_caches():
                 assert bl == tensor1.nbytes // tensor1.shape[0]
             assert worker.registered_layer_names == list(kv_caches)
             assert worker.registered_layer_indices == [0, 1]
+
+
+def test_register_kv_caches_skips_mtp_layers_outside_base_model():
+    num_hidden_layers = 32
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.use_mla = False
+    worker.model_config = SimpleNamespace(
+        get_total_num_hidden_layers=lambda: num_hidden_layers
+    )
+    worker.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="mtp")
+    )
+    worker.kv_cache_config = _make_test_kv_cache_config()
+    worker.transfer_topo = SimpleNamespace(
+        virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
+    )
+    worker.engine = MagicMock()
+    worker.engine.batch_register_memory.return_value = 0
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = False
+    worker.receiver_loop = MagicMock()
+    worker.receiver_loop.is_running.return_value = False
+
+    kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
+    )
+    normal_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    mtp_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    normal_layer = "model.layers.0.self_attn"
+    kv_caches = {
+        normal_layer: normal_cache,
+        f"model.layers.{num_hidden_layers}.attn.swa_cache": mtp_cache,
+    }
+    worker._layer_specs = {
+        normal_layer: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+        )
+    }
+    worker._layer_group_indices = {normal_layer: 0}
+    worker._layer_logical_group_indices = {normal_layer: [0]}
+
+    worker.register_kv_caches(kv_caches)
+
+    worker.engine.batch_register_memory.assert_called_once_with(
+        [normal_cache.data_ptr()], [normal_cache.nbytes]
+    )
+    assert worker.registered_layer_names == [normal_layer]
+    assert worker.registered_layer_indices == [0]
+
+
+def test_register_kv_caches_keeps_non_mtp_layers_outside_base_model():
+    num_hidden_layers = 32
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.use_mla = False
+    worker.model_config = SimpleNamespace(
+        get_total_num_hidden_layers=lambda: num_hidden_layers
+    )
+    worker.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="eagle")
+    )
+    worker.kv_cache_config = _make_test_kv_cache_config()
+    worker.transfer_topo = SimpleNamespace(
+        virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
+    )
+    worker.engine = MagicMock()
+    worker.engine.batch_register_memory.return_value = 0
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = False
+    worker.receiver_loop = MagicMock()
+    worker.receiver_loop.is_running.return_value = False
+
+    kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
+        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
+    )
+    normal_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    eagle_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    kv_caches = {
+        "model.layers.0.self_attn": normal_cache,
+        f"model.layers.{num_hidden_layers}.attn.swa_cache": eagle_cache,
+    }
+    worker._layer_specs = {
+        name: FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float16,
+        )
+        for name in kv_caches
+    }
+    worker._layer_group_indices = {
+        name: group_index for group_index, name in enumerate(kv_caches)
+    }
+    worker._layer_logical_group_indices = {
+        name: [group_index] for group_index, name in enumerate(kv_caches)
+    }
+
+    worker.register_kv_caches(kv_caches)
+
+    worker.engine.batch_register_memory.assert_called_once_with(
+        [normal_cache.data_ptr(), eagle_cache.data_ptr()],
+        [normal_cache.nbytes, eagle_cache.nbytes],
+    )
+    assert worker.registered_layer_names == list(kv_caches)
+    assert worker.registered_layer_indices == [0, num_hidden_layers]
+
+
+def test_register_kv_caches_aggregates_shared_overlay_aliases():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.use_mla = True
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 64)
+    worker.vllm_config = SimpleNamespace(speculative_config=None)
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.4.attn"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=4,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["model.layers.4.attn.swa_cache"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=4,
+                    head_size=16,
+                    dtype=torch.float16,
+                    sliding_window=128,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["model.layers.4.attn.compressor.state_cache"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=4,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            ),
+        ],
+    )
+    worker.transfer_topo = SimpleNamespace(
+        virtually_split_kv_in_blocks=False,
+        get_transfer_cache_regions=lambda cache, _spec: [cache],
+    )
+    worker.engine = MagicMock()
+    worker.engine.batch_register_memory.return_value = 0
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = False
+    worker.receiver_loop = MagicMock()
+    worker.receiver_loop.is_running.return_value = False
+
+    shared_cache = torch.zeros((2, 16, 4, 16), dtype=torch.float16)
+    kv_caches = {
+        "model.layers.4.attn": shared_cache,
+        "model.layers.4.attn.swa_cache": shared_cache,
+        "model.layers.4.attn.compressor.state_cache": shared_cache,
+    }
+    worker._layer_specs = {
+        group.layer_names[0]: group.kv_cache_spec
+        for group in worker.kv_cache_config.kv_cache_groups
+    }
+    worker._layer_group_indices = {
+        name: group_index for group_index, name in enumerate(kv_caches)
+    }
+    worker._layer_logical_group_indices = {
+        name: [group_index] for group_index, name in enumerate(kv_caches)
+    }
+
+    worker.register_kv_caches(kv_caches)
+
+    worker.engine.batch_register_memory.assert_called_once_with(
+        [shared_cache.data_ptr()], [shared_cache.nbytes]
+    )
+    assert worker.registered_layer_names == ["model.layers.4.attn"]
+    assert worker.registered_layer_aliases == [list(kv_caches)]
+    assert worker.registered_layer_index_aliases == [[4, 4, 4]]
+    assert worker.registered_group_indices == [0]
+    assert worker.registered_logical_group_indices == [[0, 1, 2]]
+    assert worker.registered_alias_group_indices == [[[0], [1], [2]]]
+
+    regions = worker._get_transfer_regions(
+        base_addrs=worker.kv_caches_base_addr,
+        block_lens=worker.block_len_per_layer,
+        kv_block_lens=worker.kv_block_len_per_layer,
+        layer_names=worker.registered_layer_names,
+        layer_indices=worker.registered_layer_indices,
+        layer_aliases=worker.registered_layer_aliases,
+        layer_index_aliases=worker.registered_layer_index_aliases,
+        group_indices=worker.registered_group_indices,
+        logical_group_indices=worker.registered_logical_group_indices,
+        alias_group_indices=worker.registered_alias_group_indices,
+    )
+    aligned_local, aligned_remote, err = _align_transfer_regions(regions, regions)
+    assert err is None
+    assert aligned_local == regions
+    assert aligned_remote == regions
+
+
+def test_get_transfer_regions_rejects_metadata_shape_mismatch():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = True
+    worker._layer_group_indices = {}
+    worker.transfer_topo = SimpleNamespace(virtually_split_kv_in_blocks=False)
+
+    with pytest.raises(AssertionError, match="matching metadata lengths"):
+        worker._get_transfer_regions(
+            base_addrs=[0x1000],
+            block_lens=[64],
+            kv_block_lens=[64],
+            layer_names=[],
+            layer_indices=[],
+        )
 
 
 def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():

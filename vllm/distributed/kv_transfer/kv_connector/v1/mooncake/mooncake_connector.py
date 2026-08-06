@@ -181,15 +181,17 @@ def _expand_transfer_regions(
         layer_index,
         group_index,
         split_kv_region,
-    ) in enumerate(zip(
-        base_addrs,
-        block_lens,
-        kv_block_lens,
-        layer_names,
-        layer_indices,
-        group_indices,
-        split_kv_regions,
-    )):
+    ) in enumerate(
+        zip(
+            base_addrs,
+            block_lens,
+            kv_block_lens,
+            layer_names,
+            layer_indices,
+            group_indices,
+            split_kv_regions,
+        )
+    ):
         if split_kv_region:
             aliases: tuple[str, ...] = ()
             index_aliases: tuple[int, ...] = ()
@@ -233,9 +235,7 @@ def _expand_transfer_regions(
     return regions
 
 
-def _get_region_metadata(
-    metadata: list[list[_T]] | None, idx: int
-) -> tuple[_T, ...]:
+def _get_region_metadata(metadata: list[list[_T]] | None, idx: int) -> tuple[_T, ...]:
     if metadata is not None and idx < len(metadata) and metadata[idx]:
         return tuple(metadata[idx])
     return ()
@@ -395,17 +395,33 @@ def _align_transfer_regions_by_occurrence(
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
     def keyed_regions(
         regions: list[TransferRegion],
-    ) -> list[tuple[tuple[str, int], TransferRegion]]:
+    ) -> tuple[
+        list[tuple[tuple[str, int], TransferRegion]],
+        dict[str, int],
+    ]:
         counts: dict[str, int] = defaultdict(int)
         keyed: list[tuple[tuple[str, int], TransferRegion]] = []
         for region in regions:
             occurrence = counts[region.layer_name]
             counts[region.layer_name] += 1
             keyed.append(((region.layer_name, occurrence), region))
-        return keyed
+        return keyed, counts
 
-    local_keyed = keyed_regions(local_regions)
-    remote_keyed = keyed_regions(remote_regions)
+    local_keyed, local_counts = keyed_regions(local_regions)
+    remote_keyed, remote_counts = keyed_regions(remote_regions)
+    for layer_name, local_count in local_counts.items():
+        remote_count = remote_counts.get(layer_name)
+        if remote_count is not None and local_count != remote_count:
+            return (
+                [],
+                [],
+                (
+                    "Mooncake registered layer occurrence count mismatch for "
+                    f"{layer_name}: producer={local_count}, "
+                    f"consumer={remote_count}."
+                ),
+            )
+
     remote_by_key = dict(remote_keyed)
     aligned_local: list[TransferRegion] = []
     aligned_remote: list[TransferRegion] = []
@@ -506,9 +522,7 @@ def _align_transfer_regions(
         for remote_idx, remote_region in enumerate(alias_remote_regions):
             if not _regions_share_layer_identity(local_region, remote_region):
                 continue
-            if not _regions_have_bound_alias_layer_indices(
-                local_region, remote_region
-            ):
+            if not _regions_have_bound_alias_layer_indices(local_region, remote_region):
                 index_mismatch_region = index_mismatch_region or remote_region
                 continue
             shared_keys = _shared_alias_group_keys(local_region, remote_region)
@@ -607,9 +621,11 @@ def _common_group_indices_for_regions(
         remote_region.logical_group_indices
     ):
         return tuple(range(num_groups))
-    if local_region.group_index == remote_region.group_index:
-        if local_region.group_index < num_groups:
-            return (local_region.group_index,)
+    if (
+        local_region.group_index == remote_region.group_index
+        and local_region.group_index < num_groups
+    ):
+        return (local_region.group_index,)
     return ()
 
 
@@ -2026,8 +2042,7 @@ class MooncakeConnectorWorker:
             self.vllm_config.speculative_config, "method", None
         )
         is_mtp_speculative = speculative_method == "mtp" or (
-            isinstance(speculative_method, str)
-            and speculative_method.endswith("_mtp")
+            isinstance(speculative_method, str) and speculative_method.endswith("_mtp")
         )
         total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
 
@@ -2117,8 +2132,8 @@ class MooncakeConnectorWorker:
                 )
                 self.registered_layer_aliases.append([layer_name])
                 self.registered_layer_index_aliases.append([layer_index])
-                self.registered_logical_group_indices.append(logical_groups)
-                self.registered_alias_group_indices.append([logical_groups])
+                self.registered_logical_group_indices.append(list(logical_groups))
+                self.registered_alias_group_indices.append([list(logical_groups)])
 
         self.kv_caches_base_addr = region_base_addresses
         self.seen_base_addresses = kv_data_ptrs
