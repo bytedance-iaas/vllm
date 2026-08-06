@@ -8,7 +8,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 import msgspec
@@ -83,16 +83,31 @@ if TYPE_CHECKING:
 
 ReqId = str  # Internal scheduler request ID
 TransferId = str  # KV transfer coordination ID (shared by P/D)
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
 class TransferRegion:
+    """A registered KV region plus its logical cache identities."""
+
     layer_name: str
     layer_index: int
     base_addr: int
     block_len: int
     kv_block_len: int
     group_index: int = 0
+    layer_aliases: tuple[str, ...] = ()
+    layer_indices: tuple[int, ...] = ()
+    logical_group_indices: tuple[int, ...] = ()
+    alias_group_indices: tuple[tuple[int, ...], ...] = ()
+
+    @property
+    def match_layer_names(self) -> tuple[str, ...]:
+        return self.layer_aliases or (self.layer_name,)
+
+    @property
+    def match_layer_indices(self) -> tuple[int, ...]:
+        return self.layer_indices or (self.layer_index,)
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -125,6 +140,10 @@ def _expand_transfer_regions(
     is_kv_layout_blocks_first: bool,
     group_indices: list[int] | None = None,
     split_kv_regions: list[bool] | None = None,
+    layer_aliases: list[list[str]] | None = None,
+    layer_index_aliases: list[list[int]] | None = None,
+    logical_group_indices: list[list[int]] | None = None,
+    alias_group_indices: list[list[list[int]]] | None = None,
 ) -> list[TransferRegion]:
     """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
@@ -154,7 +173,7 @@ def _expand_transfer_regions(
         f"layer_names={len(layer_names)}."
     )
     regions: list[TransferRegion] = []
-    for (
+    for idx, (
         base_addr,
         block_len,
         kv_block_len,
@@ -162,7 +181,7 @@ def _expand_transfer_regions(
         layer_index,
         group_index,
         split_kv_region,
-    ) in zip(
+    ) in enumerate(zip(
         base_addrs,
         block_lens,
         kv_block_lens,
@@ -170,7 +189,22 @@ def _expand_transfer_regions(
         layer_indices,
         group_indices,
         split_kv_regions,
-    ):
+    )):
+        if split_kv_region:
+            aliases: tuple[str, ...] = ()
+            index_aliases: tuple[int, ...] = ()
+            region_logical_group_indices: tuple[int, ...] = ()
+            region_alias_group_indices: tuple[tuple[int, ...], ...] = ()
+        else:
+            aliases = _get_region_metadata(layer_aliases, idx)
+            index_aliases = _get_region_metadata(layer_index_aliases, idx)
+            region_logical_group_indices = _get_region_metadata(
+                logical_group_indices, idx
+            )
+            region_alias_group_indices = tuple(
+                tuple(groups)
+                for groups in _get_region_metadata(alias_group_indices, idx)
+            )
         regions.append(
             TransferRegion(
                 layer_name=layer_name,
@@ -179,6 +213,10 @@ def _expand_transfer_regions(
                 block_len=block_len,
                 kv_block_len=kv_block_len,
                 group_index=group_index,
+                layer_aliases=aliases,
+                layer_indices=index_aliases,
+                logical_group_indices=region_logical_group_indices,
+                alias_group_indices=region_alias_group_indices,
             )
         )
         if split_kv_region:
@@ -193,6 +231,14 @@ def _expand_transfer_regions(
                 )
             )
     return regions
+
+
+def _get_region_metadata(
+    metadata: list[list[_T]] | None, idx: int
+) -> tuple[_T, ...]:
+    if metadata is not None and idx < len(metadata) and metadata[idx]:
+        return tuple(metadata[idx])
+    return ()
 
 
 def _compute_sender_transfer_plan(
@@ -302,18 +348,51 @@ def _validate_asymmetric_region_lengths(
     return None
 
 
-def _align_transfer_regions(
+def _region_has_aliases(region: TransferRegion) -> bool:
+    return bool(region.layer_aliases)
+
+
+def _alias_group_map(region: TransferRegion) -> dict[str, dict[int, set[int]]]:
+    if (
+        not region.layer_aliases
+        or not region.layer_indices
+        or not region.alias_group_indices
+    ):
+        return {}
+
+    alias_groups: dict[str, dict[int, set[int]]] = defaultdict(lambda: defaultdict(set))
+    for alias, layer_index, group_indices in zip(
+        region.layer_aliases,
+        region.layer_indices,
+        region.alias_group_indices,
+    ):
+        alias_groups[alias][layer_index].update(group_indices)
+    return alias_groups
+
+
+def _regions_have_bound_alias_layer_indices(
+    local_region: TransferRegion, remote_region: TransferRegion
+) -> bool:
+    local_alias_groups = _alias_group_map(local_region)
+    remote_alias_groups = _alias_group_map(remote_region)
+    for alias in set(local_alias_groups) & set(remote_alias_groups):
+        if set(local_alias_groups[alias]) & set(remote_alias_groups[alias]):
+            return True
+    return False
+
+
+def _regions_share_layer_identity(
+    local_region: TransferRegion, remote_region: TransferRegion
+) -> bool:
+    return bool(
+        set(local_region.match_layer_names) & set(remote_region.match_layer_names)
+    )
+
+
+def _align_transfer_regions_by_occurrence(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
-    """Align KV transfer regions by registered layer-name occurrence.
-
-    PP shards own different layer subsets. Positional matching is therefore
-    wrong once producer and consumer have different PP layouts. Multiple
-    registered transfer buffers for the same layer are represented by repeated
-    layer names and matched by occurrence order.
-    """
-
     def keyed_regions(
         regions: list[TransferRegion],
     ) -> list[tuple[tuple[str, int], TransferRegion]]:
@@ -333,14 +412,7 @@ def _align_transfer_regions(
     for key, local_region in local_keyed:
         remote_region = remote_by_key.get(key)
         if remote_region is None:
-            return (
-                [],
-                [],
-                (
-                    "Mooncake producer registered layer has no matching "
-                    f"consumer occurrence: {key[0]} occurrence {key[1]}."
-                ),
-            )
+            continue
         if local_region.layer_index != remote_region.layer_index:
             return (
                 [],
@@ -369,6 +441,230 @@ def _align_transfer_regions(
     return aligned_local, aligned_remote, None
 
 
+def _align_transfer_regions(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
+    """Align regions by alias/group identity, then legacy name occurrence."""
+    has_aliases = any(
+        _region_has_aliases(region) for region in local_regions + remote_regions
+    )
+    if not has_aliases:
+        return _align_transfer_regions_by_occurrence(local_regions, remote_regions)
+
+    alias_local_regions = [
+        region for region in local_regions if _region_has_aliases(region)
+    ]
+    alias_remote_regions = [
+        region for region in remote_regions if _region_has_aliases(region)
+    ]
+    legacy_local_regions = [
+        region for region in local_regions if not _region_has_aliases(region)
+    ]
+    legacy_remote_regions = [
+        region for region in remote_regions if not _region_has_aliases(region)
+    ]
+    if any(
+        _regions_share_layer_identity(alias_region, legacy_region)
+        for alias_region in alias_local_regions
+        for legacy_region in legacy_remote_regions
+    ) or any(
+        _regions_share_layer_identity(legacy_region, alias_region)
+        for legacy_region in legacy_local_regions
+        for alias_region in alias_remote_regions
+    ):
+        return (
+            [],
+            [],
+            (
+                "Mooncake alias metadata is present on only one side of "
+                "matching transfer regions. Producer and consumer must use "
+                "the same Mooncake metadata schema."
+            ),
+        )
+    if not all(
+        region.alias_group_indices
+        for region in alias_local_regions + alias_remote_regions
+    ):
+        return (
+            [],
+            [],
+            (
+                "Mooncake alias metadata is missing alias-group ownership. "
+                "Producer and consumer must use the same Mooncake metadata schema."
+            ),
+        )
+
+    aligned_local: list[TransferRegion] = []
+    aligned_remote: list[TransferRegion] = []
+    matched_local_indices: set[int] = set()
+    matched_remote_keys: set[tuple[int, tuple[str, int, int]]] = set()
+
+    for local_idx, local_region in enumerate(alias_local_regions):
+        index_mismatch_region: TransferRegion | None = None
+        matched_local_keys: set[tuple[str, int, int]] = set()
+        for remote_idx, remote_region in enumerate(alias_remote_regions):
+            if not _regions_share_layer_identity(local_region, remote_region):
+                continue
+            if not _regions_have_bound_alias_layer_indices(
+                local_region, remote_region
+            ):
+                index_mismatch_region = index_mismatch_region or remote_region
+                continue
+            shared_keys = _shared_alias_group_keys(local_region, remote_region)
+            if not shared_keys:
+                continue
+            available_keys = [
+                key
+                for key in shared_keys
+                if (remote_idx, key) not in matched_remote_keys
+                and key not in matched_local_keys
+            ]
+            if not available_keys:
+                continue
+            matched_local_keys.update(available_keys)
+            matched_remote_keys.update((remote_idx, key) for key in available_keys)
+            aligned_local.append(local_region)
+            aligned_remote.append(remote_region)
+            matched_local_indices.add(local_idx)
+
+        if local_idx not in matched_local_indices and index_mismatch_region is not None:
+            return (
+                [],
+                [],
+                (
+                    "Mooncake registered layer index mismatch for "
+                    f"{local_region.match_layer_names}: producer="
+                    f"{local_region.match_layer_indices}, consumer="
+                    f"{index_mismatch_region.match_layer_indices}."
+                ),
+            )
+
+    for local_idx, local_region in enumerate(alias_local_regions):
+        if local_idx in matched_local_indices:
+            continue
+        if any(
+            _regions_share_layer_identity(local_region, remote_region)
+            for remote_region in alias_remote_regions
+        ):
+            return (
+                [],
+                [],
+                (
+                    "Mooncake producer registered layer aliases have no matching "
+                    "consumer alias groups: "
+                    f"{sorted(local_region.match_layer_names)}."
+                ),
+            )
+
+    for remote_idx, remote_region in enumerate(alias_remote_regions):
+        for local_region in alias_local_regions:
+            if not _regions_share_layer_identity(local_region, remote_region):
+                continue
+            shared_keys = _shared_alias_group_keys(local_region, remote_region)
+            if shared_keys and any(
+                (remote_idx, key) not in matched_remote_keys for key in shared_keys
+            ):
+                return (
+                    [],
+                    [],
+                    (
+                        "Mooncake duplicate alias group match for "
+                        f"{remote_region.match_layer_names}."
+                    ),
+                )
+
+    legacy_local, legacy_remote, legacy_err = _align_transfer_regions_by_occurrence(
+        legacy_local_regions, legacy_remote_regions
+    )
+    if legacy_err is not None:
+        return [], [], legacy_err
+    return (
+        aligned_local + legacy_local,
+        aligned_remote + legacy_remote,
+        None,
+    )
+
+
+def _common_group_indices_for_regions(
+    local_region: TransferRegion, remote_region: TransferRegion, num_groups: int
+) -> tuple[int, ...]:
+    if num_groups <= 0:
+        return ()
+    alias_groups = _shared_alias_group_indices(local_region, remote_region)
+    if alias_groups is not None:
+        return tuple(group for group in alias_groups if 0 <= group < num_groups)
+    if local_region.logical_group_indices and remote_region.logical_group_indices:
+        return tuple(
+            group
+            for group in sorted(
+                set(local_region.logical_group_indices)
+                & set(remote_region.logical_group_indices)
+            )
+            if 0 <= group < num_groups
+        )
+    if bool(local_region.logical_group_indices) != bool(
+        remote_region.logical_group_indices
+    ):
+        return tuple(range(num_groups))
+    if local_region.group_index == remote_region.group_index:
+        if local_region.group_index < num_groups:
+            return (local_region.group_index,)
+    return ()
+
+
+def _shared_alias_group_indices(
+    local_region: TransferRegion, remote_region: TransferRegion
+) -> tuple[int, ...] | None:
+    shared_keys = _shared_alias_group_keys(local_region, remote_region)
+    if shared_keys is None:
+        return None
+    return tuple(sorted({group for _, _, group in shared_keys}))
+
+
+def _shared_alias_group_keys(
+    local_region: TransferRegion, remote_region: TransferRegion
+) -> tuple[tuple[str, int, int], ...] | None:
+    if not local_region.alias_group_indices or not remote_region.alias_group_indices:
+        return None
+
+    local_alias_groups = _alias_group_map(local_region)
+    remote_alias_groups = _alias_group_map(remote_region)
+    keys: set[tuple[str, int, int]] = set()
+    for alias in set(local_alias_groups) & set(remote_alias_groups):
+        common_layer_indices = set(local_alias_groups[alias]) & set(
+            remote_alias_groups[alias]
+        )
+        for layer_index in common_layer_indices:
+            common_groups = (
+                local_alias_groups[alias][layer_index]
+                & remote_alias_groups[alias][layer_index]
+            )
+            keys.update((alias, layer_index, group) for group in common_groups)
+    return tuple(sorted(keys))
+
+
+def _select_region_block_ids(
+    local_block_ids_per_group: list[list[int]],
+    remote_block_ids_per_group: list[list[int]],
+    group_indices: tuple[int, ...],
+) -> tuple[list[int], list[int], str | None]:
+    local_block_ids: list[int] = []
+    remote_block_ids: list[int] = []
+    for group_idx in group_indices:
+        local_group = local_block_ids_per_group[group_idx]
+        remote_group = remote_block_ids_per_group[group_idx]
+        if not remote_group:
+            continue
+        if len(local_group) < len(remote_group):
+            return [], [], "P num blocks less than D"
+        if len(local_group) > len(remote_group):
+            local_group = local_group[-len(remote_group) :]
+        local_block_ids.extend(local_group)
+        remote_block_ids.extend(remote_group)
+    return local_block_ids, remote_block_ids, None
+
+
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
@@ -391,6 +687,16 @@ class MooncakeXferMetadata(
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
+    registered_layer_aliases: list[list[str]] = msgspec.field(default_factory=list)
+    registered_layer_index_aliases: list[list[int]] = msgspec.field(
+        default_factory=list
+    )
+    registered_logical_group_indices: list[list[int]] = msgspec.field(
+        default_factory=list
+    )
+    registered_alias_group_indices: list[list[list[int]]] = msgspec.field(
+        default_factory=list
+    )
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -959,6 +1265,10 @@ class MooncakeConnectorWorker:
         self.registered_layer_names: list[str] = []
         self.registered_layer_indices: list[int] = []
         self.registered_group_indices: list[int] = []
+        self.registered_layer_aliases: list[list[str]] = []
+        self.registered_layer_index_aliases: list[list[int]] = []
+        self.registered_logical_group_indices: list[list[int]] = []
+        self.registered_alias_group_indices: list[list[list[int]]] = []
         self.seen_base_addresses: list[int] = []
 
         assert (parallel_config := vllm_config.parallel_config)
@@ -1044,6 +1354,10 @@ class MooncakeConnectorWorker:
             for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
             for layer in group.layer_names
         }
+        self._layer_logical_group_indices: dict[str, list[int]] = defaultdict(list)
+        for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer in group.layer_names:
+                self._layer_logical_group_indices[layer].append(group_index)
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1216,6 +1530,10 @@ class MooncakeConnectorWorker:
             self.registered_layer_names,
             self.registered_layer_indices,
             self.registered_group_indices,
+            self.registered_layer_aliases,
+            self.registered_layer_index_aliases,
+            self.registered_logical_group_indices,
+            self.registered_alias_group_indices,
         )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
@@ -1224,6 +1542,10 @@ class MooncakeConnectorWorker:
             meta.registered_layer_names,
             meta.registered_layer_indices,
             meta.registered_group_indices,
+            meta.registered_layer_aliases,
+            meta.registered_layer_index_aliases,
+            meta.registered_logical_group_indices,
+            meta.registered_alias_group_indices,
         )
         local_regions, remote_regions, align_err = _align_transfer_regions(
             local_regions, remote_regions
@@ -1520,20 +1842,51 @@ class MooncakeConnectorWorker:
                 remote_block_ids_by_group
             )
 
+            selected_region_blocks: list[
+                tuple[TransferRegion, TransferRegion, list[int], list[int]]
+            ] = []
+            selected_block_count = 0
+            num_groups = len(remote_block_ids_by_group)
             for local_region, remote_region in zip(local_regions, remote_regions):
-                assert local_region.group_index == remote_region.group_index, (
-                    "Aligned Mooncake transfer regions must belong to the same "
-                    "KV group."
+                region_group_indices = _common_group_indices_for_regions(
+                    local_region, remote_region, num_groups
                 )
-                group_index = local_region.group_index
-                assert group_index < len(local_block_ids_by_group), (
-                    "Transfer region references a missing KV group."
+                (
+                    local_block_ids,
+                    remote_block_ids,
+                    select_err,
+                ) = _select_region_block_ids(
+                    local_block_ids_by_group,
+                    remote_block_ids_by_group,
+                    region_group_indices,
                 )
-                local_block_ids = local_block_ids_by_group[group_index]
-                remote_block_ids = remote_block_ids_by_group[group_index]
+                if select_err is not None:
+                    logger.error(
+                        "req %s: local blocks < remote blocks for KV groups %s",
+                        d_req_id,
+                        region_group_indices,
+                    )
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = select_err
+                    selected_region_blocks = []
+                    break
                 if not local_block_ids:
                     continue
+                selected_block_count += len(local_block_ids)
+                selected_region_blocks.append(
+                    (local_region, remote_region, local_block_ids, remote_block_ids)
+                )
 
+            if not selected_region_blocks:
+                continue
+
+            for (
+                local_region,
+                remote_region,
+                local_block_ids,
+                remote_block_ids,
+            ) in selected_region_blocks:
                 # Group by indices within this region's KV-cache group only.
                 group_local_block_ids, group_remote_block_ids = (
                     group_concurrent_contiguous(local_block_ids, remote_block_ids)
@@ -1607,7 +1960,7 @@ class MooncakeConnectorWorker:
             logger.debug(
                 "Sending kv_caches for request %s (%d blocks) to %s",
                 d_req_id,
-                sum(len(group) for group in local_block_ids_by_group),
+                selected_block_count,
                 remote_session,
             )
 
@@ -1664,9 +2017,30 @@ class MooncakeConnectorWorker:
         self.registered_layer_names = []
         self.registered_layer_indices = []
         self.registered_group_indices = []
+        self.registered_layer_aliases = []
+        self.registered_layer_index_aliases = []
+        self.registered_logical_group_indices = []
+        self.registered_alias_group_indices = []
+        overlay_to_region: dict[tuple[int, int, int, int], int] = {}
+        speculative_method = getattr(
+            self.vllm_config.speculative_config, "method", None
+        )
+        is_mtp_speculative = speculative_method == "mtp" or (
+            isinstance(speculative_method, str)
+            and speculative_method.endswith("_mtp")
+        )
+        total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
 
         for layer_name, cache_or_caches in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
+            if is_mtp_speculative and layer_index >= total_num_hidden_layers:
+                logger.debug(
+                    "Skipping MTP speculative KV cache layer %s outside the "
+                    "base model layer range [0, %d)",
+                    layer_name,
+                    total_num_hidden_layers,
+                )
+                continue
             layer_spec = self._layer_specs.get(layer_name)
             if layer_spec is None:
                 logger.debug(
@@ -1692,7 +2066,6 @@ class MooncakeConnectorWorker:
                 self._log_debug_cache_registration(layer_name, cache)
                 base_addr = cache.data_ptr()
                 block_len = cache.stride(0) * cache.element_size()
-                region_base_addresses.append(base_addr)
 
                 if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
                     kv_block_len = layer_spec.page_size_bytes
@@ -1702,6 +2075,39 @@ class MooncakeConnectorWorker:
                     kv_block_len = block_len // 2
                 else:
                     kv_block_len = block_len
+                storage = cache.untyped_storage()
+                storage_addr = storage.data_ptr()
+                if storage_addr not in seen_storage_ptrs:
+                    seen_storage_ptrs.add(storage_addr)
+                    kv_data_ptrs.append(storage_addr)
+                    kv_data_lens.append(storage.nbytes())
+
+                overlay_key = (storage_addr, base_addr, block_len, kv_block_len)
+                logical_groups = list(
+                    self._layer_logical_group_indices.get(layer_name, [])
+                )
+                if overlay_key in overlay_to_region:
+                    region_idx = overlay_to_region[overlay_key]
+                    if layer_name not in self.registered_layer_aliases[region_idx]:
+                        self.registered_layer_aliases[region_idx].append(layer_name)
+                        self.registered_layer_index_aliases[region_idx].append(
+                            layer_index
+                        )
+                        self.registered_alias_group_indices[region_idx].append(
+                            logical_groups
+                        )
+                    for group_idx in logical_groups:
+                        if (
+                            group_idx
+                            not in self.registered_logical_group_indices[region_idx]
+                        ):
+                            self.registered_logical_group_indices[region_idx].append(
+                                group_idx
+                            )
+                    continue
+
+                overlay_to_region[overlay_key] = len(region_base_addresses)
+                region_base_addresses.append(base_addr)
                 self.block_len_per_layer.append(block_len)
                 self.kv_block_len_per_layer.append(kv_block_len)
                 self.registered_layer_names.append(layer_name)
@@ -1709,12 +2115,10 @@ class MooncakeConnectorWorker:
                 self.registered_group_indices.append(
                     self._layer_group_indices[layer_name]
                 )
-                storage = cache.untyped_storage()
-                storage_addr = storage.data_ptr()
-                if storage_addr not in seen_storage_ptrs:
-                    seen_storage_ptrs.add(storage_addr)
-                    kv_data_ptrs.append(storage_addr)
-                    kv_data_lens.append(storage.nbytes())
+                self.registered_layer_aliases.append([layer_name])
+                self.registered_layer_index_aliases.append([layer_index])
+                self.registered_logical_group_indices.append(logical_groups)
+                self.registered_alias_group_indices.append([logical_groups])
 
         self.kv_caches_base_addr = region_base_addresses
         self.seen_base_addresses = kv_data_ptrs
@@ -1837,6 +2241,10 @@ class MooncakeConnectorWorker:
             registered_layer_names=self.registered_layer_names,
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
+            registered_layer_aliases=self.registered_layer_aliases,
+            registered_layer_index_aliases=self.registered_layer_index_aliases,
+            registered_logical_group_indices=self.registered_logical_group_indices,
+            registered_alias_group_indices=self.registered_alias_group_indices,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2049,6 +2457,10 @@ class MooncakeConnectorWorker:
         layer_names: list[str],
         layer_indices: list[int],
         group_indices: list[int] | None = None,
+        layer_aliases: list[list[str]] | None = None,
+        layer_index_aliases: list[list[int]] | None = None,
+        logical_group_indices: list[list[int]] | None = None,
+        alias_group_indices: list[list[list[int]]] | None = None,
     ) -> list[TransferRegion]:
         if not group_indices:
             group_indices = [
@@ -2073,6 +2485,10 @@ class MooncakeConnectorWorker:
             is_kv_layout_blocks_first=self.transfer_topo.virtually_split_kv_in_blocks,
             group_indices=group_indices,
             split_kv_regions=split_kv_regions,
+            layer_aliases=layer_aliases,
+            layer_index_aliases=layer_index_aliases,
+            logical_group_indices=logical_group_indices,
+            alias_group_indices=alias_group_indices,
         )
 
     def _get_sender_transfer_plan(

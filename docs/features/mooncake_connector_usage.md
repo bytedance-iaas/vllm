@@ -60,6 +60,7 @@ Now you can send requests to the proxy server through port 8000.
 
 - **num_workers**: Size of thread pool for one prefiller worker to transfer KV caches by mooncake. (default 10)
 - **mooncake_protocol**: Mooncake connector protocol. (default "rdma")
+- **device_name**: RDMA device list for the Mooncake transfer engine, for example `"mlx5_1,mlx5_2"`. If unset, Mooncake uses its default device selection.
 
 ## Example Scripts/Code
 
