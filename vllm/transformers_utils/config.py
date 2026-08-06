@@ -619,6 +619,81 @@ def _maybe_update_auto_config_kwargs(kwargs: dict[str, Any], model_type: str):
     return kwargs
 
 
+def _get_quant_method(quant_cfg: Any) -> Any:
+    if quant_cfg is None:
+        return None
+    if isinstance(quant_cfg, dict):
+        return quant_cfg.get("quant_method")
+    return getattr(quant_cfg, "quant_method", None)
+
+
+_DSV4_FP8_WEIGHT_DTYPES = ("F8_E4M3", "F8_E4M3FN", "FLOAT8_E4M3FN")
+
+
+def _infer_dsv4_expert_dtype_from_checkpoint(
+    model: str | Path,
+    *,
+    revision: str | None = None,
+) -> str | None:
+    try:
+        index = get_hf_file_to_dict(
+            constants.SAFETENSORS_INDEX_FILE,
+            model,
+            revision,
+        )
+        active_weight_names: set[str] | None = None
+        if index is not None:
+            weight_map = index.get("weight_map") if isinstance(index, dict) else None
+            active_weight_names = (
+                set(weight_map) if isinstance(weight_map, dict) else set()
+            )
+
+        metadata = get_safetensors_params_metadata(
+            str(model),
+            revision=revision,
+        )
+    except (OSError, ValueError):
+        return None
+
+    for name, info in metadata.items():
+        if active_weight_names is not None and name not in active_weight_names:
+            continue
+        if ".experts." not in name or not name.endswith(".weight"):
+            continue
+        dtype = info.get("dtype")
+        if dtype is not None and str(dtype).upper() in _DSV4_FP8_WEIGHT_DTYPES:
+            return "fp8"
+    return None
+
+
+def _maybe_resolve_dsv4_expert_dtype(
+    config: PretrainedConfig,
+    model: str | Path,
+    *,
+    revision: str | None = None,
+) -> PretrainedConfig:
+    """Infer missing DeepSeek-V4 expert dtype from checkpoint metadata."""
+    if (
+        getattr(config, "model_type", None) != "deepseek_v4"
+        or _get_quant_method(getattr(config, "quantization_config", None))
+        not in ("fp8", "deepseek_v4_fp8")
+        or getattr(config, "expert_dtype", None) is not None
+    ):
+        return config
+
+    expert_dtype = _infer_dsv4_expert_dtype_from_checkpoint(
+        model,
+        revision=revision,
+    )
+    if expert_dtype is not None:
+        config.expert_dtype = expert_dtype
+        logger.info_once(
+            "Resolved DeepSeek-V4 expert_dtype=%s from checkpoint metadata",
+            expert_dtype,
+        )
+    return config
+
+
 def _maybe_remap_hf_config_attrs(config: PretrainedConfig) -> PretrainedConfig:
     """Remap config attributes to match the expected names."""
     for old_attr, new_attr in _CONFIG_ATTRS_MAPPING.items():
@@ -797,6 +872,12 @@ def get_config(
     if hf_overrides_fn:
         logger.debug("Overriding HF config with %s", hf_overrides_fn)
         config = hf_overrides_fn(config)
+
+    config = _maybe_resolve_dsv4_expert_dtype(
+        config,
+        model,
+        revision=revision,
+    )
 
     # Exhaustively patch RoPE parameters everywhere they might be
     patch_rope_parameters(config)

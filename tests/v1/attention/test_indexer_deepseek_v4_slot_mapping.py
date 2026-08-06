@@ -6,6 +6,9 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.compressor_utils import (
+    get_compressed_slot_mapping,
+)
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
@@ -90,3 +93,47 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "num_tokens",
+        "query_start_loc",
+        "seq_lens",
+        "block_table",
+        "use_padded_stride",
+        "expected",
+    ),
+    [
+        (4, [0, 4], [2], [[5], [7], [9]], False, [-1, -1, -1, -1]),
+        (4, [0, 4], [260], [[5, 999]], True, [-1, -1, -1, -1]),
+        (4, [0, 6], [6], [[5]], False, [-1, -1, -1, 320]),
+    ],
+)
+def test_compressed_slot_mapping_ignores_padded_or_out_of_range_rows(
+    num_tokens: int,
+    query_start_loc: list[int],
+    seq_lens: list[int],
+    block_table: list[list[int]],
+    use_padded_stride: bool,
+    expected: list[int],
+):
+    device = torch.device("cuda")
+    block_table_tensor = torch.tensor(block_table, dtype=torch.int32, device=device)
+    if use_padded_stride:
+        block_table_tensor = block_table_tensor[:, :1]
+    result = get_compressed_slot_mapping(
+        num_tokens=num_tokens,
+        query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32, device=device),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        block_table=block_table_tensor,
+        block_size=64,
+        compress_ratio=4,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor(expected, dtype=torch.int64, device=device),
+    )
