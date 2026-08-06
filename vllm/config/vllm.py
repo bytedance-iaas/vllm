@@ -550,6 +550,15 @@ class VllmConfig:
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
+            if (
+                not use_v2_model_runner
+                and self.speculative_config is not None
+                and self.speculative_config.method == "dspark"
+            ):
+                raise ValueError(
+                    "DSpark speculative decoding requires the V2 model runner, "
+                    "but VLLM_USE_V2_MODEL_RUNNER explicitly disables it."
+                )
             return use_v2_model_runner
 
         # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
@@ -2260,6 +2269,15 @@ class VllmConfig:
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.method in ("dflash", "dspark")
+            ):
+                raise NotImplementedError(
+                    "DFlash/DSpark speculative decoding does not support "
+                    "decode context parallelism; use "
+                    "decode_context_parallel_size=1 or another speculative method."
+                )
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":

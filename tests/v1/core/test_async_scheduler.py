@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from vllm.platforms import current_platform
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
+from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output import StructuredOutputGrammar
 from vllm.v1.utils import ConstantList
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from .utils import create_requests, create_scheduler
 
@@ -29,6 +34,179 @@ def _make_model_runner_output(
         prompt_logprobs_dict={},
         pooler_output=[],
     )
+
+
+def _prepare_async_spec_decode_request(monkeypatch, max_model_len: int):
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        max_model_len=max_model_len,
+        max_num_batched_tokens=8,
+        max_num_seqs=1,
+    )
+    # CPU validation disables the config flag, but the test explicitly
+    # constructs AsyncScheduler to exercise async scheduling behavior.
+    scheduler.scheduler_config.async_scheduling = True
+    scheduler.max_model_len = max_model_len
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    scheduler.add_request(request)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output, _make_model_runner_output(prefill_output)
+    )
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            req_ids=[request.request_id],
+            draft_token_ids=[[1, 2, 3]],
+        )
+    )
+    return scheduler, request
+
+
+def test_async_spec_decode_falls_back_without_splitting_draft_group(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        max_num_batched_tokens=6,
+        max_num_seqs=2,
+    )
+    scheduler.scheduler_config.async_scheduling = True
+    requests = create_requests(num_requests=2, num_tokens=1)
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output, _make_model_runner_output(prefill_output)
+    )
+    req_ids = [request.request_id for request in requests]
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(req_ids=req_ids, draft_token_ids=[[1, 2, 3], [4, 5, 6]])
+    )
+
+    decode_output = scheduler.schedule()
+
+    first_req_id, second_req_id = req_ids
+    assert decode_output.num_scheduled_tokens[first_req_id] == 4
+    assert decode_output.num_scheduled_tokens[second_req_id] == 1
+    assert decode_output.scheduled_spec_decode_tokens[first_req_id] == [1, 2, 3]
+    assert second_req_id not in decode_output.scheduled_spec_decode_tokens
+
+
+def test_async_spec_decode_preserves_zero_fit_model_length(monkeypatch):
+    scheduler, request = _prepare_async_spec_decode_request(monkeypatch, 3)
+    decode_output = scheduler.schedule()
+
+    assert decode_output.num_scheduled_tokens[request.request_id] == 1
+    assert request.request_id not in decode_output.scheduled_spec_decode_tokens
+
+
+@pytest.mark.parametrize("max_model_len", [4, 5])
+def test_async_spec_decode_falls_back_from_partial_model_length(
+    monkeypatch, max_model_len
+):
+    scheduler, request = _prepare_async_spec_decode_request(monkeypatch, max_model_len)
+
+    first_output = scheduler.schedule()
+    second_output = scheduler.schedule()
+
+    for output in (first_output, second_output):
+        assert output.num_scheduled_tokens[request.request_id] == 1
+        assert request.request_id not in output.scheduled_spec_decode_tokens
+
+
+def test_async_spec_decode_preserves_full_group_at_model_length(monkeypatch):
+    scheduler, request = _prepare_async_spec_decode_request(monkeypatch, 6)
+
+    decode_output = scheduler.schedule()
+
+    assert decode_output.num_scheduled_tokens[request.request_id] == 4
+    assert decode_output.scheduled_spec_decode_tokens[request.request_id] == [1, 2, 3]
+
+
+def test_update_draft_token_ids_trims_at_first_negative_token(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+    )
+    request = create_requests(num_requests=1, num_tokens=1)[0]
+    scheduler.add_request(request)
+    prefill_output = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill_output, _make_model_runner_output(prefill_output)
+    )
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds(
+            req_ids=[request.request_id],
+            draft_token_ids=[[11, -1, 12]],
+        )
+    )
+    assert request.spec_token_ids == [11]
+
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={request.request_id: [-1, -1, -1, -1]},
+        num_invalid_spec_tokens={},
+    )
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(
+            req_ids=[request.request_id],
+            draft_token_ids=[[11, -1, 12]],
+        ),
+        scheduler_output,
+    )
+    assert scheduler_output.scheduled_spec_decode_tokens[request.request_id] == [
+        11,
+        -1,
+        -1,
+        -1,
+    ]
+    assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 3}
+
+
+def test_batch_change_ignores_out_of_range_previous_rows():
+    num_computed_tokens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    prev_positions = torch.tensor([-1, 3, 1], dtype=torch.int64)
+    valid_sampled_token_count = torch.tensor([2, 4, 6], dtype=torch.int32)
+    prev_num_draft_tokens = torch.tensor([1, 1, 1], dtype=torch.int32)
+    cpu_num_computed_tokens = torch.tensor([100, 200, 300], dtype=torch.int32)
+
+    update_num_computed_tokens_for_batch_change(
+        num_computed_tokens,
+        num_accepted_tokens,
+        prev_positions,
+        valid_sampled_token_count,
+        prev_num_draft_tokens,
+        cpu_num_computed_tokens,
+    )
+
+    assert num_computed_tokens.tolist() == [100, 200, 24]
+    assert num_accepted_tokens.tolist() == [7, 8, 4]
+
+
+def test_async_input_updates_ignore_stale_previous_rows():
+    input_batch = object.__new__(InputBatch)
+    input_batch._req_ids = ["req-0"]
+    input_batch.prev_req_id_to_index = {"req-0": 1}
+    input_batch.sampling_metadata = SimpleNamespace(
+        output_token_ids=[[-1]],
+        spec_token_ids=[[9]],
+    )
+    input_batch.sampled_token_ids_cpu = torch.tensor([[7]])
+    input_batch.async_copy_ready_event = Mock()
+
+    input_batch.update_async_output_token_ids()
+    input_batch.update_async_spec_token_ids([[8]])
+
+    assert input_batch.sampling_metadata.output_token_ids == [[-1]]
+    assert input_batch.sampling_metadata.spec_token_ids == [[9]]
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 3, 5])
