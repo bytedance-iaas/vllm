@@ -163,7 +163,9 @@ def fuse_moe_blockwise_impl(
     from hpc import fuse_moe_blockwise as fuse_moe_blockwise_
     clamp = 0.0 if activation_clamp is None else float(activation_clamp)
 
-    if _hpc_blockwise_supports_activation_clamp(fuse_moe_blockwise_):
+    # Preserve the original HPC-Ops call for regular SwiGLU. Only clipped
+    # SwiGLU requires the newer activation_clamp argument.
+    if clamp == 0.0:
         return fuse_moe_blockwise_(
             x,
             x_scale,
@@ -177,10 +179,9 @@ def fuse_moe_blockwise_impl(
             num_expert_total,
             shared_output,
             output=output,
-            activation_clamp=clamp,
         )
 
-    if clamp != 0.0:
+    if not _hpc_blockwise_supports_activation_clamp(fuse_moe_blockwise_):
         raise RuntimeError(
             "HPC blockwise MoE requires hpc-ops with activation_clamp "
             "support for DeepSeek-V4 clipped-SwiGLU."
@@ -199,6 +200,7 @@ def fuse_moe_blockwise_impl(
         num_expert_total,
         shared_output,
         output=output,
+        activation_clamp=clamp,
     )
 
 

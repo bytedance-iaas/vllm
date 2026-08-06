@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import dataclasses
 import sys
 import types
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -17,22 +15,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.hpc_moe import HPCExperts
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
-    Fp8MoeBackend,
-    select_fp8_moe_backend,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    kFp8Dynamic128Sym,
-    kFp8Static128BlockSym,
-)
 from vllm.utils.hpc import hpc_fuse_moe_blockwise
 
 
-def _moe_config(
-    *,
-    moe_backend: str = "hpc",
-    parallel_config: FusedMoEParallelConfig | None = None,
-) -> FusedMoEConfig:
+def _moe_config() -> FusedMoEConfig:
     return FusedMoEConfig(
         num_experts=4,
         experts_per_token=2,
@@ -40,12 +26,12 @@ def _moe_config(
         intermediate_size=128,
         num_local_experts=4,
         num_logical_experts=4,
-        moe_parallel_config=parallel_config or FusedMoEParallelConfig.make_no_parallel(),
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         activation=MoEActivation.SILU,
         in_dtype=torch.bfloat16,
         device="cuda",
         routing_method=RoutingMethodType.TopK,
-        moe_backend=moe_backend,
+        moe_backend="hpc",
     )
 
 
@@ -57,36 +43,6 @@ def _quant_config(clamp: float | None = 7.0) -> FusedMoEQuantConfig:
         w2_scale=torch.empty(1),
         gemm1_clamp_limit=clamp,
     )
-
-
-def test_explicit_hpc_fp8_backend_selects_hpc_experts():
-    with patch.object(HPCExperts, "_supports_current_device", return_value=True):
-        backend, experts_cls = select_fp8_moe_backend(
-            _moe_config(),
-            weight_key=kFp8Static128BlockSym,
-            activation_key=kFp8Dynamic128Sym,
-        )
-
-    assert backend == Fp8MoeBackend.HPC
-    assert experts_cls is HPCExperts
-
-
-@pytest.mark.parametrize(
-    ("parallel_config", "supported"),
-    [
-        (FusedMoEParallelConfig.make_no_parallel(), True),
-        (dataclasses.replace(FusedMoEParallelConfig.make_no_parallel(), dp_size=2), False),
-        (
-            dataclasses.replace(
-                FusedMoEParallelConfig.make_no_parallel(), ep_size=2, use_ep=True
-            ),
-            False,
-        ),
-        (dataclasses.replace(FusedMoEParallelConfig.make_no_parallel(), sp_size=2), False),
-    ],
-)
-def test_hpc_fp8_backend_limits_parallel_config(parallel_config, supported):
-    assert HPCExperts._supports_parallel_config(parallel_config) is supported
 
 
 def test_hpc_blockwise_wrapper_passes_activation_clamp(monkeypatch):

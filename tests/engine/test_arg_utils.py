@@ -251,16 +251,6 @@ def test_hf_token_cli_arg(cli_args, expected):
     assert args.hf_token == expected
 
 
-@pytest.mark.parametrize("option", ["--moe-backend", "--mode-backend"])
-def test_moe_backend_cli_alias(option):
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-
-    args = parser.parse_args([option, "hpc"])
-
-    assert args.moe_backend == "hpc"
-    assert EngineArgs.from_cli_args(args).moe_backend == "hpc"
-
-
 @pytest.mark.parametrize(
     ("arg", "expected"),
     [

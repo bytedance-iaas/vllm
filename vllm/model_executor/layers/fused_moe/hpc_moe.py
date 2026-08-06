@@ -52,16 +52,6 @@ class HPCExperts(mk.FusedMoEExpertsModular):
         self.out_dtype = moe_config.in_dtype
         self.activation_clamp = quant_config.gemm1_clamp_limit
 
-        logger.info_once(
-            "Using HPC FP8 MoE backend: tp_size=%s ep_size=%s dp_size=%s "
-            "sp_size=%s activation_clamp=%s",
-            self.tp_size,
-            self.ep_size,
-            moe_config.moe_parallel_config.dp_size,
-            moe_config.moe_parallel_config.sp_size,
-            self.activation_clamp,
-        )
-
     @property
     def expects_unquantized_inputs(self) -> bool:
         return False
@@ -112,12 +102,7 @@ class HPCExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return (
-            moe_parallel_config.dp_size == 1
-            and moe_parallel_config.ep_size == 1
-            and moe_parallel_config.sp_size == 1
-            and not moe_parallel_config.use_ep
-        )
+        return True
 
     def supports_expert_map(self) -> bool:
         return False

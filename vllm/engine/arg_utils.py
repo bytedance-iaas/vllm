@@ -1495,12 +1495,7 @@ class EngineArgs:
         )
         moe_backend_kwargs = kernel_kwargs["moe_backend"]
         moe_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
-        kernel_group.add_argument(
-            "--moe-backend",
-            "--mode-backend",
-            dest="moe_backend",
-            **moe_backend_kwargs,
-        )
+        kernel_group.add_argument("--moe-backend", **moe_backend_kwargs)
         linear_backend_kwargs = kernel_kwargs["linear_backend"]
         linear_backend_kwargs["type"] = lambda s: s.lower().replace("-", "_")
         kernel_group.add_argument("--linear-backend", **linear_backend_kwargs)
