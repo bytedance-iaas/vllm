@@ -8,6 +8,7 @@ Users of vLLM should always import **only** these wrappers.
 import functools
 import importlib
 import importlib.util
+import inspect
 
 import torch
 
@@ -129,6 +130,15 @@ def hpc_fuse_moe(
     )
 
 
+@functools.cache
+def _hpc_blockwise_supports_activation_clamp(fuse_moe_blockwise: object) -> bool:
+    signature = inspect.signature(fuse_moe_blockwise)
+    return any(
+        param_name == "activation_clamp" or param.kind == inspect.Parameter.VAR_KEYWORD
+        for param_name, param in signature.parameters.items()
+    )
+
+
 # @torch.library.custom_op(
 #     "vllm::fuse_moe_blockwise_impl",
 #     mutates_args=[],
@@ -147,8 +157,35 @@ def fuse_moe_blockwise_impl(
     num_expert_total: int,
     shared_output: torch.Tensor = None,
     output: torch.Tensor = None,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     from hpc import fuse_moe_blockwise as fuse_moe_blockwise_
+
+    clamp = 0.0 if activation_clamp is None else float(activation_clamp)
+
+    # Preserve the original HPC-Ops call for regular SwiGLU. Only clipped
+    # SwiGLU requires the newer activation_clamp argument.
+    if clamp == 0.0:
+        return fuse_moe_blockwise_(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert_total,
+            shared_output,
+            output=output,
+        )
+
+    if not _hpc_blockwise_supports_activation_clamp(fuse_moe_blockwise_):
+        raise RuntimeError(
+            "HPC blockwise MoE requires hpc-ops with activation_clamp "
+            "support for DeepSeek-V4 clipped-SwiGLU."
+        )
 
     return fuse_moe_blockwise_(
         x,
@@ -163,6 +200,7 @@ def fuse_moe_blockwise_impl(
         num_expert_total,
         shared_output,
         output=output,
+        activation_clamp=clamp,
     )
 
 
@@ -182,6 +220,7 @@ def fuse_moe_blockwise_impl_fake(
     num_expert_total: int,
     shared_output: torch.Tensor = None,
     output: torch.Tensor = None,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -199,6 +238,7 @@ def hpc_fuse_moe_blockwise(
     num_expert_total: int,
     shared_output: torch.Tensor = None,
     output: torch.Tensor = None,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     return fuse_moe_blockwise_impl(
         x,
@@ -213,6 +253,7 @@ def hpc_fuse_moe_blockwise(
         num_expert_total,
         shared_output,
         output=output,
+        activation_clamp=activation_clamp,
     )
 
 

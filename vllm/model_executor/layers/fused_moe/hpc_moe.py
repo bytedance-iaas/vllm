@@ -50,6 +50,7 @@ class HPCExperts(mk.FusedMoEExpertsModular):
         self.tp_rank = moe_config.moe_parallel_config.tp_rank
         self.tp_size = moe_config.moe_parallel_config.tp_size
         self.out_dtype = moe_config.in_dtype
+        self.activation_clamp = quant_config.gemm1_clamp_limit
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -188,6 +189,7 @@ class HPCExperts(mk.FusedMoEExpertsModular):
                 rank_ep=self.ep_rank,
                 num_expert_total=global_num_experts,
                 output=output,
+                activation_clamp=self.activation_clamp,
             )
         else:
             assert self.quant_config.a1_scale is not None, (
