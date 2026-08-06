@@ -562,6 +562,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
 ARG TARGETPLATFORM
+ARG INSTALL_HPC_OPS
+ARG HPC_OPS_REPO
+ARG HPC_OPS_REF
+ARG HPC_OPS_COMMIT
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -635,6 +639,31 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Record the wheel checksum so downstream stages can bust their layer cache
 # when the wheel changes, without copying the wheel itself into the image.
 RUN sha256sum dist/*.whl > dist/wheel.sha256
+
+# Optionally build HPC-Ops alongside vLLM. ByteIAAS enables this for its
+# OpenAI images; other builds retain the existing behavior by default.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    mkdir -p /tmp/hpc-ops-dist && \
+    if [ "${INSTALL_HPC_OPS:-false}" = "true" ]; then \
+        test "${TARGETPLATFORM}" = "linux/amd64" && \
+        test -n "${HPC_OPS_REPO}" && \
+        test -n "${HPC_OPS_REF}" && \
+        test -n "${HPC_OPS_COMMIT}" && \
+        test -f /usr/local/cuda/include/cusparse.h && \
+        test -f /usr/local/cuda/include/cusolverDn.h && \
+        git clone --branch "${HPC_OPS_REF}" --single-branch --depth 1 \
+            "${HPC_OPS_REPO}" /tmp/hpc-ops-src && \
+        test "$(git -C /tmp/hpc-ops-src rev-parse HEAD)" = \
+            "${HPC_OPS_COMMIT}" && \
+        cd /tmp/hpc-ops-src && \
+        CUDA_VISIBLE_DEVICES="" python3 -m build --wheel --no-isolation && \
+        cp dist/*.whl /tmp/hpc-ops-dist/ && \
+        sha256sum /tmp/hpc-ops-dist/*.whl \
+            > /tmp/hpc-ops-dist/wheels.sha256 && \
+        rm -rf /tmp/hpc-ops-src; \
+    else \
+        printf 'disabled\n' > /tmp/hpc-ops-dist/wheels.sha256; \
+    fi
 
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
@@ -1074,6 +1103,8 @@ FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_VLLM_ROUTER=false
+ARG INSTALL_HPC_OPS
+ARG HPC_OPS_COMMIT
 ARG VLLM_ROUTER_VERSION=0.1.15
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
@@ -1149,6 +1180,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ -n "${DEEPGEMM_WHEEL_X86_64}" ]; then \
         uv pip install --system "${DEEPGEMM_WHEEL_X86_64}" && \
         python3 -c 'import deep_gemm; required = ["get_symm_buffer_for_mega_moe", "transform_sf_into_required_layout", "transform_weights_for_mega_moe_sm90", "transform_weights_for_mega_moe_sm90_fp4", "fp8_mega_moe", "fp8_fp4_mega_moe"]; missing = [name for name in required if not hasattr(deep_gemm, name)]; assert not missing, f"DeepGEMM wheel missing required MegaMoE symbols: {missing}"; print("DeepGEMM MegaMoE symbols verified")'; \
+    fi
+
+# Install the optional source-built HPC-Ops wheel. Copy only its checksum so
+# wheel changes invalidate this layer without retaining the wheel in the image.
+COPY --from=build /tmp/hpc-ops-dist/wheels.sha256 /tmp/hpc-ops-wheels.sha256
+RUN --mount=type=bind,from=build,src=/tmp/hpc-ops-dist,target=/tmp/hpc-ops-dist \
+    --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_HPC_OPS:-false}" = "true" ]; then \
+        uv pip install --system --no-deps /tmp/hpc-ops-dist/*.whl && \
+        HPC_OPS_EXPECTED_COMMIT="${HPC_OPS_COMMIT}" python3 -c 'import inspect, os, torch; import hpc; from hpc.version import git_hash; from vllm.utils.hpc import _hpc_blockwise_supports_activation_clamp, has_hpc; required = ["fuse_moe", "fuse_moe_blockwise", "fuse_moe_blockwise_fp8"]; missing = [name for name in required if not hasattr(hpc, name)]; assert not missing, f"HPC-Ops wheel missing required symbols: {missing}"; assert git_hash == os.environ["HPC_OPS_EXPECTED_COMMIT"][:7]; assert "activation_clamp" in inspect.signature(hpc.fuse_moe_blockwise).parameters; assert hasattr(torch.ops.hpc, "fuse_moe_blockwise"); assert has_hpc(); assert _hpc_blockwise_supports_activation_clamp(hpc.fuse_moe_blockwise); print(f"HPC-Ops {hpc.__version__} verified for vLLM")'; \
     fi
 
 # Install vllm-router in ByteIAAS PD images so router pods do not need runtime
