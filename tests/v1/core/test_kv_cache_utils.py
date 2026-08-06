@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2085,6 +2086,135 @@ def new_swa_mla_spec(head_size=576, sliding_window=128):
         head_size=head_size,
         dtype=torch.float32,
         sliding_window=sliding_window,
+    )
+
+
+def test_deepseek_v4_uniform_groups_allow_ragged_swa_page_size_buckets():
+    def new_dsv4_mla_spec(head_size: int) -> MLAAttentionSpec:
+        return MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.float16,
+            model_version="deepseek_v4",
+        )
+
+    def new_dsv4_swa_mla_spec(head_size: int) -> SlidingWindowMLASpec:
+        return SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.float16,
+            sliding_window=128,
+            model_version="deepseek_v4",
+        )
+
+    def make_uniform_group(
+        specs: dict[str, KVCacheSpec],
+    ) -> UniformTypeKVCacheSpecs:
+        group = UniformTypeKVCacheSpecs.from_specs(specs)
+        assert group is not None
+        return group
+
+    full_specs: dict[str, KVCacheSpec] = {
+        "full.small.0": new_dsv4_mla_spec(64),
+        "full.large.0": new_dsv4_mla_spec(128),
+        "full.small.1": new_dsv4_mla_spec(64),
+        "full.large.1": new_dsv4_mla_spec(128),
+    }
+    swa_specs: dict[str, KVCacheSpec] = {}
+    for idx in range(4):
+        swa_specs[f"swa.small.{idx}"] = new_dsv4_swa_mla_spec(64)
+        swa_specs[f"swa.large.{idx}"] = new_dsv4_swa_mla_spec(128)
+    swa_specs["swa.small.4"] = new_dsv4_swa_mla_spec(64)
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
+        [make_uniform_group(full_specs), make_uniform_group(swa_specs)]
+    )
+
+    assert len(groups) == 4
+    assert groups[0].layer_names == list(full_specs)
+    assert [group.layer_names for group in groups[1:]] == [
+        ["swa.small.0", "swa.large.0", "swa.small.3", "swa.large.3"],
+        ["swa.small.1", "swa.large.1", "swa.small.4"],
+        ["swa.small.2", "swa.large.2"],
+    ]
+    flattened_swa_layers = [name for group in groups[1:] for name in group.layer_names]
+    assert sorted(flattened_swa_layers) == sorted(swa_specs)
+    for group in groups[1:]:
+        assert set(group.kv_cache_spec.kv_cache_specs) == set(group.layer_names)
+
+
+def test_deepseek_v4_ragged_packed_memory_uses_actual_slots():
+    full_specs: dict[str, KVCacheSpec] = {
+        "full.small.0": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            model_version="deepseek_v4",
+        ),
+        "full.large.0": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+            model_version="deepseek_v4",
+        ),
+        "full.small.1": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            model_version="deepseek_v4",
+        ),
+    }
+    swa_specs: dict[str, KVCacheSpec] = {
+        "swa.small.0": SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=128,
+            model_version="deepseek_v4",
+        ),
+        "swa.large.0": SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+            sliding_window=128,
+            model_version="deepseek_v4",
+        ),
+    }
+    full_group_spec = UniformTypeKVCacheSpecs.from_specs(full_specs)
+    swa_group_spec = UniformTypeKVCacheSpecs.from_specs(swa_specs)
+    assert full_group_spec is not None
+    assert swa_group_spec is not None
+    groups = [
+        KVCacheGroupSpec(list(full_specs), full_group_spec),
+        KVCacheGroupSpec(list(swa_specs), swa_group_spec),
+    ]
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=256),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        max_in_flight_tokens=16,
+        kv_transfer_config=None,
+    )
+
+    small_page = full_specs["full.small.0"].page_size_bytes
+    large_page = full_specs["full.large.0"].page_size_bytes
+    expected_bytes_per_block = 2 * small_page + large_page
+    assert (
+        kv_cache_utils._pool_bytes_per_block(vllm_config, groups)
+        == expected_bytes_per_block
+    )
+
+    blocks_per_request = full_group_spec.max_memory_usage_pages(
+        vllm_config
+    ) + swa_group_spec.max_memory_usage_pages(vllm_config)
+    assert kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups) == (
+        expected_bytes_per_block * blocks_per_request
     )
 
 

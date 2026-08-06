@@ -1674,16 +1674,18 @@ def _get_kv_cache_groups_uniform_groups(
             if current_size < candidate:
                 object.__setattr__(layer_spec, "page_size_padded", candidate)
             layers_per_size[candidate].append(layer_name)
-        # NOTE(yifan): for now, inside a UniformKV group, each page_size should
-        # have the same number of layers. This also means we don't need to pad layers
-        # inside a partial-full layer tuple.
-        assert len(set(len(layers) for layers in layers_per_size.values())) == 1
-        num_layers_per_size = len(next(iter(layers_per_size.values())))
+        # IndexCache omits the indexer's K and compressor-state caches from
+        # consumer layers, so page-size slots can be ragged. Keep each present
+        # layer in its original slot order without inventing padding layers.
+        num_layers_per_size = max(len(layers) for layers in layers_per_size.values())
 
         # Split layers inside each UniformKV group for aligned #(layers).
         # See `_get_kv_cache_groups_uniform_page_size` for more details.
         num_tuple_groups = cdiv(num_layers_per_size, num_layer_tuples)
-        layer_tuples = list(zip(*layers_per_size.values()))
+        layer_tuples = [
+            tuple(layers[i] for layers in layers_per_size.values() if i < len(layers))
+            for i in range(num_layers_per_size)
+        ]
         for i in range(num_tuple_groups):
             group_layer_tuples = layer_tuples[i::num_tuple_groups]
             # Flatten tuples and build dict for from_specs
@@ -1861,26 +1863,18 @@ def _max_memory_usage_bytes_from_groups(
         for group in kv_cache_groups
     ):
         # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
-        num_layer_tuples = max(
-            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
+        # UniformTypeKVCacheSpecs. Match the packed allocator exactly: one
+        # physical block costs the actual ragged slot layout, while a request
+        # consumes an independent number of blocks from every cache group.
+        bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
+        blocks_per_request = sum(
+            cast(
+                UniformTypeKVCacheSpecs,
+                group.kv_cache_spec,
+            ).max_memory_usage_pages(vllm_config)
             for group in kv_cache_groups
         )
-
-        total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
-            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
-            g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
-            g_max_mem_usage_page_bytes = (
-                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
-            )
-            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
+        return bytes_per_block * blocks_per_request
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
