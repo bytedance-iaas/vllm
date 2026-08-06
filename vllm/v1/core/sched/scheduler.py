@@ -568,6 +568,7 @@ class Scheduler(SchedulerInterface):
         )
         if (
             candidate_padding_k <= 0
+            or self.num_sampled_tokens_per_step <= 0
             or num_new_tokens != 1
             or not scheduled_running_reqs
             or prefill_scheduled

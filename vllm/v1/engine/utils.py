@@ -17,11 +17,12 @@ import msgspec
 import zmq
 
 from vllm import envs
-from vllm.config import CacheConfig, ParallelConfig, VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.ray.ray_env import get_env_vars_to_copy
 from vllm.utils import numa_utils
+from vllm.utils.hashing import safe_hash
 from vllm.utils.network_utils import (
     get_open_port,
     get_open_zmq_ipc_path,
@@ -32,6 +33,7 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
 if TYPE_CHECKING:
@@ -40,6 +42,53 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+
+
+def compute_dp_collective_config_hash(vllm_config: VllmConfig) -> str:
+    """Hash config that can change coordinated-DP collective ordering."""
+    factors: list[object] = [vllm_config.parallel_config.compute_hash()]
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is not None
+        and speculative_config.uses_dynamic_speculative_decoding()
+    ):
+        schedule = speculative_config.num_speculative_tokens_per_batch_size
+        assert schedule is not None
+        effective_schedule = build_dynamic_sd_schedule_lookup(
+            schedule,
+            vllm_config.scheduler_config.max_num_seqs,
+            vllm_config.num_speculative_tokens,
+        )
+        factors.append(
+            (
+                speculative_config.dynamic_sd_dp_batch_policy,
+                speculative_config.dynamic_sd_dp_sync_interval,
+                tuple(effective_schedule),
+            )
+        )
+    else:
+        factors.append(None)
+    return safe_hash(
+        repr(factors).encode(),
+        usedforsecurity=False,
+    ).hexdigest()
+
+
+def validate_dp_collective_config_hash(
+    worker_hash: str | None,
+    expected_hash: str,
+    engine_index: int,
+) -> None:
+    if worker_hash != expected_hash:
+        raise RuntimeError(
+            f"Configuration mismatch detected for engine {engine_index}. "
+            "All DP workers must have identical configurations for parameters "
+            "that affect collective communication, including Dynamic SD policy, "
+            "sync interval, and effective schedule. "
+            f"Worker hash: {worker_hash}, Expected hash: {expected_hash}. "
+            "Please ensure all workers are started with the same command-line "
+            "arguments."
+        )
 
 
 class CoreEngineState(Enum):
@@ -1216,7 +1265,7 @@ def launch_core_engines(
             engines_to_handshake,
             parallel_config,
             dp_size > 1 and vllm_config.model_config.is_moe,
-            vllm_config.cache_config,
+            vllm_config,
             local_engine_manager,
             coordinator.proc if coordinator else None,
         )
@@ -1228,7 +1277,7 @@ def wait_for_engine_startup(
     core_engines: list[CoreEngine],
     parallel_config: ParallelConfig,
     coordinated_dp: bool,
-    cache_config: CacheConfig,
+    vllm_config: VllmConfig,
     proc_manager: CoreEngineProcManager | None,
     coord_process: Process | None,
 ):
@@ -1333,20 +1382,11 @@ def wait_for_engine_startup(
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
             # Validate config hash consistency across DP workers for MoE models.
             if coordinated_dp:
-                worker_config_hash = msg.get("parallel_config_hash")
-                expected_hash = parallel_config.compute_hash()
-                if worker_config_hash != expected_hash:
-                    raise RuntimeError(
-                        f"Configuration mismatch detected for engine "
-                        f"{eng_index}. All DP workers must have identical "
-                        f"configurations for parameters that affect collective "
-                        f"communication (e.g., enable_eplb, "
-                        f"eplb_config.log_balancedness). "
-                        f"Worker hash: {worker_config_hash}, "
-                        f"Expected hash: {expected_hash}. "
-                        f"Please ensure all workers are started with the same "
-                        f"command-line arguments."
-                    )
+                validate_dp_collective_config_hash(
+                    msg.get("dp_collective_config_hash"),
+                    compute_dp_collective_config_hash(vllm_config),
+                    eng_index,
+                )
 
             start_pending[0 if local else 1] -= 1
             engine.state = CoreEngineState.READY

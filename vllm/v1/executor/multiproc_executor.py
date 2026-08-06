@@ -334,6 +334,12 @@ class MultiprocExecutor(Executor):
     def execute_dummy_batch(
         self, num_spec_tokens_to_schedule: int | None = None
     ) -> None:
+        if num_spec_tokens_to_schedule is None:
+            self.collective_rpc(
+                "execute_dummy_batch",
+                unique_reply_rank=self.output_rank,
+            )
+            return
         self.collective_rpc(
             "execute_dummy_batch",
             args=(num_spec_tokens_to_schedule,),
