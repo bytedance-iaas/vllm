@@ -76,6 +76,7 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+DynamicSDBatchPolicy = Literal["global_max"]
 
 
 @config
@@ -180,6 +181,20 @@ class SpeculativeConfig:
 
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
     inclusive batch-size range.
+    """
+    dynamic_sd_dp_batch_policy: DynamicSDBatchPolicy | None = None
+    """Opt-in policy for DP-safe Dynamic SD when DP > 1.
+
+    Dynamic SD stays fail-closed under DP > 1 unless this is explicitly set.
+    ``global_max`` uses one DP-global batch-pressure estimate so every DP rank
+    uses the same K. The synchronized pressure may be cached between refreshes
+    according to ``dynamic_sd_dp_sync_interval``.
+    """
+    dynamic_sd_dp_sync_interval: int = Field(default=8, ge=1)
+    """Number of DP engine steps between Dynamic SD global pressure syncs.
+
+    This only applies to ``dynamic_sd_dp_batch_policy='global_max'``. A value
+    of 1 restores per-step synchronization.
     """
 
     # params generated in the post-init stage
@@ -1256,6 +1271,31 @@ class SpeculativeConfig:
                 self.draft_parallel_config
             )
 
+        if (
+            self.dynamic_sd_dp_batch_policy is not None
+            and not self.uses_dynamic_speculative_decoding()
+        ):
+            raise ValueError(
+                "dynamic_sd_dp_batch_policy requires "
+                "num_speculative_tokens_per_batch_size."
+            )
+
+        if self.uses_dynamic_sd_dp_global_max_policy():
+            assert self.num_speculative_tokens_per_batch_size is not None
+            last_k: int | None = None
+            for _, _, num_speculative_tokens in sorted(
+                self.num_speculative_tokens_per_batch_size,
+                key=lambda entry: int(entry[0]),
+            ):
+                current_k = int(num_speculative_tokens)
+                if last_k is not None and current_k > last_k:
+                    raise ValueError(
+                        "dynamic_sd_dp_batch_policy='global_max' requires "
+                        "num_speculative_tokens_per_batch_size to be non-increasing "
+                        "as batch size grows."
+                    )
+                last_k = current_k
+
         if self.use_heterogeneous_vocab and not self.uses_draft_model():
             raise ValueError(
                 "use_heterogeneous_vocab only works with method='draft_model'"
@@ -1335,6 +1375,9 @@ class SpeculativeConfig:
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
+
+    def uses_dynamic_sd_dp_global_max_policy(self) -> bool:
+        return self.dynamic_sd_dp_batch_policy == "global_max"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

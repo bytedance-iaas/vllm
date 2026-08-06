@@ -844,7 +844,7 @@ class VllmConfig:
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
-    def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
+    def _verify_dynamic_sd_dp_config(self) -> None:
         speculative_config = self.speculative_config
         if (
             speculative_config is None
@@ -853,15 +853,24 @@ class VllmConfig:
         ):
             return
 
-        logger.warning_once(
-            "Dynamic speculative decoding is not supported with data "
-            "parallelism because data-parallel ranks can select different "
-            "speculative-token counts, causing DP divergence and deadlocks. "
-            "Disabling num_speculative_tokens_per_batch_size and falling back "
-            "to static num_speculative_tokens=%d.",
-            speculative_config.num_speculative_tokens,
-        )
-        speculative_config.num_speculative_tokens_per_batch_size = None
+        if not speculative_config.uses_dynamic_sd_dp_global_max_policy():
+            raise ValueError(
+                "num_speculative_tokens_per_batch_size with data_parallel_size > 1 "
+                "requires explicit opt-in via "
+                "dynamic_sd_dp_batch_policy='global_max'. Rank-local Dynamic SD "
+                "remains disabled under DP > 1."
+            )
+
+        if (
+            speculative_config.method == "dspark"
+            and self.scheduler_config.async_scheduling is False
+        ):
+            raise ValueError(
+                "DSpark Dynamic SD with data_parallel_size > 1 requires "
+                "async_scheduling. The DSpark proposer generates the static maximum "
+                "draft width without async placeholders, so Dynamic SD would not "
+                "control the verification width."
+            )
 
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
@@ -1119,6 +1128,7 @@ class VllmConfig:
             "Asynchronous scheduling is %s.",
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
         )
+        self._verify_dynamic_sd_dp_config()
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
@@ -1279,7 +1289,6 @@ class VllmConfig:
                 "optimization level defaults."
             )
 
-        self._maybe_disable_dynamic_sd_for_data_parallel()
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (
@@ -1713,6 +1722,17 @@ class VllmConfig:
                 self.scheduler_config.max_num_scheduled_tokens = (
                     max_num_batched_tokens - scheduled_token_delta
                 )
+                self.scheduler_config.max_num_scheduled_tokens_auto_derived = True
+            else:
+                auto_derived_tokens = max_num_batched_tokens - scheduled_token_delta
+                if (
+                    self.scheduler_config.max_num_scheduled_tokens_auto_derived
+                    and self.scheduler_config.max_num_scheduled_tokens
+                    == auto_derived_tokens
+                ):
+                    self.scheduler_config.max_num_scheduled_tokens_auto_derived = True
+                else:
+                    self.scheduler_config.max_num_scheduled_tokens_auto_derived = False
 
             if self.scheduler_config.max_num_scheduled_tokens <= 0:
                 raise ValueError(

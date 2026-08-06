@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -65,6 +65,58 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _DynamicSDBudgetPolicy:
+    max_num_batched_tokens: int
+    max_num_seqs: int
+
+    def token_budget(self, runtime_k: int) -> int:
+        num_extra_slots = max(runtime_k - 1, 0)
+        return self.max_num_batched_tokens - num_extra_slots * self.max_num_seqs
+
+
+@dataclass
+class _DynamicSDSchedulerState:
+    lookup: list[int]
+    max_runtime_k: int
+    budget_policy: _DynamicSDBudgetPolicy | None
+    batch_size_override: int | None = None
+    last_selected_k: int = 0
+
+    def __post_init__(self) -> None:
+        self.last_selected_k = self.max_runtime_k
+
+    def k_for_batch_size(self, batch_size: int) -> int:
+        batch_size = min(batch_size, len(self.lookup) - 1)
+        return self.lookup[batch_size]
+
+    def set_global_batch_pressure(self, batch_size: int | None) -> None:
+        self.batch_size_override = batch_size
+        if batch_size is not None:
+            self.last_selected_k = self.k_for_batch_size(batch_size)
+
+    def early_k(self) -> int | None:
+        if self.batch_size_override is None:
+            return None
+        return self.k_for_batch_size(self.batch_size_override)
+
+    def final_k(self, actual_batch_size: int, early_k: int | None) -> int:
+        if early_k is not None:
+            selected_k = early_k
+        elif actual_batch_size > 0:
+            selected_k = self.k_for_batch_size(actual_batch_size)
+        else:
+            selected_k = self.max_runtime_k
+        self.last_selected_k = selected_k
+        self.batch_size_override = None
+        return selected_k
+
+    def token_budget(self, runtime_k: int, default_budget: int) -> int:
+        if self.budget_policy is None:
+            return default_budget
+        return self.budget_policy.token_budget(runtime_k)
 
 
 class Scheduler(SchedulerInterface):
@@ -238,13 +290,41 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
-        self.dynamic_sd_lookup: list[int] | None = None
+        self._dynamic_sd: _DynamicSDSchedulerState | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
-                self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+                dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
+                auto_max_num_scheduled_tokens = (
+                    self.scheduler_config.max_num_batched_tokens
+                    - speculative_config.max_num_new_slots_for_drafting
+                    * self.scheduler_config.max_num_seqs
+                )
+                can_reclaim_token_budget = (
+                    self.scheduler_config.max_num_scheduled_tokens_auto_derived
+                    and (
+                        speculative_config.use_dflash()
+                        or speculative_config.use_dspark()
+                    )
+                    and self.max_num_scheduled_tokens == auto_max_num_scheduled_tokens
+                )
+                budget_policy = (
+                    _DynamicSDBudgetPolicy(
+                        max_num_batched_tokens=(
+                            self.scheduler_config.max_num_batched_tokens
+                        ),
+                        max_num_seqs=self.scheduler_config.max_num_seqs,
+                    )
+                    if can_reclaim_token_budget
+                    else None
+                )
+                self._dynamic_sd = _DynamicSDSchedulerState(
+                    lookup=dynamic_sd_lookup,
+                    max_runtime_k=self.num_spec_tokens,
+                    budget_policy=budget_policy,
                 )
             if speculative_config.use_eagle():
                 self.use_eagle = True
@@ -427,6 +507,85 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _get_dynamic_sd_k_for_batch_size(self, batch_size: int) -> int:
+        assert self._dynamic_sd is not None
+        return self._dynamic_sd.k_for_batch_size(batch_size)
+
+    def _get_dynamic_sd_early_k(self) -> int | None:
+        if self._dynamic_sd is None:
+            return None
+        return self._dynamic_sd.early_k()
+
+    def _get_uniform_running_decode_k(
+        self,
+        scheduled_running_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+        scheduled_spec_decode_tokens: dict[str, list[int]],
+        prefill_scheduled: bool,
+    ) -> int | None:
+        if (
+            not scheduled_running_reqs
+            or prefill_scheduled
+            or self.num_sampled_tokens_per_step <= 0
+        ):
+            return None
+
+        running_decode_k: int | None = None
+        for request in scheduled_running_reqs:
+            if request.is_prefill_chunk:
+                return None
+
+            spec_token_ids = scheduled_spec_decode_tokens.get(request.request_id)
+            if not spec_token_ids:
+                return None
+
+            num_spec_tokens = len(spec_token_ids)
+            if num_spec_tokens <= 0 or num_spec_tokens > self.num_spec_tokens:
+                return None
+            if (
+                num_scheduled_tokens[request.request_id]
+                != num_spec_tokens + self.num_sampled_tokens_per_step
+            ):
+                return None
+            if running_decode_k is None:
+                running_decode_k = num_spec_tokens
+            elif running_decode_k != num_spec_tokens:
+                return None
+
+        return running_decode_k
+
+    def _get_waiting_decode_padding(
+        self,
+        num_new_tokens: int,
+        running_decode_k: int | None,
+        scheduled_running_reqs: list[Request],
+        prefill_scheduled: bool,
+    ) -> tuple[int, int]:
+        candidate_padding_k = (
+            self.num_spec_tokens
+            if self._dynamic_sd is None
+            else (running_decode_k or 0)
+        )
+        if (
+            candidate_padding_k <= 0
+            or num_new_tokens != 1
+            or not scheduled_running_reqs
+            or prefill_scheduled
+        ):
+            return num_new_tokens, 0
+
+        padded_num_new_tokens = self.num_sampled_tokens_per_step + candidate_padding_k
+        return padded_num_new_tokens, candidate_padding_k
+
+    def _get_effective_max_num_scheduled_tokens(self, dynamic_sd_k: int | None) -> int:
+        if dynamic_sd_k is None or self._dynamic_sd is None:
+            return self.max_num_scheduled_tokens
+
+        return self._dynamic_sd.token_budget(
+            dynamic_sd_k,
+            default_budget=self.max_num_scheduled_tokens,
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -447,7 +606,8 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        dynamic_sd_early_k = self._get_dynamic_sd_early_k()
+        token_budget = self._get_effective_max_num_scheduled_tokens(dynamic_sd_early_k)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -697,6 +857,13 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        running_decode_k = self._get_uniform_running_decode_k(
+            scheduled_running_reqs,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            prefill_scheduled,
+        )
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
@@ -858,7 +1025,9 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
-                pad_spec_decode = False
+                pad_spec_decode = 0
+                unpadded_num_new_tokens = 0
+                padded_num_new_tokens = 0
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -874,24 +1043,24 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    unpadded_num_new_tokens = num_new_tokens
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
-                    # Not for diffusion where draft tokens can't be padded.
-                    if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
-                        and self.num_sampled_tokens_per_step > 0
-                        and num_new_tokens == 1
-                        and (scheduled_running_reqs and not prefill_scheduled)
-                    ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                    num_new_tokens, pad_spec_decode = self._get_waiting_decode_padding(
+                        num_new_tokens,
+                        running_decode_k,
+                        scheduled_running_reqs,
+                        prefill_scheduled,
+                    )
+                    if pad_spec_decode:
+                        padded_num_new_tokens = num_new_tokens
                         if (
                             num_new_tokens > token_budget
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
                             break
-                        pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
@@ -938,6 +1107,10 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
+
+                if pad_spec_decode and num_new_tokens != padded_num_new_tokens:
+                    num_new_tokens = unpadded_num_new_tokens
+                    pad_spec_decode = 0
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1065,9 +1238,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
-                    scheduled_spec_decode_tokens[request_id] = [
-                        -1
-                    ] * self.num_spec_tokens
+                    scheduled_spec_decode_tokens[request_id] = [-1] * pad_spec_decode
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1098,7 +1269,10 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert (
+            total_num_scheduled_tokens
+            <= self._get_effective_max_num_scheduled_tokens(dynamic_sd_early_k)
+        )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -1164,12 +1338,15 @@ class Scheduler(SchedulerInterface):
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
 
-        # Dynamic speculative decoding: compute optimal K
+        # Dynamic speculative decoding: compute optimal K. Under DP, the
+        # engine may provide a synchronized global batch pressure so every rank
+        # chooses the same K and enters the same collective/control-flow path.
         num_spec_tokens_to_schedule = self.num_spec_tokens
-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
-            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
-                len(num_scheduled_tokens)
-            ]
+        if self._dynamic_sd is not None:
+            num_spec_tokens_to_schedule = self._dynamic_sd.final_k(
+                len(num_scheduled_tokens),
+                dynamic_sd_early_k,
+            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -2007,6 +2184,29 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.add_request(request)
         else:
             self.waiting.add_request(request)
+
+    def set_dynamic_sd_batch_size_override(self, batch_size: int | None) -> None:
+        if self._dynamic_sd is not None:
+            self._dynamic_sd.set_global_batch_pressure(batch_size)
+
+    def get_num_spec_tokens_to_schedule_for_dummy_batch(self) -> int | None:
+        if self._dynamic_sd is None:
+            return self.num_spec_tokens
+        return self._dynamic_sd.last_selected_k
+
+    def get_dynamic_sd_local_batch_pressure(self) -> int:
+        """Return a cheap local decode pressure estimate for DP Dynamic SD.
+
+        This intentionally ignores newly admitted prefills. The first DP-safe
+        Dynamic SD policy targets decode-side verification width, and the
+        scheduler still keeps the static maximum lookahead/KV allocation.
+        """
+        if self._dynamic_sd is None:
+            return 0
+        num_decode_reqs = sum(
+            1 for request in self.running if not request.is_prefill_chunk
+        )
+        return min(num_decode_reqs, self.scheduler_config.max_num_seqs)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
