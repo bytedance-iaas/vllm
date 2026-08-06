@@ -8,11 +8,14 @@ tail sorted in front of the uniform decodes misclassifies every decode as a
 prefill.
 """
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
 
 
 def _make_common_attn_metadata(query_lens: list[int]) -> CommonAttentionMetadata:
@@ -68,3 +71,74 @@ def test_spec_decodes_lead_short_prefill_tail():
     )
     assert (num_decodes, num_prefills) == (8, 1)
     assert (num_decode_tokens, num_prefill_tokens) == (16, 1)
+
+
+def test_dynamic_sd_reduced_k_orders_by_runtime_verification_width():
+    # Kmax=7 would give a static decode_query_len of 8, but the current target
+    # step is verifying K=3 and therefore has a runtime query width of 4.
+    num_tokens_per_req = {"tail": 1, **{f"d{i}": 4 for i in range(8)}}
+    is_prefilling = {"tail": True, **{f"d{i}": False for i in range(8)}}
+
+    req_ids = sort_batch_req_ids(
+        num_tokens_per_req,
+        decode_query_len=4,
+        is_prefilling=is_prefilling,
+    )
+    query_lens = [num_tokens_per_req[r] for r in req_ids]
+
+    assert query_lens == [4] * 8 + [1]
+    num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+        split_decodes_and_prefills(
+            _make_common_attn_metadata(query_lens),
+            decode_threshold=4,
+            require_uniform=True,
+        )
+    )
+    assert (num_decodes, num_prefills) == (8, 1)
+    assert (num_decode_tokens, num_prefill_tokens) == (32, 1)
+
+
+def test_dynamic_sd_target_width_uses_current_drafts_not_next_proposal_k():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.decode_query_len = 8
+    runner.speculative_config = SimpleNamespace(
+        uses_dynamic_speculative_decoding=lambda: True
+    )
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.scheduled_spec_decode_tokens = {
+        "d1": [1, 2, 3],
+        "d2": [4, 5, 6],
+    }
+    # The next proposal may use another K; current target width is 3 drafts + 1.
+    scheduler_output.num_spec_tokens_to_schedule = 7
+
+    assert runner._get_target_decode_query_len(scheduler_output) == 4
+
+
+def test_dynamic_sd_k_zero_uses_request_state_for_equal_widths():
+    num_tokens_per_req = {"tail": 1, "d1": 1, "d2": 1}
+    is_prefilling = {"tail": True, "d1": False, "d2": False}
+
+    assert sort_batch_req_ids(
+        num_tokens_per_req,
+        decode_query_len=1,
+        is_prefilling=is_prefilling,
+    ) == ["d1", "d2", "tail"]
+
+
+def test_dynamic_sd_uniform_width_precedes_fallback_decode():
+    num_tokens_per_req = {"fallback": 1, "tail": 1, "d1": 4, "d2": 4}
+    is_prefilling = {
+        "fallback": False,
+        "tail": True,
+        "d1": False,
+        "d2": False,
+    }
+
+    req_ids = sort_batch_req_ids(
+        num_tokens_per_req,
+        decode_query_len=4,
+        is_prefilling=is_prefilling,
+    )
+    assert req_ids == ["d1", "d2", "fallback", "tail"]

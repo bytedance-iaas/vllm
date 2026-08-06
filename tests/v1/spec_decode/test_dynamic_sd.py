@@ -3,6 +3,7 @@
 """Regression tests for the Dynamic SD batch-size schedule helpers."""
 
 import pytest
+import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.config import (
@@ -18,6 +19,8 @@ from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 
 def _make_lookup(
@@ -198,6 +201,64 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
 
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_dflash_runtime_k_maps_to_bonus_query_width():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = False
+
+    assert speculator._get_runtime_num_speculative_tokens(None) == 7
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 4
+    assert speculator._get_num_speculative_tokens_for_query_len(4) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 1
+    assert speculator._get_num_speculative_tokens_for_query_len(1) == 0
+
+    with pytest.raises(ValueError, match="runtime_num_speculative_tokens"):
+        speculator._get_runtime_num_speculative_tokens(8)
+
+
+def test_dflash_runtime_sample_col_uses_runtime_k_stride():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.device = torch.device("cpu")
+    speculator.sample_col = torch.arange(7, dtype=torch.int32).repeat(4)
+    speculator._sample_col_steps = torch.arange(7, dtype=torch.int32)
+    speculator._runtime_sample_col = torch.empty(4 * 7, dtype=torch.int32)
+
+    sample_col = speculator._get_sample_col_for_k(num_reqs=3, num_speculative_tokens=3)
+
+    assert sample_col.tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    assert speculator._get_sample_col_for_k(2, 0).numel() == 0
+    assert speculator._get_sample_col_for_k(2, 7).tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+
+
+def test_dspark_runtime_k_maps_to_anchor_query_width():
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = True
+
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 3
+    assert speculator._get_num_speculative_tokens_for_query_len(3) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 0
+    assert speculator._get_num_speculative_tokens_for_query_len(0) == 0
 
 
 def test_scheduler_uses_dsd_batch_size_override():
