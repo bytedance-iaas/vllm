@@ -5,3 +5,7 @@ self-hosted-runner:
     - vllm-runners
     # Not yet in actionlint's known-label set.
     - macos-26
+    - x64-vllm-wheel-build-node
+    - vllm-byteiaas-build-01
+    - x64-vllm-docker-build-node
+    - vllm-byteiaas-build-02

@@ -78,6 +78,7 @@ ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_INDEX_URL=${PIP_INDEX_URL}
 ARG UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ARG UV_VERSION=0.11.25
 
 # PyTorch provides its own indexes for standard and nightly builds
 ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
@@ -95,6 +96,13 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+# Flag enables vllm-router in openai-style images for PD routing deployments
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_VERSION=0.1.15
+
+# Flag enables source-built HPC-Ops in openai-style images
+ARG INSTALL_HPC_OPS=false
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -109,6 +117,10 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
+ARG UV_VERSION
+ARG DEADSNAKES_MIRROR_URL
+ARG DEADSNAKES_GPGKEY_URL
+ARG DEEPGEMM_PYTHON_VERSIONS=3.10,3.11,3.12,3.13,3.14
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -122,6 +134,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # See #15174, #15359, #31959. Child stages inherit these via Dockerfile
 # `ENV` unless they override them explicitly.
 ENV UV_HTTP_TIMEOUT=500
+ENV UV_NATIVE_TLS=true
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/uv/cache
@@ -130,7 +143,7 @@ ENV PATH="/opt/venv/bin:/opt/uv/bin:$PATH"
 ENV VIRTUAL_ENV="/opt/venv"
 
 # Install system dependencies including build tools.
-# The Ubuntu path uses apt + deadsnakes-via-uv for Python; the manylinux path
+# The Ubuntu path installs Python locally via apt/deadsnakes; the manylinux path
 # (AlmaLinux 8, e.g. pytorch/manylinux2_28-builder) uses dnf and the Python
 # interpreters pre-installed at /opt/python/cpXY-cpXY/.
 RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
@@ -162,10 +175,35 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
             gcc-11 \
             g++-11 \
         && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 \
-        # Install python dev headers if available (needed for cmake FindPython on Ubuntu 24.04
-        # which ships cmake 3.28 and requires Development.SABIModule; silently skipped on
-        # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
-        && (apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
+        && deepgemm_python_versions="$(printf '%s' "${DEEPGEMM_PYTHON_VERSIONS}" | tr ',' ' ')" \
+        && python_versions="$(printf '%s\n' ${PYTHON_VERSION} ${deepgemm_python_versions} | awk '!seen[$0]++')" \
+        && needs_deadsnakes=0 \
+        && for py_version in ${python_versions}; do \
+            if ! apt-cache show "python${py_version}-dev" >/dev/null 2>&1; then \
+                needs_deadsnakes=1; \
+            fi; \
+        done \
+        && if [ "${needs_deadsnakes}" = "1" ]; then \
+            if [ -n "${DEADSNAKES_MIRROR_URL:-}" ]; then \
+                if [ -n "${DEADSNAKES_GPGKEY_URL:-}" ]; then \
+                    mkdir -p -m 0755 /etc/apt/keyrings \
+                    && curl -L "${DEADSNAKES_GPGKEY_URL}" | gpg --dearmor > /etc/apt/keyrings/deadsnakes.gpg \
+                    && chmod 644 /etc/apt/keyrings/deadsnakes.gpg \
+                    && echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list; \
+                fi; \
+            else \
+                for i in 1 2 3; do \
+                    add-apt-repository -y ppa:deadsnakes/ppa && break || \
+                    { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+                done; \
+            fi \
+            && apt-get update -y; \
+        fi \
+        && python_packages="" \
+        && for py_version in ${python_versions}; do \
+            python_packages="${python_packages} python${py_version} python${py_version}-dev python${py_version}-venv"; \
+        done \
+        && apt-get install -y --no-install-recommends ${python_packages} \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -191,10 +229,19 @@ ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 
 # Install uv and bootstrap /opt/venv. Both paths converge on /opt/venv so all
-# downstream stages stay distro-agnostic.
+# downstream stages stay distro-agnostic. Install uv through pip instead of the
+# astral installer so CI does not depend on downloading release tarballs.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && if [ "${BUILD_OS}" = "manylinux" ]; then \
+           PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
+           && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
+           && "$MANYLINUX_PY" -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+           && ln -sf "/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/uv" "${UV_INSTALL_DIR}/uv"; \
+       else \
+           python3 -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+           && ln -sf "$(command -v uv)" "${UV_INSTALL_DIR}/uv"; \
+       fi \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
@@ -204,10 +251,22 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
            # at the matching interpreter rather than letting it fetch one.
            PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
            && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
-           && uv venv --seed /opt/venv --python "$MANYLINUX_PY"; \
+           && venv_python="$MANYLINUX_PY"; \
        else \
-           uv venv --seed /opt/venv --python ${PYTHON_VERSION}; \
+           venv_python="/usr/bin/python${PYTHON_VERSION}"; \
        fi \
+    && for attempt in 1 2 3 4 5; do \
+           timeout 600s uv venv --seed /opt/venv --python "${venv_python}" && break; \
+           rc=$?; \
+           if [ "${attempt}" = "5" ]; then \
+               exit "${rc}"; \
+           fi; \
+           echo "uv venv failed on attempt ${attempt}/5; cleaning partial state and retrying..." >&2; \
+           rm -rf /opt/venv "${UV_PYTHON_INSTALL_DIR}/.temp" "${UV_CACHE_DIR:?}"/*; \
+           sleep $((attempt * 30)); \
+       done \
+    && /opt/venv/bin/python3 -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+    && ln -sf /opt/venv/bin/uv "${UV_INSTALL_DIR}/uv" \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -sf /opt/venv/bin/python3-config /usr/bin/python3-config \
@@ -421,9 +480,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # DEEPGEMM_PYTHON_INTERPRETERS to build DeepGEMM `_C` for each. See
 # cmake/external_projects/deepgemm.cmake for the full picture.
 COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+ENV DEEPGEMM_PYTHON_VERSIONS=${DEEPGEMM_PYTHON_VERSIONS}
 ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
 RUN --mount=type=cache,target=/root/.cache/uv \
-    tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
+    tools/setup_deepgemm_pythons.sh $(printf '%s' "${DEEPGEMM_PYTHON_VERSIONS}" | tr ',' ' ') > /tmp/dg_pythons.txt \
+    && echo "DeepGEMM Python interpreters: $(cat /tmp/dg_pythons.txt)"
 
 # Build the vLLM wheel
 # if USE_SCCACHE is set, use sccache to speed up compilation
@@ -493,6 +554,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
 ARG TARGETPLATFORM
+ARG INSTALL_HPC_OPS
+ARG HPC_OPS_REPO
+ARG HPC_OPS_REF
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -566,6 +630,33 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Record the wheel checksum so downstream stages can bust their layer cache
 # when the wheel changes, without copying the wheel itself into the image.
 RUN sha256sum dist/*.whl > dist/wheel.sha256
+
+# Optionally build HPC-Ops alongside vLLM. ByteIAAS enables this for its
+# OpenAI images; other builds retain the existing behavior by default.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    mkdir -p /tmp/hpc-ops-dist && \
+    if [ "${INSTALL_HPC_OPS:-false}" = "true" ]; then \
+        test "${TARGETPLATFORM}" = "linux/amd64" && \
+        test -n "${HPC_OPS_REPO}" && \
+        test -n "${HPC_OPS_REF}" && \
+        printf '%s\n' "${HPC_OPS_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
+        test -f /usr/local/cuda/include/cusparse.h && \
+        test -f /usr/local/cuda/include/cusolverDn.h && \
+        git init /tmp/hpc-ops-src && \
+        git -C /tmp/hpc-ops-src remote add origin "${HPC_OPS_REPO}" && \
+        git -C /tmp/hpc-ops-src fetch --no-tags --depth 1 origin \
+            "${HPC_OPS_REF}" && \
+        git -C /tmp/hpc-ops-src checkout --detach FETCH_HEAD && \
+        test "$(git -C /tmp/hpc-ops-src rev-parse HEAD)" = "${HPC_OPS_REF}" && \
+        cd /tmp/hpc-ops-src && \
+        CUDA_VISIBLE_DEVICES="" python3 -m build --wheel --no-isolation && \
+        cp dist/*.whl /tmp/hpc-ops-dist/ && \
+        sha256sum /tmp/hpc-ops-dist/*.whl \
+            > /tmp/hpc-ops-dist/wheels.sha256 && \
+        rm -rf /tmp/hpc-ops-src; \
+    else \
+        printf 'disabled\n' > /tmp/hpc-ops-dist/wheels.sha256; \
+    fi
 
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
@@ -980,11 +1071,18 @@ RUN mv vllm src/vllm
 FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
+ARG INSTALL_VLLM_ROUTER=false
+ARG INSTALL_HPC_OPS
+ARG HPC_OPS_REF
+ARG VLLM_ROUTER_VERSION=0.1.15
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
+ARG DEEPGEMM_WHEEL_X86_64
+ARG DEEPGEMM_WHEEL_X86_64_SHA256
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -999,6 +1097,7 @@ ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
+    set -e; \
     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
     CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-'); \
     CUDA_HOME=/usr/local/cuda; \
@@ -1018,6 +1117,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         ); \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
         uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
+        if [ "${CUDA_MAJOR}" = "13" ]; then \
+            uv pip uninstall --system mooncake-transfer-engine || true; \
+            uv pip install --system --no-deps "mooncake-transfer-engine-cuda13>=0.3.8"; \
+        fi; \
     fi
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the
@@ -1042,12 +1145,46 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
+# Install the DeepGEMM fork wheel at image build time when the deployment
+# requires fork-only MegaMoE SM90 APIs. vLLM prefers site-packages deep_gemm
+# over its vendored fallback, so this keeps runtime manifests free of hotfixes.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$TARGETPLATFORM" = "linux/amd64" ] && [ -n "${DEEPGEMM_WHEEL_X86_64}" ]; then \
+        test -n "${DEEPGEMM_WHEEL_X86_64_SHA256}" || \
+            { echo "DEEPGEMM_WHEEL_X86_64_SHA256 is required when DEEPGEMM_WHEEL_X86_64 is set" >&2; exit 1; }; \
+        DEEPGEMM_WHEEL_PATH=/tmp/deep_gemm-2.5.0+local-260630mega_moe-cp312-cp312-linux_x86_64.whl; \
+        curl -fL --retry 3 --output "${DEEPGEMM_WHEEL_PATH}" "${DEEPGEMM_WHEEL_X86_64}" && \
+        echo "${DEEPGEMM_WHEEL_X86_64_SHA256}  ${DEEPGEMM_WHEEL_PATH}" | sha256sum --check --strict - && \
+        uv pip install --system "${DEEPGEMM_WHEEL_PATH}" && \
+        python3 -c 'import deep_gemm; required = ["get_symm_buffer_for_mega_moe", "transform_sf_into_required_layout", "transform_weights_for_mega_moe_sm90", "transform_weights_for_mega_moe_sm90_fp4", "fp8_mega_moe", "fp8_fp4_mega_moe"]; missing = [name for name in required if not hasattr(deep_gemm, name)]; assert not missing, f"DeepGEMM wheel missing required MegaMoE symbols: {missing}"; print("DeepGEMM MegaMoE symbols verified")' && \
+        rm -f "${DEEPGEMM_WHEEL_PATH}"; \
+    fi
+
+# Install the optional source-built HPC-Ops wheel. Copy only its checksum so
+# wheel changes invalidate this layer without retaining the wheel in the image.
+COPY --from=build /tmp/hpc-ops-dist/wheels.sha256 /tmp/hpc-ops-wheels.sha256
+RUN --mount=type=bind,from=build,src=/tmp/hpc-ops-dist,target=/tmp/hpc-ops-dist \
+    --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_HPC_OPS:-false}" = "true" ]; then \
+        uv pip install --system --no-deps /tmp/hpc-ops-dist/*.whl && \
+        HPC_OPS_EXPECTED_REF="${HPC_OPS_REF}" python3 -c 'import inspect, os, torch; import hpc; from hpc.version import git_hash; from vllm.utils.hpc import has_hpc; required = ["fuse_moe", "fuse_moe_blockwise", "fuse_moe_blockwise_fp8"]; missing = [name for name in required if not hasattr(hpc, name)]; assert not missing, f"HPC-Ops wheel missing required symbols: {missing}"; assert git_hash == os.environ["HPC_OPS_EXPECTED_REF"][:7]; assert "activation_clamp" in inspect.signature(hpc.fuse_moe_blockwise).parameters; assert hasattr(torch.ops.hpc, "fuse_moe_blockwise"); assert has_hpc(); print(f"HPC-Ops {hpc.__version__} verified for vLLM")'; \
+    fi
+
+# Install vllm-router in ByteIAAS PD images so router pods do not need runtime
+# network access before their liveness probes start.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$INSTALL_VLLM_ROUTER" = "true" ]; then \
+        uv pip install --system "vllm-router==${VLLM_ROUTER_VERSION}" && \
+        command -v vllm-router && \
+        python3 -m pip show vllm-router >/dev/null; \
+    fi
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-openai:dev}
-LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       org.opencontainers.image.url="${VLLM_BUILD_URL}" \

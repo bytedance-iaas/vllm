@@ -1,0 +1,82 @@
+name: ByteIAAS vLLM Release Build
+
+on:
+  push:
+    tags:
+      - "v[0-9]+*"
+      - "[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing git tag to release when dispatching from iaas_main"
+        required: false
+        default: ""
+      vllm_version:
+        description: "Optional vLLM version override for image tag generation"
+        required: false
+        default: ""
+
+concurrency:
+  group: byteiaas-vllm-release-${{ github.event.inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-release:
+    if: github.repository == 'bytedance-iaas/vllm'
+    runs-on: ubuntu-22.04
+    outputs:
+      internal_tag: ${{ steps.release.outputs.internal_tag }}
+      checkout_ref: ${{ steps.release.outputs.checkout_ref }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve existing release tag
+        id: release
+        env:
+          REQUESTED_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          raw_tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${REQUESTED_RELEASE_TAG}" ]; then
+            raw_tag="${REQUESTED_RELEASE_TAG}"
+          fi
+          raw_tag="${raw_tag#refs/tags/}"
+          if [ -z "${raw_tag}" ] || ! git rev-parse -q --verify "refs/tags/${raw_tag}" >/dev/null; then
+            echo "::error::ByteIAAS release publishing requires an existing git tag ref"
+            exit 1
+          fi
+          internal_tag="${raw_tag#v}"
+          if ! echo "${internal_tag}" | grep -qE '^[0-9A-Za-z][0-9A-Za-z_.-]*$'; then
+            echo "::error::Invalid internal tag value: ${internal_tag}"
+            exit 1
+          fi
+          echo "internal_tag=${internal_tag}" >> "${GITHUB_OUTPUT}"
+          echo "checkout_ref=refs/tags/${raw_tag}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved existing release tag ${raw_tag}"
+          echo "Build checkout ref refs/tags/${raw_tag}"
+
+  build-wheel:
+    if: github.repository == 'bytedance-iaas/vllm'
+    needs: resolve-release
+    uses: ./.github/workflows/_byteiaas-build-wheel.yml
+    with:
+      checkout_ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+      cuda_version: "13.0.2"
+      artifact_name: vllm-cu130-wheel-release-${{ needs.resolve-release.outputs.internal_tag }}
+
+  build-image:
+    if: github.repository == 'bytedance-iaas/vllm'
+    needs: resolve-release
+    uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
+    with:
+      checkout_ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+      cuda_version: "13.0.2"
+      tag_mode: release
+      tag_value: ${{ needs.resolve-release.outputs.internal_tag }}
+      vllm_version: ${{ github.event.inputs.vllm_version || '' }}
+    secrets: inherit
