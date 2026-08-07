@@ -1172,12 +1172,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 # Install the optional source-built HPC-Ops wheel. Copy only its checksum so
 # wheel changes invalidate this layer without retaining the wheel in the image.
+# Docker build has no NVIDIA driver, so inspect the package without importing it.
 COPY --from=build /tmp/hpc-ops-dist/wheels.sha256 /tmp/hpc-ops-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/hpc-ops-dist,target=/tmp/hpc-ops-dist \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_HPC_OPS:-false}" = "true" ]; then \
         uv pip install --system --no-deps /tmp/hpc-ops-dist/*.whl && \
-        HPC_OPS_EXPECTED_REF="${HPC_OPS_REF}" python3 -c 'import inspect, os, torch; import hpc; from hpc.version import git_hash; from vllm.utils.hpc import has_hpc; required = ["fuse_moe", "fuse_moe_blockwise", "fuse_moe_blockwise_fp8"]; missing = [name for name in required if not hasattr(hpc, name)]; assert not missing, f"HPC-Ops wheel missing required symbols: {missing}"; assert git_hash == os.environ["HPC_OPS_EXPECTED_REF"][:7]; assert "activation_clamp" in inspect.signature(hpc.fuse_moe_blockwise).parameters; assert hasattr(torch.ops.hpc, "fuse_moe_blockwise"); assert has_hpc(); print(f"HPC-Ops {hpc.__version__} verified for vLLM")'; \
+        HPC_OPS_EXPECTED_REF="${HPC_OPS_REF}" python3 -c 'import ast, os; from importlib.metadata import distribution; dist = distribution("hpc-ops"); files = {str(path) for path in dist.files or ()}; required_files = {"hpc/_C.abi3.so", "hpc/fuse_moe.py"}; missing_files = required_files - files; assert not missing_files, f"HPC-Ops wheel missing required files: {sorted(missing_files)}"; expected_hash = os.environ["HPC_OPS_EXPECTED_REF"][:7]; assert dist.version.endswith(f"+g{expected_hash}"), f"HPC-Ops version {dist.version} does not match {expected_hash}"; tree = ast.parse(dist.locate_file("hpc/fuse_moe.py").read_text()); functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}; required_functions = {"fuse_moe", "fuse_moe_blockwise", "fuse_moe_blockwise_fp8"}; missing_functions = required_functions - functions.keys(); assert not missing_functions, f"HPC-Ops wheel missing required functions: {sorted(missing_functions)}"; parameters = {arg.arg for arg in functions["fuse_moe_blockwise"].args.args}; assert "activation_clamp" in parameters; print(f"HPC-Ops {dist.version} package verified for vLLM")'; \
     fi
 
 # Install vllm-router in ByteIAAS PD images so router pods do not need runtime
