@@ -7,8 +7,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from vllm.config import CacheConfig
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
+from vllm.config import CacheConfig
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import get_draft_cache_config
 
 pytestmark = pytest.mark.cpu_test
@@ -104,9 +104,7 @@ def _install_load_dflash_import_stubs(monkeypatch, *, has_non_causal: bool):
     monkeypatch.setitem(sys.modules, "vllm.compilation.backends", backend_module)
 
     qwen3_dflash_module = ModuleType("vllm.model_executor.models.qwen3_dflash")
-    qwen3_dflash_module.dflash_has_any_non_causal = (
-        lambda _hf_config: has_non_causal
-    )
+    qwen3_dflash_module.dflash_has_any_non_causal = lambda _hf_config: has_non_causal
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.models.qwen3_dflash",
