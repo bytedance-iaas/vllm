@@ -34,18 +34,35 @@ def _uses_parallel_draft_full_k_warmup(model_runner: GPUModelRunner) -> bool:
     )
 
 
+def _parallel_draft_full_k_warmup_req_id(
+    req_id_prefix: str = "_warmup_parallel_draft_full_k",
+) -> str:
+    return f"{req_id_prefix}_0_"
+
+
+def _cleanup_warmup_requests(
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    req_ids: set[str],
+) -> None:
+    if not req_ids:
+        return
+    cleanup_output = SchedulerOutput.make_empty()
+    cleanup_output.finished_req_ids = set(req_ids)
+    worker_execute_model(cleanup_output)
+
+
 def _run_parallel_draft_full_k_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
     *,
     req_id_prefix: str = "_warmup_parallel_draft_full_k",
-) -> set[str]:
+) -> str:
     """Warm up the real one-target-token/full-K proposer path."""
 
     prompt_len = 2
     prompt_token_ids = list(range(prompt_len))
-    req_id = f"{req_id_prefix}_0_"
+    req_id = _parallel_draft_full_k_warmup_req_id(req_id_prefix)
     sampling_params = SamplingParams.for_sampler_warmup()
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
@@ -107,7 +124,7 @@ def _run_parallel_draft_full_k_warmup(
     worker_sample_tokens(None)
     worker_execute_model(decode_output)
     worker_sample_tokens(None)
-    return {req_id}
+    return req_id
 
 
 def run_mixed_prefill_decode_warmup(
@@ -358,112 +375,139 @@ def warmup_kernels(
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
+    generic_finished_req_ids = set(req_ids)
+    parallel_finished_req_ids: set[str] = set()
+    parallel_warmup_attempted = False
+    startup_num_spec_tokens = getattr(
+        model_runner, "last_completed_num_spec_tokens_to_schedule", 0
+    )
+
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
-    worker_execute_model(prefill_output)
+    try:
+        worker_execute_model(prefill_output)
 
-    extra_finished_req_ids: set[str] = set()
-    if not model_runner.is_pooling_model:
-        # Warm up sampler and perform a decode step for non-pooling models.
+        if not model_runner.is_pooling_model:
+            # Warm up sampler and perform a decode step for non-pooling models.
 
-        grammar_output = None
-        if model_runner.is_last_pp_rank:
-            # Build a GrammarOutput to exercise the structured output bitmask
-            # kernel during the prefill step.
-            vocab_size = model_runner.model_config.get_vocab_size()
-            bitmask_width = (vocab_size + 31) // 32
-            grammar_bitmask = np.full(
-                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
-            )
-            grammar_output = GrammarOutput(
-                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
-            )
-
-        worker_sample_tokens(grammar_output)
-
-        # Per-request state carried across the decode steps.
-        req_computed = [prompt_len] * num_reqs
-        req_blocks = [list(prefill_block_counts) for _ in range(num_reqs)]
-
-        def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
-            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`."""
-            cached_req_data = CachedRequestData.make_empty()
-            cached_req_data.req_ids = [req_ids[i] for i in indices]
-            cached_req_data.num_computed_tokens = [req_computed[i] for i in indices]
-            cached_req_data.num_output_tokens = [1] * len(indices)
-            cached_req_data.new_block_ids = []
-
-            step_num_scheduled_tokens: dict[str, int] = {}
-            step_spec_tokens: dict[str, list[int]] = {}
-            for i, use_spec in zip(indices, spec_flags):
-                num_tokens = decode_query_len if use_spec else 1
-                after = req_computed[i] + num_tokens
-                deltas = [
-                    _warmup_block_count(after, spec) - held
-                    for spec, held in zip(kv_cache_specs, req_blocks[i])
-                ]
-                cached_req_data.new_block_ids.append(
-                    tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
+            grammar_output = None
+            if model_runner.is_last_pp_rank:
+                # Build a GrammarOutput to exercise the structured output bitmask
+                # kernel during the prefill step.
+                vocab_size = model_runner.model_config.get_vocab_size()
+                bitmask_width = (vocab_size + 31) // 32
+                grammar_bitmask = np.full(
+                    (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
                 )
-                req_blocks[i] = [
-                    held + delta for held, delta in zip(req_blocks[i], deltas)
-                ]
-                step_num_scheduled_tokens[req_ids[i]] = num_tokens
-                if use_spec:
-                    step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
+                grammar_output = GrammarOutput(
+                    structured_output_request_ids=req_ids,
+                    grammar_bitmask=grammar_bitmask,
+                )
 
-            decode_output = SchedulerOutput.make_empty()
-            decode_output.scheduled_cached_reqs = cached_req_data
-            decode_output.num_scheduled_tokens = step_num_scheduled_tokens
-            decode_output.scheduled_spec_decode_tokens = step_spec_tokens
-            decode_output.total_num_scheduled_tokens = sum(
-                step_num_scheduled_tokens.values()
-            )
-            decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            worker_sample_tokens(grammar_output)
 
-            worker_execute_model(decode_output)
-            worker_sample_tokens(None)
+            # Per-request state carried across the decode steps.
+            req_computed = [prompt_len] * num_reqs
+            req_blocks = [list(prefill_block_counts) for _ in range(num_reqs)]
 
-            for i, use_spec in zip(indices, spec_flags):
-                req_computed[i] += decode_query_len if use_spec else 1
+            def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
+                """Decode `indices`, spec-decoding the ones flagged."""
+                cached_req_data = CachedRequestData.make_empty()
+                cached_req_data.req_ids = [req_ids[i] for i in indices]
+                cached_req_data.num_computed_tokens = [req_computed[i] for i in indices]
+                cached_req_data.num_output_tokens = [1] * len(indices)
+                cached_req_data.new_block_ids = []
 
-        all_indices = list(range(num_reqs))
-        use_spec_decode = num_spec_steps > 0
+                step_num_scheduled_tokens: dict[str, int] = {}
+                step_spec_tokens: dict[str, list[int]] = {}
+                for i, use_spec in zip(indices, spec_flags):
+                    num_tokens = decode_query_len if use_spec else 1
+                    after = req_computed[i] + num_tokens
+                    deltas = [
+                        _warmup_block_count(after, spec) - held
+                        for spec, held in zip(kv_cache_specs, req_blocks[i])
+                    ]
+                    cached_req_data.new_block_ids.append(
+                        tuple(_alloc_blocks(n) for n in deltas) if any(deltas) else None
+                    )
+                    req_blocks[i] = [
+                        held + delta for held, delta in zip(req_blocks[i], deltas)
+                    ]
+                    step_num_scheduled_tokens[req_ids[i]] = num_tokens
+                    if use_spec:
+                        step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
 
-        # Decode steps to warm, as (request indices, per-request spec flag).
-        # Under spec decoding the scheduler drops requests the drafter proposed
-        # nothing for, so warm each batch shape with and without draft tokens.
-        decode_steps: list[tuple[list[int], list[bool]]] = [
-            (all_indices, [use_spec_decode] * num_reqs),
-        ]
-        if num_reqs >= 2:
-            # Mixed spec / non-spec: GDN and KDA reclassify the non-spec decode
-            # as a prefill and split the batch into spec/non-spec token indices.
-            decode_steps.append(([0, 1], [use_spec_decode, False]))
-            if use_spec_decode:
-                # Exercise the model paths that split a batch by whether each
-                # request received draft tokens.
-                decode_steps.append(([0, 1], [False, False]))
-        if num_reqs > 1:
-            decode_steps.append(([0], [use_spec_decode]))
-            if use_spec_decode:
+                decode_output = SchedulerOutput.make_empty()
+                decode_output.scheduled_cached_reqs = cached_req_data
+                decode_output.num_scheduled_tokens = step_num_scheduled_tokens
+                decode_output.scheduled_spec_decode_tokens = step_spec_tokens
+                decode_output.total_num_scheduled_tokens = sum(
+                    step_num_scheduled_tokens.values()
+                )
+                decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+                worker_execute_model(decode_output)
+                worker_sample_tokens(None)
+
+                for i, use_spec in zip(indices, spec_flags):
+                    req_computed[i] += decode_query_len if use_spec else 1
+
+            all_indices = list(range(num_reqs))
+            use_spec_decode = num_spec_steps > 0
+
+            # Warm every decode batch shape, with and without draft tokens.
+            decode_steps: list[tuple[list[int], list[bool]]] = [
+                (all_indices, [use_spec_decode] * num_reqs),
+            ]
+            if num_reqs >= 2:
+                decode_steps.append(([0, 1], [use_spec_decode, False]))
+                if use_spec_decode:
+                    decode_steps.append(([0, 1], [False, False]))
+            if num_reqs > 1:
+                decode_steps.append(([0], [use_spec_decode]))
+                if use_spec_decode:
+                    decode_steps.append(([0], [False]))
+            elif use_spec_decode:
                 decode_steps.append(([0], [False]))
-        elif use_spec_decode:
-            decode_steps.append(([0], [False]))
 
-        for step_indices, step_spec_flags in decode_steps:
-            _run_decode_step(step_indices, step_spec_flags)
+            for step_indices, step_spec_flags in decode_steps:
+                _run_decode_step(step_indices, step_spec_flags)
 
-        if _uses_parallel_draft_full_k_warmup(model_runner):
-            extra_finished_req_ids = _run_parallel_draft_full_k_warmup(
-                model_runner,
-                worker_execute_model,
-                worker_sample_tokens,
+            _cleanup_warmup_requests(worker_execute_model, generic_finished_req_ids)
+            generic_finished_req_ids = set()
+
+            if _uses_parallel_draft_full_k_warmup(model_runner):
+                parallel_warmup_attempted = True
+                parallel_finished_req_ids = {_parallel_draft_full_k_warmup_req_id()}
+                _run_parallel_draft_full_k_warmup(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                )
+                _cleanup_warmup_requests(
+                    worker_execute_model, parallel_finished_req_ids
+                )
+                parallel_finished_req_ids = set()
+
+        if generic_finished_req_ids:
+            _cleanup_warmup_requests(worker_execute_model, generic_finished_req_ids)
+            generic_finished_req_ids = set()
+    finally:
+        if generic_finished_req_ids:
+            try:
+                _cleanup_warmup_requests(worker_execute_model, generic_finished_req_ids)
+            except Exception:
+                logger.exception("Failed to clean up generic warmup requests.")
+        if parallel_finished_req_ids:
+            try:
+                _cleanup_warmup_requests(
+                    worker_execute_model, parallel_finished_req_ids
+                )
+            except Exception:
+                logger.exception("Failed to clean up parallel-draft warmup request.")
+        if parallel_warmup_attempted:
+            model_runner.last_completed_num_spec_tokens_to_schedule = (
+                startup_num_spec_tokens
             )
-
-    # Clean up - process finish_req_ids.
-    cleanup_output = SchedulerOutput.make_empty()
-    cleanup_output.finished_req_ids = set(req_ids) | extra_finished_req_ids
-    worker_execute_model(cleanup_output)
-    model_runner.kv_connector.set_disabled(False)
+        model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
