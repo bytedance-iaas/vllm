@@ -28,6 +28,23 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _set_draft_query_padding_mask(
+    input_buffers: InputBuffers,
+    num_query_tokens: int,
+    num_tokens_padded: int,
+    *,
+    dummy_run: bool,
+) -> torch.Tensor:
+    assert 0 <= num_query_tokens <= num_tokens_padded <= input_buffers.max_num_tokens
+    is_padding = input_buffers.is_padding[:num_tokens_padded]
+    if dummy_run:
+        is_padding.fill_(True)
+    else:
+        is_padding[:num_query_tokens].fill_(False)
+        is_padding[num_query_tokens:].fill_(True)
+    return is_padding
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -288,6 +305,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_padding=self.input_buffers.is_padding[:num_tokens],
         ):
             last_hidden_states = self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
@@ -423,6 +441,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
+            _set_draft_query_padding_mask(
+                self.input_buffers,
+                num_query_tokens,
+                num_query_tokens,
+                dummy_run=True,
+            )
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
@@ -518,6 +542,13 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
+
+        _set_draft_query_padding_mask(
+            self.input_buffers,
+            num_query_tokens,
+            num_tokens_padded,
+            dummy_run=dummy_run,
+        )
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.

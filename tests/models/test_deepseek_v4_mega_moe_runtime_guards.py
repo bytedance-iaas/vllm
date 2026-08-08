@@ -603,3 +603,125 @@ def test_sm90_fp8_dispatch_preserves_weight_scale_pairs(monkeypatch):
     assert args[1] is l1_weights
     assert args[2] is l2_weights
     assert kwargs["recipe"] == (128, 128, 128)
+
+
+def test_sm100_run_mega_moe_forwards_padding_mask_to_prepare(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.eplb_state = SimpleNamespace(logical_to_physical_map=None)
+    experts._use_sm90_mega_moe = False
+    experts._transformed_l1_weights = object()
+    experts._transformed_l2_weights = object()
+    monkeypatch.setattr(experts, "finalize_weights", lambda: None)
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda n: SimpleNamespace(
+            x=torch.empty(n, 4),
+            x_sf=torch.empty(n, 1),
+            topk_idx=torch.empty(n, 2, dtype=torch.int64),
+            topk_weights=torch.empty(n, 2),
+        ),
+    )
+    monkeypatch.setattr(dsv4_model.envs, "VLLM_MOE_SKIP_PADDING", True)
+
+    captured = {}
+
+    def fake_prepare(*args, **kwargs):
+        captured["is_padding"] = kwargs["is_padding"]
+
+    monkeypatch.setattr(dsv4_model, "prepare_megamoe_inputs", fake_prepare)
+
+    calls = []
+
+    class FakeDeepGemm:
+        def fp8_fp4_mega_moe(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+
+    hidden_states = torch.randn(3, 4)
+    topk_weights = torch.randn(3, 2)
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64)
+    y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+    is_padding = torch.tensor([False, True, True], dtype=torch.bool)
+
+    with override_forward_context(SimpleNamespace(is_padding=is_padding)):
+        experts._run_mega_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            y,
+            activation_clamp=None,
+            fast_math=True,
+        )
+
+    assert len(calls) == 1
+    torch.testing.assert_close(captured["is_padding"], is_padding)
+
+
+def test_sm90_run_mega_moe_uses_skip_padding_sentinel_for_idle_rows(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.eplb_state = SimpleNamespace(logical_to_physical_map=None)
+    experts._use_sm90_mega_moe = True
+    experts._use_sm90_fp4_mega_moe = True
+    experts._transformed_l1_weights = object()
+    experts._transformed_l2_weights = object()
+    monkeypatch.setattr(experts, "finalize_weights", lambda: None)
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda n: SimpleNamespace(
+            x=torch.empty(n, 4),
+            x_sf=torch.empty(n, 1),
+            topk_idx=torch.empty(n, 2, dtype=torch.int64),
+            topk_weights=torch.empty(n, 2),
+        ),
+    )
+    monkeypatch.setattr(dsv4_model.envs, "VLLM_MOE_SKIP_PADDING", True)
+
+    captured = {}
+
+    def fake_prepare(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *args,
+        **kwargs,
+    ):
+        captured["topk_ids"] = topk_ids.clone()
+        captured["topk_weights"] = topk_weights.clone()
+
+    monkeypatch.setattr(dsv4_model, "prepare_megamoe_inputs_sm90", fake_prepare)
+
+    class FakeDeepGemm:
+        def fp8_fp4_mega_moe(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+
+    hidden_states = torch.randn(2, 4)
+    topk_weights = torch.tensor([[0.3, 0.7], [0.4, 0.6]], dtype=torch.float32)
+    topk_ids = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64)
+    y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+    is_padding = torch.tensor([True, True], dtype=torch.bool)
+
+    with override_forward_context(SimpleNamespace(is_padding=is_padding)):
+        experts._run_mega_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            y,
+            activation_clamp=None,
+            fast_math=True,
+        )
+
+    assert torch.equal(captured["topk_ids"], torch.full_like(topk_ids, -1))
+    assert torch.equal(captured["topk_weights"], torch.zeros_like(topk_weights))
