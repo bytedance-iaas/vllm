@@ -34,18 +34,35 @@ def _uses_parallel_draft_full_k_warmup(model_runner: GPUModelRunner) -> bool:
     )
 
 
+def _parallel_draft_full_k_warmup_req_id(
+    req_id_prefix: str = "_warmup_parallel_draft_full_k",
+) -> str:
+    return f"{req_id_prefix}_0_"
+
+
+def _cleanup_warmup_requests(
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    req_ids: set[str],
+) -> None:
+    if not req_ids:
+        return
+    cleanup_output = SchedulerOutput.make_empty()
+    cleanup_output.finished_req_ids = set(req_ids)
+    worker_execute_model(cleanup_output)
+
+
 def _run_parallel_draft_full_k_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
     *,
     req_id_prefix: str = "_warmup_parallel_draft_full_k",
-) -> set[str]:
+) -> str:
     """Warm up the real one-target-token/full-K proposer path."""
 
     prompt_len = 2
     prompt_token_ids = list(range(prompt_len))
-    req_id = f"{req_id_prefix}_0_"
+    req_id = _parallel_draft_full_k_warmup_req_id(req_id_prefix)
     sampling_params = SamplingParams.for_sampler_warmup()
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
@@ -107,7 +124,7 @@ def _run_parallel_draft_full_k_warmup(
     worker_sample_tokens(None)
     worker_execute_model(decode_output)
     worker_sample_tokens(None)
-    return {req_id}
+    return req_id
 
 
 def run_mixed_prefill_decode_warmup(
@@ -345,67 +362,102 @@ def warmup_kernels(
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
+    generic_finished_req_ids = set(req_ids)
+    parallel_finished_req_ids: set[str] = set()
+    parallel_warmup_attempted = False
+    startup_num_spec_tokens = getattr(
+        model_runner, "last_completed_num_spec_tokens_to_schedule", 0
+    )
+
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
-    worker_execute_model(prefill_output)
+    try:
+        worker_execute_model(prefill_output)
 
-    extra_finished_req_ids: set[str] = set()
-    if not model_runner.is_pooling_model:
-        # Warm up sampler and perform a decode step for non-pooling models.
+        if not model_runner.is_pooling_model:
+            # Warm up sampler and perform a decode step for non-pooling models.
 
-        grammar_output = None
-        if model_runner.is_last_pp_rank:
-            # Build a GrammarOutput to exercise the structured output bitmask
-            # kernel during the prefill step.
-            vocab_size = model_runner.model_config.get_vocab_size()
-            bitmask_width = (vocab_size + 31) // 32
-            grammar_bitmask = np.full(
-                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
-            )
-            grammar_output = GrammarOutput(
-                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
-            )
+            grammar_output = None
+            if model_runner.is_last_pp_rank:
+                # Build a GrammarOutput to exercise the structured output bitmask
+                # kernel during the prefill step.
+                vocab_size = model_runner.model_config.get_vocab_size()
+                bitmask_width = (vocab_size + 31) // 32
+                grammar_bitmask = np.full(
+                    (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
+                )
+                grammar_output = GrammarOutput(
+                    structured_output_request_ids=req_ids,
+                    grammar_bitmask=grammar_bitmask,
+                )
 
-        worker_sample_tokens(grammar_output)
+            worker_sample_tokens(grammar_output)
 
-        # Step 2: Decode all requests with decode_query_len tokens each.
-        cached_req_data = CachedRequestData.make_empty()
-        cached_req_data.req_ids = list(req_ids)
-        cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
-        cached_req_data.num_output_tokens = [1] * num_reqs
-        new_block = any(decode_block_deltas)
-        cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
-            for _ in range(num_reqs)
-        ]
+            # Step 2: Decode all requests with decode_query_len tokens each.
+            cached_req_data = CachedRequestData.make_empty()
+            cached_req_data.req_ids = list(req_ids)
+            cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
+            cached_req_data.num_output_tokens = [1] * num_reqs
+            new_block = any(decode_block_deltas)
+            cached_req_data.new_block_ids = [
+                tuple(_alloc_blocks(n) for n in decode_block_deltas)
+                if new_block
+                else None
+                for _ in range(num_reqs)
+            ]
 
-        decode_output = SchedulerOutput.make_empty()
-        decode_output.scheduled_cached_reqs = cached_req_data
-        decode_output.num_scheduled_tokens = {
-            req_id: decode_query_len for req_id in req_ids
-        }
-        if num_spec_steps > 0:
-            decode_output.scheduled_spec_decode_tokens = {
-                req_id: [0] * num_spec_steps for req_id in req_ids
+            decode_output = SchedulerOutput.make_empty()
+            decode_output.scheduled_cached_reqs = cached_req_data
+            decode_output.num_scheduled_tokens = {
+                req_id: decode_query_len for req_id in req_ids
             }
-        decode_output.total_num_scheduled_tokens = sum(
-            decode_output.num_scheduled_tokens.values()
-        )
-        decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
-
-        worker_execute_model(decode_output)
-        worker_sample_tokens(None)
-
-        if _uses_parallel_draft_full_k_warmup(model_runner):
-            extra_finished_req_ids = _run_parallel_draft_full_k_warmup(
-                model_runner,
-                worker_execute_model,
-                worker_sample_tokens,
+            if num_spec_steps > 0:
+                decode_output.scheduled_spec_decode_tokens = {
+                    req_id: [0] * num_spec_steps for req_id in req_ids
+                }
+            decode_output.total_num_scheduled_tokens = sum(
+                decode_output.num_scheduled_tokens.values()
             )
+            decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    # Clean up - process finish_req_ids.
-    cleanup_output = SchedulerOutput.make_empty()
-    cleanup_output.finished_req_ids = set(req_ids) | extra_finished_req_ids
-    worker_execute_model(cleanup_output)
-    model_runner.kv_connector.set_disabled(False)
+            worker_execute_model(decode_output)
+            worker_sample_tokens(None)
+
+            _cleanup_warmup_requests(worker_execute_model, generic_finished_req_ids)
+            generic_finished_req_ids = set()
+
+            if _uses_parallel_draft_full_k_warmup(model_runner):
+                parallel_warmup_attempted = True
+                parallel_finished_req_ids = {_parallel_draft_full_k_warmup_req_id()}
+                _run_parallel_draft_full_k_warmup(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                )
+                _cleanup_warmup_requests(
+                    worker_execute_model, parallel_finished_req_ids
+                )
+                parallel_finished_req_ids = set()
+
+        if generic_finished_req_ids:
+            _cleanup_warmup_requests(worker_execute_model, generic_finished_req_ids)
+            generic_finished_req_ids = set()
+    finally:
+        if generic_finished_req_ids:
+            try:
+                _cleanup_warmup_requests(worker_execute_model, generic_finished_req_ids)
+            except Exception:
+                logger.exception("Failed to clean up generic warmup requests.")
+        if parallel_finished_req_ids:
+            try:
+                _cleanup_warmup_requests(
+                    worker_execute_model, parallel_finished_req_ids
+                )
+            except Exception:
+                logger.exception("Failed to clean up parallel-draft warmup request.")
+        if parallel_warmup_attempted:
+            model_runner.last_completed_num_spec_tokens_to_schedule = (
+                startup_num_spec_tokens
+            )
+        model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
