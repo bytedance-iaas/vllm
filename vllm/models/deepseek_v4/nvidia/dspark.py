@@ -15,7 +15,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -85,11 +85,10 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
-                    current_vllm_config,
+                    vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
                 )
                 for i in range(self.num_dspark_layers)

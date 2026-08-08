@@ -6,9 +6,11 @@ from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch.nn as nn
 
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm.config import CacheConfig
+from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4Model
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import get_draft_cache_config
 
 pytestmark = pytest.mark.cpu_test
@@ -190,3 +192,73 @@ def test_load_dflash_model_inherits_target_moe_backend_when_unset(monkeypatch):
     assert captured_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
     assert captured_config.attention_config.backend == "flash_attn"
     assert captured_config.attention_config.use_non_causal is False
+
+
+def test_dspark_layers_use_passed_draft_vllm_config(monkeypatch):
+    captured_layer_configs = []
+
+    class FakeModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeDecoderLayer(nn.Module):
+        def __init__(self, vllm_config, prefix, *args, **kwargs):
+            super().__init__()
+            captured_layer_configs.append((vllm_config, prefix))
+
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.dspark.VocabParallelEmbedding",
+        FakeModule,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.dspark.ReplicatedLinear",
+        FakeModule,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.dspark.RMSNorm",
+        FakeModule,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.dspark.DSparkMarkovHead",
+        FakeModule,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.dspark.DeepseekV4DecoderLayer",
+        FakeDecoderLayer,
+    )
+
+    draft_hf_config = SimpleNamespace(
+        hidden_size=16,
+        hc_mult=2,
+        hc_eps=1e-6,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=61,
+        dspark_target_layer_ids=(58, 59, 60),
+        n_mtp_layers=2,
+        vocab_size=128,
+        dspark_markov_rank=4,
+    )
+    draft_vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+        ),
+        quant_config=None,
+        kernel_config=SimpleNamespace(moe_backend="marlin"),
+    )
+    target_vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+    )
+
+    model = DSparkDeepseekV4Model(vllm_config=draft_vllm_config)
+
+    assert len(captured_layer_configs) == draft_hf_config.n_mtp_layers
+    assert all(config is draft_vllm_config for config, _ in captured_layer_configs)
+    assert all(
+        config.kernel_config.moe_backend == "marlin"
+        for config, _ in captured_layer_configs
+    )
+    assert all(
+        config.kernel_config.moe_backend != target_vllm_config.kernel_config.moe_backend
+        for config, _ in captured_layer_configs
+    )
+    assert isinstance(model.layers, nn.ModuleList)
