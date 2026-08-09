@@ -562,7 +562,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     def _prepare_paged_mqa_metadata_seq_lens(
         self,
         seq_lens: torch.Tensor,
-        dummy_decode_mask: torch.Tensor,
+        dummy_decode_mask: torch.Tensor | None,
         num_decode_tokens: int,
         seq_lens_is_buffer_view: bool,
     ) -> torch.Tensor:
@@ -575,14 +575,28 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.decode_seq_lens_buffer[:num_decode_tokens].copy_(seq_lens)
             seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
 
-        seq_lens.masked_fill_(dummy_decode_mask, 1)
+        if dummy_decode_mask is None:
+            seq_lens.fill_(1)
+        else:
+            seq_lens.masked_fill_(dummy_decode_mask, 1)
         return seq_lens
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> DeepseekV32IndexerMetadata:
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            for_cudagraph_capture=True,
+        )
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        *,
+        for_cudagraph_capture: bool = False,
     ) -> DeepseekV32IndexerMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
@@ -731,7 +745,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     max_decode_len=max_decode_len,
                 )
             )
-            dummy_decode_mask = seq_lens == 0
+            dummy_decode_mask = None if for_cudagraph_capture else seq_lens == 0
 
             seq_lens_is_buffer_view = (use_native and next_n > 1) or (
                 not use_native and max_decode_len > 1
@@ -749,13 +763,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # compressed tokens. Convert uncompressed seq_lens to compressed.
             if self.compress_ratio > 1:
                 if seq_lens_is_buffer_view:
-                    seq_lens //= self.compress_ratio
+                    if for_cudagraph_capture:
+                        seq_lens.fill_(1)
+                    else:
+                        seq_lens //= self.compress_ratio
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
-                    self.expanded_seq_lens_buffer[:num_decodes] = (
-                        seq_lens // self.compress_ratio
-                    )
-                    self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
+                    if for_cudagraph_capture:
+                        self.expanded_seq_lens_buffer[:num_decode_tokens] = 1
+                    else:
+                        self.expanded_seq_lens_buffer[:num_decodes] = (
+                            seq_lens // self.compress_ratio
+                        )
+                        self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
 
             seq_lens = self._prepare_paged_mqa_metadata_seq_lens(

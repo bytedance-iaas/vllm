@@ -224,16 +224,16 @@ def test_compressed_slot_mapping_ignores_padded_or_out_of_range_rows(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch_size", [32, 64, 96])
-def test_indexer_builder_uncompressed_dummy_decode_rows_use_metadata_ones(
+def test_indexer_builder_capture_build_uses_metadata_ones_for_compressed_decodes(
     monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
 ):
     device = torch.device("cuda")
-    builder = _make_indexer_builder(monkeypatch, device, compress_ratio=1)
+    builder = _make_indexer_builder(monkeypatch, device, compress_ratio=4)
     metadata_calls = _mock_paged_mqa_metadata(monkeypatch)
-    common = _make_decode_common_metadata([0] * batch_size, device)
+    common = _make_decode_common_metadata([1] * batch_size, device)
 
-    md = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    md = builder.build_for_cudagraph_capture(common)
 
     assert md.decode is not None
     assert len(metadata_calls) == 1
@@ -243,9 +243,9 @@ def test_indexer_builder_uncompressed_dummy_decode_rows_use_metadata_ones(
     )
     torch.testing.assert_close(
         common.seq_lens,
-        torch.zeros(batch_size, dtype=torch.int32, device=device),
+        torch.ones(batch_size, dtype=torch.int32, device=device),
     )
-    assert metadata_calls[0]["block_size"] == 256
+    assert metadata_calls[0]["block_size"] == 64
     assert metadata_calls[0]["num_sms"] == builder.num_sms == 17
 
 
@@ -275,29 +275,31 @@ def test_indexer_builder_compressed_dummy_mask_preserves_real_zero_rows(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prepare_paged_mqa_metadata_seq_lens_all_false_mask_cudagraph(
+def test_prepare_paged_mqa_metadata_seq_lens_none_mask_cudagraph(
     monkeypatch: pytest.MonkeyPatch,
 ):
     device = torch.device("cuda")
     builder = _make_indexer_builder(monkeypatch, device, compress_ratio=1)
     num_decode_tokens = 4
     seq_lens = torch.tensor([3, 5, 7, 9], dtype=torch.int32, device=device)
-    dummy_decode_mask = torch.zeros(num_decode_tokens, dtype=torch.bool, device=device)
 
     warmup = builder._prepare_paged_mqa_metadata_seq_lens(
         seq_lens=seq_lens,
-        dummy_decode_mask=dummy_decode_mask,
+        dummy_decode_mask=None,
         num_decode_tokens=num_decode_tokens,
         seq_lens_is_buffer_view=False,
     )
-    torch.testing.assert_close(warmup, seq_lens)
+    torch.testing.assert_close(
+        warmup,
+        torch.ones(num_decode_tokens, dtype=torch.int32, device=device),
+    )
     assert warmup.data_ptr() == builder.decode_seq_lens_buffer.data_ptr()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = builder._prepare_paged_mqa_metadata_seq_lens(
             seq_lens=seq_lens,
-            dummy_decode_mask=dummy_decode_mask,
+            dummy_decode_mask=None,
             num_decode_tokens=num_decode_tokens,
             seq_lens_is_buffer_view=False,
         )
@@ -306,7 +308,7 @@ def test_prepare_paged_mqa_metadata_seq_lens_all_false_mask_cudagraph(
     graph.replay()
     torch.cuda.synchronize()
 
-    expected = torch.tensor([11, 13, 15, 17], dtype=torch.int32, device=device)
+    expected = torch.ones(num_decode_tokens, dtype=torch.int32, device=device)
     torch.testing.assert_close(captured, expected)
     torch.testing.assert_close(
         builder.decode_seq_lens_buffer[:num_decode_tokens],
