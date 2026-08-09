@@ -571,9 +571,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         Dummy rows are identified from the pre-compression decode lengths so real
         short requests that legitimately compress to zero stay unchanged.
         """
-        if not torch.any(dummy_decode_mask):
-            return seq_lens
-
         if not seq_lens_is_buffer_view:
             self.decode_seq_lens_buffer[:num_decode_tokens].copy_(seq_lens)
             seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
