@@ -6,11 +6,94 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer as indexer_module
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_compressed_slot_mapping,
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def _make_decode_common_metadata(seq_lens: list[int], device: torch.device):
+    batch_size = len(seq_lens)
+    query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    return CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        seq_lens=seq_lens_tensor,
+        seq_lens_cpu_upper_bound=seq_lens_tensor.cpu(),
+        num_reqs=batch_size,
+        num_actual_tokens=batch_size,
+        max_query_len=1,
+        max_seq_len=max(seq_lens, default=0),
+        block_table_tensor=torch.zeros(
+            batch_size, 1, dtype=torch.int32, device=device
+        ),
+        slot_mapping=torch.arange(batch_size, dtype=torch.int64, device=device),
+        causal=True,
+    )
+
+
+def _make_indexer_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    device: torch.device,
+    *,
+    compress_ratio: int,
+    block_size: int = 256,
+    num_sms: int = 17,
+) -> DeepseekV32IndexerMetadataBuilder:
+    monkeypatch.setattr(
+        indexer_module,
+        "num_compute_units",
+        lambda _device_id=0: num_sms,
+    )
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=compress_ratio,
+    )
+    vllm_config = create_vllm_config(max_model_len=1024, block_size=block_size)
+    return DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=device,
+    )
+
+
+def _mock_paged_mqa_metadata(monkeypatch: pytest.MonkeyPatch):
+    calls: list[dict[str, torch.Tensor | int]] = []
+
+    monkeypatch.setattr(indexer_module, "has_deep_gemm", lambda: True)
+
+    def fake_get_paged_mqa_logits_metadata(
+        seq_lens: torch.Tensor,
+        block_size: int,
+        num_sms: int,
+    ) -> torch.Tensor:
+        calls.append(
+            {
+                "seq_lens": seq_lens.detach().clone(),
+                "block_size": block_size,
+                "num_sms": num_sms,
+            }
+        )
+        return torch.full(
+            (num_sms + 1, 2),
+            7,
+            dtype=torch.int32,
+            device=seq_lens.device,
+        )
+
+    monkeypatch.setattr(
+        indexer_module,
+        "get_paged_mqa_logits_metadata",
+        fake_get_paged_mqa_logits_metadata,
+    )
+    return calls
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -137,3 +220,55 @@ def test_compressed_slot_mapping_ignores_padded_or_out_of_range_rows(
         result,
         torch.tensor(expected, dtype=torch.int64, device=device),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch_size", [32, 64, 96])
+def test_indexer_builder_uncompressed_dummy_decode_rows_use_metadata_ones(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+):
+    device = torch.device("cuda")
+    builder = _make_indexer_builder(monkeypatch, device, compress_ratio=1)
+    metadata_calls = _mock_paged_mqa_metadata(monkeypatch)
+    common = _make_decode_common_metadata([0] * batch_size, device)
+
+    md = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert md.decode is not None
+    assert len(metadata_calls) == 1
+    torch.testing.assert_close(
+        metadata_calls[0]["seq_lens"],
+        torch.ones((batch_size, 1), dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(
+        common.seq_lens,
+        torch.zeros(batch_size, dtype=torch.int32, device=device),
+    )
+    assert metadata_calls[0]["block_size"] == 256
+    assert metadata_calls[0]["num_sms"] == builder.num_sms == 17
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_indexer_builder_compressed_dummy_mask_preserves_real_zero_rows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = torch.device("cuda")
+    builder = _make_indexer_builder(monkeypatch, device, compress_ratio=4)
+    metadata_calls = _mock_paged_mqa_metadata(monkeypatch)
+    common = _make_decode_common_metadata([0, 1, 3, 4, 8], device)
+
+    md = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert md.decode is not None
+    assert len(metadata_calls) == 1
+    torch.testing.assert_close(
+        metadata_calls[0]["seq_lens"],
+        torch.tensor([[1], [0], [0], [1], [2]], dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(
+        common.seq_lens,
+        torch.tensor([0, 1, 3, 4, 8], dtype=torch.int32, device=device),
+    )
+    assert metadata_calls[0]["block_size"] == 64
+    assert metadata_calls[0]["num_sms"] == builder.num_sms == 17
