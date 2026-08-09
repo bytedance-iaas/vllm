@@ -138,19 +138,38 @@ def test_dynamic_sd_dp_pressure_cache_reset_forces_next_sync(monkeypatch):
     assert core.scheduler.overrides == [22, 25]
 
 
-def test_feature_off_dummy_batch_preserves_legacy_no_arg_call():
+def test_feature_off_dummy_batch_passes_none_to_executor():
     core = EngineCore.__new__(EngineCore)
     core.vllm_config = SimpleNamespace(
         use_v2_model_runner=True,
         speculative_config=None,
     )
     core.scheduler = Mock()
+    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.return_value = None
     core.model_executor = Mock()
 
     EngineCore.execute_dummy_batch(core)
 
-    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.assert_not_called()
-    core.model_executor.execute_dummy_batch.assert_called_once_with()
+    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.assert_called_once_with()
+    core.model_executor.execute_dummy_batch.assert_called_once_with(None)
+
+
+def test_static_dspark_dummy_batch_passes_scheduler_k():
+    core = EngineCore.__new__(EngineCore)
+    core.vllm_config = SimpleNamespace(
+        use_v2_model_runner=True,
+        speculative_config=SimpleNamespace(
+            uses_dynamic_speculative_decoding=lambda: False
+        ),
+    )
+    core.scheduler = Mock()
+    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.return_value = 5
+    core.model_executor = Mock()
+
+    EngineCore.execute_dummy_batch(core)
+
+    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.assert_called_once_with()
+    core.model_executor.execute_dummy_batch.assert_called_once_with(5)
 
 
 def test_dynamic_sd_dummy_batch_passes_runtime_k():
