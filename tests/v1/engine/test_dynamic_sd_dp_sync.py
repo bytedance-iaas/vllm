@@ -138,20 +138,20 @@ def test_dynamic_sd_dp_pressure_cache_reset_forces_next_sync(monkeypatch):
     assert core.scheduler.overrides == [22, 25]
 
 
-def test_feature_off_dummy_batch_passes_none_to_executor():
+def test_feature_off_dummy_batch_passes_explicit_zero_to_executor():
     core = EngineCore.__new__(EngineCore)
     core.vllm_config = SimpleNamespace(
         use_v2_model_runner=True,
         speculative_config=None,
     )
     core.scheduler = Mock()
-    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.return_value = None
+    core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.return_value = 0
     core.model_executor = Mock()
 
     EngineCore.execute_dummy_batch(core)
 
     core.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch.assert_called_once_with()
-    core.model_executor.execute_dummy_batch.assert_called_once_with(None)
+    core.model_executor.execute_dummy_batch.assert_called_once_with(0)
 
 
 def test_static_dspark_dummy_batch_passes_scheduler_k():
