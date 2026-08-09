@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Contract tests for the QuantizedActivation linear-kernel integration."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -19,6 +21,7 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
     FlashInferCutlassNvFp4LinearKernel,
     FlashInferTrtllmNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm import flashinfer as flashinfer_mm
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFP8ScaledMMLinearKernel,
 )
@@ -129,3 +132,55 @@ def test_as_quantized_activation_validates_key():
         as_quantized_activation(qa, None)
     assert as_quantized_activation(torch.zeros(2, 4), kFp8StaticTensorSym) is None
     assert as_quantized_activation(qa, kFp8StaticTensorSym) is qa
+
+
+@pytest.mark.parametrize("tma_aligned_scales", [False, True])
+def test_hybrid_deepgemm_branch_forwards_tma_aligned_scales(
+    tma_aligned_scales: bool,
+):
+    quant_kwargs = {}
+    gemm_calls = 0
+
+    def fake_quant(x: torch.Tensor, **kwargs):
+        quant_kwargs.update(kwargs)
+        return x, torch.ones((x.shape[0], 1), dtype=torch.float32, device=x.device)
+
+    def fake_fp8_gemm_nt(*args, **kwargs):
+        nonlocal gemm_calls
+        gemm_calls += 1
+        args[2].zero_()
+
+    x = torch.randn(32, 128, dtype=torch.bfloat16)
+    weight = torch.randn(64, 128, dtype=torch.bfloat16)
+    weight_scale = torch.ones(1, 1, dtype=torch.float32)
+
+    with (
+        patch("vllm.envs.VLLM_BATCH_INVARIANT", True),
+        patch(
+            "vllm.envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES",
+            tma_aligned_scales,
+        ),
+        patch.object(
+            flashinfer_mm, "per_token_group_quant_fp8", side_effect=fake_quant
+        ) as quant_mock,
+        patch.object(
+            flashinfer_mm, "fp8_gemm_nt", side_effect=fake_fp8_gemm_nt
+        ),
+    ):
+        out = flashinfer_mm._dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
+            x,
+            weight,
+            weight_scale,
+            group_size=128,
+            use_deep_gemm_e8m0=False,
+        )
+
+    assert quant_mock.call_count == 1
+    assert gemm_calls == 1
+    assert quant_kwargs == {
+        "group_size": 128,
+        "column_major_scales": True,
+        "tma_aligned_scales": tma_aligned_scales,
+        "use_ue8m0": False,
+    }
+    assert out.shape == (32, 64)
