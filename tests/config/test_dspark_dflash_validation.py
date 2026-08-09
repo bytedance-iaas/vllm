@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 
 pytestmark = pytest.mark.cpu_test
 
@@ -49,3 +49,51 @@ def test_explicit_v1_runner_rejected_for_dspark(monkeypatch):
 
     with pytest.raises(ValueError, match="requires the V2 model runner"):
         VllmConfig.use_v2_model_runner.fget(config)
+
+
+def test_dspark_allows_static_k_below_checkpoint_block_size(monkeypatch):
+    def _fake_draft_model_config(*args, **kwargs):
+        hf_config = SimpleNamespace(
+            model_type="dspark",
+            architectures=["Qwen3DSparkModel"],
+            dspark_block_size=5,
+            n_predict=5,
+        )
+        return SimpleNamespace(
+            model=kwargs["model"],
+            hf_config=hf_config,
+            architectures=["Qwen3DSparkModel"],
+            max_model_len=kwargs["spec_target_max_model_len"],
+        )
+
+    monkeypatch.setattr(
+        "vllm.config.speculative.ModelConfig", _fake_draft_model_config
+    )
+
+    target_model_config = SimpleNamespace(
+        model="deepseek-ai/DeepSeek-V4",
+        quantization=None,
+        tokenizer="deepseek-ai/DeepSeek-V4",
+        tokenizer_mode="auto",
+        trust_remote_code=True,
+        allowed_local_media_path="",
+        allowed_media_domains=None,
+        dtype="float16",
+        seed=0,
+        tokenizer_revision=None,
+        max_model_len=8192,
+        enforce_eager=False,
+        max_logprobs=20,
+        hf_overrides={},
+        config_format="hf",
+    )
+
+    speculative_config = SpeculativeConfig(
+        method="dspark",
+        num_speculative_tokens=4,
+        target_model_config=target_model_config,
+        target_parallel_config=ParallelConfig(),
+    )
+
+    assert speculative_config.num_speculative_tokens == 4
+    assert speculative_config.draft_model_config.hf_config.dspark_block_size == 5
