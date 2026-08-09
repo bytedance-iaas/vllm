@@ -919,15 +919,6 @@ class EngineCore:
         return self.is_scheduler_paused() or self.model_executor.is_sleeping
 
     def execute_dummy_batch(self):
-        speculative_config = self.vllm_config.speculative_config
-        if (
-            not self.vllm_config.use_v2_model_runner
-            or speculative_config is None
-            or not speculative_config.uses_dynamic_speculative_decoding()
-        ):
-            self.model_executor.execute_dummy_batch()
-            return
-
         num_spec_tokens_to_schedule = (
             self.scheduler.get_num_spec_tokens_to_schedule_for_dummy_batch()
         )
