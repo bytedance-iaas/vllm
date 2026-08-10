@@ -9,6 +9,7 @@ import pytest
 import torch.nn as nn
 
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
+import vllm.v1.worker.gpu.spec_decode.dspark.utils as dspark_utils
 from vllm.config import CacheConfig
 from vllm.models.deepseek_v4.nvidia.dspark import DSparkDeepseekV4Model
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import get_draft_cache_config
@@ -192,6 +193,102 @@ def test_load_dflash_model_inherits_target_moe_backend_when_unset(monkeypatch):
     assert captured_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
     assert captured_config.attention_config.backend == "flash_attn"
     assert captured_config.attention_config.use_non_causal is False
+
+
+def test_load_dspark_model_applies_explicit_draft_moe_backend(monkeypatch):
+    captured_config = None
+
+    def fake_get_model(*, vllm_config, model_config):
+        nonlocal captured_config
+        captured_config = vllm_config
+        assert model_config is vllm_config.speculative_config.draft_model_config
+        return SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=object()),
+            lm_head=object(),
+        )
+
+    monkeypatch.setattr(dspark_utils, "replace", _replace_namespace)
+    monkeypatch.setattr(dspark_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(
+        dspark_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(dspark_utils, "_should_share", lambda *_args: False)
+    monkeypatch.setattr(dflash_utils, "replace", _replace_namespace)
+    _install_load_dflash_import_stubs(monkeypatch, has_non_causal=True)
+
+    target_model = SimpleNamespace(
+        get_language_model=lambda: _make_language_model(),
+        lm_head=object(),
+    )
+    vllm_config = _make_load_dflash_config(
+        target_moe_backend="deep_gemm_mega_moe",
+        draft_moe_backend="marlin",
+    )
+    original_attention_config = vllm_config.attention_config
+    original_cache_config = vllm_config.cache_config
+
+    dspark_utils.load_dspark_model(target_model, vllm_config)
+
+    assert captured_config is not None
+    assert captured_config.kernel_config.moe_backend == "marlin"
+    assert vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    assert captured_config.attention_config.backend == "flash_attn"
+    assert captured_config.attention_config.use_non_causal is True
+    assert captured_config.cache_config is vllm_config.cache_config
+    assert vllm_config.attention_config is original_attention_config
+    assert vllm_config.attention_config.backend == "target_attention"
+    assert vllm_config.attention_config.use_non_causal is False
+    assert vllm_config.cache_config is original_cache_config
+
+
+def test_load_dspark_model_inherits_target_moe_backend_when_unset(monkeypatch):
+    captured_config = None
+
+    def fake_get_model(*, vllm_config, model_config):
+        nonlocal captured_config
+        captured_config = vllm_config
+        assert model_config is vllm_config.speculative_config.draft_model_config
+        return SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=object()),
+            lm_head=object(),
+        )
+
+    monkeypatch.setattr(dspark_utils, "replace", _replace_namespace)
+    monkeypatch.setattr(dspark_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(
+        dspark_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(dspark_utils, "_should_share", lambda *_args: False)
+    monkeypatch.setattr(dflash_utils, "replace", _replace_namespace)
+    _install_load_dflash_import_stubs(monkeypatch, has_non_causal=False)
+
+    target_model = SimpleNamespace(
+        get_language_model=lambda: _make_language_model(),
+        lm_head=object(),
+    )
+    vllm_config = _make_load_dflash_config(
+        target_moe_backend="deep_gemm_mega_moe",
+        draft_moe_backend=None,
+    )
+    original_attention_config = vllm_config.attention_config
+    original_cache_config = vllm_config.cache_config
+
+    dspark_utils.load_dspark_model(target_model, vllm_config)
+
+    assert captured_config is not None
+    assert captured_config.kernel_config is vllm_config.kernel_config
+    assert captured_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    assert captured_config.attention_config.backend == "flash_attn"
+    assert captured_config.attention_config.use_non_causal is False
+    assert captured_config.cache_config is vllm_config.cache_config
+    assert vllm_config.attention_config is original_attention_config
+    assert vllm_config.attention_config.backend == "target_attention"
+    assert vllm_config.attention_config.use_non_causal is False
+    assert vllm_config.cache_config is original_cache_config
 
 
 def test_dspark_layers_use_passed_draft_vllm_config(monkeypatch):

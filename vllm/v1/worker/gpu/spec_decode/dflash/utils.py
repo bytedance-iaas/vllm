@@ -31,6 +31,19 @@ def get_draft_cache_config(vllm_config: VllmConfig) -> CacheConfig:
     return vllm_config.cache_config
 
 
+def get_draft_kernel_config(vllm_config: VllmConfig):
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+
+    if speculative_config.moe_backend is not None:
+        return replace(
+            vllm_config.kernel_config,
+            moe_backend=speculative_config.moe_backend,
+        )
+
+    return vllm_config.kernel_config
+
+
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
@@ -40,24 +53,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_model_config = speculative_config.draft_model_config
     # Select an attention backend that supports the drafter's attention: mixing
     # a non-causal layer onto a causal-only backend would fail.
-    draft_vllm_config = vllm_config
-    if speculative_config.moe_backend is not None:
-        draft_vllm_config = replace(
-            draft_vllm_config,
-            kernel_config=replace(
-                draft_vllm_config.kernel_config,
-                moe_backend=speculative_config.moe_backend,
-            ),
-        )
-
     draft_vllm_config = replace(
-        draft_vllm_config,
+        vllm_config,
         attention_config=replace(
-            draft_vllm_config.attention_config,
+            vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=speculative_config.attention_backend,
         ),
         cache_config=get_draft_cache_config(vllm_config),
+        kernel_config=get_draft_kernel_config(vllm_config),
     )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(

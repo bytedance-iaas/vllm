@@ -6,7 +6,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import get_draft_cache_config
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+    get_draft_cache_config,
+    get_draft_kernel_config,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -29,6 +32,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             backend=speculative_config.attention_backend,
         ),
         cache_config=get_draft_cache_config(vllm_config),
+        kernel_config=get_draft_kernel_config(vllm_config),
     )
 
     with set_model_tag("dspark_head"):
