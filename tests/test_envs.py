@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 import os
 from unittest.mock import patch
 
@@ -143,6 +144,40 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
     ):
         assert environment_variables["VLLM_USE_PRECOMPILED"]() is True
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is True
+
+
+class TestVllmUseCutedslLlBf16:
+    def test_defaults_to_true(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_USE_CUTEDSL_LL_BF16", None)
+            assert environment_variables["VLLM_USE_CUTEDSL_LL_BF16"]() is True
+
+    def test_zero_disables(self):
+        with patch.dict(os.environ, {"VLLM_USE_CUTEDSL_LL_BF16": "0"}):
+            assert environment_variables["VLLM_USE_CUTEDSL_LL_BF16"]() is False
+
+    def test_one_enables(self):
+        with patch.dict(os.environ, {"VLLM_USE_CUTEDSL_LL_BF16": "1"}):
+            assert environment_variables["VLLM_USE_CUTEDSL_LL_BF16"]() is True
+
+    def test_ll_bf16_is_available_short_circuits_when_disabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        ll_bf16 = importlib.import_module(
+            "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16"
+        )
+
+        monkeypatch.setenv("VLLM_USE_CUTEDSL_LL_BF16", "0")
+        monkeypatch.setattr(ll_bf16, "_cutedsl_available", True)
+
+        with patch(
+            "builtins.__import__",
+            side_effect=AssertionError(
+                "is_available should not import cutlass when disabled"
+            ),
+        ):
+            assert ll_bf16.is_available() is False
 
 
 class TestEnvWithChoices:
