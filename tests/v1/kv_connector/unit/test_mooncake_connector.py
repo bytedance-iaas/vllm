@@ -1542,6 +1542,93 @@ def test_register_kv_caches_keeps_non_mtp_layers_outside_base_model():
     assert worker.registered_layer_indices == [0, num_hidden_layers]
 
 
+def test_pd_trace_lifecycle_clears_on_success_and_failure(monkeypatch):
+    """Request-scoped trace timestamps must not survive terminal outcomes."""
+    monkeypatch.setattr(envs, "VLLM_MOONCAKE_PD_TRACE", True)
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.finished_recving_reqs = set()
+    worker.dp_rank = worker.pp_rank = worker.tp_rank = 0
+    worker._pd_trace_pull_started = {
+        "d-req-ok": time.perf_counter(),
+        "d-req-failed": time.perf_counter(),
+    }
+
+    ok_meta = PullReqMeta(
+        d_req_id="d-req-ok",
+        transfer_id="xfer-ok",
+        local_block_ids=[[100]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap",
+        pull_tasks_count=1,
+    )
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=[ok_meta.d_req_id],
+        ),
+        {ok_meta.d_req_id: ok_meta},
+    )
+
+    failed_meta = PullReqMeta(
+        d_req_id="d-req-failed",
+        transfer_id="xfer-failed",
+        local_block_ids=[[101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap",
+    )
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            err_reqs=[failed_meta.d_req_id],
+            err_msg="transfer failed",
+        ),
+        {failed_meta.d_req_id: failed_meta},
+    )
+
+    assert worker._pd_trace_pull_started == {}
+    assert worker.finished_recving_reqs == {"d-req-ok"}
+
+
+def test_large_request_gate_uses_largest_kv_group_block_count():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._large_request_semaphore = object()
+    worker.large_request_threshold_tokens = 32768
+    worker.block_size = 256
+
+    long_meta = SimpleNamespace(req_blocks={"request": ("transfer", [[0] * 256])})
+    short_meta = SimpleNamespace(req_blocks={"request": ("transfer", [[0] * 14])})
+
+    assert worker._is_large_request_meta(long_meta)
+    assert not worker._is_large_request_meta(short_meta)
+
+
+@pytest.mark.asyncio
+async def test_node_large_request_slots_are_mutually_exclusive(tmp_path):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._node_large_request_slot_paths = (
+        MooncakeConnectorWorker._get_node_large_request_slot_paths(
+            str(tmp_path), "engine-a", 1
+        )
+    )
+    assert worker._node_large_request_slot_paths != (
+        MooncakeConnectorWorker._get_node_large_request_slot_paths(
+            str(tmp_path), "engine-b", 1
+        )
+    )
+
+    first_slot = await worker._acquire_node_large_request_slot()
+    assert first_slot is not None
+
+    waiting_for_slot = asyncio.create_task(worker._acquire_node_large_request_slot())
+    await asyncio.sleep(0.01)
+    assert not waiting_for_slot.done()
+
+    worker._release_node_large_request_slot(first_slot)
+    second_slot = await asyncio.wait_for(waiting_for_slot, timeout=1)
+    assert second_slot is not None
+    worker._release_node_large_request_slot(second_slot)
+
+
 def test_register_kv_caches_aggregates_shared_overlay_aliases():
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.use_mla = True
