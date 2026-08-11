@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import fcntl
+import hashlib
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -1406,6 +1409,79 @@ class MooncakeConnectorWorker:
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
+        self.max_concurrent_large_requests = int(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "max_concurrent_large_requests", 0
+            )
+        )
+        self.large_request_threshold_tokens = int(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "large_request_threshold_tokens", 0
+            )
+        )
+        self.node_large_request_slots = int(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "node_large_request_slots", 0
+            )
+        )
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        self.node_large_request_slot_dir = extra_config.get(
+            "node_large_request_slot_dir", "/dev/shm"
+        )
+        self.node_large_request_slot_namespace = (
+            extra_config.get(
+                "node_large_request_slot_namespace", engine_id
+            )
+        )
+        if self.max_concurrent_large_requests < 0:
+            raise ValueError(
+                "max_concurrent_large_requests must be non-negative, got "
+                f"{self.max_concurrent_large_requests}"
+            )
+        if self.large_request_threshold_tokens < 0:
+            raise ValueError(
+                "large_request_threshold_tokens must be non-negative"
+            )
+        if self.node_large_request_slots < 0:
+            raise ValueError(
+                "node_large_request_slots must be non-negative, got "
+                f"{self.node_large_request_slots}"
+            )
+        if not isinstance(self.node_large_request_slot_namespace, str) or not (
+            self.node_large_request_slot_namespace
+        ):
+            raise ValueError(
+                "node_large_request_slot_namespace must be a non-empty string"
+            )
+        self._large_request_semaphore: asyncio.Semaphore | None = (
+            asyncio.Semaphore(self.max_concurrent_large_requests)
+            if self.max_concurrent_large_requests > 0
+            and self.large_request_threshold_tokens > 0
+            else None
+        )
+        if self._large_request_semaphore is not None:
+            logger.info(
+                "Mooncake limiting requests >= %d tokens to %d concurrent send(s)",
+                self.large_request_threshold_tokens,
+                self.max_concurrent_large_requests,
+            )
+        if self.node_large_request_slots and self._large_request_semaphore is None:
+            raise ValueError(
+                "node_large_request_slots requires positive "
+                "max_concurrent_large_requests and "
+                "large_request_threshold_tokens"
+            )
+        self._node_large_request_slot_paths = self._get_node_large_request_slot_paths(
+            self.node_large_request_slot_dir,
+            self.node_large_request_slot_namespace,
+            self.node_large_request_slots,
+        )
+        if self._node_large_request_slot_paths:
+            logger.info(
+                "Mooncake limiting long requests to %d shared node slot(s) under %s",
+                self.node_large_request_slots,
+                self.node_large_request_slot_dir,
+            )
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
@@ -1538,6 +1614,8 @@ class MooncakeConnectorWorker:
         self.finished_recving_reqs: set[ReqId] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
+        # D-side request start times for opt-in P/D transfer tracing.
+        self._pd_trace_pull_started: dict[ReqId, float] = {}
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1705,7 +1783,18 @@ class MooncakeConnectorWorker:
                 identity, metadata_bytes = await self.sender_worker_queue.get()
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
-                    await self.send_kv_to_decode(identity, sock, metadata)
+                    if self._is_large_request_meta(metadata):
+                        assert self._large_request_semaphore is not None
+                        async with self._large_request_semaphore:
+                            slot_fd = await self._acquire_node_large_request_slot()
+                            try:
+                                await self.send_kv_to_decode(
+                                    identity, sock, metadata
+                                )
+                            finally:
+                                self._release_node_large_request_slot(slot_fd)
+                    else:
+                        await self.send_kv_to_decode(identity, sock, metadata)
                 except Exception as e:
                     logger.error("Error processing Mooncake xfer request: %s", e)
                     error_response = MooncakeXferResponse(
@@ -1721,9 +1810,65 @@ class MooncakeConnectorWorker:
             except Exception as e:
                 logger.error("Error in _sender_worker: %s", e)
 
+    def _is_large_request_meta(self, meta: MooncakeXferMetadata) -> bool:
+        """Return whether a pull covers a long-context request.
+
+        The per-group block count, rather than their sum, reflects prompt
+        length: KV cache groups represent parallel cache layouts.
+        """
+        if self._large_request_semaphore is None:
+            return False
+        max_blocks = max(
+            (
+                len(block_ids)
+                for _, request_groups in meta.req_blocks.values()
+                for block_ids in request_groups
+            ),
+            default=0,
+        )
+        return max_blocks * self.block_size >= self.large_request_threshold_tokens
+
+    @staticmethod
+    def _get_node_large_request_slot_paths(
+        slot_dir: str, namespace: str, num_slots: int
+    ) -> list[str]:
+        namespace_hash = hashlib.sha256(namespace.encode()).hexdigest()[:16]
+        return [
+            os.path.join(
+                slot_dir,
+                f"vllm-mooncake-large-request-{namespace_hash}-slot-{slot}",
+            )
+            for slot in range(num_slots)
+        ]
+
+    async def _acquire_node_large_request_slot(self) -> int | None:
+        """Acquire one advisory node-wide slot without blocking the event loop."""
+        if not self._node_large_request_slot_paths:
+            return None
+        while True:
+            for slot_path in self._node_large_request_slot_paths:
+                fd = os.open(slot_path, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError:
+                    os.close(fd)
+            await asyncio.sleep(0.001)
+
+    @staticmethod
+    def _release_node_large_request_slot(slot_fd: int | None) -> None:
+        if slot_fd is None:
+            return
+        try:
+            fcntl.flock(slot_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(slot_fd)
+
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
+        trace_enabled = envs.VLLM_MOONCAKE_PD_TRACE
+        query_started = time.perf_counter() if trace_enabled else 0.0
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
@@ -1870,6 +2015,7 @@ class MooncakeConnectorWorker:
             err_msg: str | None = None
             ok_ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
             try:
+                build_started = time.perf_counter() if trace_enabled else 0.0
                 (
                     src_ptrs,
                     dst_ptrs,
@@ -1883,6 +2029,9 @@ class MooncakeConnectorWorker:
                     local_regions,
                     remote_regions,
                 )
+                build_duration = (
+                    time.perf_counter() - build_started if trace_enabled else 0.0
+                )
                 err_req_set = set(err_reqs)
                 ok_ready_reqs = [
                     (d_req_id, send_meta)
@@ -1892,6 +2041,7 @@ class MooncakeConnectorWorker:
 
                 if src_ptrs:
                     remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                    send_started = time.perf_counter() if trace_enabled else 0.0
                     ret_value = await self.sender_loop.run_in_executor(
                         self._sender_executor,
                         self._send_blocks,
@@ -1901,6 +2051,21 @@ class MooncakeConnectorWorker:
                         lengths,
                         state_transfer_events,
                     )
+                    if trace_enabled:
+                        logger.info(
+                            "MOONCAKE_PD_TRACE P_BATCH reqs=%s pp=%d tp=%d "
+                            "remote_tp=%d ready_wait_ms=%.3f build_ms=%.3f "
+                            "send_ms=%.3f descriptors=%d bytes=%d",
+                            [req_id for req_id, _ in ready_reqs],
+                            self.pp_rank,
+                            self.tp_rank,
+                            meta.remote_tp_rank,
+                            (build_started - query_started) * 1e3,
+                            build_duration * 1e3,
+                            (time.perf_counter() - send_started) * 1e3,
+                            len(src_ptrs),
+                            sum(lengths),
+                        )
 
                     if ret_value != 0:
                         transfer_err_msg = (
@@ -3084,6 +3249,7 @@ class MooncakeConnectorWorker:
 
     def _mark_pull_failed(self, pull_meta: "PullReqMeta") -> None:
         """Report a failed async pull to the scheduler after RDMA quiesce."""
+        getattr(self, "_pd_trace_pull_started", {}).pop(pull_meta.d_req_id, None)
         invalid_blocks = {
             block_id for group in pull_meta.local_block_ids for block_id in group
         }
@@ -3110,6 +3276,8 @@ class MooncakeConnectorWorker:
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        trace_enabled = envs.VLLM_MOONCAKE_PD_TRACE
+        worker_started = time.perf_counter() if trace_enabled else 0.0
         req_ids = list(pull_metas.keys())
         outstanding_req_ids: set[ReqId] = set(req_ids)
         metadata = MooncakeXferMetadata(
@@ -3196,6 +3364,17 @@ class MooncakeConnectorWorker:
                     outstanding_req_ids.difference_update(accounted_req_ids)
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
+            if trace_enabled:
+                logger.info(
+                    "MOONCAKE_PD_TRACE D_WORKER reqs=%s dp=%d pp=%d tp=%d "
+                    "worker=%s duration_ms=%.3f",
+                    req_ids,
+                    self.dp_rank,
+                    self.pp_rank,
+                    self.tp_rank,
+                    worker_addr,
+                    (time.perf_counter() - worker_started) * 1e3,
+                )
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
         except Exception as e:
@@ -3224,7 +3403,21 @@ class MooncakeConnectorWorker:
                 if pull_meta.pull_failed:
                     self._mark_pull_failed(pull_meta)
                 else:
+                    ready_started = time.perf_counter()
                     self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    if envs.VLLM_MOONCAKE_PD_TRACE:
+                        pull_started = getattr(
+                            self, "_pd_trace_pull_started", {}
+                        ).pop(pull_meta.d_req_id, ready_started)
+                        logger.info(
+                            "MOONCAKE_PD_TRACE D_READY req=%s dp=%d pp=%d tp=%d "
+                            "wait_ms=%.3f",
+                            pull_meta.d_req_id,
+                            self.dp_rank,
+                            self.pp_rank,
+                            self.tp_rank,
+                            (ready_started - pull_started) * 1e3,
+                        )
         # Success keeps the slot for admission unless another worker fails.
         if ok_reqs:
             self._c128_account_pull_tasks(pull_metas, failed=False, req_ids=ok_reqs)
@@ -3349,6 +3542,20 @@ class MooncakeConnectorWorker:
                 and pull_meta.c128_import_slot is not None
             ):
                 self._c128_active_pulls[pull_meta.d_req_id] = pull_meta
+        if envs.VLLM_MOONCAKE_PD_TRACE:
+            trace_started = time.perf_counter()
+            for pull_meta in pull_metas.values():
+                self._pd_trace_pull_started[pull_meta.d_req_id] = trace_started
+            logger.info(
+                "MOONCAKE_PD_TRACE D_START reqs=%s engine=%s workers=%d "
+                "dp=%d pp=%d tp=%d",
+                list(pull_metas),
+                remote_engine_id,
+                count,
+                self.dp_rank,
+                self.pp_rank,
+                self.tp_rank,
+            )
         for worker_addr in worker_addrs:
             asyncio.create_task(
                 self.receive_kv_from_single_worker(worker_addr, pull_metas)

@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER: bool = False
     VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB: int = 512
+    VLLM_MOONCAKE_PD_TRACE: bool = False
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
@@ -1593,6 +1594,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Per-call payload limit used when VLLM_MOONCAKE_ENABLE_CHUNKED_TRANSFER=1.
     "VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB": lambda: int(
         os.getenv("VLLM_MOONCAKE_TRANSFER_CHUNK_SIZE_MB", "512")
+    ),
+    # Emit request-scoped Mooncake P/D timing and byte diagnostics. Disabled
+    # by default because INFO logs can perturb latency measurements.
+    "VLLM_MOONCAKE_PD_TRACE": lambda: (
+        os.getenv("VLLM_MOONCAKE_PD_TRACE", "False").lower() in ("true", "1")
     ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),
