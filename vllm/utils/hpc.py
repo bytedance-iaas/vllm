@@ -257,8 +257,64 @@ def hpc_fuse_moe_blockwise(
     )
 
 
+def hpc_build_mxfp8_k32_moe_routing_cache(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    import hpc  # noqa: F401
+
+    return torch.ops.hpc.build_mxfp8_k32_moe_routing_cache(
+        topk_ids.to(torch.int32).contiguous(),
+        num_experts,
+    )
+
+
+def hpc_fuse_moe_mxfp8_k32_candidate(
+    hidden_q: torch.Tensor,
+    hidden_scale: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    routing_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    output: torch.Tensor | None = None,
+    activation_clamp: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    import hpc  # noqa: F401
+
+    row_indices, topk_pos, seqlens, cu_seqlens = routing_cache
+    return torch.ops.hpc.fuse_moe_mxfp8_k32_candidate(
+        hidden_q,
+        hidden_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        row_indices,
+        topk_pos,
+        seqlens,
+        cu_seqlens,
+        topk_weights.contiguous(),
+        output,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        activation_clamp,
+        alpha,
+        beta,
+    )
+
+
 __all__ = [
     "has_hpc",
+    "hpc_build_mxfp8_k32_moe_routing_cache",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",
+    "hpc_fuse_moe_mxfp8_k32_candidate",
 ]

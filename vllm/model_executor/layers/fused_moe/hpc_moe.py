@@ -18,9 +18,20 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
+    kMxfp8Static,
+)
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
 )
 from vllm.platforms import current_platform
-from vllm.utils.hpc import has_hpc, hpc_fuse_moe, hpc_fuse_moe_blockwise
+from vllm.utils.hpc import (
+    has_hpc,
+    hpc_build_mxfp8_k32_moe_routing_cache,
+    hpc_fuse_moe,
+    hpc_fuse_moe_blockwise,
+    hpc_fuse_moe_mxfp8_k32_candidate,
+)
 
 logger = init_logger(__name__)
 
@@ -211,3 +222,151 @@ class HPCExperts(mk.FusedMoEExpertsModular):
                 num_expert_total=global_num_experts,
                 output=output,
             )
+
+
+class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
+    """MiniMax-M3 MXFP8 K32 MoE body backed by hpc-ops.
+
+    This backend is intentionally model-specific. It targets the MiniMax-M3
+    routed expert shape: hidden size 6144, intermediate size 192, 128 experts,
+    top-4 routing, MXFP8 E4M3 values with UE8M0 K32 scales, and SwiGLU-OAI over
+    packed [gate | up] output.
+    """
+
+    def __init__(
+        self,
+        moe_config: mk.FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(moe_config, quant_config)
+
+        assert quant_config.weight_quant_dtype == "mxfp8", (
+            "MiniMaxM3HPCExperts only supports MXFP8 weights."
+        )
+        assert quant_config.block_shape == [1, 32], (
+            "MiniMaxM3HPCExperts requires MXFP8 K32 scales."
+        )
+
+        self.device = moe_config.device
+        self.num_experts = moe_config.num_local_experts
+        self.ep_rank = moe_config.moe_parallel_config.ep_rank
+        self.ep_size = moe_config.moe_parallel_config.ep_size
+        self.tp_rank = moe_config.moe_parallel_config.tp_rank
+        self.tp_size = moe_config.moe_parallel_config.tp_size
+        self.out_dtype = moe_config.in_dtype
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return True
+
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        p = current_platform
+        return p.is_cuda() and p.is_device_capability(90) and has_hpc()
+
+    @staticmethod
+    def _supports_no_act_and_mul() -> bool:
+        return False
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) == (kMxfp8Static, kMxfp8Dynamic)
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+
+    @staticmethod
+    def _supports_shape(hidden_dim: int) -> bool:
+        return hidden_dim == 6144
+
+    @staticmethod
+    def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        return moe_parallel_config.ep_size == 1
+
+    def supports_expert_map(self) -> bool:
+        return False
+
+    def supports_chunking(self) -> bool:
+        return True
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return TopKWeightAndReduceNoOP()
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        return (M, K), (0,), (M, K)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor | None,
+        workspace2: torch.Tensor | None,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool | None,
+    ):
+        assert self._supports_activation(activation), f"{activation=} not supported"
+        assert not apply_router_weight_on_input, (
+            "MiniMaxM3HPCExperts applies router weights in hpc.reduce."
+        )
+        assert expert_map is None, "MiniMaxM3HPCExperts does not support expert_map"
+        assert a1q_scale is None and a2_scale is None
+        assert topk_ids.size(1) == 4, "MiniMax-M3 expects top_k=4"
+        assert w1.size(0) == w2.size(0) == 128, "MiniMax-M3 expects 128 experts"
+        assert w1.size(1) == 384 and w1.size(2) == 6144
+        assert w2.size(1) == 6144 and w2.size(2) == 192
+        assert self.quant_config.w1_scale is not None
+        assert self.quant_config.w2_scale is not None
+
+        hidden_q, hidden_scale = mxfp8_e4m3_quantize(
+            hidden_states.contiguous(),
+            is_sf_swizzled_layout=False,
+        )
+        routing_cache = hpc_build_mxfp8_k32_moe_routing_cache(
+            topk_ids,
+            num_experts=w1.size(0),
+        )
+
+        clamp = self.quant_config.gemm1_clamp_limit
+        alpha = self.quant_config.gemm1_alpha
+        beta = self.quant_config.gemm1_beta
+        hpc_fuse_moe_mxfp8_k32_candidate(
+            hidden_q=hidden_q,
+            hidden_scale=hidden_scale,
+            gate_up_weight=w1,
+            gate_up_weight_scale=self.quant_config.w1_scale,
+            down_weight=w2,
+            down_weight_scale=self.quant_config.w2_scale,
+            routing_cache=routing_cache,
+            topk_weights=topk_weights.float().contiguous(),
+            output=output,
+            activation_clamp=7.0 if clamp is None else float(clamp),
+            alpha=1.702 if alpha is None else float(alpha),
+            beta=1.0 if beta is None else float(beta),
+        )
