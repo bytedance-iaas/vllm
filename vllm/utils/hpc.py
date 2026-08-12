@@ -46,6 +46,7 @@ def has_hpc_mxfp8_k32_moe() -> bool:
         "build_mxfp8_k32_moe_routing_cache",
         "fuse_moe_mxfp8_k32_candidate",
         "fuse_moe_mxfp8_k32_bf16_candidate",
+        "fuse_moe_mxfp8_k32_bf16_candidate_out",
     )
     missing_ops = [op for op in required_ops if not hasattr(torch.ops.hpc, op)]
     if missing_ops:
@@ -337,7 +338,7 @@ def hpc_fuse_moe_mxfp8_k32_candidate(
     )
 
 
-def hpc_fuse_moe_mxfp8_k32_bf16_candidate(
+def hpc_fuse_moe_mxfp8_k32_bf16_candidate_out(
     hidden: torch.Tensor,
     gate_up_weight: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
@@ -345,38 +346,47 @@ def hpc_fuse_moe_mxfp8_k32_bf16_candidate(
     down_weight_scale: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    output: torch.Tensor | None = None,
-    gate_output: torch.Tensor | None = None,
-    down_output: torch.Tensor | None = None,
+    output: torch.Tensor,
+    row_indices: torch.Tensor,
+    topk_pos: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    grouped_hidden: torch.Tensor,
+    grouped_hidden_scale: torch.Tensor,
+    gate_output: torch.Tensor,
+    activated_output: torch.Tensor,
+    activated_scale: torch.Tensor,
+    down_output: torch.Tensor,
     activation_clamp: float = 7.0,
     alpha: float = 1.702,
     beta: float = 1.0,
 ) -> torch.Tensor:
     import hpc  # noqa: F401
 
-    return torch.ops.hpc.fuse_moe_mxfp8_k32_bf16_candidate(
-        hidden.contiguous(),
+    torch.ops.hpc.fuse_moe_mxfp8_k32_bf16_candidate_out(
+        hidden,
         gate_up_weight,
         gate_up_weight_scale,
         down_weight,
         down_weight_scale,
-        topk_ids.to(torch.int32).contiguous(),
-        topk_weights.float().contiguous(),
+        topk_ids,
+        topk_weights,
         output,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        row_indices,
+        topk_pos,
+        seqlens,
+        cu_seqlens,
+        grouped_hidden,
+        grouped_hidden_scale,
         gate_output,
-        None,
-        None,
+        activated_output,
+        activated_scale,
         down_output,
         activation_clamp,
         alpha,
         beta,
     )
+    return output
 
 
 __all__ = [
@@ -385,6 +395,6 @@ __all__ = [
     "hpc_build_mxfp8_k32_moe_routing_cache",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",
-    "hpc_fuse_moe_mxfp8_k32_bf16_candidate",
+    "hpc_fuse_moe_mxfp8_k32_bf16_candidate_out",
     "hpc_fuse_moe_mxfp8_k32_candidate",
 ]

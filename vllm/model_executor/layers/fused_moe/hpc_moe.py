@@ -27,7 +27,7 @@ from vllm.utils.hpc import (
     has_hpc_mxfp8_k32_moe,
     hpc_fuse_moe,
     hpc_fuse_moe_blockwise,
-    hpc_fuse_moe_mxfp8_k32_bf16_candidate,
+    hpc_fuse_moe_mxfp8_k32_bf16_candidate_out,
 )
 
 logger = init_logger(__name__)
@@ -324,6 +324,9 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
     def supports_chunking(self) -> bool:
         return True
 
+    def supports_output_alias(self) -> bool:
+        return True
+
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
@@ -338,7 +341,16 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return (M * topk, N), (M * topk, K), (M, K)
+        routed_rows = M * topk
+        routing_bytes = (
+            (2 * routed_rows + 2 * local_num_experts + 1) * 4 + 15
+        ) & ~15
+        grouped_bytes = routed_rows * (K + K // 32)
+        gate_output_bytes = routed_rows * N * 2
+        workspace13_elements = (
+            routing_bytes + grouped_bytes + gate_output_bytes + 1
+        ) // 2
+        return (workspace13_elements,), (routed_rows, K), (M, K)
 
     def apply(
         self,
@@ -370,11 +382,75 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
         assert w2.size(1) == 6144 and w2.size(2) == 192
         assert self.quant_config.w1_scale is not None
         assert self.quant_config.w2_scale is not None
+        assert hidden_states.is_contiguous()
+        assert topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+        assert topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()
+        assert workspace13 is not None and workspace2 is not None
+
+        num_tokens = hidden_states.size(0)
+        topk = topk_ids.size(1)
+        routed_rows = num_tokens * topk
+        hidden_dim = hidden_states.size(1)
+        gate_n = w1.size(1)
+
+        scratch = workspace13.view(torch.uint8).flatten()
+        offset = 0
+
+        def take(
+            num_bytes: int,
+            dtype: torch.dtype,
+            shape: tuple[int, ...],
+        ) -> torch.Tensor:
+            nonlocal offset
+            result = scratch[offset : offset + num_bytes].view(dtype).view(shape)
+            offset += num_bytes
+            return result
+
+        row_indices = take(routed_rows * 4, torch.int32, (routed_rows,))
+        topk_pos = take(routed_rows * 4, torch.int32, (num_tokens, topk))
+        seqlens = take(self.num_experts * 4, torch.int32, (self.num_experts,))
+        cu_seqlens = take(
+            (self.num_experts + 1) * 4,
+            torch.int32,
+            (self.num_experts + 1,),
+        )
+
+        offset = (offset + 15) & ~15
+        grouped_start = offset
+        grouped_hidden = take(
+            routed_rows * hidden_dim,
+            torch.float8_e4m3fn,
+            (routed_rows, hidden_dim),
+        )
+        grouped_hidden_scale = take(
+            routed_rows * (hidden_dim // 32),
+            torch.uint8,
+            (routed_rows, hidden_dim // 32),
+        )
+        gate_output = take(
+            routed_rows * gate_n * 2,
+            torch.bfloat16,
+            (routed_rows, gate_n),
+        )
+        assert offset <= scratch.numel()
+
+        # Gate consumes grouped input before activation runs on the same stream,
+        # so activation output can reuse the dead grouped-input prefix.
+        activated_output_bytes = routed_rows * (gate_n // 2)
+        activated_output = scratch[
+            grouped_start : grouped_start + activated_output_bytes
+        ].view(torch.float8_e4m3fn).view(routed_rows, gate_n // 2)
+        activated_scale = scratch[
+            grouped_start
+            + activated_output_bytes : grouped_start
+            + activated_output_bytes
+            + routed_rows * (gate_n // 64)
+        ].view(torch.uint8).view(routed_rows, gate_n // 64)
 
         clamp = self.quant_config.gemm1_clamp_limit
         alpha = self.quant_config.gemm1_alpha
         beta = self.quant_config.gemm1_beta
-        hpc_fuse_moe_mxfp8_k32_bf16_candidate(
+        hpc_fuse_moe_mxfp8_k32_bf16_candidate_out(
             hidden=hidden_states,
             gate_up_weight=w1,
             gate_up_weight_scale=self.quant_config.w1_scale,
@@ -383,7 +459,15 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             output=output,
-            gate_output=workspace13,
+            row_indices=row_indices,
+            topk_pos=topk_pos,
+            seqlens=seqlens,
+            cu_seqlens=cu_seqlens,
+            grouped_hidden=grouped_hidden,
+            grouped_hidden_scale=grouped_hidden_scale,
+            gate_output=gate_output,
+            activated_output=activated_output,
+            activated_scale=activated_scale,
             down_output=workspace2,
             activation_clamp=7.0 if clamp is None else float(clamp),
             alpha=1.702 if alpha is None else float(alpha),
