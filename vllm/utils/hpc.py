@@ -45,6 +45,7 @@ def has_hpc_mxfp8_k32_moe() -> bool:
     required_ops = (
         "build_mxfp8_k32_moe_routing_cache",
         "fuse_moe_mxfp8_k32_candidate",
+        "fuse_moe_mxfp8_k32_bf16_candidate",
     )
     missing_ops = [op for op in required_ops if not hasattr(torch.ops.hpc, op)]
     if missing_ops:
@@ -336,11 +337,54 @@ def hpc_fuse_moe_mxfp8_k32_candidate(
     )
 
 
+def hpc_fuse_moe_mxfp8_k32_bf16_candidate(
+    hidden: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor | None = None,
+    gate_output: torch.Tensor | None = None,
+    down_output: torch.Tensor | None = None,
+    activation_clamp: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    import hpc  # noqa: F401
+
+    return torch.ops.hpc.fuse_moe_mxfp8_k32_bf16_candidate(
+        hidden.contiguous(),
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids.to(torch.int32).contiguous(),
+        topk_weights.float().contiguous(),
+        output,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        gate_output,
+        None,
+        None,
+        down_output,
+        activation_clamp,
+        alpha,
+        beta,
+    )
+
+
 __all__ = [
     "has_hpc",
     "has_hpc_mxfp8_k32_moe",
     "hpc_build_mxfp8_k32_moe_routing_cache",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",
+    "hpc_fuse_moe_mxfp8_k32_bf16_candidate",
     "hpc_fuse_moe_mxfp8_k32_candidate",
 ]

@@ -21,17 +21,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kMxfp8Static,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-    mxfp8_e4m3_quantize,
-)
 from vllm.platforms import current_platform
 from vllm.utils.hpc import (
     has_hpc,
     has_hpc_mxfp8_k32_moe,
-    hpc_build_mxfp8_k32_moe_routing_cache,
     hpc_fuse_moe,
     hpc_fuse_moe_blockwise,
-    hpc_fuse_moe_mxfp8_k32_candidate,
+    hpc_fuse_moe_mxfp8_k32_bf16_candidate,
 )
 
 logger = init_logger(__name__)
@@ -342,7 +338,7 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return (M, K), (0,), (M, K)
+        return (M * topk, N), (M * topk, K), (M, K)
 
     def apply(
         self,
@@ -375,28 +371,20 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
         assert self.quant_config.w1_scale is not None
         assert self.quant_config.w2_scale is not None
 
-        hidden_q, hidden_scale = mxfp8_e4m3_quantize(
-            hidden_states.contiguous(),
-            is_sf_swizzled_layout=False,
-        )
-        routing_cache = hpc_build_mxfp8_k32_moe_routing_cache(
-            topk_ids,
-            num_experts=w1.size(0),
-        )
-
         clamp = self.quant_config.gemm1_clamp_limit
         alpha = self.quant_config.gemm1_alpha
         beta = self.quant_config.gemm1_beta
-        hpc_fuse_moe_mxfp8_k32_candidate(
-            hidden_q=hidden_q,
-            hidden_scale=hidden_scale,
+        hpc_fuse_moe_mxfp8_k32_bf16_candidate(
+            hidden=hidden_states,
             gate_up_weight=w1,
             gate_up_weight_scale=self.quant_config.w1_scale,
             down_weight=w2,
             down_weight_scale=self.quant_config.w2_scale,
-            routing_cache=routing_cache,
-            topk_weights=topk_weights.float().contiguous(),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
             output=output,
+            gate_output=workspace13,
+            down_output=workspace2,
             activation_clamp=7.0 if clamp is None else float(clamp),
             alpha=1.702 if alpha is None else float(alpha),
             beta=1.0 if beta is None else float(beta),
