@@ -31,6 +31,31 @@ def has_hpc() -> bool:
     return True
 
 
+@functools.cache
+def has_hpc_mxfp8_k32_moe() -> bool:
+    """Return True if the installed hpc package has MiniMax-M3 K32 MoE ops."""
+    if not has_hpc():
+        return False
+    try:
+        import hpc  # noqa: F401
+    except Exception as err:
+        logger.warning_once("Failed to import hpc package: %s", err)
+        return False
+
+    required_ops = (
+        "build_mxfp8_k32_moe_routing_cache",
+        "fuse_moe_mxfp8_k32_candidate",
+    )
+    missing_ops = [op for op in required_ops if not hasattr(torch.ops.hpc, op)]
+    if missing_ops:
+        logger.warning_once(
+            "Installed hpc package is missing MiniMax-M3 MXFP8 K32 MoE ops: %s",
+            ", ".join(missing_ops),
+        )
+        return False
+    return True
+
+
 # Remove 'torch._library.custom_ops':
 # The output of this custom operator (1) must not also be an input to
 # this custom operator and (2) may not alias any inputs to this custom
@@ -313,6 +338,7 @@ def hpc_fuse_moe_mxfp8_k32_candidate(
 
 __all__ = [
     "has_hpc",
+    "has_hpc_mxfp8_k32_moe",
     "hpc_build_mxfp8_k32_moe_routing_cache",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",

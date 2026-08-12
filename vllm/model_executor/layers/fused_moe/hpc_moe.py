@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.hpc import (
     has_hpc,
+    has_hpc_mxfp8_k32_moe,
     hpc_build_mxfp8_k32_moe_routing_cache,
     hpc_fuse_moe,
     hpc_fuse_moe_blockwise,
@@ -266,7 +267,7 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return p.is_cuda() and p.is_device_capability(90) and has_hpc()
+        return p.is_cuda() and p.is_device_capability(90) and has_hpc_mxfp8_k32_moe()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -286,6 +287,36 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_shape(hidden_dim: int) -> bool:
         return hidden_dim == 6144
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: mk.FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        supported, reason = mk.FusedMoEExperts.is_supported_config(
+            cls,
+            moe_config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+        if not supported:
+            return supported, reason
+
+        if moe_config.num_experts != 128 or moe_config.num_local_experts != 128:
+            return False, "MiniMax-M3 HPC backend requires 128 local experts"
+        if moe_config.experts_per_token != 4:
+            return False, "MiniMax-M3 HPC backend requires top_k=4"
+        if moe_config.intermediate_size_per_partition != 192:
+            return False, (
+                "MiniMax-M3 HPC backend requires intermediate_size_per_partition=192"
+            )
+        if moe_config.in_dtype != torch.bfloat16:
+            return False, "MiniMax-M3 HPC backend requires BF16 activations"
+        return True, None
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
