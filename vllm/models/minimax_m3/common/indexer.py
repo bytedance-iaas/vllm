@@ -64,12 +64,11 @@ class MiniMaxM3IndexerBackend(AttentionBackend):
     """Indexer side-cache backend (key-only)."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
-    # bf16 today; mirrors the main backend to keep spec validation permissive.
+    # Keep spec validation aligned with the implemented cache/impl paths.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     ]
 
     @staticmethod
@@ -424,6 +423,9 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
         # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
         buf = self.topk_indices_buffer
+        buf_htk = (
+            buf if buf is None or current_platform.is_rocm() else buf.transpose(0, 1)
+        )
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
         if index_md.num_decodes > 0:
@@ -441,7 +443,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.num_kv_heads,
                 d.decode_query_len,
                 d.max_decode_query_len,
-                out=buf,
+                out=buf_htk,
             )
         if index_md.num_prefills > 0:
             p = index_md.prefill
@@ -465,7 +467,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.topk_blocks,
                 self.init_blocks,
                 self.local_blocks,
-                out=buf[:, nd:, :] if buf is not None else None,
+                out=buf_htk[:, nd:, :] if buf_htk is not None else None,
             )
         return decode_topk, prefill_topk
 
