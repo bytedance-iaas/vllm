@@ -82,6 +82,12 @@ def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
     return bool(getattr(vllm_config, "use_v2_model_runner", False))
 
 
+def _uses_prefill_context_parallelism(runner: "GPUModelRunner") -> bool:
+    vllm_config = getattr(runner, "vllm_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
+
+
 def _run_flashinfer_sparse_mla_decode_autotune(
     worker: "Worker",
     num_tokens: int,
@@ -223,6 +229,14 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
     runner = worker.model_runner
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
+        return
+
+    if _uses_prefill_context_parallelism(runner):
+        logger.info(
+            "Skipping DeepSeek V4 sparse MLA mixed prefill+decode warmup "
+            "because prefill context parallelism only supports standalone "
+            "prefill batches."
+        )
         return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens

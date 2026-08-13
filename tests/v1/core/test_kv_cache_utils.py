@@ -3037,3 +3037,44 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+def test_resolve_kv_cache_block_sizes_scales_only_legacy_pcp():
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn"],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+
+    def make_config(use_v2_model_runner: bool):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=16,
+                enable_prefix_caching=False,
+                prefix_match_unit=None,
+                mamba_cache_mode="align",
+            ),
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=2,
+            ),
+            kv_transfer_config=None,
+            use_v2_model_runner=use_v2_model_runner,
+        )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, make_config(use_v2_model_runner=False)
+    ) == (32, 32)
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, make_config(use_v2_model_runner=True)
+    ) == (16, 16)

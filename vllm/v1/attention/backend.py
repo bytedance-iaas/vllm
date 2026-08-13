@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
     from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.worker.cp_utils import PCPInterleaveRequestView
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -451,6 +452,16 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    pcp_allgather_restore_idx: torch.Tensor | None = None
+    """Indices that restore PCP all-gathered tensors to global token order."""
+
+    pcp_full_seq_lens: torch.Tensor | None = None
+    pcp_full_seq_lens_cpu: torch.Tensor | None = None
+    """Full per-request sequence lengths before PCP splits prefill tokens."""
+
+    pcp_request_views: list["PCPInterleaveRequestView"] | None = None
+    """Request-level dual-chunk layout for model-specific PCP metadata."""
+
     positions: torch.Tensor | None = None
     """(num_actual_tokens,) token positions.  Optional; set when the caller
     has positions available so that builders can pre-compute position-dependent
@@ -568,6 +579,7 @@ class CommonAttentionMetadata:
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
+            seq_lens_cpu_upper_bound=maybe_slice_reqs(self.seq_lens_cpu_upper_bound),
             _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
             if self._seq_lens_cpu is not None
             else None,
@@ -589,6 +601,15 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            pcp_allgather_restore_idx=self.pcp_allgather_restore_idx,
+            pcp_full_seq_lens=maybe_slice_reqs(self.pcp_full_seq_lens),
+            pcp_full_seq_lens_cpu=maybe_slice_reqs(self.pcp_full_seq_lens_cpu),
+            pcp_request_views=self.pcp_request_views[:num_actual_reqs]
+            if self.pcp_request_views is not None
+            else None,
+            positions=self.positions[:num_actual_tokens]
+            if self.positions is not None
+            else None,
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
         )

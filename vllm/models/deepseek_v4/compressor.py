@@ -4,10 +4,12 @@
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
+import numpy as np
 import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -20,7 +22,14 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
+from vllm.models.deepseek_v4.pcp_metadata import (
+    build_pcp_compressed_slot_mapping,
+    build_pcp_full_slot_mapping,
+    build_pcp_restored_req_indices,
+    build_pcp_restored_valid_mask,
+)
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import np_to_pinned_tensor
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -28,7 +37,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_pcp_max_buffer_num_tokens,
+    get_pcp_num_local_tokens_from_restore_idx,
+    pcp_allgather_and_restore,
+    split_decodes_and_prefills,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -90,6 +104,19 @@ class CompressorMetadata:
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     num_decode_tokens: int | None = None
+    pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_request_views: list[Any] | None = None
+
+
+class _SlotMappingMetadataOverride:
+    """Proxy metadata while replacing only the slot mapping used by kernels."""
+
+    def __init__(self, base: Any, slot_mapping: torch.Tensor) -> None:
+        self._base = base
+        self.slot_mapping = slot_mapping
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -99,10 +126,13 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
         mla_spec = cast(SlidingWindowMLASpec | MLAAttentionSpec, self.kv_cache_spec)
-        self.block_size = mla_spec.block_size
+        self.block_size = mla_spec.storage_block_size
+        self.pcp_world_size = (
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
 
         self.token_to_req_indices = torch.zeros(
-            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            get_pcp_max_buffer_num_tokens(self.vllm_config),
             dtype=torch.int32,
             device=self.device,
         )
@@ -113,9 +143,22 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
-        )
+        pcp_restore_idx = common_attn_metadata.pcp_allgather_restore_idx
+        if pcp_restore_idx is None:
+            token_to_req_indices = common_attn_metadata.token_to_req_indices(
+                self.token_to_req_indices
+            )
+        else:
+            query_lens = np.diff(
+                np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
+            ) * self.pcp_world_size
+            req_indices = np.repeat(
+                np.arange(common_attn_metadata.num_reqs, dtype=np.int32), query_lens
+            )
+            token_to_req_indices = self.token_to_req_indices[: req_indices.shape[0]]
+            token_to_req_indices.copy_(
+                np_to_pinned_tensor(req_indices), non_blocking=True
+            )
         num_decode_tokens = None
         if _prefer_two_stage_compressor():
             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
@@ -127,6 +170,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
             num_decode_tokens=num_decode_tokens,
+            pcp_allgather_restore_idx=pcp_restore_idx,
+            pcp_request_views=common_attn_metadata.pcp_request_views,
         )
 
 
@@ -224,6 +269,13 @@ class DeepseekCompressor(nn.Module):
         self.device = current_platform.device_type
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = 0
+        if self.pcp_world_size > 1:
+            self.pcp_rank = get_pcp_group().rank_in_group
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
 
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
@@ -329,6 +381,63 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        k_cache_slot_mapping = None
+        if state_metadata.pcp_allgather_restore_idx is not None:
+            restore_idx = state_metadata.pcp_allgather_restore_idx
+            pcp_group = get_pcp_group()
+            num_local_tokens = get_pcp_num_local_tokens_from_restore_idx(
+                restore_idx, pcp_group.world_size
+            )
+            kv_score = pcp_allgather_and_restore(
+                kv_score,
+                num_local_tokens,
+                restore_idx,
+                pcp_group,
+            )
+            positions = pcp_allgather_and_restore(
+                positions,
+                num_local_tokens,
+                restore_idx,
+                pcp_group,
+            )
+            kv, score = kv_score.split(
+                [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
+            )
+            assert state_metadata.pcp_request_views is not None
+            restored_valid_mask = build_pcp_restored_valid_mask(
+                positions=positions,
+                views=state_metadata.pcp_request_views,
+            )
+            restored_req_indices = build_pcp_restored_req_indices(
+                positions=positions,
+                views=state_metadata.pcp_request_views,
+            )
+            slot_mapping = build_pcp_full_slot_mapping(
+                positions=positions,
+                req_indices=restored_req_indices,
+                block_table=block_table,
+                block_size=block_size,
+                valid_mask=restored_valid_mask,
+                cp_world_size=self.pcp_world_size,
+                cp_rank=self.pcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            )
+            num_actual = slot_mapping.shape[0]
+            k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+            k_cache_layer = self._static_forward_context[self.k_cache_prefix]
+            kv_cache = k_cache_layer.kv_cache
+            if hasattr(k_cache_metadata, "block_table"):
+                k_cache_slot_mapping = build_pcp_compressed_slot_mapping(
+                    positions=positions,
+                    req_indices=restored_req_indices,
+                    block_table=k_cache_metadata.block_table,
+                    block_size=int(kv_cache.shape[1]),
+                    compress_ratio=self.compress_ratio,
+                    valid_mask=restored_valid_mask,
+                    cp_world_size=self.pcp_world_size,
+                    cp_rank=self.pcp_rank,
+                    cp_kv_cache_interleave_size=(self.cp_kv_cache_interleave_size),
+                )
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -370,6 +479,11 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
+        if k_cache_slot_mapping is not None:
+            k_cache_metadata = _SlotMappingMetadataOverride(
+                k_cache_metadata,
+                k_cache_slot_mapping,
+            )
 
         # Plain-row V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # fp8_ds_mla path uses the UE8M0 paged uint8 layout.

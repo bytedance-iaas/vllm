@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _pair_pcp_block_ids,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -68,6 +70,290 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
             )
         ],
     )
+
+
+@pytest.mark.parametrize("group_block_size", [256, 64, 4, 8])
+def test_pair_pcp_blocks_reassembles_v4_groups(group_block_size: int):
+    """PCP ranks must write disjoint pages whose union is the D cache."""
+
+    total_tokens = 1024
+    remote_blocks = list(range(1000, 1000 + total_tokens // group_block_size))
+    local_count = total_tokens // 2 // group_block_size
+
+    rank_pairs = [
+        _pair_pcp_block_ids(
+            list(range(rank * 100, rank * 100 + local_count)),
+            remote_blocks,
+            total_tokens=total_tokens,
+            num_external_tokens=total_tokens,
+            external_start_token=0,
+            producer_pcp_size=2,
+            producer_pcp_rank=rank,
+            consumer_pcp_size=1,
+            consumer_pcp_rank=0,
+            group_block_size=group_block_size,
+            interleave_size=256,
+        )
+        for rank in range(2)
+    ]
+
+    assert all(error is None for _, _, error in rank_pairs)
+    rank0_remote = rank_pairs[0][1]
+    rank1_remote = rank_pairs[1][1]
+    assert set(rank0_remote).isdisjoint(rank1_remote)
+    assert sorted(rank0_remote + rank1_remote) == remote_blocks
+
+
+def test_pair_pcp_blocks_skips_padding_after_partial_final_chunk():
+    """Only the rank owning the request tail may write its final D page."""
+
+    total_tokens = 600
+    remote_blocks = [100, 101, 102]
+    rank0 = _pair_pcp_block_ids(
+        [10, 11],
+        remote_blocks,
+        total_tokens=total_tokens,
+        num_external_tokens=total_tokens,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+    rank1 = _pair_pcp_block_ids(
+        [20],
+        remote_blocks,
+        total_tokens=total_tokens,
+        num_external_tokens=total_tokens,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=1,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+
+    assert rank0 == ([10, 11], [100, 102], None)
+    assert rank1 == ([20], [101], None)
+
+
+def test_pair_pcp_blocks_skips_padding_on_rank_without_tokens():
+    """A short request may allocate one page on every PCP rank."""
+
+    rank0 = _pair_pcp_block_ids(
+        [10],
+        [100],
+        total_tokens=9,
+        num_external_tokens=9,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+    rank1 = _pair_pcp_block_ids(
+        [20],
+        [100],
+        total_tokens=9,
+        num_external_tokens=9,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=1,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+
+    assert rank0 == ([10], [100], None)
+    assert rank1 == ([], [], None)
+
+
+@pytest.mark.parametrize("group_block_size", [256, 64, 8, 4])
+def test_pair_pcp_blocks_maps_exact_external_suffix(group_block_size: int):
+    """Prefix hits must not shift producer-local suffix pages on Decode."""
+
+    total_tokens = 1024
+    external_start_token = 512
+    num_external_tokens = total_tokens - external_start_token
+    remote_blocks = list(range(100, 100 + num_external_tokens // group_block_size))
+    local_suffix_pages = num_external_tokens // 2 // group_block_size
+
+    rank_pairs = [
+        _pair_pcp_block_ids(
+            list(range(rank * 1000, rank * 1000 + local_suffix_pages)),
+            remote_blocks,
+            total_tokens=total_tokens,
+            num_external_tokens=num_external_tokens,
+            external_start_token=external_start_token,
+            producer_pcp_size=2,
+            producer_pcp_rank=rank,
+            consumer_pcp_size=1,
+            consumer_pcp_rank=0,
+            group_block_size=group_block_size,
+            interleave_size=256,
+        )
+        for rank in range(2)
+    ]
+
+    assert all(error is None for _, _, error in rank_pairs)
+    assert set(rank_pairs[0][1]).isdisjoint(rank_pairs[1][1])
+    assert sorted(rank_pairs[0][1] + rank_pairs[1][1]) == remote_blocks
+
+
+def test_pair_pcp_blocks_rejects_non_suffix_external_range():
+    _, _, error = _pair_pcp_block_ids(
+        [10],
+        [100],
+        total_tokens=1024,
+        num_external_tokens=256,
+        external_start_token=512,
+        producer_pcp_size=2,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=256,
+        interleave_size=256,
+    )
+
+    assert error is not None
+    assert "exact suffix" in error
+
+
+def test_pair_pcp_blocks_fails_closed_for_unsupported_page_geometry():
+    _, _, error = _pair_pcp_block_ids(
+        [10],
+        [100],
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        producer_pcp_size=2,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        group_block_size=96,
+        interleave_size=256,
+    )
+
+    assert error is not None
+    assert "interleave" in error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_block_size", [256, 64, 8, 4])
+@pytest.mark.parametrize("pcp_rank", [0, 1])
+async def test_build_transfer_params_reassembles_pcp_pages(
+    group_block_size: int,
+    pcp_rank: int,
+):
+    """The transfer plan must scatter compact PCP pages into D global order."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = False
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.pcp_rank = pcp_rank
+    worker.pcp_size = 2
+    worker.cp_kv_cache_interleave_size = 256
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn"],
+                FullAttentionSpec(
+                    block_size=group_block_size,
+                    num_kv_heads=1,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+
+    local_base = 0x1000
+    remote_base = 0xA000
+    region_block_len = 128
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=local_base,
+            block_len=region_block_len,
+            kv_block_len=region_block_len,
+            logical_group_indices=(0,),
+        )
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=remote_base,
+            block_len=region_block_len,
+            kv_block_len=region_block_len,
+            logical_group_indices=(0,),
+        )
+    ]
+    local_pages_per_chunk = 256 // group_block_size
+    local_block_ids = list(range(10, 10 + 512 // group_block_size))
+    remote_block_ids = list(range(100, 100 + 1024 // group_block_size))
+    transfer_id = "xfer-pcp"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-pcp",
+        transfer_id=transfer_id,
+        local_block_ids=[local_block_ids],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        remote_pcp_size=1,
+        remote_pcp_rank=0,
+        req_blocks={"d-req-pcp": (transfer_id, [remote_block_ids])},
+        kv_caches_base_addr=[remote_base],
+        block_lens=[region_block_len],
+        kv_block_lens=[region_block_len],
+        req_total_tokens={"d-req-pcp": 1024},
+        req_num_external_tokens={"d-req-pcp": 1024},
+        req_external_start_tokens={"d-req-pcp": 0},
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-req-pcp", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=local_regions,
+        remote_regions=remote_regions,
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src_ptrs == [
+        local_base + 10 * region_block_len,
+        local_base + (10 + local_pages_per_chunk) * region_block_len,
+    ]
+    assert dst_ptrs == [
+        remote_base + (100 + pcp_rank * local_pages_per_chunk) * region_block_len,
+        remote_base + (100 + (2 + pcp_rank) * local_pages_per_chunk) * region_block_len,
+    ]
+    assert lengths == [region_block_len * local_pages_per_chunk] * 2
 
 
 class FakeMooncakeWrapper:
@@ -382,6 +668,7 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
     """Each producer PP stage should send only its registered layer shard."""
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = True
     worker.is_kv_producer = True
@@ -493,6 +780,7 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
             lengths,
             err_reqs,
             err_msg,
+            state_transfer_events,
         ) = await worker._build_transfer_params(
             ready_reqs=[("d-req-pp", send_meta)],
             agent_meta=xfer_meta,
@@ -502,6 +790,7 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
 
         assert err_reqs == []
         assert err_msg is None
+        assert state_transfer_events == []
         assert src_ptrs == expected_by_pp_rank[pp_rank]["src_ptrs"]
         assert dst_ptrs == expected_by_pp_rank[pp_rank]["dst_ptrs"]
         assert lengths == [2 * block_len, 2 * block_len]
@@ -574,10 +863,13 @@ async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
         ) as mock_send_blocks:
             await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
 
-        src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0][1:]
+        src_ptrs, dst_ptrs, lengths, state_transfer_events = mock_send_blocks.call_args[
+            0
+        ][1:]
         assert src_ptrs == [0x1000 + 10 * block_len]
         assert dst_ptrs == [0xB000 + 20 * block_len]
         assert lengths == [block_len]
+        assert state_transfer_events == []
 
         sent_identity, sent_payload = mock_socket.send_multipart.call_args[0][0]
         assert sent_identity == identity
@@ -712,6 +1004,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 0,
         "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 2,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -719,11 +1013,26 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
+    payload1_pcp1 = {
+        "engine_id": "eng-1",
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "pp_rank": 0,
+        "pcp_rank": 1,
+        "pcp_size": 2,
+        "addr": "tcp://1.1.1.2:1112",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=payload1_pcp1)
+        assert response.status_code == 200
+
     payload2 = {
         "engine_id": "eng-1",
         "dp_rank": 0,
         "tp_rank": 0,
         "pp_rank": 1,
+        "pcp_rank": 0,
+        "pcp_size": 2,
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
@@ -738,8 +1047,10 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         data = response.json()
         assert "0" in data
         assert data["0"]["engine_id"] == "eng-1"
-        assert data["0"]["worker_addr"]["0"]["0"] == "tcp://1.1.1.1:1111"
-        assert data["0"]["worker_addr"]["0"]["1"] == "tcp://2.2.2.2:2222"
+        assert data["0"]["pcp_size"] == 2
+        assert data["0"]["worker_addr"]["0"]["0"]["0"] == ("tcp://1.1.1.1:1111")
+        assert data["0"]["worker_addr"]["0"]["0"]["1"] == ("tcp://1.1.1.2:1112")
+        assert data["0"]["worker_addr"]["0"]["1"]["0"] == ("tcp://2.2.2.2:2222")
 
     # Test failure: re-registering the same worker
     async with httpx.AsyncClient() as client:
@@ -753,6 +1064,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 1,
         "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 2,
         "addr": "tcp://3.3.3.3:3333",
     }
     async with httpx.AsyncClient() as client:
@@ -832,6 +1145,33 @@ def test_should_launch_bootstrap_server_selects_single_owner(
     ):
         mock_pp_group.return_value.rank_in_group = pp_rank
         assert should_launch_bootstrap_server(vllm_config) is expected
+
+
+def test_should_launch_bootstrap_server_rejects_nonzero_pcp_rank():
+    vllm_config = _make_bootstrap_vllm_config(
+        local_engines_only=True,
+        data_parallel_rank_local=0,
+    )
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pp_group"
+        ) as mock_pp_group,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pcp_group",
+            create=True,
+        ) as mock_pcp_group,
+    ):
+        mock_pp_group.return_value.rank_in_group = 0
+        mock_pcp_group.return_value.rank_in_group = 1
+        assert should_launch_bootstrap_server(vllm_config) is False
 
 
 @pytest.mark.parametrize(
@@ -924,6 +1264,7 @@ def patch_worker_dependencies():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.current_platform.set_device"
         ),
+        patch("torch.accelerator.current_device_index", return_value=0),
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.get_current_attn_backends",
@@ -1011,56 +1352,201 @@ async def test_receive_kv_selects_remote_pp_workers(
 ):
     """Decode workers should not hard-code producer pp_rank 0."""
 
-    vllm_config = create_vllm_config(
-        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    decode_worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    decode_worker.shutdown = MagicMock()
+    decode_worker.pp_size = local_pp_size
+    decode_worker.pp_rank = local_pp_rank
+    decode_worker.pcp_size = 1
+    decode_worker.pcp_rank = 0
+    decode_worker.transfer_topo = SimpleNamespace(
+        handshake_target_ranks=lambda _size: [0]
     )
-
-    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        decode_connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
-        decode_worker = decode_connector.connector_worker
-        decode_worker.pp_size = local_pp_size
-        decode_worker.pp_rank = local_pp_rank
-        decode_worker._remote_agents = {
-            "p-engine": {
-                0: {
-                    0: "tcp://producer-pp0:1234",
-                    1: "tcp://producer-pp1:1234",
-                }
+    decode_worker._remote_agents = {
+        "p-engine": {
+            0: {
+                0: {0: "tcp://producer-pp0:1234"},
+                1: {0: "tcp://producer-pp1:1234"},
             }
         }
-        decode_worker._tp_size["p-engine"] = 1
+    }
+    decode_worker._tp_size = {"p-engine": 1}
+    decode_worker._pcp_size = {"p-engine": 1}
 
-        pull_metas = {
-            "d-req-1": PullReqMeta(
-                d_req_id="d-req-1",
-                transfer_id="xfer-req-1",
-                local_block_ids=[[100, 101]],
-                remote_engine_id="p-engine",
-                remote_bootstrap_addr="http://bootstrap:33333",
-            )
+    pull_metas = {
+        "d-req-1": PullReqMeta(
+            d_req_id="d-req-1",
+            transfer_id="xfer-req-1",
+            local_block_ids=[[100, 101]],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://bootstrap:33333",
+        )
+    }
+    seen_addrs: list[str] = []
+
+    async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
+        seen_addrs.append(worker_addr)
+        for meta in metas.values():
+            meta.pull_tasks_count -= 1
+
+    with patch.object(
+        decode_worker,
+        "receive_kv_from_single_worker",
+        side_effect=fake_receive,
+    ):
+        decode_worker.receive_kv("p-engine", pull_metas)
+        await asyncio.sleep(0)
+
+    assert seen_addrs == expected_addrs
+    assert pull_metas["d-req-1"].pull_tasks_count == 0
+
+
+@pytest.mark.asyncio
+async def test_receive_kv_waits_for_every_remote_pp_pcp_worker():
+    """A PCP1 decoder must pull every PP/PCP shard from a PCP2 producer."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda _size: [0])
+    worker._remote_agents = {
+        "p-engine": {
+            0: {
+                0: {
+                    0: "tcp://producer-pp0-pcp0:1234",
+                    1: "tcp://producer-pp0-pcp1:1234",
+                },
+                1: {
+                    0: "tcp://producer-pp1-pcp0:1234",
+                    1: "tcp://producer-pp1-pcp1:1234",
+                },
+            }
         }
-        seen_addrs: list[str] = []
+    }
+    worker._tp_size = {"p-engine": 1}
+    worker._pcp_size = {"p-engine": 2}
+    worker.finished_recving_reqs = set()
+    pull_metas = {
+        "d-req-1": PullReqMeta(
+            d_req_id="d-req-1",
+            transfer_id="xfer-req-1",
+            local_block_ids=[[100, 101]],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://bootstrap:33333",
+        )
+    }
+    seen_addrs: list[str] = []
 
-        async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
-            seen_addrs.append(worker_addr)
-            for meta in metas.values():
-                meta.pull_tasks_count -= 1
+    async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
+        seen_addrs.append(worker_addr)
+        worker.process_pulling_result(
+            MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=list(metas),
+            ),
+            metas,
+        )
 
-        with patch.object(
-            decode_worker,
-            "receive_kv_from_single_worker",
-            side_effect=fake_receive,
-        ):
-            decode_worker.receive_kv("p-engine", pull_metas)
-            await asyncio.sleep(0)
+    with patch.object(
+        worker,
+        "receive_kv_from_single_worker",
+        side_effect=fake_receive,
+    ):
+        worker.receive_kv("p-engine", pull_metas)
+        await asyncio.sleep(0)
 
-        assert seen_addrs == expected_addrs
-        assert pull_metas["d-req-1"].pull_tasks_count == 0
-        decode_worker.shutdown()
+    assert seen_addrs == [
+        "tcp://producer-pp0-pcp0:1234",
+        "tcp://producer-pp0-pcp1:1234",
+        "tcp://producer-pp1-pcp0:1234",
+        "tcp://producer-pp1-pcp1:1234",
+    ]
+    assert pull_metas["d-req-1"].pull_tasks_count == 0
+    assert worker.finished_recving_reqs == {"d-req-1"}
+
+
+def test_receive_kv_rejects_incomplete_remote_pcp_workers():
+    """A decoder must fail closed when any producer PCP shard is absent."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda _size: [0])
+    worker._remote_agents = {
+        "p-engine": {
+            0: {
+                0: {0: "tcp://producer-pp0-pcp0:1234"},
+                1: {0: "tcp://producer-pp1-pcp0:1234"},
+            }
+        }
+    }
+    worker._tp_size = {"p-engine": 1}
+    worker._pcp_size = {"p-engine": 2}
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-incomplete",
+        transfer_id="xfer-incomplete",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+
+    worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
+
+
+def test_multi_shard_late_failure_waits_for_quiesce_and_invalidates_blocks():
+    """A late PCP shard failure must not expose partially reconstructed KV."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-late-failure",
+        transfer_id="xfer-late-failure",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        pull_tasks_count=2,
+    )
+    pull_metas = {pull_meta.d_req_id: pull_meta}
+
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.CONTINUE,
+            ok_reqs=[pull_meta.d_req_id],
+        ),
+        pull_metas,
+    )
+    assert pull_meta.pull_tasks_count == 1
+    assert worker.finished_recving_reqs == set()
+
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.ERROR,
+            err_reqs=[pull_meta.d_req_id],
+            err_msg="producer PCP shard failed",
+        ),
+        pull_metas,
+    )
+    assert pull_meta.pull_tasks_count == 0
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
 def test_resolve_need_send_accounts_for_remote_tp_fanout():
@@ -1167,6 +1653,7 @@ async def test_kv_producer(monkeypatch):
                 src,
                 dst,
                 lens,
+                [],
             )
             mock_socket.send_multipart.assert_called_once()
 
@@ -1199,6 +1686,7 @@ async def test_kv_producer(monkeypatch):
                 src,
                 dst,
                 lens,
+                [],
             )
             mock_socket.send_multipart.assert_called_once()
 
@@ -1296,7 +1784,10 @@ async def test_kv_consumuer(monkeypatch):
                 pull_tasks_count=1,
             )
         }
-        decode_worker._remote_agents = {"p-engine": {0: {0: "tcp://producer:1234"}}}
+        decode_worker._remote_agents = {
+            "p-engine": {0: {0: {0: "tcp://producer:1234"}}}
+        }
+        decode_worker._pcp_size["p-engine"] = 1
         decode_worker._tp_size["p-engine"] = 1
 
         # Mock the response from the producer.
@@ -1668,6 +2159,21 @@ def test_register_kv_caches_aggregates_shared_overlay_aliases():
             ),
         ],
     )
+    worker._layer_specs = {
+        layer_name: group.kv_cache_spec
+        for group in worker.kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    worker._layer_group_indices = {
+        layer_name: group_index
+        for group_index, group in enumerate(worker.kv_cache_config.kv_cache_groups)
+        for layer_name in group.layer_names
+    }
+    worker._layer_logical_group_indices = {
+        layer_name: [group_index]
+        for group_index, group in enumerate(worker.kv_cache_config.kv_cache_groups)
+        for layer_name in group.layer_names
+    }
     worker.transfer_topo = SimpleNamespace(
         virtually_split_kv_in_blocks=False,
         get_transfer_cache_regions=lambda cache, _spec: [cache],

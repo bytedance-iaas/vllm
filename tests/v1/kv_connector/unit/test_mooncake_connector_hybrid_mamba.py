@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from transformers import OPTConfig
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -212,9 +213,12 @@ def test_register_kv_caches_deduplicates_shared_backing_memory(monkeypatch):
         connector.connector_worker = None
 
 
-def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
+def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    model_path = tmp_path / "opt"
+    OPTConfig().save_pretrained(model_path)
     vllm_config = create_vllm_config(
+        model=str(model_path),
         kv_connector="MooncakeConnector",
         kv_role="kv_producer",
     )
