@@ -322,7 +322,7 @@ class MiniMaxM3HPCExperts(mk.FusedMoEExpertsModular):
         return False
 
     def supports_chunking(self) -> bool:
-        return True
+        return False
 
     def supports_output_alias(self) -> bool:
         return True

@@ -132,6 +132,12 @@ def test_minimax_hpc_apply_packs_aligned_reused_workspace(monkeypatch):
     )
 
 
+def test_minimax_hpc_disables_modular_chunking():
+    experts = make_hpc_experts()
+
+    assert not experts.supports_chunking()
+
+
 def test_hpc_out_wrapper_preserves_input_and_workspace_identity(monkeypatch):
     calls = []
     monkeypatch.setitem(sys.modules, "hpc", ModuleType("hpc"))
