@@ -60,6 +60,10 @@ class CompressorBackend(AttentionBackend):
     def __init__(self):
         super().__init__()
 
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "CompressorBackend"

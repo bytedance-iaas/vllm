@@ -110,6 +110,10 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
 
 class DeepseekSparseSWABackend(AttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_SPARSE_SWA"
