@@ -16,7 +16,10 @@ from vllm.models.deepseek_v4.compressor import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.pcp_metadata import DeepseekV4PcpPrefillMetadata
-from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
+from vllm.models.deepseek_v4.sparse_mla import (
+    DeepseekV4FlashMLABackend,
+    DeepseekV4FlashMLAMetadata,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -38,6 +41,7 @@ def test_deepseek_v4_hybrid_backends_declare_pcp_support():
     assert CompressorBackend.supports_pcp()
     assert DeepseekV32IndexerBackend.supports_pcp()
     assert DeepseekSparseSWABackend.supports_pcp()
+    assert DeepseekV4FlashMLABackend.supports_pcp()
 
 
 def test_common_attention_metadata_unpadded_preserves_pcp_batch_view():
