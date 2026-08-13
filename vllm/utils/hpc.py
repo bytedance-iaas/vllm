@@ -31,6 +31,33 @@ def has_hpc() -> bool:
     return True
 
 
+@functools.cache
+def has_hpc_mxfp8_k32_moe() -> bool:
+    """Return True if the installed hpc package has MiniMax-M3 K32 MoE ops."""
+    if not has_hpc():
+        return False
+    try:
+        import hpc  # noqa: F401
+    except Exception as err:
+        logger.warning_once("Failed to import hpc package: %s", err)
+        return False
+
+    required_ops = (
+        "build_mxfp8_k32_moe_routing_cache",
+        "fuse_moe_mxfp8_k32_candidate",
+        "fuse_moe_mxfp8_k32_bf16_candidate",
+        "fuse_moe_mxfp8_k32_bf16_candidate_out",
+    )
+    missing_ops = [op for op in required_ops if not hasattr(torch.ops.hpc, op)]
+    if missing_ops:
+        logger.warning_once(
+            "Installed hpc package is missing MiniMax-M3 MXFP8 K32 MoE ops: %s",
+            ", ".join(missing_ops),
+        )
+        return False
+    return True
+
+
 # Remove 'torch._library.custom_ops':
 # The output of this custom operator (1) must not also be an input to
 # this custom operator and (2) may not alias any inputs to this custom
@@ -257,8 +284,117 @@ def hpc_fuse_moe_blockwise(
     )
 
 
+def hpc_build_mxfp8_k32_moe_routing_cache(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    import hpc  # noqa: F401
+
+    return torch.ops.hpc.build_mxfp8_k32_moe_routing_cache(
+        topk_ids.to(torch.int32).contiguous(),
+        num_experts,
+    )
+
+
+def hpc_fuse_moe_mxfp8_k32_candidate(
+    hidden_q: torch.Tensor,
+    hidden_scale: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    routing_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    output: torch.Tensor | None = None,
+    activation_clamp: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    import hpc  # noqa: F401
+
+    row_indices, topk_pos, seqlens, cu_seqlens = routing_cache
+    return torch.ops.hpc.fuse_moe_mxfp8_k32_candidate(
+        hidden_q,
+        hidden_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        row_indices,
+        topk_pos,
+        seqlens,
+        cu_seqlens,
+        topk_weights.contiguous(),
+        output,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        activation_clamp,
+        alpha,
+        beta,
+    )
+
+
+def hpc_fuse_moe_mxfp8_k32_bf16_candidate_out(
+    hidden: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    row_indices: torch.Tensor,
+    topk_pos: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    grouped_hidden: torch.Tensor,
+    grouped_hidden_scale: torch.Tensor,
+    gate_output: torch.Tensor,
+    activated_output: torch.Tensor,
+    activated_scale: torch.Tensor,
+    down_output: torch.Tensor,
+    activation_clamp: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    import hpc  # noqa: F401
+
+    torch.ops.hpc.fuse_moe_mxfp8_k32_bf16_candidate_out(
+        hidden,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_weights,
+        output,
+        row_indices,
+        topk_pos,
+        seqlens,
+        cu_seqlens,
+        grouped_hidden,
+        grouped_hidden_scale,
+        gate_output,
+        activated_output,
+        activated_scale,
+        down_output,
+        activation_clamp,
+        alpha,
+        beta,
+    )
+    return output
+
+
 __all__ = [
     "has_hpc",
+    "has_hpc_mxfp8_k32_moe",
+    "hpc_build_mxfp8_k32_moe_routing_cache",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",
+    "hpc_fuse_moe_mxfp8_k32_bf16_candidate_out",
+    "hpc_fuse_moe_mxfp8_k32_candidate",
 ]
