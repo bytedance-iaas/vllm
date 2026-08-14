@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+    CutlassBatchedExpertsFp8,
     CutlassBatchedExpertsW4A8Fp8,
     CutlassExpertsFp4,
     CutlassExpertsFp8,
@@ -77,7 +78,11 @@ def test_cutlass_moe_supports_gelu_tanh_activation_metadata():
     assert CutlassExpertsFp4._supports_activation(MoEActivation.GELU_TANH_NO_MUL)
 
 
-def test_cutlass_permute_scratch_covers_naive_dp_ep_gather():
+@pytest.mark.parametrize(
+    "experts_cls",
+    [CutlassExpertsFp8, CutlassExpertsW4A8Fp8],
+)
+def test_cutlass_permute_scratch_covers_naive_dp_ep_gather(experts_cls):
     config = make_dummy_moe_config()
     config.moe_parallel_config = dataclasses.replace(
         config.moe_parallel_config,
@@ -85,7 +90,7 @@ def test_cutlass_permute_scratch_covers_naive_dp_ep_gather():
         ep_size=8,
         use_ep=True,
     )
-    experts = object.__new__(CutlassExpertsFp8)
+    experts = object.__new__(experts_cls)
     object.__setattr__(experts, "moe_config", config)
     object.__setattr__(experts, "_permute_scratch", None)
     scratch = object()
@@ -108,6 +113,31 @@ def test_cutlass_permute_scratch_covers_naive_dp_ep_gather():
     assert scratch_cls.call_args.kwargs["max_num_tokens"] == (
         config.max_num_tokens * config.dp_size
     )
+
+
+def test_cutlass_batched_permute_scratch_keeps_per_rank_capacity():
+    config = make_dummy_moe_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        dp_size=8,
+        ep_size=8,
+        use_ep=True,
+    )
+    experts = object.__new__(CutlassBatchedExpertsFp8)
+    object.__setattr__(experts, "moe_config", config)
+    object.__setattr__(experts, "_permute_scratch", None)
+
+    with (
+        patch.object(
+            cutlass_moe,
+            "moe_permute_unpermute_supported",
+            return_value=True,
+        ),
+        patch.object(cutlass_moe, "MoEPermuteScratch") as scratch_cls,
+    ):
+        experts._get_permute_scratch()
+
+    assert scratch_cls.call_args.kwargs["max_num_tokens"] == config.max_num_tokens
 
 
 def make_minimax_w4a8_config(intermediate_size: int = 3072):
@@ -250,6 +280,7 @@ def test_cutlass_w4a8_batched_workspace_and_finalize_contract():
         experts.finalize_weight_and_reduce_impl(), TopKWeightAndReduceDelegate
     )
     assert experts.expects_unquantized_inputs
+    assert experts._get_permute_scratch() is None
     assert isinstance(
         CutlassExpertsW4A8Fp8(
             moe_config=config,
