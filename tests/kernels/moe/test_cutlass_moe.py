@@ -77,6 +77,39 @@ def test_cutlass_moe_supports_gelu_tanh_activation_metadata():
     assert CutlassExpertsFp4._supports_activation(MoEActivation.GELU_TANH_NO_MUL)
 
 
+def test_cutlass_permute_scratch_covers_naive_dp_ep_gather():
+    config = make_dummy_moe_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        dp_size=8,
+        ep_size=8,
+        use_ep=True,
+    )
+    experts = object.__new__(CutlassExpertsFp8)
+    object.__setattr__(experts, "moe_config", config)
+    object.__setattr__(experts, "_permute_scratch", None)
+    scratch = object()
+
+    with (
+        patch.object(
+            cutlass_moe,
+            "moe_permute_unpermute_supported",
+            return_value=True,
+        ),
+        patch.object(
+            cutlass_moe,
+            "MoEPermuteScratch",
+            return_value=scratch,
+        ) as scratch_cls,
+    ):
+        result = experts._get_permute_scratch()
+
+    assert result is scratch
+    assert scratch_cls.call_args.kwargs["max_num_tokens"] == (
+        config.max_num_tokens * config.dp_size
+    )
+
+
 def make_minimax_w4a8_config(intermediate_size: int = 3072):
     config = make_dummy_moe_config(
         num_experts=128,
