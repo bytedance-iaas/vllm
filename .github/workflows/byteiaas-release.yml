@@ -15,6 +15,10 @@ on:
         description: "Optional vLLM version override for image tag generation"
         required: false
         default: ""
+      image_formats:
+        description: "CSV of image formats to build: oci,zstd,nydus"
+        required: false
+        default: "oci,zstd,nydus"
 
 concurrency:
   group: byteiaas-vllm-release-${{ github.event.inputs.release_tag || github.ref_name }}
@@ -79,4 +83,5 @@ jobs:
       tag_mode: release
       tag_value: ${{ needs.resolve-release.outputs.internal_tag }}
       vllm_version: ${{ github.event.inputs.vllm_version || '' }}
+      image_formats: ${{ github.event.inputs.image_formats || 'oci,zstd,nydus' }}
     secrets: inherit

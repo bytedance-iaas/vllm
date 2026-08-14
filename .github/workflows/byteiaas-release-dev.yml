@@ -17,6 +17,10 @@ on:
         description: "Optional vLLM version override for image tag generation"
         required: false
         default: ""
+      image_formats:
+        description: "CSV of image formats to build: oci,zstd,nydus"
+        required: false
+        default: "oci,zstd,nydus"
 
 concurrency:
   group: byteiaas-vllm-dev-${{ github.ref_name }}
@@ -39,4 +43,5 @@ jobs:
       cuda_version: "13.0.2"
       tag_mode: dev
       vllm_version: ${{ github.event_name == 'workflow_dispatch' && inputs.vllm_version || '' }}
+      image_formats: ${{ github.event_name == 'workflow_dispatch' && inputs.image_formats || 'oci,zstd,nydus' }}
     secrets: inherit

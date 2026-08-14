@@ -111,6 +111,7 @@ def build_tag(
     timestamp: str,
     tag_value: str,
     cuda_suffix: str,
+    format_suffix: str = "",
 ) -> str:
     if mode == "dev":
         tag = f"v{vllm_version}.iaas.dev.{timestamp}"
@@ -132,6 +133,10 @@ def build_tag(
 
     if cuda_suffix:
         tag = f"{tag}-{cuda_suffix}"
+    if format_suffix:
+        if not is_tag_safe_suffix(format_suffix):
+            raise SystemExit("--format-suffix must be a Docker tag-safe suffix")
+        tag = f"{tag}-{format_suffix}"
     return tag
 
 
@@ -163,6 +168,11 @@ def main() -> None:
         help="Explicit vLLM version. Defaults to BYTEIAAS_VLLM_VERSION or git.",
     )
     parser.add_argument(
+        "--format-suffix",
+        default="",
+        help="Optional image format suffix appended after the CUDA suffix.",
+    )
+    parser.add_argument(
         "--timestamp",
         default="",
         help="Optional deterministic timestamp in YYYYMMDDHHMM format.",
@@ -176,6 +186,7 @@ def main() -> None:
         timestamp=current_timestamp(args.timestamp),
         tag_value=args.tag_value,
         cuda_suffix=args.cuda_suffix,
+        format_suffix=args.format_suffix,
     )
     print(tag)
 
