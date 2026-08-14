@@ -364,8 +364,11 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
+            max_num_tokens = self.moe_config.max_num_tokens
+            if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
+                max_num_tokens *= self.moe_config.dp_size
             self._permute_scratch = MoEPermuteScratch(
-                max_num_tokens=self.moe_config.max_num_tokens,
+                max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
@@ -1412,7 +1415,9 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
             self._permute_scratch = MoEPermuteScratch(
-                max_num_tokens=self.moe_config.max_num_tokens,
+                max_num_tokens=(
+                    self.moe_config.max_num_tokens * self.moe_config.dp_size
+                ),
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
