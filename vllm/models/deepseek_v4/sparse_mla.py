@@ -21,7 +21,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_pcp_max_buffer_num_tokens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
@@ -48,6 +51,10 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
     ]
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -150,7 +157,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         self.topk_tokens = self.model_config.hf_config.index_topk
 
-        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        max_num_batched_tokens = get_pcp_max_buffer_num_tokens(vllm_config)
         self.req_id_per_token_buffer = torch.empty(
             (max_num_batched_tokens,), dtype=torch.int32, device=device
         )

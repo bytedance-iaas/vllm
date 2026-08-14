@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pcp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -17,7 +18,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_pcp_max_buffer_num_tokens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -25,6 +29,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     get_kv_quant_mode,
 )
+
+if TYPE_CHECKING:
+    from vllm.models.deepseek_v4.pcp_metadata import DeepseekV4PcpPrefillMetadata
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -103,6 +110,10 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
 
 class DeepseekSparseSWABackend(AttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_SPARSE_SWA"
@@ -183,10 +194,13 @@ class DeepseekSparseSWAMetadata:
     prefill_seq_lens: torch.Tensor | None = None
     prefill_seq_lens_cpu: torch.Tensor | None = None
     prefill_gather_lens: torch.Tensor | None = None
+    prefill_gather_lens_cpu: torch.Tensor | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
     prefill_window_size: int = 0
     prefill_max_model_len: int = 0
     prefill_max_num_batched_tokens: int = 0
+    pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_prefill_metadata: "DeepseekV4PcpPrefillMetadata | None" = None
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -232,6 +246,8 @@ class DeepseekSparseSWAMetadata:
         gather_lens_cpu = self.prefill_query_lens_cpu + torch.clamp(
             prefix_lens_cpu, min=0, max=self.prefill_window_size - 1
         )
+        if self.prefill_gather_lens_cpu is not None:
+            gather_lens_cpu = self.prefill_gather_lens_cpu
         compressed_lens_cpu = (
             torch.zeros_like(self.prefill_seq_lens_cpu)
             if compress_ratio <= 1
@@ -303,9 +319,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.compress_ratio = mla_spec.compress_ratio
         self.block_size = mla_spec.block_size
         self.max_model_len = self.vllm_config.model_config.max_model_len
-        self.max_num_batched_tokens = (
-            self.vllm_config.scheduler_config.max_num_batched_tokens
-        )
+        self.max_num_batched_tokens = get_pcp_max_buffer_num_tokens(self.vllm_config)
 
         # Handle MTP: adjust decode_threshold like the indexer does
         spec_config = self.vllm_config.speculative_config
@@ -334,7 +348,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         for ratio in compress_ratios:
             self._layer_types.add(_layer_type_for(int(ratio)))
 
-        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        max_tokens = self.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(
             max_tokens,
             dtype=torch.int32,
@@ -406,6 +420,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        pcp_enabled = common_attn_metadata.pcp_allgather_restore_idx is not None
+        prefill_seq_lens = seq_lens
+        prefill_seq_lens_cpu = seq_lens_cpu
+        if pcp_enabled:
+            assert common_attn_metadata.pcp_full_seq_lens is not None
+            assert common_attn_metadata.pcp_full_seq_lens_cpu is not None
+            prefill_seq_lens = common_attn_metadata.pcp_full_seq_lens
+            prefill_seq_lens_cpu = common_attn_metadata.pcp_full_seq_lens_cpu
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
@@ -413,6 +435,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata, decode_threshold=self.decode_threshold
             )
         )
+        if pcp_enabled and num_decodes:
+            raise NotImplementedError(
+                "DeepSeek V4 PCP currently supports standalone prefill batches "
+                "only; mixed decode/prefill and decode rows are not supported."
+            )
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
@@ -477,7 +504,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
-        if num_prefill_tokens > 0:
+        if num_prefill_tokens > 0 and not pcp_enabled:
             prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
             _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
@@ -500,10 +527,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
             num_decodes,
             num_prefills,
-            seq_lens,
-            seq_lens_cpu,
+            prefill_seq_lens,
+            prefill_seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            slot_mapping,
+            common_attn_metadata.positions,
+            common_attn_metadata.pcp_allgather_restore_idx,
+            common_attn_metadata.pcp_request_views,
+            pcp_enabled,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -518,18 +550,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc_cpu=query_start_loc_cpu,
             block_table=block_table,
             slot_mapping=slot_mapping,
+            pcp_allgather_restore_idx=common_attn_metadata.pcp_allgather_restore_idx,
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             prefill_swa_indices=(
                 self.prefill_swa_indices[:num_prefill_tokens]
-                if num_prefill_tokens > 0
+                if num_prefill_tokens > 0 and not pcp_enabled
                 else None
             ),
             prefill_swa_lens=(
                 self.prefill_swa_lens[:num_prefill_tokens]
-                if num_prefill_tokens > 0
+                if num_prefill_tokens > 0 and not pcp_enabled
                 else None
             ),
             block_size=self.block_size,
@@ -585,7 +618,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
-    ) -> dict[str, torch.Tensor | int | None]:
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor | None,
+        pcp_allgather_restore_idx: torch.Tensor | None,
+        pcp_request_views: list | None,
+        pcp_enabled: bool,
+    ) -> dict[str, object]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
         Returns a dict of keyword arguments to pass to the
@@ -594,27 +632,33 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         Note: C128A sparse metadata is computed by the FlashMLASparse builder
         (which owns the C128A block_table), not here.
         """
-        result: dict[str, torch.Tensor | int | None] = {}
+        result: dict[str, object] = {}
 
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:
             assert seq_lens_cpu is not None
-            pfx_gather_lens = torch.empty(
-                num_prefills, dtype=torch.int32, device=seq_lens.device
-            )
-            _compute_prefill_metadata_kernel[(1,)](
-                pfx_gather_lens,
-                seq_lens,
-                query_start_loc,
-                num_prefills,
-                num_decodes,
-                self.window_size,
-                BLOCK_SIZE=triton.next_power_of_2(num_prefills),
-            )
+            pfx_gather_lens_cpu = None
+            if pcp_enabled:
+                pfx_gather_lens = seq_lens[num_decodes:].contiguous()
+                pfx_gather_lens_cpu = seq_lens_cpu[num_decodes:].to(dtype=torch.int32)
+            else:
+                pfx_gather_lens = torch.empty(
+                    num_prefills, dtype=torch.int32, device=seq_lens.device
+                )
+                _compute_prefill_metadata_kernel[(1,)](
+                    pfx_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                    BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+                )
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
             result["prefill_gather_lens"] = pfx_gather_lens
+            result["prefill_gather_lens_cpu"] = pfx_gather_lens_cpu
             result["prefill_query_lens_cpu"] = (
                 query_start_loc_cpu[num_decodes + 1 : num_decodes + num_prefills + 1]
                 - query_start_loc_cpu[num_decodes : num_decodes + num_prefills]
@@ -622,6 +666,39 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             result["prefill_window_size"] = self.window_size
             result["prefill_max_model_len"] = self.max_model_len
             result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
+            if pcp_enabled:
+                from vllm.models.deepseek_v4.pcp_metadata import (
+                    DeepseekV4PcpPrefillMetadata,
+                )
+
+                assert pcp_allgather_restore_idx is not None
+                assert pcp_request_views is not None
+                base = query_start_loc_cpu[num_decodes]
+                local_query_start_loc = query_start_loc[
+                    num_decodes : num_decodes + num_prefills + 1
+                ] - int(base.item())
+                try:
+                    pcp_rank = get_pcp_group().rank_in_group
+                except AssertionError:
+                    pcp_rank = 0
+                result["pcp_prefill_metadata"] = DeepseekV4PcpPrefillMetadata(
+                    cp_size=(
+                        self.vllm_config.parallel_config.prefill_context_parallel_size
+                    ),
+                    cp_rank=pcp_rank,
+                    strategy="dual_chunk",
+                    views=pcp_request_views,
+                    local_query_start_loc=local_query_start_loc,
+                    local_seq_lens=seq_lens[num_decodes:],
+                    local_swa_indices=None,
+                    local_swa_valid_lens=None,
+                    local_c4_indices=None,
+                    local_c128_indices=None,
+                    global_slot_mapping=slot_mapping,
+                    compressor_write_locs_global=None,
+                    restore_idx=pcp_allgather_restore_idx,
+                    debug_global_positions=positions,
+                )
 
         return result
 

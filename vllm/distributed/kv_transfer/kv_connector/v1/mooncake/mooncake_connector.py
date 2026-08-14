@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -54,6 +55,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, get_kv_cache_layout
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -684,6 +686,107 @@ def _select_region_block_ids(
     return local_block_ids, remote_block_ids, None
 
 
+def _pair_pcp_block_ids(
+    local_block_ids: list[int],
+    remote_block_ids: list[int],
+    *,
+    total_tokens: int,
+    num_external_tokens: int,
+    external_start_token: int,
+    producer_pcp_size: int,
+    producer_pcp_rank: int,
+    consumer_pcp_size: int,
+    consumer_pcp_rank: int,
+    group_block_size: int,
+    interleave_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Pair compact producer PCP pages with global consumer pages."""
+    if producer_pcp_size <= 0 or consumer_pcp_size <= 0:
+        return [], [], "PCP world sizes must be positive"
+    if not 0 <= producer_pcp_rank < producer_pcp_size:
+        return [], [], "Invalid producer PCP rank"
+    if not 0 <= consumer_pcp_rank < consumer_pcp_size:
+        return [], [], "Invalid consumer PCP rank"
+    if group_block_size <= 0 or interleave_size <= 0:
+        return [], [], "PCP block and interleave sizes must be positive"
+    if total_tokens < 0 or num_external_tokens < 0 or external_start_token < 0:
+        return [], [], "PCP token ranges must be non-negative"
+    if external_start_token + num_external_tokens != total_tokens:
+        return [], [], "Mooncake PCP transfer requires an exact suffix token range"
+
+    if producer_pcp_size == consumer_pcp_size:
+        if producer_pcp_rank != consumer_pcp_rank:
+            return [], [], "Aligned PCP transfer requires matching PCP ranks"
+        if len(local_block_ids) < len(remote_block_ids):
+            return [], [], "P num blocks less than D"
+        if len(local_block_ids) > len(remote_block_ids):
+            local_block_ids = local_block_ids[-len(remote_block_ids) :]
+        return list(local_block_ids), list(remote_block_ids), None
+
+    if producer_pcp_size <= 1 or consumer_pcp_size != 1:
+        return (
+            [],
+            [],
+            (
+                "Unsupported unaligned PCP topology: "
+                f"producer={producer_pcp_size}, consumer={consumer_pcp_size}"
+            ),
+        )
+    if interleave_size % group_block_size != 0:
+        return (
+            [],
+            [],
+            (
+                "PCP interleave size must be divisible by every KV group block size: "
+                f"interleave={interleave_size}, block={group_block_size}"
+            ),
+        )
+
+    remote_total_blocks = cdiv(total_tokens, group_block_size)
+    if len(remote_block_ids) > remote_total_blocks:
+        return [], [], "D block list exceeds the request token range"
+    remote_first_block = remote_total_blocks - len(remote_block_ids)
+
+    cycle_size = producer_pcp_size * interleave_size
+    full_cycles, cycle_tail = divmod(total_tokens, cycle_size)
+    rank_tail = min(
+        max(cycle_tail - producer_pcp_rank * interleave_size, 0),
+        interleave_size,
+    )
+    local_tokens = full_cycles * interleave_size + rank_tail
+    local_total_blocks = cdiv(local_tokens, group_block_size)
+    # PCP allocates block-table entries uniformly across ranks. For short or
+    # partial final interleave chunks, a rank can therefore receive trailing
+    # padding pages even though it owns fewer (or zero) valid tokens. Keep the
+    # suffix offset for normal prefix-hit transfers and let the token-boundary
+    # check below discard only those padded tail pages.
+    local_first_block = max(local_total_blocks - len(local_block_ids), 0)
+
+    paired_local: list[int] = []
+    paired_remote: list[int] = []
+    for local_offset, local_block_id in enumerate(local_block_ids):
+        local_block_index = local_first_block + local_offset
+        local_token_start = local_block_index * group_block_size
+        if local_token_start >= local_tokens:
+            continue
+        cycle_index, cycle_offset = divmod(local_token_start, interleave_size)
+        global_token_start = (
+            cycle_index * cycle_size
+            + producer_pcp_rank * interleave_size
+            + cycle_offset
+        )
+        if global_token_start >= total_tokens:
+            continue
+        global_block_index = global_token_start // group_block_size
+        remote_offset = global_block_index - remote_first_block
+        if not 0 <= remote_offset < len(remote_block_ids):
+            continue
+        paired_local.append(local_block_id)
+        paired_remote.append(remote_block_ids[remote_offset])
+
+    return paired_local, paired_remote, None
+
+
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
@@ -703,6 +806,11 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     block_lens: list[int]
     kv_block_lens: list[int]
+    remote_pcp_size: int = 1
+    remote_pcp_rank: int = 0
+    req_total_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    req_num_external_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    req_external_start_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
@@ -744,10 +852,14 @@ class PullReqMeta:
     local_block_ids: list[list[int]]
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
+    total_tokens: int = 0
+    num_external_tokens: int = 0
+    external_start_token: int = 0
     # Set expire time to avoid infinitely sending requests.
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    pull_failed: bool = False
 
 
 @dataclass
@@ -776,6 +888,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        total_tokens: int = 0,
+        num_external_tokens: int = 0,
+        external_start_token: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -786,6 +901,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                total_tokens=total_tokens,
+                num_external_tokens=num_external_tokens,
+                external_start_token=external_start_token,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -928,6 +1046,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         return self.connector_worker.get_kv_connector_stats()
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.connector_worker is None:
+            return set()
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
@@ -945,7 +1068,7 @@ class MooncakeConnectorScheduler:
         kv_cache_config: "KVCacheConfig",
     ):
         self.vllm_config = vllm_config
-        self.block_size = vllm_config.cache_config.block_size
+        self.block_size, _ = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
 
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
@@ -970,15 +1093,24 @@ class MooncakeConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
+        self._reqs_need_recv: dict[
+            ReqId, tuple[Request, list[list[int]], int, int, int]
+        ] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
 
         # Compute sliding window block counts per KV cache group.
+        cp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
         sw_sizes_tokens: list[tuple[int, int]] = [
-            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
+            (
+                g.kv_cache_spec.sliding_window,
+                g.kv_cache_spec.block_size * cp_world_size,
+            )
             if isinstance(g.kv_cache_spec, SlidingWindowSpec)
             else (0, self.block_size)
             for g in kv_cache_config.kv_cache_groups
@@ -1109,8 +1241,18 @@ class MooncakeConnectorScheduler:
                     else ()
                 )
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                total_tokens = self._get_remote_prefill_token_count(
+                    request.num_prompt_tokens
+                )
+                external_start_token = max(total_tokens - num_external_tokens, 0)
                 # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                    total_tokens,
+                    num_external_tokens,
+                    external_start_token,
+                )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -1136,12 +1278,21 @@ class MooncakeConnectorScheduler:
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
-            for req_id, (req, block_ids) in self._reqs_need_recv.items():
+            for req_id, (
+                req,
+                block_ids,
+                total_tokens,
+                num_external_tokens,
+                external_start_token,
+            ) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    total_tokens=total_tokens,
+                    num_external_tokens=num_external_tokens,
+                    external_start_token=external_start_token,
                 )
             self._reqs_need_recv.clear()
 
@@ -1189,7 +1340,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], 0, 0, 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -1342,7 +1493,7 @@ class MooncakeConnectorWorker:
             self.rpc_port,
         )
 
-        self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = {}
+        self._remote_agents: dict[EngineId, dict[int, dict[int, dict[int, str]]]] = {}
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
@@ -1365,6 +1516,11 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1409,6 +1565,8 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self._invalid_block_ids_lock = threading.Lock()
+        self._invalid_block_ids: set[int] = set()
         # D-side request start times for opt-in P/D transfer tracing.
         self._pd_trace_pull_started: dict[ReqId, float] = {}
 
@@ -1431,6 +1589,7 @@ class MooncakeConnectorWorker:
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
+        self._pcp_size: dict[EngineId, int] = {self.engine_id: self.pcp_size}
         self._layer_specs: dict[str, KVCacheSpec] = {}
         for group in kv_cache_config.kv_cache_groups:
             group_spec = group.kv_cache_spec
@@ -1512,6 +1671,8 @@ class MooncakeConnectorWorker:
             dp_rank=self.dp_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
             addr=worker_addr,
         )
         while True:
@@ -1982,29 +2143,41 @@ class MooncakeConnectorWorker:
                         if block_id != NULL_BLOCK_ID
                     ]
 
-                n_local = len(local_group)
-                n_remote = len(remote_group)
-                if n_local < n_remote:
+                local_group, remote_group, pair_error = _pair_pcp_block_ids(
+                    local_group,
+                    remote_group,
+                    total_tokens=agent_meta.req_total_tokens.get(d_req_id, 0),
+                    num_external_tokens=(
+                        agent_meta.req_num_external_tokens.get(d_req_id, 0)
+                    ),
+                    external_start_token=(
+                        agent_meta.req_external_start_tokens.get(d_req_id, 0)
+                    ),
+                    producer_pcp_size=getattr(self, "pcp_size", 1),
+                    producer_pcp_rank=getattr(self, "pcp_rank", 0),
+                    consumer_pcp_size=agent_meta.remote_pcp_size,
+                    consumer_pcp_rank=agent_meta.remote_pcp_rank,
+                    group_block_size=group_specs[group_index].kv_cache_spec.block_size,
+                    interleave_size=getattr(self, "cp_kv_cache_interleave_size", 1),
+                )
+                if pair_error is not None:
                     logger.error(
-                        "req %s: local blocks(%d) < remote blocks(%d) "
-                        "in a KV cache group (is_mamba_group=%s)",
+                        "req %s: failed to pair PCP blocks for KV group %d: %s",
                         d_req_id,
-                        n_local,
-                        n_remote,
-                        is_mamba_group,
+                        group_index,
+                        pair_error,
                     )
                     has_block_error = True
+                    if err_msg is None:
+                        err_msg = pair_error
                     break
-                elif n_local > n_remote:
-                    # Partial prefix cache hit: just read uncomputed blocks.
-                    local_group = local_group[-n_remote:] if n_remote > 0 else []
                 local_block_ids_by_group.append(local_group)
                 remote_block_ids_by_group.append(remote_group)
 
             if has_block_error:
                 err_reqs.append(d_req_id)
                 if err_msg is None:
-                    err_msg = "P num blocks less than D"
+                    err_msg = "Failed to pair Mooncake PCP blocks"
                 continue
 
             if not any(local_block_ids_by_group):
@@ -2394,6 +2567,38 @@ class MooncakeConnectorWorker:
             return None
         return self.xfer_stats.clone_and_reset()
 
+    def _mark_pull_failed(self, pull_meta: PullReqMeta) -> None:
+        """Report a failed pull after all remote worker tasks have quiesced."""
+        getattr(self, "_pd_trace_pull_started", {}).pop(pull_meta.d_req_id, None)
+        invalid_blocks = {
+            block_id for group in pull_meta.local_block_ids for block_id in group
+        }
+        if invalid_blocks:
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.update(invalid_blocks)
+        self.finished_recving_reqs.add(pull_meta.d_req_id)
+
+    def _account_failed_pull_tasks(
+        self,
+        pull_metas: dict[ReqId, PullReqMeta],
+        req_ids: list[ReqId],
+    ) -> None:
+        for req_id in req_ids:
+            pull_meta = pull_metas.get(req_id)
+            if pull_meta is None:
+                continue
+            pull_meta.pull_failed = True
+            if pull_meta.pull_tasks_count > 0:
+                pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count == 0:
+                self._mark_pull_failed(pull_meta)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        with self._invalid_block_ids_lock:
+            invalid_block_ids = set(self._invalid_block_ids)
+            self._invalid_block_ids.clear()
+        return invalid_block_ids
+
     async def receive_kv_from_single_worker(
         self,
         worker_addr: str,
@@ -2401,7 +2606,8 @@ class MooncakeConnectorWorker:
     ):
         trace_enabled = envs.VLLM_MOONCAKE_PD_TRACE
         worker_started = time.perf_counter() if trace_enabled else 0.0
-        req_ids = set(pull_metas)
+        req_ids = list(pull_metas)
+        outstanding_req_ids = set(req_ids)
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -2414,6 +2620,20 @@ class MooncakeConnectorWorker:
             kv_caches_base_addr=self.kv_caches_base_addr,
             block_lens=self.block_len_per_layer,
             kv_block_lens=self.kv_block_len_per_layer,
+            remote_pcp_size=self.pcp_size,
+            remote_pcp_rank=self.pcp_rank,
+            req_total_tokens={
+                req_id: pull_meta.total_tokens
+                for req_id, pull_meta in pull_metas.items()
+            },
+            req_num_external_tokens={
+                req_id: pull_meta.num_external_tokens
+                for req_id, pull_meta in pull_metas.items()
+            },
+            req_external_start_tokens={
+                req_id: pull_meta.external_start_token
+                for req_id, pull_meta in pull_metas.items()
+            },
             registered_layer_names=self.registered_layer_names,
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
@@ -2451,10 +2671,14 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         self.xfer_stats.record_failed_recv()
-                        for req_id in req_ids:
-                            self._pd_trace_pull_started.pop(req_id, None)
+                        self._account_failed_pull_tasks(
+                            pull_metas, list(outstanding_req_ids)
+                        )
                         return
-                    self.process_pulling_result(response, pull_metas)
+                    accounted_req_ids = self.process_pulling_result(
+                        response, pull_metas
+                    )
+                    outstanding_req_ids.difference_update(accounted_req_ids)
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
             if trace_enabled:
@@ -2473,49 +2697,56 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             self.xfer_stats.record_failed_recv()
-            for req_id in req_ids:
-                self._pd_trace_pull_started.pop(req_id, None)
+            self._account_failed_pull_tasks(pull_metas, list(outstanding_req_ids))
             return
 
     def process_pulling_result(
         self,
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
-    ):
+    ) -> set[ReqId]:
+        accounted_req_ids: set[ReqId] = set()
         ok_reqs: list[ReqId] = response.ok_reqs or []
 
         for req_id in ok_reqs:
             pull_meta = pull_metas[req_id]
             # No race because we are in async loop.
-            pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count > 0:
+                pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
-                ready_started = time.perf_counter()
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
-                if envs.VLLM_MOONCAKE_PD_TRACE:
-                    pull_started = self._pd_trace_pull_started.pop(
-                        pull_meta.d_req_id, ready_started
-                    )
-                    logger.info(
-                        "MOONCAKE_PD_TRACE D_READY req=%s dp=%d pp=%d tp=%d "
-                        "wait_ms=%.3f",
-                        pull_meta.d_req_id,
-                        self.dp_rank,
-                        self.pp_rank,
-                        self.tp_rank,
-                        (ready_started - pull_started) * 1e3,
-                    )
+                if pull_meta.pull_failed:
+                    self._mark_pull_failed(pull_meta)
+                else:
+                    ready_started = time.perf_counter()
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    if envs.VLLM_MOONCAKE_PD_TRACE:
+                        pull_started = self._pd_trace_pull_started.pop(
+                            pull_meta.d_req_id, ready_started
+                        )
+                        logger.info(
+                            "MOONCAKE_PD_TRACE D_READY req=%s dp=%d pp=%d tp=%d "
+                            "wait_ms=%.3f",
+                            pull_meta.d_req_id,
+                            self.dp_rank,
+                            self.pp_rank,
+                            self.tp_rank,
+                            (ready_started - pull_started) * 1e3,
+                        )
+            accounted_req_ids.add(req_id)
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
 
         if response.err_reqs:
-            for req_id in response.err_reqs:
-                self._pd_trace_pull_started.pop(req_id, None)
+            err_reqs = list(response.err_reqs)
             logger.error(
                 "pulling kv_caches for %s failed: %s",
-                response.err_reqs,
+                err_reqs,
                 response.err_msg,
             )
+            self._account_failed_pull_tasks(pull_metas, err_reqs)
+            accounted_req_ids.update(err_reqs)
+        return accounted_req_ids
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
@@ -2528,12 +2759,16 @@ class MooncakeConnectorWorker:
                     remote_engine_id = dp_entry["engine_id"]
                     self._remote_agents[remote_engine_id] = {
                         int(tp_rank): {
-                            int(pp_rank): worker_addr
-                            for pp_rank, worker_addr in tp_entry.items()
+                            int(pp_rank): {
+                                int(pcp_rank): worker_addr
+                                for pcp_rank, worker_addr in pp_entry.items()
+                            }
+                            for pp_rank, pp_entry in tp_entry.items()
                         }
                         for tp_rank, tp_entry in dp_entry["worker_addr"].items()
                     }
                     self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
+                    self._pcp_size[remote_engine_id] = int(dp_entry.get("pcp_size", 1))
         except Exception as e:
             logger.error(
                 "Failed to connect to bootstrap server %s: %s",
@@ -2555,22 +2790,68 @@ class MooncakeConnectorWorker:
         )
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
+        selected_remote_pcp: dict[tuple[int, int], list[int]] = {}
+        remote_pcp_size = self._pcp_size[remote_engine_id]
+        if self.pcp_size != remote_pcp_size and self.pcp_size != 1:
+            logger.error(
+                "Unsupported Mooncake PCP topology for engine %s: "
+                "producer=%d, consumer=%d",
+                remote_engine_id,
+                remote_pcp_size,
+                self.pcp_size,
+            )
+            for pull_meta in pull_metas.values():
+                pull_meta.pull_failed = True
+                self._mark_pull_failed(pull_meta)
+            return
         for remote_tp_rank in remote_tp_ranks:
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
+            pp_to_pcp = self._remote_agents[remote_engine_id][remote_tp_rank]
+            if self.pp_size == len(pp_to_pcp) and self.pp_rank in pp_to_pcp:
                 pp_ranks = [self.pp_rank]
             else:
-                pp_ranks = sorted(pp_to_addr)
+                pp_ranks = sorted(pp_to_pcp)
             selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+            for pp_rank in pp_ranks:
+                pcp_to_addr = pp_to_pcp[pp_rank]
+                if self.pcp_size == remote_pcp_size:
+                    if self.pcp_rank not in pcp_to_addr:
+                        logger.error(
+                            "Missing producer PCP rank %d for TP=%d PP=%d",
+                            self.pcp_rank,
+                            remote_tp_rank,
+                            pp_rank,
+                        )
+                        for pull_meta in pull_metas.values():
+                            pull_meta.pull_failed = True
+                            self._mark_pull_failed(pull_meta)
+                        return
+                    pcp_ranks = [self.pcp_rank]
+                else:
+                    pcp_ranks = sorted(pcp_to_addr)
+                    if pcp_ranks != list(range(remote_pcp_size)):
+                        logger.error(
+                            "Incomplete producer PCP workers for TP=%d PP=%d: "
+                            "expected=%s, got=%s",
+                            remote_tp_rank,
+                            pp_rank,
+                            list(range(remote_pcp_size)),
+                            pcp_ranks,
+                        )
+                        for pull_meta in pull_metas.values():
+                            pull_meta.pull_failed = True
+                            self._mark_pull_failed(pull_meta)
+                        return
+                selected_remote_pcp[(remote_tp_rank, pp_rank)] = pcp_ranks
+                worker_addrs.extend(pcp_to_addr[rank] for rank in pcp_ranks)
 
         count = len(worker_addrs)
         logger.debug(
             "Receiving Mooncake KV for engine %s from producer TP ranks %s "
-            "and PP ranks %s",
+            "PP ranks %s and PCP ranks %s",
             remote_engine_id,
             remote_tp_ranks,
             selected_remote_pp,
+            selected_remote_pcp,
         )
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
@@ -2784,6 +3065,11 @@ def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    if (
+        getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
+        and get_pcp_group().rank_in_group != 0
+    ):
         return False
 
     # In hybrid or external LB mode,

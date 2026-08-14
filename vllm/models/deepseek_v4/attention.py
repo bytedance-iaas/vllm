@@ -26,6 +26,11 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.models.deepseek_v4.pcp_metadata import (
+    build_pcp_full_slot_mapping,
+    build_pcp_restored_req_indices,
+    build_pcp_restored_valid_mask,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -37,7 +42,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -53,9 +58,17 @@ from vllm.utils.multi_stream_utils import (
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
+    DeepseekV32IndexerMetadata,
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.utils import (
+    get_pcp_local_indices_after_restore,
+    get_pcp_max_buffer_num_tokens,
+    get_pcp_num_local_tokens_from_restore_idx,
+    pcp_allgather_and_restore,
+    restore_pcp_local_tensor_to_padded_tokens,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -387,6 +400,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = 0
+        if self.pcp_world_size > 1:
+            self.pcp_rank = get_pcp_group().rank_in_group
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
@@ -394,9 +414,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
-        self.max_num_batched_tokens = (
-            vllm_config.scheduler_config.max_num_batched_tokens
-        )
+        self.max_num_batched_tokens = get_pcp_max_buffer_num_tokens(vllm_config)
         self.max_model_len = vllm_config.model_config.max_model_len
 
         # Resolve the kv-cache dtype from this backend's block format. The same
@@ -652,31 +670,118 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         assert swa_metadata is not None
 
+        local_q_indices = None
+        num_padded_local_tokens = q.shape[0]
+        if swa_metadata.pcp_allgather_restore_idx is not None:
+            restore_idx = swa_metadata.pcp_allgather_restore_idx
+            num_local_tokens = get_pcp_num_local_tokens_from_restore_idx(
+                restore_idx, self.pcp_world_size
+            )
+            local_q_indices = get_pcp_local_indices_after_restore(
+                num_local_tokens,
+                self.pcp_rank,
+                restore_idx,
+            )
+            pcp_group = get_pcp_group()
+            q = pcp_allgather_and_restore(q, num_local_tokens, restore_idx, pcp_group)
+            kv = pcp_allgather_and_restore(kv, num_local_tokens, restore_idx, pcp_group)
+            positions = pcp_allgather_and_restore(
+                positions,
+                num_local_tokens,
+                restore_idx,
+                pcp_group,
+            )
+
         swa_kv_cache = self.swa_cache_layer.kv_cache
+        swa_storage_block_size = (
+            int(swa_kv_cache.shape[1])
+            if swa_kv_cache.dim() >= 3
+            else int(self.swa_cache_layer.block_size)
+        )
         # The fused insert ops require int64 position_ids; the runner's positions
         # buffer is already int64, so no cast is needed.
         assert positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
+        slot_mapping = swa_metadata.slot_mapping
+        kv_insert_mask = None
+        pcp_prefill_metadata = None
+        if local_q_indices is not None:
+            assert swa_metadata.pcp_prefill_metadata is not None
+            pcp_prefill_metadata = swa_metadata.pcp_prefill_metadata
+            pcp_prefill_metadata.restored_swa_positions = positions
+            restored_valid_mask = build_pcp_restored_valid_mask(
+                positions=positions,
+                views=pcp_prefill_metadata.views,
+            )
+            pcp_prefill_metadata.restored_swa_valid_mask = restored_valid_mask
+            req_indices = build_pcp_restored_req_indices(
+                positions=positions,
+                views=pcp_prefill_metadata.views,
+            )
+            slot_mapping = build_pcp_full_slot_mapping(
+                positions=positions,
+                req_indices=req_indices,
+                block_table=swa_metadata.block_table,
+                block_size=swa_storage_block_size,
+                valid_mask=restored_valid_mask,
+                cp_world_size=self.pcp_world_size,
+                cp_rank=self.pcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            )
+            kv_insert_mask = slot_mapping >= 0
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
+            if local_q_indices is not None:
+                from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
+                    xpu_qnorm_rope_kv_fp8_insert,
+                )
+
+                kv_roped = xpu_qnorm_rope_kv_fp8_insert(
+                    q,
+                    kv,
+                    swa_kv_cache,
+                    slot_mapping,
+                    positions,
+                    cos_sin_cache,
+                    self.eps,
+                    swa_storage_block_size,
+                    insert_mask=kv_insert_mask,
+                    return_kv_roped=True,
+                )
+                assert pcp_prefill_metadata is not None
+                assert kv_roped is not None
+                pcp_prefill_metadata.restored_swa_kv = kv_roped
+                if self.n_local_heads < self.padded_heads:
+                    q = F.pad(
+                        q,
+                        (0, 0, 0, self.padded_heads - self.n_local_heads),
+                        value=0.0,
+                    )
+                return restore_pcp_local_tensor_to_padded_tokens(
+                    q, local_q_indices, num_padded_local_tokens
+                )
+
             # fp8_ds_mla UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
             #            the padding head slots; the kernel allocates and returns
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.padded_heads,
                 self.eps,
-                swa_metadata.block_size,
+                swa_storage_block_size,
+            )
+            return restore_pcp_local_tensor_to_padded_tokens(
+                q, local_q_indices, num_padded_local_tokens
             )
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
@@ -690,13 +795,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q,
                 kv,
                 swa_kv_cache_3d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.eps,
                 block_size,
             )
-            return q
+            return restore_pcp_local_tensor_to_padded_tokens(
+                q, local_q_indices, num_padded_local_tokens
+            )
 
         # per-tensor fp8 (torch.float8_e4m3fn)
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
@@ -705,7 +812,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             kv,
             q_fp8,
             swa_kv_cache_3d,
-            swa_metadata.slot_mapping,
+            slot_mapping,
             positions,
             cos_sin_cache,
             self._flashinfer_fp8_kv_scale,
@@ -713,7 +820,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
             block_size,
         )
-        return q_fp8
+        return restore_pcp_local_tensor_to_padded_tokens(
+            q_fp8, local_q_indices, num_padded_local_tokens
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
@@ -920,4 +1029,52 @@ class DeepseekV4Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return self.indexer_op(hidden_states, q_quant, k, weights)
+        indexer_metadata = cast(
+            DeepseekV32IndexerMetadata, attn_metadata[self.k_cache.prefix]
+        )
+        if indexer_metadata.pcp_allgather_restore_idx is None:
+            return self.indexer_op(hidden_states, q_quant, k, weights)
+
+        compact_indices = indexer_metadata.pcp_compact_restored_indices
+        local_compact_indices = indexer_metadata.pcp_local_compact_indices
+        local_valid_mask = indexer_metadata.pcp_local_valid_mask
+        assert compact_indices is not None
+        assert local_compact_indices is not None
+        assert local_valid_mask is not None
+
+        restore_idx = indexer_metadata.pcp_allgather_restore_idx
+        num_local_tokens = get_pcp_num_local_tokens_from_restore_idx(
+            restore_idx, self.compressor.pcp_world_size
+        )
+        pcp_group = get_pcp_group()
+
+        def gather_and_compact(tensor: torch.Tensor) -> torch.Tensor:
+            restored = pcp_allgather_and_restore(
+                tensor,
+                num_local_tokens,
+                restore_idx,
+                pcp_group,
+            )
+            return torch.index_select(restored, 0, compact_indices)
+
+        if isinstance(q_quant, tuple):
+            q_quant = tuple(gather_and_compact(tensor) for tensor in q_quant)
+        else:
+            q_quant = gather_and_compact(q_quant)
+        weights = gather_and_compact(weights)
+
+        topk_indices = self.indexer_op(hidden_states, q_quant, k, weights)
+        global_topk = topk_indices[: compact_indices.numel()]
+        local_topk = torch.index_select(global_topk, 0, local_compact_indices)
+
+        # Preserve the model runner's PCP-local padded row layout. Padding can
+        # occur between requests, so scatter into the valid local rows instead
+        # of packing all results at the front of the shared buffer.
+        num_padded_local_rows = min(hidden_states.shape[0], topk_indices.shape[0])
+        topk_indices[:num_padded_local_rows].fill_(-1)
+        local_rows = torch.nonzero(local_valid_mask, as_tuple=False).flatten()
+        topk_indices.index_copy_(0, local_rows, local_topk)
+        return topk_indices

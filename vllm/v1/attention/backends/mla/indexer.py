@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import (
+    get_cp_local_seq_lens,
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
@@ -217,6 +218,7 @@ class DeepseekV32IndexerMetadata:
     seq_lens: torch.Tensor
     max_seq_len: int
     slot_mapping: torch.Tensor
+    block_table: torch.Tensor
 
     # New for MLA (compared to FlashAttention)
     # For handling prefill decode split
@@ -227,6 +229,10 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_compact_restored_indices: torch.Tensor | None = None
+    pcp_local_compact_indices: torch.Tensor | None = None
+    pcp_local_valid_mask: torch.Tensor | None = None
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -263,6 +269,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
+        if self.pcp_world_size > 1 and self.dcp_world_size > 1:
+            raise NotImplementedError(
+                "DeepSeek V4 sparse indexer does not yet support combined "
+                "PCP and DCP. Use PCP with decode_context_parallel_size=1."
+            )
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
@@ -344,6 +356,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.pcp_query_start_loc_cpu = torch.zeros(
+            (scheduler_config.max_num_seqs + 1,), dtype=torch.int32, device="cpu"
+        )
+        self.pcp_query_start_loc = torch.zeros_like(
+            self.pcp_query_start_loc_cpu, device=self.device
+        )
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
             self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
@@ -372,6 +390,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 "DCP is not supported with sparse indexer KV compression "
                 f"(compress_ratio={self.compress_ratio})."
             )
+        if (
+            self.pcp_world_size > 1
+            and self.cp_kv_cache_interleave_size % self.compress_ratio != 0
+        ):
+            raise NotImplementedError(
+                "DeepSeek V4 PCP indexer requires cp_kv_cache_interleave_size "
+                "to be divisible by the indexer compression ratio, got "
+                f"interleave={self.cp_kv_cache_interleave_size}, "
+                f"compress_ratio={self.compress_ratio}."
+            )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
@@ -395,7 +423,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_decodes: int,
         seq_lens_is_buffer_view: bool,
     ) -> torch.Tensor:
-        local_seq_lens = get_dcp_local_seq_lens(
+        local_seq_lens = get_cp_local_seq_lens(
             seq_lens,
             self.dcp_world_size,
             self.dcp_rank,
@@ -606,6 +634,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        pcp_enabled = common_attn_metadata.pcp_allgather_restore_idx is not None
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -619,26 +648,76 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
 
+        pcp_query_plan = None
+        if pcp_enabled:
+            if num_decodes:
+                raise NotImplementedError(
+                    "DeepSeek V4 PCP sparse indexer currently supports standalone "
+                    "prefill batches only."
+                )
+            assert common_attn_metadata.pcp_request_views is not None
+            assert common_attn_metadata.pcp_full_seq_lens is not None
+            assert common_attn_metadata.pcp_full_seq_lens_cpu is not None
+            from vllm.models.deepseek_v4.pcp_metadata import build_pcp_query_plan
+
+            pcp_query_plan = build_pcp_query_plan(
+                pcp_allgather_restore_idx=(
+                    common_attn_metadata.pcp_allgather_restore_idx
+                ),
+                views=common_attn_metadata.pcp_request_views,
+                pcp_world_size=self.pcp_world_size,
+                pcp_rank=self.pcp_rank,
+            )
+            query_lens_cpu = torch.tensor(
+                [
+                    int(view.global_seq_len)
+                    for view in common_attn_metadata.pcp_request_views
+                ],
+                dtype=torch.int32,
+            )
+            self.pcp_query_start_loc_cpu[0] = 0
+            torch.cumsum(
+                query_lens_cpu,
+                dim=0,
+                out=self.pcp_query_start_loc_cpu[1 : num_reqs + 1],
+            )
+            self.pcp_query_start_loc[: num_reqs + 1].copy_(
+                self.pcp_query_start_loc_cpu[: num_reqs + 1],
+                non_blocking=True,
+            )
+            query_start_loc = self.pcp_query_start_loc[: num_reqs + 1]
+            query_start_loc_cpu = self.pcp_query_start_loc_cpu[: num_reqs + 1]
+            seq_lens = common_attn_metadata.pcp_full_seq_lens[:num_reqs]
+            num_tokens = int(query_lens_cpu.sum().item())
+            num_prefill_tokens = num_tokens
+
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
         if self.compress_ratio > 1:
-            padded_num_tokens = num_tokens
-            if self.pcp_world_size > 1:
-                padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
-            compressed_slot_mapping = get_compressed_slot_mapping(
-                num_tokens,
-                query_start_loc,
-                seq_lens,
-                block_table,
-                self.kv_cache_spec.storage_block_size,
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-            )
-            if self.pcp_world_size > 1:
-                compressed_slot_mapping = get_pcp_group().all_gather(
-                    self.compressed_slot_mapping_buffer[:padded_num_tokens],
-                    dim=0,
+            if pcp_enabled:
+                # The compressor owns PCP cache insertion and overrides this
+                # metadata with an owner-aware mapping.  The indexer custom op
+                # only needs the restored compact query-row count here.
+                compressed_slot_mapping = self.compressed_slot_mapping_buffer[
+                    :num_tokens
+                ]
+                compressed_slot_mapping.fill_(-1)
+            else:
+                compressed_slot_mapping = get_compressed_slot_mapping(
+                    num_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    block_table,
+                    self.kv_cache_spec.storage_block_size,
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
                 )
+                if self.use_pcp:
+                    padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+                    compressed_slot_mapping = get_pcp_group().all_gather(
+                        self.compressed_slot_mapping_buffer[:padded_num_tokens],
+                        dim=0,
+                    )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
         prefill_metadata = None
@@ -646,8 +725,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # This CPU value is an upper bound for async-spec extend rows.  It
             # is safe for chunking/allocation because CUDA metadata below is
             # built from exact device seq_lens and gather ignores the tail.
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            if pcp_enabled:
+                assert common_attn_metadata.pcp_full_seq_lens_cpu is not None
+                seq_lens_cpu = common_attn_metadata.pcp_full_seq_lens_cpu[:num_reqs]
+            else:
+                assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+                seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             compressed_seq_lens_cpu = (
                 seq_lens_cpu // self.compress_ratio
                 if self.compress_ratio > 1
@@ -659,8 +742,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             chunk_specs = split_indexer_prefill_chunks(
                 compressed_seq_lens_cpu[num_decodes:],
                 prefill_query_lens_cpu,
@@ -683,9 +764,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.compress_ratio,
                     query_slice=query_slice,
                     skip_kv_gather=query_slice.start > 0,
-                    dcp_rank=self.dcp_rank,
-                    dcp_world_size=self.dcp_world_size,
-                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                    dcp_rank=(self.pcp_rank if pcp_enabled else self.dcp_rank),
+                    dcp_world_size=(
+                        self.pcp_world_size if pcp_enabled else self.dcp_world_size
+                    ),
+                    cp_kv_cache_interleave_size=(
+                        self.cp_kv_cache_interleave_size // self.compress_ratio
+                        if pcp_enabled
+                        else self.cp_kv_cache_interleave_size
+                    ),
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
@@ -812,12 +899,29 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=compressed_slot_mapping,
+            block_table=common_attn_metadata.block_table_tensor,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            pcp_allgather_restore_idx=(
+                common_attn_metadata.pcp_allgather_restore_idx if pcp_enabled else None
+            ),
+            pcp_compact_restored_indices=(
+                pcp_query_plan.compact_restored_indices
+                if pcp_query_plan is not None
+                else None
+            ),
+            pcp_local_compact_indices=(
+                pcp_query_plan.local_compact_indices
+                if pcp_query_plan is not None
+                else None
+            ),
+            pcp_local_valid_mask=(
+                pcp_query_plan.local_valid_mask if pcp_query_plan is not None else None
+            ),
         )
 
         return attn_metadata

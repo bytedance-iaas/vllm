@@ -164,6 +164,111 @@ def get_vllm_config():
     return vllm_config
 
 
+class _FakePCPGroup:
+    def __init__(self, rank: int, other: torch.Tensor | None = None):
+        self.rank_in_group = rank
+        self.world_size = 2
+        self._other = other
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        assert dim == 0
+        assert self._other is not None
+        return torch.cat([tensor, self._other], dim=dim)
+
+
+def test_apply_pcp_token_sharding_updates_runner_local_view():
+    runner = object.__new__(GPUModelRunner)
+    runner.pcp_manager = gpu_model_runner_module.PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        max_buffer_num_tokens=64,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+    )
+    runner.arange_np = np.arange(64, dtype=np.int64)
+    runner.query_pos = SimpleNamespace(np=np.empty(64, dtype=np.int64))
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([10, 20, 30], dtype=np.int32)
+    )
+    runner.reorder_batch_threshold = 1
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=14)
+    scheduled = np.array([1, 5, 8], dtype=np.int32)
+
+    total, req_indices, cu_num_tokens, positions = runner._apply_pcp_token_sharding(
+        scheduler_output,
+        scheduled,
+        num_reqs=3,
+    )
+
+    assert total == 9
+    assert scheduler_output.total_num_scheduled_tokens == 9
+    np.testing.assert_array_equal(scheduled, np.array([1, 4, 4], dtype=np.int32))
+    np.testing.assert_array_equal(
+        req_indices,
+        np.array([0, 1, 1, 1, 1, 2, 2, 2, 2], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(cu_num_tokens, np.array([1, 5, 9]))
+    np.testing.assert_array_equal(
+        positions,
+        np.array([10, 20, 21, 26, 27, 30, 31, 36, 37]),
+    )
+
+
+def test_update_pcp_full_seq_lens_removes_per_request_padding():
+    runner = object.__new__(GPUModelRunner)
+    runner.pcp_world_size = 2
+    runner.optimistic_seq_lens_cpu = torch.tensor([11, 24, 34, 99], dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu_tensor=torch.tensor([10, 20, 30, 0], dtype=torch.int32)
+    )
+    runner.pcp_manager = SimpleNamespace(
+        num_pcp_pads_cpu_tensor=torch.tensor([1, 3, 0, 0], dtype=torch.int64)
+    )
+    full_seq_lens_cpu = torch.full((4,), -1, dtype=torch.int32)
+    copied: list[int] = []
+    runner.pcp_full_seq_lens = SimpleNamespace(
+        cpu=full_seq_lens_cpu,
+        copy_to_gpu=lambda count: copied.append(count),
+    )
+
+    result = runner._update_pcp_full_seq_lens(num_reqs=3, num_reqs_padded=4)
+
+    torch.testing.assert_close(result, torch.tensor([11, 25, 38], dtype=torch.int32))
+    torch.testing.assert_close(
+        full_seq_lens_cpu,
+        torch.tensor([11, 25, 38, 0], dtype=torch.int32),
+    )
+    assert copied == [4]
+
+
+def test_restore_pcp_hidden_states_for_logits(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = object.__new__(GPUModelRunner)
+    local = torch.tensor([[10.0], [11.0]])
+
+    runner.pcp_world_size = 1
+    assert runner._maybe_restore_pcp_hidden_states_for_logits(local, 2) is local
+
+    restore_idx = torch.tensor([0, 2, 3, 1], dtype=torch.int64)
+    runner.pcp_world_size = 2
+    runner.pcp_manager = SimpleNamespace(
+        pcp_allgather_restore_idx=SimpleNamespace(gpu=restore_idx)
+    )
+    pcp_group = _FakePCPGroup(
+        rank=0,
+        other=torch.tensor([[20.0], [21.0]]),
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "get_pcp_group", lambda: pcp_group)
+
+    restored = runner._maybe_restore_pcp_hidden_states_for_logits(local, 2)
+
+    torch.testing.assert_close(
+        restored,
+        torch.tensor([[10.0], [20.0], [21.0], [11.0]]),
+    )
+
+
 @pytest.fixture
 def model_runner():
     vllm_config = get_vllm_config()

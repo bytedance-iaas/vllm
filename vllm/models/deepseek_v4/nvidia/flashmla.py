@@ -9,12 +9,18 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
+    combine_topk_swa_indices_with_positions,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
     deep_gemm_fp8_o_proj,
+)
+from vllm.models.deepseek_v4.pcp_metadata import (
+    compact_pcp_sparse_indices,
+    compact_pcp_sparse_prefill_queries,
+    overlay_pcp_restored_swa_kv_workspace,
 )
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
@@ -24,16 +30,27 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
 )
+from vllm.v1.worker.cp_utils import guard_dsv4_pcp_prefill_runtime_metadata
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
+def _kv_cache_storage_block_size(
+    k_cache: torch.Tensor | None,
+    fallback: int,
+) -> int:
+    if k_cache is not None and k_cache.dim() >= 3:
+        return int(k_cache.shape[1])
+    return int(fallback)
+
+
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
     backend_cls = DeepseekV4FlashMLABackend
+    supports_pcp = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -249,6 +266,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        is_pcp_prefill = swa_metadata.pcp_allgather_restore_idx is not None
+        guard_dsv4_pcp_prefill_runtime_metadata(
+            pcp_allgather_restore_idx=swa_metadata.pcp_allgather_restore_idx,
+            num_prefill_tokens=num_prefill_tokens,
+            runtime_metadata=swa_metadata.pcp_prefill_metadata,
+        )
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
@@ -293,27 +316,55 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
+                compressed_cache_block_size = _kv_cache_storage_block_size(
+                    compressed_k_cache,
+                    attn_metadata.block_size // self.compress_ratio,
+                )
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
                     seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
                     gather_lens=None,
                     block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    block_size=compressed_cache_block_size,
                     offset=0,
                 )
 
             # Gather SWA KV
             swa_block_table = swa_metadata.block_table[num_decodes:]
+            swa_cache_block_size = _kv_cache_storage_block_size(
+                swa_k_cache,
+                swa_metadata.block_size,
+            )
             dequantize_and_gather_k_cache(
                 kv[:chunk_size],
                 swa_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end],
                 gather_lens=gather_lens[chunk_start:chunk_end],
                 block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
+                block_size=swa_cache_block_size,
                 offset=chunk_N,
+                force_triton=is_pcp_prefill,
             )
+            if is_pcp_prefill:
+                assert swa_metadata.pcp_prefill_metadata is not None
+                pcp_metadata = swa_metadata.pcp_prefill_metadata
+                assert pcp_metadata.restored_swa_kv is not None
+                assert pcp_metadata.restored_swa_positions is not None
+                assert pcp_metadata.restored_swa_valid_mask is not None
+                overlay_pcp_restored_swa_kv_workspace(
+                    out=kv[:chunk_size],
+                    restored_kv=pcp_metadata.restored_swa_kv,
+                    restored_positions=pcp_metadata.restored_swa_positions,
+                    restored_valid_mask=pcp_metadata.restored_swa_valid_mask,
+                    views=pcp_metadata.views,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    chunk_n=chunk_N,
+                    chunk_m=chunk_M,
+                )
 
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
@@ -323,11 +374,53 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
+            chunk_query_start_loc = query_start_loc[
+                num_decodes + chunk_start : num_decodes + chunk_end + 1
+            ]
+            if is_pcp_prefill:
+                combined_indices, combined_lens = (
+                    combine_topk_swa_indices_with_positions(
+                        topk_indices[query_start:query_end],
+                        positions[query_start:query_end],
+                        chunk_query_start_loc,
+                        seq_lens[chunk_start:chunk_end],
+                        gather_lens[chunk_start:chunk_end],
+                        self.window_size,
+                        self.compress_ratio,
+                        top_k,
+                        chunk_M,
+                        chunk_N,
+                    )
+                )
+                combined_indices, combined_lens = compact_pcp_sparse_indices(
+                    combined_indices, combined_lens
+                )
+                chunk_output = output[query_start:query_end]
+                chunk_output.zero_()
+                pcp_q, pcp_indices, pcp_lens, valid_rows = (
+                    compact_pcp_sparse_prefill_queries(
+                        q[query_start:query_end],
+                        combined_indices,
+                        combined_lens,
+                    )
+                )
+                if valid_rows.numel() > 0:
+                    pcp_out = output.new_empty((pcp_q.shape[0], *output.shape[1:]))
+                    flash_mla_sparse_fwd(
+                        q=pcp_q,
+                        kv=kv.view(-1, 1, q.shape[-1]),
+                        indices=pcp_indices.unsqueeze(1),
+                        sm_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_length=pcp_lens,
+                        out=pcp_out,
+                    )
+                    chunk_output.index_copy_(0, valid_rows, pcp_out)
+                continue
+
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
+                chunk_query_start_loc,
                 seq_lens[chunk_start:chunk_end],
                 gather_lens[chunk_start:chunk_end],
                 self.window_size,

@@ -810,6 +810,13 @@ class ParallelConfig:
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        if self.prefill_context_parallel_size > 1 and self.use_ubatching:
+            raise ValueError(
+                "Prefill context parallelism does not support DBO or "
+                "microbatching yet. Disable --enable-dbo and set "
+                "--ubatch-size=1."
+            )
+
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size
