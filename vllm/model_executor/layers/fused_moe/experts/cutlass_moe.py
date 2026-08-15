@@ -51,6 +51,8 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+_W4A8_COMPACT_PROGRAMS_PER_EXPERT = 16
+
 
 def _require_w4a8_swigluoai_params(
     gemm1_alpha: float | None,
@@ -132,13 +134,14 @@ def _masked_per_token_fp8_quant_kernel(
     fp8_max: tl.constexpr,
     min_scale: tl.constexpr,
     block_n: tl.constexpr,
+    programs_per_expert: tl.constexpr,
 ):
     expert = tl.program_id(0)
-    token = tl.program_id(1)
+    lane = tl.program_id(1)
     valid_tokens = tl.load(expert_num_tokens + expert)
-    if token < valid_tokens:
-        offsets = tl.arange(0, block_n)
-        mask = offsets < hidden
+    offsets = tl.arange(0, block_n)
+    mask = offsets < hidden
+    for token in tl.range(lane, valid_tokens, programs_per_expert):
         src_ptr = src + expert * src_stride_e + token * src_stride_m + offsets
         values = tl.load(src_ptr, mask=mask, other=0.0).to(tl.float32)
         absmax = tl.max(tl.abs(values), axis=0)
@@ -172,13 +175,14 @@ def _masked_swigluoai_quant_kernel(
     fp8_max: tl.constexpr,
     min_scale: tl.constexpr,
     block_n: tl.constexpr,
+    programs_per_expert: tl.constexpr,
 ):
     expert = tl.program_id(0)
-    token = tl.program_id(1)
+    lane = tl.program_id(1)
     valid_tokens = tl.load(expert_num_tokens + expert)
-    if token < valid_tokens:
-        offsets = tl.arange(0, block_n)
-        mask = offsets < hidden
+    offsets = tl.arange(0, block_n)
+    mask = offsets < hidden
+    for token in tl.range(lane, valid_tokens, programs_per_expert):
         src_ptr = src + expert * src_stride_e + token * src_stride_m
         gate = tl.load(src_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(src_ptr + hidden + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -213,10 +217,12 @@ def _masked_per_token_fp8_quant(
     assert expert_num_tokens.shape == (src.shape[0],)
     assert expert_num_tokens.is_cuda and expert_num_tokens.dtype == torch.int32
     assert expert_num_tokens.is_contiguous()
-    _, padded_m, hidden = src.shape
+    _, _, hidden = src.shape
     fp8_info = torch.finfo(torch.float8_e4m3fn)
     min_scale = 1.0 / (fp8_info.max * 512.0)
-    _masked_per_token_fp8_quant_kernel[(src.shape[0], padded_m)](
+    _masked_per_token_fp8_quant_kernel[
+        (src.shape[0], _W4A8_COMPACT_PROGRAMS_PER_EXPERT)
+    ](
         src,
         dst,
         scales,
@@ -232,6 +238,7 @@ def _masked_per_token_fp8_quant(
         fp8_info.max,
         min_scale,
         triton.next_power_of_2(hidden),
+        _W4A8_COMPACT_PROGRAMS_PER_EXPERT,
         num_warps=8,
     )
 
@@ -255,11 +262,13 @@ def _masked_swigluoai_quant(
     assert expert_num_tokens.shape == (src.shape[0],)
     assert expert_num_tokens.is_cuda and expert_num_tokens.dtype == torch.int32
     assert expert_num_tokens.is_contiguous()
-    _, padded_m, two_hidden = src.shape
+    _, _, two_hidden = src.shape
     hidden = two_hidden // 2
     fp8_info = torch.finfo(torch.float8_e4m3fn)
     min_scale = 1.0 / (fp8_info.max * 512.0)
-    _masked_swigluoai_quant_kernel[(src.shape[0], padded_m)](
+    _masked_swigluoai_quant_kernel[
+        (src.shape[0], _W4A8_COMPACT_PROGRAMS_PER_EXPERT)
+    ](
         src,
         dst,
         scales,
@@ -278,6 +287,7 @@ def _masked_swigluoai_quant(
         fp8_info.max,
         min_scale,
         triton.next_power_of_2(hidden),
+        _W4A8_COMPACT_PROGRAMS_PER_EXPERT,
         num_warps=8,
     )
 
