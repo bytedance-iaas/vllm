@@ -380,27 +380,9 @@ jobs:
         if: ${{ steps.image-formats.outputs.zstd == 'true' }}
         run: |
           set -euo pipefail
-          python3 - \
+          python3 scripts/ci/verify_byteiaas_image_format.py --format zstd \
             "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_zstd_image_tag }}" \
-            "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_zstd_image_tag }}" <<'PY'
-          import json
-          import subprocess
-          import sys
-
-          for target in sys.argv[1:]:
-              raw = subprocess.check_output(
-                  ["docker", "buildx", "imagetools", "inspect", "--raw", target]
-              )
-              manifest = json.loads(raw)
-              media_types = {
-                  layer.get("mediaType", "") for layer in manifest.get("layers", [])
-              }
-              if not any("zstd" in media_type for media_type in media_types):
-                  raise SystemExit(
-                      f"expected zstd layer media types for {target}, got {media_types}"
-                  )
-              print(f"Verified zstd image {target}: {sorted(media_types)}")
-          PY
+            "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_zstd_image_tag }}"
 
       - name: Install nydus tooling
         if: ${{ steps.image-formats.outputs.nydus == 'true' }}
@@ -469,30 +451,5 @@ jobs:
             nydusify check --target "${target}"
             docker buildx imagetools inspect "${target}"
           done
-          python3 - "${targets[@]}" <<'PY'
-          import json
-          import subprocess
-          import sys
-
-          for target in sys.argv[1:]:
-              raw = subprocess.check_output(
-                  ["docker", "buildx", "imagetools", "inspect", "--raw", target]
-              )
-              manifest = json.loads(raw)
-              layers = manifest.get("layers", [])
-              media_types = [layer.get("mediaType", "") for layer in layers]
-              annotation_keys = {
-                  key
-                  for layer in layers
-                  for key in (layer.get("annotations", {}) or {})
-              }
-              has_nydus = any("nydus" in item for item in media_types) or any(
-                  "nydus" in key for key in annotation_keys
-              )
-              if not has_nydus:
-                  raise SystemExit(
-                      f"expected nydus markers for {target}; "
-                      f"layers={media_types}, annotations={sorted(annotation_keys)}"
-                  )
-              print(f"Verified nydus image {target}: {media_types}")
-          PY
+          python3 scripts/ci/verify_byteiaas_image_format.py --format nydus \
+            "${targets[@]}"
