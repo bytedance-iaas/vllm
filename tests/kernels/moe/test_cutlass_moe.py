@@ -486,7 +486,7 @@ def test_cutlass_w4a8_masked_per_token_quant_matches_full_flatten(counts):
             torch.testing.assert_close(
                 quantized * scales[expert, :count],
                 ref_quantized * ref_scales,
-                rtol=1e-1,
+                rtol=0,
                 atol=3e-1,
             )
         torch.testing.assert_close(
