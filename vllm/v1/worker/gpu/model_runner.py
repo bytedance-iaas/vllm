@@ -119,7 +119,11 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+)
+from vllm.v1.worker.workspace import use_workspace_lane
 
 logger = init_logger(__name__)
 
@@ -135,6 +139,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        self._draft_workspace_lane = int(
+            self.speculative_config is not None and self.speculative_config.use_dspark()
+        )
         self.observability_config = vllm_config.observability_config
 
         self.device = device
@@ -360,10 +367,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if isinstance(self.speculator, DraftModelSpeculator):
-                self.speculator.load_model(self.model)
-                eplb_models_added = self.eplb.maybe_register_speculator(
-                    self.speculator, self.speculative_config, load_dummy_weights
-                )
+                with use_workspace_lane(self._draft_workspace_lane):
+                    self.speculator.load_model(self.model)
+                    eplb_models_added = self.eplb.maybe_register_speculator(
+                        self.speculator, self.speculative_config, load_dummy_weights
+                    )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -720,28 +728,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            self.speculator.propose(
-                input_batch=input_batch,
-                attn_metadata=attn_metadata,
-                slot_mappings=slot_mappings_by_layer,
-                last_hidden_states=spec_hidden_states,
-                aux_hidden_states=aux_hidden_states,
-                num_sampled=torch.ones(
-                    input_batch.num_reqs, dtype=torch.int32, device=self.device
-                ),
-                num_rejected=torch.zeros(
-                    input_batch.num_reqs, dtype=torch.int32, device=self.device
-                ),
-                last_sampled=self.req_states.last_sampled_tokens,
-                next_prefill_tokens=self.req_states.next_prefill_tokens,
-                temperature=self.sampler.sampling_states.temperature.gpu,
-                seeds=self.sampler.sampling_states.seeds.gpu,
-                runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
-                dummy_run=True,
-                skip_attn_for_dummy_run=skip_attn,
-                mm_inputs=mm_inputs,
-                is_profile=is_profile,
-            )
+            with use_workspace_lane(self._draft_workspace_lane):
+                self.speculator.propose(
+                    input_batch=input_batch,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings_by_layer,
+                    last_hidden_states=spec_hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                    num_sampled=torch.ones(
+                        input_batch.num_reqs, dtype=torch.int32, device=self.device
+                    ),
+                    num_rejected=torch.zeros(
+                        input_batch.num_reqs, dtype=torch.int32, device=self.device
+                    ),
+                    last_sampled=self.req_states.last_sampled_tokens,
+                    next_prefill_tokens=self.req_states.next_prefill_tokens,
+                    temperature=self.sampler.sampling_states.temperature.gpu,
+                    seeds=self.sampler.sampling_states.seeds.gpu,
+                    runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
+                    dummy_run=True,
+                    skip_attn_for_dummy_run=skip_attn,
+                    mm_inputs=mm_inputs,
+                    is_profile=is_profile,
+                )
+            self.step_timing.drafter_end()
 
         if uniform_decode and not is_profile:
             self._retain_completed_num_spec_tokens(
@@ -854,7 +864,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
             )
             if self.speculator is not None:
-                self.speculator.capture()
+                with use_workspace_lane(self._draft_workspace_lane):
+                    self.speculator.capture()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1667,26 +1678,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
-                mm_inputs=mm_inputs,
-            )
+            with use_workspace_lane(self._draft_workspace_lane):
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    runtime_num_speculative_tokens=num_spec_tokens_to_schedule,
+                    mm_inputs=mm_inputs,
+                )
             if num_spec_tokens_to_schedule > 0:
                 draft_tokens = draft_tokens[:, :num_spec_tokens_to_schedule]
                 self.req_states.draft_tokens[
                     input_batch.idx_mapping, :num_spec_tokens_to_schedule
                 ] = draft_tokens
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.record_confidences(
+                    self.speculator.draft_token_confidence_probs, input_batch
+                )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
