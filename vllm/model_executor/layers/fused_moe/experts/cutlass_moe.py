@@ -71,6 +71,34 @@ def _require_w4a8_swigluoai_params(
     return gemm1_alpha, gemm1_beta, gemm1_clamp_limit
 
 
+def _select_w4a8_batched_schedule(
+    local_num_tokens: int,
+    topk: int,
+    num_local_experts: int,
+) -> str:
+    """Select a grouped-GEMM schedule from useful, rather than padded, M."""
+    assert local_num_tokens >= 0
+    assert topk > 0
+    assert num_local_experts > 0
+
+    # DeepEP dispatches every rank's routes and partitions experts evenly.
+    # Assuming balanced routing, the dispatcher count and global expert count
+    # cancel, leaving this expected number of rows per local expert.
+    m_expert = (local_num_tokens * topk + num_local_experts - 1) // num_local_experts
+
+    if m_expert <= 1:
+        return "Kernel_128x16_1x1x1_Coop"
+    if m_expert <= 16:
+        return "Kernel_256x16_1x1x1_Coop"
+    if m_expert <= 32:
+        return "Kernel_256x32_1x1x1_Coop"
+    if m_expert <= 64:
+        return "Kernel_256x64_1x1x1_Coop"
+    if m_expert <= 128:
+        return "Kernel_256x128_2x1x1_Coop"
+    return "Kernel_128x256_2x1x1_Coop"
+
+
 @triton.jit
 def _masked_per_token_fp8_quant_kernel(
     src,
@@ -1406,6 +1434,7 @@ def run_cutlass_moe_w4a8_fp8(
     topk = topk_ids.size(1)
     problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
+    schedule = None
 
     if use_batched_format:
         assert expert_num_tokens is not None
@@ -1464,6 +1493,11 @@ def run_cutlass_moe_w4a8_fp8(
         # c3x get_group_gemm_starts expects int64 to avoid overflow during
         # offset calculations. W4A8 offsets are physical padded slabs.
         expert_offsets = expert_offsets.to(torch.int64)
+        schedule = _select_w4a8_batched_schedule(
+            local_num_tokens=topk_ids.size(0),
+            topk=topk,
+            num_local_experts=local_E,
+        )
     else:
         assert expert_num_tokens is None
         assert a1q_scale is not None
@@ -1511,6 +1545,7 @@ def run_cutlass_moe_w4a8_fp8(
         b_strides1,
         c_strides1,
         s_strides1,
+        schedule,
     )
 
     use_masked_swigluoai = (
@@ -1578,6 +1613,7 @@ def run_cutlass_moe_w4a8_fp8(
         b_strides2,
         c_strides2,
         s_strides2,
+        schedule,
     )
 
     if use_batched_format and not use_masked_swigluoai:

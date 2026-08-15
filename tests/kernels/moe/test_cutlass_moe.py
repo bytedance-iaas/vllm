@@ -172,6 +172,33 @@ def make_minimax_w4a8_deepep_ll_config():
     return config
 
 
+@pytest.mark.parametrize(
+    ("local_num_tokens", "expected"),
+    [
+        (0, "Kernel_128x16_1x1x1_Coop"),
+        (1, "Kernel_128x16_1x1x1_Coop"),
+        (16, "Kernel_256x16_1x1x1_Coop"),
+        (64, "Kernel_256x16_1x1x1_Coop"),
+        (128, "Kernel_256x32_1x1x1_Coop"),
+        (256, "Kernel_256x64_1x1x1_Coop"),
+        (512, "Kernel_256x128_2x1x1_Coop"),
+        (1024, "Kernel_128x256_2x1x1_Coop"),
+    ],
+)
+def test_w4a8_batched_schedule_uses_expected_routed_rows(
+    local_num_tokens: int,
+    expected: str,
+):
+    assert (
+        cutlass_moe._select_w4a8_batched_schedule(
+            local_num_tokens=local_num_tokens,
+            topk=4,
+            num_local_experts=16,
+        )
+        == expected
+    )
+
+
 def make_minimax_w4a8_nixl_ep_config():
     config = make_minimax_w4a8_config()
     config.moe_parallel_config = dataclasses.replace(
