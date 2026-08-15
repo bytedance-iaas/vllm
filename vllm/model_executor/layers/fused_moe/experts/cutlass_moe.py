@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -72,19 +73,18 @@ def _require_w4a8_swigluoai_params(
 
 
 def _select_w4a8_batched_schedule(
-    local_num_tokens: int,
+    total_num_tokens: int,
     topk: int,
-    num_local_experts: int,
+    global_num_experts: int,
 ) -> str:
     """Select a grouped-GEMM schedule from useful, rather than padded, M."""
-    assert local_num_tokens >= 0
+    assert total_num_tokens >= 0
     assert topk > 0
-    assert num_local_experts > 0
+    assert global_num_experts > 0
 
-    # DeepEP dispatches every rank's routes and partitions experts evenly.
-    # Assuming balanced routing, the dispatcher count and global expert count
-    # cancel, leaving this expected number of rows per local expert.
-    m_expert = (local_num_tokens * topk + num_local_experts - 1) // num_local_experts
+    m_expert = (
+        total_num_tokens * topk + global_num_experts - 1
+    ) // global_num_experts
 
     if m_expert <= 1:
         return "Kernel_128x16_1x1x1_Coop"
@@ -97,6 +97,22 @@ def _select_w4a8_batched_schedule(
     if m_expert <= 128:
         return "Kernel_256x128_2x1x1_Coop"
     return "Kernel_128x256_2x1x1_Coop"
+
+
+def _w4a8_batched_total_num_tokens(
+    local_num_tokens: int,
+    global_num_experts: int,
+    num_local_experts: int,
+) -> int:
+    dp_metadata = (
+        get_forward_context().dp_metadata if is_forward_context_available() else None
+    )
+    if dp_metadata is not None:
+        return int(dp_metadata.num_tokens_across_dp_cpu.sum().item())
+
+    assert global_num_experts % num_local_experts == 0
+    num_dispatchers = global_num_experts // num_local_experts
+    return local_num_tokens * num_dispatchers
 
 
 @triton.jit
@@ -1493,10 +1509,15 @@ def run_cutlass_moe_w4a8_fp8(
         # c3x get_group_gemm_starts expects int64 to avoid overflow during
         # offset calculations. W4A8 offsets are physical padded slabs.
         expert_offsets = expert_offsets.to(torch.int64)
-        schedule = _select_w4a8_batched_schedule(
+        total_num_tokens = _w4a8_batched_total_num_tokens(
             local_num_tokens=topk_ids.size(0),
-            topk=topk,
+            global_num_experts=global_num_experts,
             num_local_experts=local_E,
+        )
+        schedule = _select_w4a8_batched_schedule(
+            total_num_tokens=total_num_tokens,
+            topk=topk,
+            global_num_experts=global_num_experts,
         )
     else:
         assert expert_num_tokens is None
