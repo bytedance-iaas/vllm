@@ -81,9 +81,7 @@ def _estimate_w4a8_batched_m(
     assert topk > 0
     assert global_num_experts > 0
 
-    return (
-        total_num_tokens * topk + global_num_experts - 1
-    ) // global_num_experts
+    return (total_num_tokens * topk + global_num_experts - 1) // global_num_experts
 
 
 def _select_w4a8_batched_schedule(
@@ -1876,11 +1874,11 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
         assert self.w1_zp is None, "w1_zp is not supported in CUTLASS MoE"
         assert self.w2_zp is None, "w2_zp is not supported in CUTLASS MoE"
 
+        expert_num_tokens = None
         use_batched_format = (
             self.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
         )
-        expert_num_tokens = None
-        if expert_tokens_meta is not None:
+        if use_batched_format and expert_tokens_meta is not None:
             expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
         in_dtype = hidden_states.dtype

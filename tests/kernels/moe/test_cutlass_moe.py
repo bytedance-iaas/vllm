@@ -394,6 +394,76 @@ def test_cutlass_w4a8_batched_workspace_and_finalize_contract():
     )
 
 
+@pytest.mark.parametrize(
+    ("experts_cls", "config_factory", "expects_counts"),
+    [
+        (CutlassExpertsW4A8Fp8, make_minimax_w4a8_config, False),
+        (
+            CutlassBatchedExpertsW4A8Fp8,
+            make_minimax_w4a8_deepep_ll_config,
+            True,
+        ),
+    ],
+)
+def test_cutlass_w4a8_only_forwards_expert_counts_for_batched_format(
+    experts_cls,
+    config_factory,
+    expects_counts,
+):
+    config = config_factory()
+    config.device = "cpu"
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(16, 1, dtype=torch.float8_e4m3fn),
+        w2_scale=torch.empty(16, 1, dtype=torch.float8_e4m3fn),
+        g1_alphas=torch.empty(16, 6144, dtype=torch.float32),
+        g2_alphas=torch.empty(16, 6144, dtype=torch.float32),
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+    batched_kwargs = (
+        {"max_num_tokens": 64, "num_dispatchers": 2} if expects_counts else {}
+    )
+    experts = experts_cls(
+        moe_config=config,
+        quant_config=quant_config,
+        b_strides1=torch.empty(16, dtype=torch.int64),
+        b_strides2=torch.empty(16, dtype=torch.int64),
+        group_size=128,
+        **batched_kwargs,
+    )
+    expert_num_tokens = torch.arange(16, dtype=torch.int32)
+    metadata = mk.ExpertTokensMetadata(
+        expert_num_tokens=expert_num_tokens,
+        expert_num_tokens_cpu=None,
+    )
+
+    with (
+        patch.object(experts, "_get_permute_scratch", return_value=None),
+        patch.object(cutlass_moe, "run_cutlass_moe_w4a8_fp8") as run_moe,
+    ):
+        experts.apply(
+            output=torch.empty(1),
+            hidden_states=torch.empty((1, 6144), dtype=torch.bfloat16),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            topk_weights=torch.empty((1, 4)),
+            topk_ids=torch.empty((1, 4), dtype=torch.int64),
+            activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            global_num_experts=128,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=torch.empty(1),
+            workspace2=torch.empty(1),
+            expert_tokens_meta=metadata,
+            apply_router_weight_on_input=False,
+        )
+
+    forwarded_counts = run_moe.call_args.args[27]
+    assert forwarded_counts is (expert_num_tokens if expects_counts else None)
+
+
 def test_deepep_ll_receiver_defers_batched_w4a8_input_quant():
     pytest.importorskip("deep_ep")
     from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
