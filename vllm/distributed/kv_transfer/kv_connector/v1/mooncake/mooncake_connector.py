@@ -296,12 +296,57 @@ def _compute_sender_transfer_plan(
     local_kv_block_len: int,
     remote_kv_block_len: int,
     producer_cache_replicated: bool,
+    transfer_unique_kv_heads: bool = False,
+    total_num_kv_heads: int | None = None,
 ) -> tuple[bool, int, int, int]:
     """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
 
     if tp_ratio == 1:
         return True, 0, 0, local_kv_block_len
+
+    if transfer_unique_kv_heads:
+        assert total_num_kv_heads is not None and total_num_kv_heads > 0
+
+        def get_head_partition(
+            tp_rank: int,
+            tp_size: int,
+        ) -> tuple[int, int, bool]:
+            if tp_size >= total_num_kv_heads:
+                assert tp_size % total_num_kv_heads == 0
+                replicas = tp_size // total_num_kv_heads
+                return tp_rank // replicas, 1, tp_rank % replicas == 0
+            assert total_num_kv_heads % tp_size == 0
+            num_heads = total_num_kv_heads // tp_size
+            return tp_rank * num_heads, num_heads, True
+
+        local_head_start, local_head_count, is_canonical_producer = (
+            get_head_partition(local_tp_rank, local_tp_size)
+        )
+        remote_head_start, remote_head_count, _ = get_head_partition(
+            remote_tp_rank,
+            remote_tp_size,
+        )
+        overlap_start = max(local_head_start, remote_head_start)
+        overlap_end = min(
+            local_head_start + local_head_count,
+            remote_head_start + remote_head_count,
+        )
+        if not is_canonical_producer or overlap_start >= overlap_end:
+            return False, 0, 0, 0
+
+        assert local_kv_block_len % local_head_count == 0
+        assert remote_kv_block_len % remote_head_count == 0
+        local_head_len = local_kv_block_len // local_head_count
+        remote_head_len = remote_kv_block_len // remote_head_count
+        assert local_head_len == remote_head_len
+        overlap_count = overlap_end - overlap_start
+        return (
+            True,
+            (overlap_start - local_head_start) * local_head_len,
+            (overlap_start - remote_head_start) * remote_head_len,
+            overlap_count * local_head_len,
+        )
 
     if tp_ratio > 0:
         if producer_cache_replicated:
@@ -2291,6 +2336,16 @@ class MooncakeConnectorWorker:
                     remote_kv_block_len=remote_region.kv_block_len,
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
+                    transfer_unique_kv_heads=(
+                        isinstance(
+                            self._layer_specs[local_region.layer_name],
+                            (FullAttentionSpec, SlidingWindowSpec),
+                        )
+                        and not isinstance(
+                            self._layer_specs[local_region.layer_name],
+                            (MLAAttentionSpec, SlidingWindowMLASpec),
+                        )
+                    ),
                 )
                 # #region debug-point B:heterogeneous-transfer-plan
                 if local_region.layer_index < 2:
@@ -3111,6 +3166,7 @@ class MooncakeConnectorWorker:
         remote_kv_block_len: int,
         remote_tp_rank: int,
         remote_tp_size: int,
+        transfer_unique_kv_heads: bool = False,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
             local_tp_rank=self.tp_rank,
@@ -3120,6 +3176,8 @@ class MooncakeConnectorWorker:
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
             producer_cache_replicated=self._producer_cache_is_replicated(),
+            transfer_unique_kv_heads=transfer_unique_kv_heads,
+            total_num_kv_heads=self.transfer_topo.total_num_kv_heads,
         )
 
     def _log_debug_cache_registration(

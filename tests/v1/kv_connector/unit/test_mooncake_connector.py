@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _compute_sender_transfer_plan,
     _pair_pcp_block_ids,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
@@ -47,6 +48,78 @@ from vllm.v1.request import RequestStatus
 from .utils import create_request, create_scheduler, create_vllm_config
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+@pytest.mark.parametrize(
+    ("local_tp_rank", "expected"),
+    [
+        (0, (True, 0, 0, 32768)),
+        (1, (False, 0, 0, 0)),
+        (2, (True, 0, 32768, 32768)),
+        (3, (False, 0, 0, 0)),
+        (4, (True, 0, 65536, 32768)),
+        (5, (False, 0, 0, 0)),
+        (6, (True, 0, 98304, 32768)),
+        (7, (False, 0, 0, 0)),
+    ],
+)
+def test_sender_plan_gqa_replicas_tp8_to_tp1(local_tp_rank, expected):
+    assert (
+        _compute_sender_transfer_plan(
+            local_tp_rank=local_tp_rank,
+            local_tp_size=8,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            local_kv_block_len=32768,
+            remote_kv_block_len=131072,
+            producer_cache_replicated=True,
+            transfer_unique_kv_heads=True,
+            total_num_kv_heads=4,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("remote_tp_rank", "expected_src_offset"),
+    [
+        (0, 0),
+        (1, 0),
+        (2, 32768),
+        (3, 32768),
+        (4, 65536),
+        (5, 65536),
+        (6, 98304),
+        (7, 98304),
+    ],
+)
+def test_sender_plan_gqa_replicas_tp1_to_tp8(
+    remote_tp_rank,
+    expected_src_offset,
+):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=0,
+        local_tp_size=1,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=8,
+        local_kv_block_len=131072,
+        remote_kv_block_len=32768,
+        producer_cache_replicated=False,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=4,
+    ) == (True, expected_src_offset, 0, 32768)
+
+
+def test_sender_plan_fully_replicated_region_is_unchanged():
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=2,
+        local_tp_size=8,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        local_kv_block_len=4096,
+        remote_kv_block_len=4096,
+        producer_cache_replicated=True,
+    ) == (False, 0, 0, 4096)
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
