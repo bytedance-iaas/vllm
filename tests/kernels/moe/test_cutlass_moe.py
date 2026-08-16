@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import dataclasses
+import importlib
+import sys
 from math import prod
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -514,6 +516,46 @@ def test_deepep_ll_receiver_defers_batched_w4a8_input_quant():
     assert metadata.expert_num_tokens_cpu is None
     assert topk_ids is None
     assert topk_weights is None
+
+
+def test_deepep_ht_receiver_preserves_per_token_quant_contract():
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht"
+    with patch.dict(sys.modules, {"deep_ep": MagicMock()}):
+        deepep_ht = importlib.import_module(module_name)
+
+    prepare_finalize = object.__new__(deepep_ht.DeepEPHTPrepareAndFinalize)
+    prepare_finalize.rank_expert_offset = 0
+    expert_x = torch.randn((2, 256), dtype=torch.bfloat16)
+    expert_topk_ids = torch.tensor([[0], [1]], dtype=torch.int64)
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+        g1_alphas=torch.empty(1),
+        g2_alphas=torch.empty(1),
+    )
+    expected_scale = torch.empty((2, 1), dtype=torch.float32)
+
+    with patch.object(
+        deepep_ht,
+        "moe_kernel_quantize_input",
+        return_value=(expert_x, expected_scale),
+    ) as quantize:
+        result = prepare_finalize._receiver(
+            event=SimpleNamespace(event=None),
+            has_scales=False,
+            token_data=expert_x,
+            expert_topk_ids=expert_topk_ids,
+            num_experts=4,
+            expert_num_tokens_per_expert_list=[1, 1],
+            expert_topk_weights=torch.ones((2, 1)),
+            a1_scale=None,
+            quant_config=quant_config,
+            defer_input_quant=False,
+        )
+
+    assert quantize.call_args.kwargs["per_act_token_quant"] is True
+    assert result[1] is expected_scale
+    sys.modules.pop(module_name, None)
 
 
 MASKED_W4A8_ROUTING_CASES = [
