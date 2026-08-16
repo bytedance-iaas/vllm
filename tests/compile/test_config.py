@@ -360,6 +360,34 @@ def test_deepep_ht_full_cudagraph_stays_disabled(monkeypatch):
     assert config.cudagraph_mode == CUDAGraphMode.NONE
 
 
+@pytest.mark.parametrize(
+    "pass_config",
+    [
+        PassConfig(fuse_attn_quant=True),
+        PassConfig(enable_sp=True),
+        PassConfig(fuse_gemm_comms=True),
+    ],
+)
+def test_deepep_ht_piecewise_cannot_be_promoted_to_full(
+    monkeypatch,
+    pass_config,
+):
+    monkeypatch.setenv(
+        "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
+        "1",
+    )
+    config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        pass_config=pass_config,
+    )
+    config.set_splitting_ops_for_v1(
+        all2all_backend="deepep_high_throughput",
+        data_parallel_size=2,
+    )
+    assert config.cudagraph_mode == CUDAGraphMode.NONE
+
+
 def test_should_split():
     import torch
 

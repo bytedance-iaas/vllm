@@ -1127,15 +1127,17 @@ class CompilationConfig:
         uses_deepep_ht = (
             all2all_backend == "deepep_high_throughput" and data_parallel_size > 1
         )
-        deepep_ht_piecewise_supported = (
-            envs.VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE
-            and self.cudagraph_mode == CUDAGraphMode.PIECEWISE
-        )
-        if (
-            uses_deepep_ht
-            and self.cudagraph_mode != CUDAGraphMode.NONE
-            and not deepep_ht_piecewise_supported
-        ):
+
+        def disable_unsupported_deepep_ht_cudagraphs():
+            if (
+                not uses_deepep_ht
+                or self.cudagraph_mode == CUDAGraphMode.NONE
+                or (
+                    envs.VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE
+                    and self.cudagraph_mode == CUDAGraphMode.PIECEWISE
+                )
+            ):
+                return
             logger.info(
                 "DeepEP: Disabling CUDA Graphs because high-throughput kernels "
                 "only support PIECEWISE capture with forced intranode transport. "
@@ -1144,6 +1146,8 @@ class CompilationConfig:
                 "to opt in."
             )
             self.cudagraph_mode = CUDAGraphMode.NONE
+
+        disable_unsupported_deepep_ht_cudagraphs()
 
         # To compatible with OOT hardware plugin platform (for example vllm-ascend)
         # which currently only supports sequence parallelism in eager mode.
@@ -1240,6 +1244,10 @@ class CompilationConfig:
                     "Setting cudagraph_mode to FULL."
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
+
+        # Fusion and sequence-parallel normalization above can promote
+        # PIECEWISE to FULL, which DeepEP HT does not support.
+        disable_unsupported_deepep_ht_cudagraphs()
 
     def set_splitting_ops_for_attn_fusion(self):
         assert self.pass_config.fuse_attn_quant
