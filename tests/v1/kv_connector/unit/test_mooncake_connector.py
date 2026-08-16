@@ -182,6 +182,77 @@ def test_sender_plan_virtual_split_preserves_head_offsets():
     ) == (True, 0, 32768, 16384)
 
 
+@pytest.mark.parametrize(
+    ("local_tp_rank", "remote_tp_rank", "should_transfer"),
+    [
+        (0, 0, True),
+        (1, 0, False),
+        (2, 1, True),
+        (3, 1, False),
+    ],
+)
+def test_sender_plan_replicated_heads_tp4_to_tp2(
+    local_tp_rank,
+    remote_tp_rank,
+    should_transfer,
+):
+    plan = _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=4,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=2,
+        local_kv_block_len=32768,
+        remote_kv_block_len=32768,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=1,
+    )
+    assert plan == (
+        (True, 0, 0, 32768) if should_transfer else (False, 0, 0, 0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_tp_rank", "remote_tp_rank"),
+    [(0, 0), (0, 1), (1, 2), (1, 3)],
+)
+def test_sender_plan_replicated_heads_tp2_to_tp4(
+    local_tp_rank,
+    remote_tp_rank,
+):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=2,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=4,
+        local_kv_block_len=32768,
+        remote_kv_block_len=32768,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=1,
+    ) == (True, 0, 0, 32768)
+
+
+@pytest.mark.parametrize("local_tp_rank", range(16))
+def test_sender_plan_mimo_equal_region_tp16_to_tp8(local_tp_rank):
+    remote_tp_rank = local_tp_rank // 2
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=16,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=8,
+        local_kv_block_len=32768,
+        remote_kv_block_len=32768,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=8,
+    ) == (
+        (True, 0, 0, 32768)
+        if local_tp_rank % 2 == 0
+        else (False, 0, 0, 0)
+    )
+
+
 def _make_test_kv_cache_config() -> KVCacheConfig:
     return KVCacheConfig(
         num_blocks=0,

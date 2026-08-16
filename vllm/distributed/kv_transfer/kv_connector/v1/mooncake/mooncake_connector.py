@@ -371,24 +371,43 @@ def _compute_sender_transfer_plan(
         def get_head_partition(
             tp_rank: int,
             tp_size: int,
-        ) -> tuple[int, int, bool]:
+        ) -> tuple[int, int, int, int]:
             assert inferred_num_kv_heads is not None
             if tp_size >= inferred_num_kv_heads:
                 assert tp_size % inferred_num_kv_heads == 0
                 replicas = tp_size // inferred_num_kv_heads
-                return tp_rank // replicas, 1, tp_rank % replicas == 0
+                return tp_rank // replicas, 1, tp_rank % replicas, replicas
             assert inferred_num_kv_heads % tp_size == 0
             num_heads = inferred_num_kv_heads // tp_size
-            return tp_rank * num_heads, num_heads, True
+            return tp_rank * num_heads, num_heads, 0, 1
 
         if transfer_unique_kv_heads:
-            local_head_start, local_head_count, is_canonical_producer = (
-                get_head_partition(local_tp_rank, local_tp_size)
-            )
-            remote_head_start, remote_head_count, _ = get_head_partition(
-                remote_tp_rank,
-                remote_tp_size,
-            )
+            (
+                local_head_start,
+                local_head_count,
+                local_replica_index,
+                local_replicas,
+            ) = get_head_partition(local_tp_rank, local_tp_size)
+            (
+                remote_head_start,
+                remote_head_count,
+                remote_replica_index,
+                remote_replicas,
+            ) = get_head_partition(remote_tp_rank, remote_tp_size)
+
+            is_canonical_producer = True
+            if local_replicas >= remote_replicas:
+                assert local_replicas % remote_replicas == 0
+                is_canonical_producer = local_replica_index == (
+                    remote_replica_index * (local_replicas // remote_replicas)
+                )
+            elif remote_replicas > 1:
+                assert remote_replicas % local_replicas == 0
+                is_canonical_producer = (
+                    remote_replica_index // (remote_replicas // local_replicas)
+                    == local_replica_index
+                )
+
             overlap_start = max(local_head_start, remote_head_start)
             overlap_end = min(
                 local_head_start + local_head_count,
@@ -454,6 +473,7 @@ def _validate_asymmetric_region_lengths(
     producer_cache_replicated: bool,
     unique_kv_head_layers: set[str] | None = None,
     total_num_kv_heads_hint: int | None = None,
+    total_num_kv_heads_by_layer: dict[str, int] | None = None,
 ) -> str | None:
     """Validate transfer-region metadata for a fixed producer/consumer pair.
 
@@ -475,12 +495,21 @@ def _validate_asymmetric_region_lengths(
             layer_name in unique_kv_head_layers
             for layer_name in local_region.match_layer_names
         ):
+            region_num_kv_heads = next(
+                (
+                    total_num_kv_heads_by_layer[layer_name]
+                    for layer_name in local_region.match_layer_names
+                    if total_num_kv_heads_by_layer
+                    and layer_name in total_num_kv_heads_by_layer
+                ),
+                total_num_kv_heads_hint,
+            )
             inferred_num_kv_heads = _infer_total_num_kv_heads(
                 local_tp_size=local_tp_size,
                 remote_tp_size=remote_tp_size,
                 local_kv_block_len=local_region.kv_block_len,
                 remote_kv_block_len=remote_region.kv_block_len,
-                total_num_kv_heads_hint=total_num_kv_heads_hint,
+                total_num_kv_heads_hint=region_num_kv_heads,
             )
             if inferred_num_kv_heads is None:
                 return (
@@ -2055,6 +2084,10 @@ class MooncakeConnectorWorker:
                 if _spec_transfers_unique_kv_heads(spec)
             },
             total_num_kv_heads_hint=self.transfer_topo.total_num_kv_heads,
+            total_num_kv_heads_by_layer={
+                layer_name: self._get_layer_total_num_kv_heads(layer_name)
+                for layer_name in self._layer_specs
+            },
         )
         if validation_err is not None:
             response = MooncakeXferResponse(
@@ -2427,6 +2460,9 @@ class MooncakeConnectorWorker:
                     remote_tp_size=agent_meta.remote_tp_size,
                     transfer_unique_kv_heads=_spec_transfers_unique_kv_heads(
                         self._layer_specs[local_region.layer_name]
+                    ),
+                    total_num_kv_heads=self._get_layer_total_num_kv_heads(
+                        local_region.layer_name
                     ),
                 )
                 # #region debug-point B:heterogeneous-transfer-plan
@@ -3249,6 +3285,7 @@ class MooncakeConnectorWorker:
         remote_tp_rank: int,
         remote_tp_size: int,
         transfer_unique_kv_heads: bool = False,
+        total_num_kv_heads: int | None = None,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
             local_tp_rank=self.tp_rank,
@@ -3259,7 +3296,21 @@ class MooncakeConnectorWorker:
             remote_kv_block_len=remote_kv_block_len,
             producer_cache_replicated=self._producer_cache_is_replicated(),
             transfer_unique_kv_heads=transfer_unique_kv_heads,
-            total_num_kv_heads=self.transfer_topo.total_num_kv_heads,
+            total_num_kv_heads=(
+                total_num_kv_heads or self.transfer_topo.total_num_kv_heads
+            ),
+        )
+
+    def _get_layer_total_num_kv_heads(self, layer_name: str) -> int:
+        layer = self.vllm_config.compilation_config.static_forward_context.get(
+            layer_name
+        )
+        return int(
+            getattr(
+                layer,
+                "total_num_kv_heads",
+                self.transfer_topo.total_num_kv_heads,
+            )
         )
 
     def _log_debug_cache_registration(
