@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _align_transfer_regions,
     _compute_sender_transfer_plan,
     _pair_pcp_block_ids,
+    _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -120,6 +121,65 @@ def test_sender_plan_fully_replicated_region_is_unchanged():
         remote_kv_block_len=4096,
         producer_cache_replicated=True,
     ) == (False, 0, 0, 4096)
+
+
+@pytest.mark.parametrize("local_tp_rank", range(8))
+def test_sender_plan_infers_per_region_head_count(local_tp_rank):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=8,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        local_kv_block_len=32768,
+        remote_kv_block_len=8 * 32768,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        # Simulate a model-level 4-head hint for an 8-head SWA region.
+        total_num_kv_heads=4,
+    ) == (True, 0, local_tp_rank * 32768, 32768)
+
+
+def test_validate_asymmetric_regions_allows_replicated_consumer_heads():
+    local_region = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=131072,
+        kv_block_len=131072,
+    )
+    remote_region = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x2000,
+        block_len=32768,
+        kv_block_len=32768,
+    )
+    assert (
+        _validate_asymmetric_region_lengths(
+            local_regions=[local_region],
+            remote_regions=[remote_region],
+            local_tp_size=1,
+            remote_tp_size=8,
+            producer_cache_replicated=False,
+            unique_kv_head_layers={"model.layers.0.self_attn"},
+            total_num_kv_heads_hint=4,
+        )
+        is None
+    )
+
+
+def test_sender_plan_virtual_split_preserves_head_offsets():
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=4,
+        local_tp_size=8,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        local_kv_block_len=16384,
+        remote_kv_block_len=65536,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=4,
+    ) == (True, 0, 32768, 16384)
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
