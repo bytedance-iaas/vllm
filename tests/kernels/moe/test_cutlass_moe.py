@@ -558,6 +558,76 @@ def test_deepep_ht_receiver_preserves_per_token_quant_contract():
     sys.modules.pop(module_name, None)
 
 
+@pytest.mark.parametrize(
+    ("is_capturing", "expected_worst_tokens"),
+    [(False, 0), (True, 16)],
+)
+def test_deepep_ht_dispatch_uses_static_capacity_during_capture(
+    is_capturing,
+    expected_worst_tokens,
+):
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht"
+    with patch.dict(sys.modules, {"deep_ep": MagicMock()}):
+        deepep_ht = importlib.import_module(module_name)
+
+    prepare_finalize = object.__new__(deepep_ht.DeepEPHTPrepareAndFinalize)
+    prepare_finalize.buffer = MagicMock()
+    prepare_finalize.num_dispatchers_ = 8
+    prepare_finalize.rank_expert_offset = 0
+    prepare_finalize.async_prepare = True
+    prepare_finalize.sync_dbo_comm = False
+    prepare_finalize.handles = [None, None]
+
+    tokens = torch.empty((2, 16), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+    topk_weights = torch.ones((2, 1))
+    prepare_finalize.buffer.get_dispatch_layout.return_value = (
+        MagicMock(),
+        None,
+        MagicMock(),
+        MagicMock(),
+        SimpleNamespace(event=None),
+    )
+    prepare_finalize.buffer.dispatch.return_value = (
+        tokens,
+        topk_ids,
+        topk_weights,
+        [],
+        MagicMock(),
+        SimpleNamespace(event=None),
+    )
+
+    with (
+        patch.object(
+            torch.cuda,
+            "is_current_stream_capturing",
+            return_value=is_capturing,
+        ),
+        patch.object(
+            deepep_ht.DeepEPHTPrepareAndFinalize,
+            "_get_dispatch_config",
+            return_value=None,
+        ),
+    ):
+        receiver = prepare_finalize._do_dispatch(
+            tokens=tokens,
+            token_scales=None,
+            rank_topk_ids=topk_ids,
+            rank_topk_weights=topk_weights,
+            num_experts=8,
+            a1_scale=None,
+            quant_config=MagicMock(is_block_quantized=False),
+            defer_input_quant=True,
+        )
+
+    assert (
+        prepare_finalize.buffer.dispatch.call_args.kwargs["num_worst_tokens"]
+        == expected_worst_tokens
+    )
+    assert receiver()[2] is None
+    sys.modules.pop(module_name, None)
+
+
 MASKED_W4A8_ROUTING_CASES = [
     pytest.param([0, 0, 0, 0], id="empty"),
     pytest.param([8, 0, 0, 0], id="hot"),
