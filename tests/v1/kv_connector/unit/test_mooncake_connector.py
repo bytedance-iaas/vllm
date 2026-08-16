@@ -123,6 +123,70 @@ def test_sender_plan_fully_replicated_region_is_unchanged():
     ) == (False, 0, 0, 4096)
 
 
+@pytest.mark.parametrize("remote_tp_rank", range(8))
+def test_sender_plan_fully_replicated_tp1_to_tp8(remote_tp_rank):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=0,
+        local_tp_size=1,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=8,
+        local_kv_block_len=4096,
+        remote_kv_block_len=4096,
+        producer_cache_replicated=True,
+    ) == (True, 0, 0, 4096)
+
+
+@pytest.mark.parametrize(
+    ("local_tp_rank", "remote_tp_rank", "should_transfer"),
+    [(0, 0, True), (1, 0, False), (2, 1, True), (3, 1, False)],
+)
+def test_sender_plan_fully_replicated_tp4_to_tp2(
+    local_tp_rank,
+    remote_tp_rank,
+    should_transfer,
+):
+    plan = _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=4,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=2,
+        local_kv_block_len=4096,
+        remote_kv_block_len=4096,
+        producer_cache_replicated=True,
+    )
+    assert plan == (
+        (True, 0, 0, 4096) if should_transfer else (False, 0, 0, 4096)
+    )
+
+
+def test_validate_asymmetric_regions_allows_fully_replicated_index_cache():
+    local_region = TransferRegion(
+        layer_name="model.layers.0.indexer",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=4096,
+        kv_block_len=4096,
+    )
+    remote_region = TransferRegion(
+        layer_name="model.layers.0.indexer",
+        layer_index=0,
+        base_addr=0x2000,
+        block_len=4096,
+        kv_block_len=4096,
+    )
+    assert (
+        _validate_asymmetric_region_lengths(
+            local_regions=[local_region],
+            remote_regions=[remote_region],
+            local_tp_size=1,
+            remote_tp_size=8,
+            producer_cache_replicated=False,
+            fully_replicated_layers={"model.layers.0.indexer"},
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("local_tp_rank", range(8))
 def test_sender_plan_infers_per_region_head_count(local_tp_rank):
     assert _compute_sender_transfer_plan(

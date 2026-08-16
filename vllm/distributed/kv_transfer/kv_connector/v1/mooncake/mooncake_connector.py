@@ -295,6 +295,10 @@ def _spec_transfers_unique_kv_heads(spec: KVCacheSpec) -> bool:
     )
 
 
+def _spec_transfers_fully_replicated(spec: KVCacheSpec) -> bool:
+    return isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+
+
 def _infer_total_num_kv_heads(
     local_tp_size: int,
     remote_tp_size: int,
@@ -472,6 +476,7 @@ def _validate_asymmetric_region_lengths(
     remote_tp_size: int,
     producer_cache_replicated: bool,
     unique_kv_head_layers: set[str] | None = None,
+    fully_replicated_layers: set[str] | None = None,
     total_num_kv_heads_hint: int | None = None,
     total_num_kv_heads_by_layer: dict[str, int] | None = None,
 ) -> str | None:
@@ -491,6 +496,18 @@ def _validate_asymmetric_region_lengths(
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
+        if fully_replicated_layers and any(
+            layer_name in fully_replicated_layers
+            for layer_name in local_region.match_layer_names
+        ):
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Mooncake fully replicated KV region length mismatch at "
+                    f"region {idx}: local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
+            continue
+
         if unique_kv_head_layers and any(
             layer_name in unique_kv_head_layers
             for layer_name in local_region.match_layer_names
@@ -2083,6 +2100,11 @@ class MooncakeConnectorWorker:
                 for layer_name, spec in self._layer_specs.items()
                 if _spec_transfers_unique_kv_heads(spec)
             },
+            fully_replicated_layers={
+                layer_name
+                for layer_name, spec in self._layer_specs.items()
+                if _spec_transfers_fully_replicated(spec)
+            },
             total_num_kv_heads_hint=self.transfer_topo.total_num_kv_heads,
             total_num_kv_heads_by_layer={
                 layer_name: self._get_layer_total_num_kv_heads(layer_name)
@@ -2444,6 +2466,10 @@ class MooncakeConnectorWorker:
                 local_block_ids,
                 remote_block_ids,
             ) in selected_region_blocks:
+                layer_spec = self._layer_specs[local_region.layer_name]
+                region_fully_replicated = _spec_transfers_fully_replicated(
+                    layer_spec
+                )
                 # Group by indices within this region's KV-cache group only.
                 group_local_block_ids, group_remote_block_ids = (
                     group_concurrent_contiguous(local_block_ids, remote_block_ids)
@@ -2459,7 +2485,10 @@ class MooncakeConnectorWorker:
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
                     transfer_unique_kv_heads=_spec_transfers_unique_kv_heads(
-                        self._layer_specs[local_region.layer_name]
+                        layer_spec
+                    ),
+                    producer_cache_replicated=(
+                        True if region_fully_replicated else None
                     ),
                     total_num_kv_heads=self._get_layer_total_num_kv_heads(
                         local_region.layer_name
@@ -2483,8 +2512,10 @@ class MooncakeConnectorWorker:
                                 self.transfer_topo.total_num_kv_heads
                             ),
                             "producer_cache_replicated": (
-                                self._producer_cache_is_replicated()
+                                region_fully_replicated
+                                or self._producer_cache_is_replicated()
                             ),
+                            "region_fully_replicated": region_fully_replicated,
                             "local_kv_block_len": local_region.kv_block_len,
                             "remote_kv_block_len": remote_region.kv_block_len,
                             "should_transfer": should_transfer,
@@ -3285,6 +3316,7 @@ class MooncakeConnectorWorker:
         remote_tp_rank: int,
         remote_tp_size: int,
         transfer_unique_kv_heads: bool = False,
+        producer_cache_replicated: bool | None = None,
         total_num_kv_heads: int | None = None,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
@@ -3294,7 +3326,11 @@ class MooncakeConnectorWorker:
             remote_tp_size=remote_tp_size,
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
-            producer_cache_replicated=self._producer_cache_is_replicated(),
+            producer_cache_replicated=(
+                self._producer_cache_is_replicated()
+                if producer_cache_replicated is None
+                else producer_cache_replicated
+            ),
             transfer_unique_kv_heads=transfer_unique_kv_heads,
             total_num_kv_heads=(
                 total_num_kv_heads or self.transfer_topo.total_num_kv_heads
