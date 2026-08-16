@@ -91,6 +91,48 @@ TransferId = str  # KV transfer coordination ID (shared by P/D)
 _T = TypeVar("_T")
 
 
+# #region debug-point B:network-reporter
+def _report_gsm8k_kv_debug(
+    hypothesis_id: str,
+    location: str,
+    msg: str,
+    data: dict[str, Any],
+) -> None:
+    if os.getenv("VLLM_GSM8K_DEBUG") != "1":
+        return
+    try:
+        import json
+        import urllib.request
+
+        payload = json.dumps(
+            {
+                "sessionId": "gsm8k-accuracy-regression",
+                "runId": os.getenv("VLLM_GSM8K_DEBUG_RUN_ID", "pre-fix"),
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "msg": f"[DEBUG] {msg}",
+                "data": data,
+            }
+        ).encode()
+        url = os.getenv(
+            "VLLM_GSM8K_DEBUG_SERVER_URL",
+            "http://127.0.0.1:7777/event",
+        )
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+
+
+# #endregion
+
+
 @dataclass(frozen=True)
 class TransferRegion:
     """A registered KV region plus its logical cache identities."""
@@ -2250,6 +2292,35 @@ class MooncakeConnectorWorker:
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
                 )
+                # #region debug-point B:heterogeneous-transfer-plan
+                if local_region.layer_index < 2:
+                    _report_gsm8k_kv_debug(
+                        "B",
+                        "mooncake_connector.py:_build_transfer_params",
+                        "heterogeneous KV transfer plan",
+                        {
+                            "request_id": d_req_id,
+                            "layer_name": local_region.layer_name,
+                            "layer_index": local_region.layer_index,
+                            "local_tp_rank": self.tp_rank,
+                            "local_tp_size": self.tp_size,
+                            "remote_tp_rank": agent_meta.remote_tp_rank,
+                            "remote_tp_size": agent_meta.remote_tp_size,
+                            "total_num_kv_heads": (
+                                self.transfer_topo.total_num_kv_heads
+                            ),
+                            "producer_cache_replicated": (
+                                self._producer_cache_is_replicated()
+                            ),
+                            "local_kv_block_len": local_region.kv_block_len,
+                            "remote_kv_block_len": remote_region.kv_block_len,
+                            "should_transfer": should_transfer,
+                            "src_region_offset": src_region_offset,
+                            "dst_region_offset": dst_region_offset,
+                            "transfer_len": transfer_len,
+                        },
+                    )
+                # #endregion
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
                     # needs to send the actual bytes for this paired decoder rank.
@@ -2422,6 +2493,32 @@ class MooncakeConnectorWorker:
                     kv_block_len = block_len // 2
                 else:
                     kv_block_len = block_len
+                # #region debug-point B:kv-region-registration
+                if layer_index < 2:
+                    _report_gsm8k_kv_debug(
+                        "B",
+                        "mooncake_connector.py:register_kv_caches",
+                        "registered KV transfer region",
+                        {
+                            "layer_name": layer_name,
+                            "layer_index": layer_index,
+                            "spec_type": type(layer_spec).__name__,
+                            "tp_rank": self.tp_rank,
+                            "tp_size": self.tp_size,
+                            "total_num_kv_heads": (
+                                self.transfer_topo.total_num_kv_heads
+                            ),
+                            "local_cache_replicated": (
+                                self.transfer_topo.local_replicates_kv_cache
+                            ),
+                            "shape": list(cache.shape),
+                            "stride": list(cache.stride()),
+                            "dtype": str(cache.dtype),
+                            "block_len": block_len,
+                            "kv_block_len": kv_block_len,
+                        },
+                    )
+                # #endregion
                 storage = cache.untyped_storage()
                 storage_addr = storage.data_ptr()
                 if storage_addr not in seen_storage_ptrs:
@@ -2719,6 +2816,21 @@ class MooncakeConnectorWorker:
                 else:
                     ready_started = time.perf_counter()
                     self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    # #region debug-point E:decode-kv-ready
+                    _report_gsm8k_kv_debug(
+                        "E",
+                        "mooncake_connector.py:process_pulling_result",
+                        "decode request marked KV-ready",
+                        {
+                            "request_id": pull_meta.d_req_id,
+                            "dp_rank": self.dp_rank,
+                            "pp_rank": self.pp_rank,
+                            "tp_rank": self.tp_rank,
+                            "pull_failed": pull_meta.pull_failed,
+                            "pull_tasks_count": pull_meta.pull_tasks_count,
+                        },
+                    )
+                    # #endregion
                     if envs.VLLM_MOONCAKE_PD_TRACE:
                         pull_started = self._pd_trace_pull_started.pop(
                             pull_meta.d_req_id, ready_started
