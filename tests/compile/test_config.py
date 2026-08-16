@@ -315,6 +315,79 @@ def test_moe_splitting_ops_deepep_ht_inductor_partition():
     ]
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [CompilationMode.NONE, CompilationMode.VLLM_COMPILE],
+)
+def test_deepep_ht_piecewise_requires_forced_intranode(monkeypatch, mode):
+    env_name = "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE"
+    monkeypatch.delenv(env_name, raising=False)
+    disabled = CompilationConfig(
+        mode=mode,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+    )
+    disabled.set_splitting_ops_for_v1(
+        all2all_backend="deepep_high_throughput",
+        data_parallel_size=2,
+    )
+    assert disabled.cudagraph_mode == CUDAGraphMode.NONE
+
+    monkeypatch.setenv(env_name, "1")
+    enabled = CompilationConfig(
+        mode=mode,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+    )
+    enabled.set_splitting_ops_for_v1(
+        all2all_backend="deepep_high_throughput",
+        data_parallel_size=2,
+    )
+    assert enabled.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+
+def test_deepep_ht_full_cudagraph_stays_disabled(monkeypatch):
+    monkeypatch.setenv(
+        "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
+        "1",
+    )
+    config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    config.set_splitting_ops_for_v1(
+        all2all_backend="deepep_high_throughput",
+        data_parallel_size=2,
+    )
+    assert config.cudagraph_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.parametrize(
+    "pass_config",
+    [
+        PassConfig(fuse_attn_quant=True),
+        PassConfig(enable_sp=True),
+        PassConfig(fuse_gemm_comms=True),
+    ],
+)
+def test_deepep_ht_piecewise_cannot_be_promoted_to_full(
+    monkeypatch,
+    pass_config,
+):
+    monkeypatch.setenv(
+        "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
+        "1",
+    )
+    config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        pass_config=pass_config,
+    )
+    config.set_splitting_ops_for_v1(
+        all2all_backend="deepep_high_throughput",
+        data_parallel_size=2,
+    )
+    assert config.cudagraph_mode == CUDAGraphMode.NONE
+
+
 def test_should_split():
     import torch
 
