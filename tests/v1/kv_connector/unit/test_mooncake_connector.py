@@ -1668,6 +1668,39 @@ async def test_receive_kv_selects_remote_pp_workers(
     assert pull_metas["d-req-1"].pull_tasks_count == 0
 
 
+def test_receive_kv_rejects_consumer_pp_fanout():
+    """A producer PP stage cannot serve multiple consumer PP stages safely."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.pp_size = 2
+    worker.pp_rank = 0
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda _size: [0])
+    worker._remote_agents = {"p-engine": {0: {0: {0: "tcp://producer-pp0:1234"}}}}
+    worker._tp_size = {"p-engine": 1}
+    worker._pcp_size = {"p-engine": 1}
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    worker.receive_kv_from_single_worker = MagicMock()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-pp-fanout",
+        transfer_id="xfer-pp-fanout",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+
+    worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+
+    worker.receive_kv_from_single_worker.assert_not_called()
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
+
+
 @pytest.mark.asyncio
 async def test_receive_kv_waits_for_every_remote_pp_pcp_worker():
     """A PCP1 decoder must pull every PP/PCP shard from a PCP2 producer."""
