@@ -576,6 +576,7 @@ def test_deepep_ht_dispatch_uses_static_capacity_during_capture(
     prepare_finalize.rank_expert_offset = 0
     prepare_finalize.async_prepare = True
     prepare_finalize.sync_dbo_comm = False
+    prepare_finalize.num_rdma_ranks = 1
     prepare_finalize.handles = [None, None]
 
     tokens = torch.empty((2, 16), dtype=torch.bfloat16)
@@ -625,6 +626,42 @@ def test_deepep_ht_dispatch_uses_static_capacity_during_capture(
         == expected_worst_tokens
     )
     assert receiver()[2] is None
+    sys.modules.pop(module_name, None)
+
+
+def test_deepep_ht_dispatch_rejects_internode_capture():
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht"
+    with patch.dict(sys.modules, {"deep_ep": MagicMock()}):
+        deepep_ht = importlib.import_module(module_name)
+
+    prepare_finalize = object.__new__(deepep_ht.DeepEPHTPrepareAndFinalize)
+    prepare_finalize.buffer = MagicMock()
+    prepare_finalize.num_dispatchers_ = 8
+    prepare_finalize.num_rdma_ranks = 2
+
+    with (
+        patch.object(
+            torch.cuda,
+            "is_current_stream_capturing",
+            return_value=True,
+        ),
+        pytest.raises(
+            RuntimeError,
+            match="only supports intranode transport",
+        ),
+    ):
+        prepare_finalize._do_dispatch(
+            tokens=torch.empty((2, 16), dtype=torch.bfloat16),
+            token_scales=None,
+            rank_topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+            rank_topk_weights=torch.ones((2, 1)),
+            num_experts=8,
+            a1_scale=None,
+            quant_config=MagicMock(is_block_quantized=False),
+            defer_input_quant=True,
+        )
+
+    prepare_finalize.buffer.dispatch.assert_not_called()
     sys.modules.pop(module_name, None)
 
 

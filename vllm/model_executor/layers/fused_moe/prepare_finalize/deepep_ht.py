@@ -61,6 +61,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
         self.sync_dbo_comm = current_platform.is_rocm()
+        self.num_rdma_ranks = buffer.runtime.get_num_rdma_ranks()
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -115,6 +116,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         has_scales = token_scales is not None
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing and self.num_rdma_ranks > 1:
+            raise RuntimeError(
+                "DeepEP high-throughput CUDA graph capture only supports "
+                "intranode transport"
+            )
 
         # Capture a DeepEP event on the compute stream before yielding.
         # This must happen before the yield so the event only covers this
@@ -146,7 +153,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             token_data = (tokens, token_scales)
 
         num_worst_tokens = 0
-        if torch.cuda.is_current_stream_capturing():
+        if is_capturing:
             # Avoid the CPU receive-count sync during CUDA graph capture.
             # Every dispatcher can route all of its tokens to this EP rank.
             num_worst_tokens = tokens.shape[0] * self.num_dispatchers_
