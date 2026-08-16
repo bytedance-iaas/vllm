@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -71,6 +72,80 @@ def _require_w4a8_swigluoai_params(
     return gemm1_alpha, gemm1_beta, gemm1_clamp_limit
 
 
+def _estimate_w4a8_batched_m(
+    total_num_tokens: int,
+    topk: int,
+    global_num_experts: int,
+) -> int:
+    assert total_num_tokens >= 0
+    assert topk > 0
+    assert global_num_experts > 0
+
+    return (
+        total_num_tokens * topk + global_num_experts - 1
+    ) // global_num_experts
+
+
+def _select_w4a8_batched_schedule(
+    total_num_tokens: int,
+    topk: int,
+    global_num_experts: int,
+) -> str:
+    """Select a grouped-GEMM schedule from useful, rather than padded, M."""
+    m_expert = _estimate_w4a8_batched_m(
+        total_num_tokens,
+        topk,
+        global_num_experts,
+    )
+
+    if m_expert <= 1:
+        return "Kernel_128x16_1x1x1_Coop"
+    if m_expert <= 16:
+        return "Kernel_256x16_1x1x1_Coop"
+    if m_expert <= 32:
+        return "Kernel_256x32_1x1x1_Coop"
+    if m_expert <= 64:
+        return "Kernel_256x64_1x1x1_Coop"
+    if m_expert <= 128:
+        return "Kernel_256x128_2x1x1_Coop"
+    return "Kernel_128x256_2x1x1_Coop"
+
+
+def _select_w4a8_compact_programs(
+    total_num_tokens: int,
+    topk: int,
+    global_num_experts: int,
+) -> int:
+    m_expert = _estimate_w4a8_batched_m(
+        total_num_tokens,
+        topk,
+        global_num_experts,
+    )
+    if m_expert <= 16:
+        return 16
+    if m_expert <= 32:
+        return 64
+    if m_expert <= 64:
+        return 128
+    return 256
+
+
+def _w4a8_batched_total_num_tokens(
+    local_num_tokens: int,
+    global_num_experts: int,
+    num_local_experts: int,
+) -> int:
+    dp_metadata = (
+        get_forward_context().dp_metadata if is_forward_context_available() else None
+    )
+    if dp_metadata is not None:
+        return int(dp_metadata.num_tokens_across_dp_cpu.sum().item())
+
+    assert global_num_experts % num_local_experts == 0
+    num_dispatchers = global_num_experts // num_local_experts
+    return local_num_tokens * num_dispatchers
+
+
 @triton.jit
 def _masked_per_token_fp8_quant_kernel(
     src,
@@ -88,13 +163,14 @@ def _masked_per_token_fp8_quant_kernel(
     fp8_max: tl.constexpr,
     min_scale: tl.constexpr,
     block_n: tl.constexpr,
+    programs_per_expert: tl.constexpr,
 ):
     expert = tl.program_id(0)
-    token = tl.program_id(1)
+    lane = tl.program_id(1)
     valid_tokens = tl.load(expert_num_tokens + expert)
-    if token < valid_tokens:
-        offsets = tl.arange(0, block_n)
-        mask = offsets < hidden
+    offsets = tl.arange(0, block_n)
+    mask = offsets < hidden
+    for token in tl.range(lane, valid_tokens, programs_per_expert):
         src_ptr = src + expert * src_stride_e + token * src_stride_m + offsets
         values = tl.load(src_ptr, mask=mask, other=0.0).to(tl.float32)
         absmax = tl.max(tl.abs(values), axis=0)
@@ -128,13 +204,14 @@ def _masked_swigluoai_quant_kernel(
     fp8_max: tl.constexpr,
     min_scale: tl.constexpr,
     block_n: tl.constexpr,
+    programs_per_expert: tl.constexpr,
 ):
     expert = tl.program_id(0)
-    token = tl.program_id(1)
+    lane = tl.program_id(1)
     valid_tokens = tl.load(expert_num_tokens + expert)
-    if token < valid_tokens:
-        offsets = tl.arange(0, block_n)
-        mask = offsets < hidden
+    offsets = tl.arange(0, block_n)
+    mask = offsets < hidden
+    for token in tl.range(lane, valid_tokens, programs_per_expert):
         src_ptr = src + expert * src_stride_e + token * src_stride_m
         gate = tl.load(src_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         up = tl.load(src_ptr + hidden + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -159,6 +236,7 @@ def _masked_per_token_fp8_quant(
     dst: torch.Tensor,
     scales: torch.Tensor,
     expert_num_tokens: torch.Tensor,
+    programs_per_expert: int = 16,
 ) -> None:
     assert src.dim() == 3 and src.is_contiguous()
     assert src.is_cuda and src.dtype == torch.bfloat16
@@ -169,10 +247,10 @@ def _masked_per_token_fp8_quant(
     assert expert_num_tokens.shape == (src.shape[0],)
     assert expert_num_tokens.is_cuda and expert_num_tokens.dtype == torch.int32
     assert expert_num_tokens.is_contiguous()
-    _, padded_m, hidden = src.shape
+    _, _, hidden = src.shape
     fp8_info = torch.finfo(torch.float8_e4m3fn)
     min_scale = 1.0 / (fp8_info.max * 512.0)
-    _masked_per_token_fp8_quant_kernel[(src.shape[0], padded_m)](
+    _masked_per_token_fp8_quant_kernel[(src.shape[0], programs_per_expert)](
         src,
         dst,
         scales,
@@ -188,6 +266,7 @@ def _masked_per_token_fp8_quant(
         fp8_info.max,
         min_scale,
         triton.next_power_of_2(hidden),
+        programs_per_expert,
         num_warps=8,
     )
 
@@ -200,6 +279,7 @@ def _masked_swigluoai_quant(
     alpha: float,
     beta: float,
     clamp_limit: float,
+    programs_per_expert: int = 16,
 ) -> None:
     assert src.dim() == 3 and src.is_contiguous()
     assert src.is_cuda and src.dtype == torch.bfloat16
@@ -211,11 +291,11 @@ def _masked_swigluoai_quant(
     assert expert_num_tokens.shape == (src.shape[0],)
     assert expert_num_tokens.is_cuda and expert_num_tokens.dtype == torch.int32
     assert expert_num_tokens.is_contiguous()
-    _, padded_m, two_hidden = src.shape
+    _, _, two_hidden = src.shape
     hidden = two_hidden // 2
     fp8_info = torch.finfo(torch.float8_e4m3fn)
     min_scale = 1.0 / (fp8_info.max * 512.0)
-    _masked_swigluoai_quant_kernel[(src.shape[0], padded_m)](
+    _masked_swigluoai_quant_kernel[(src.shape[0], programs_per_expert)](
         src,
         dst,
         scales,
@@ -234,6 +314,7 @@ def _masked_swigluoai_quant(
         fp8_info.max,
         min_scale,
         triton.next_power_of_2(hidden),
+        programs_per_expert,
         num_warps=8,
     )
 
@@ -1406,6 +1487,7 @@ def run_cutlass_moe_w4a8_fp8(
     topk = topk_ids.size(1)
     problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
+    schedule = None
 
     if use_batched_format:
         assert expert_num_tokens is not None
@@ -1424,6 +1506,16 @@ def run_cutlass_moe_w4a8_fp8(
         assert output.shape[2] == K
         assert output.is_contiguous()
         mm1_out = _resize_cache(workspace13, (local_E * padded_M, N * 2))
+        total_num_tokens = _w4a8_batched_total_num_tokens(
+            local_num_tokens=topk_ids.size(0),
+            global_num_experts=global_num_experts,
+            num_local_experts=local_E,
+        )
+        compact_programs = _select_w4a8_compact_programs(
+            total_num_tokens=total_num_tokens,
+            topk=topk,
+            global_num_experts=global_num_experts,
+        )
 
         if a1q.dtype == torch.bfloat16:
             assert a1q_scale is None
@@ -1438,6 +1530,7 @@ def run_cutlass_moe_w4a8_fp8(
                 a1q,
                 a1q_scale,
                 expert_num_tokens,
+                compact_programs,
             )
         else:
             assert a1q.dtype == torch.float8_e4m3fn
@@ -1464,6 +1557,11 @@ def run_cutlass_moe_w4a8_fp8(
         # c3x get_group_gemm_starts expects int64 to avoid overflow during
         # offset calculations. W4A8 offsets are physical padded slabs.
         expert_offsets = expert_offsets.to(torch.int64)
+        schedule = _select_w4a8_batched_schedule(
+            total_num_tokens=total_num_tokens,
+            topk=topk,
+            global_num_experts=global_num_experts,
+        )
     else:
         assert expert_num_tokens is None
         assert a1q_scale is not None
@@ -1511,6 +1609,7 @@ def run_cutlass_moe_w4a8_fp8(
         b_strides1,
         c_strides1,
         s_strides1,
+        schedule,
     )
 
     use_masked_swigluoai = (
@@ -1537,6 +1636,7 @@ def run_cutlass_moe_w4a8_fp8(
             alpha,
             beta,
             clamp_limit,
+            compact_programs,
         )
         a2q = a2q.reshape(local_E * padded_M, N)
         a2q_scale = a2q_scale.reshape(local_E * padded_M, 1)
@@ -1578,6 +1678,7 @@ def run_cutlass_moe_w4a8_fp8(
         b_strides2,
         c_strides2,
         s_strides2,
+        schedule,
     )
 
     if use_batched_format and not use_masked_swigluoai:

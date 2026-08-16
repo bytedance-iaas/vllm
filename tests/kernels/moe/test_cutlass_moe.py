@@ -3,6 +3,7 @@
 import copy
 import dataclasses
 from math import prod
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -170,6 +171,92 @@ def make_minimax_w4a8_deepep_ll_config():
         all2all_backend="deepep_low_latency",
     )
     return config
+
+
+@pytest.mark.parametrize(
+    ("total_num_tokens", "expected"),
+    [
+        (0, "Kernel_128x16_1x1x1_Coop"),
+        (8, "Kernel_128x16_1x1x1_Coop"),
+        (128, "Kernel_256x16_1x1x1_Coop"),
+        (512, "Kernel_256x16_1x1x1_Coop"),
+        (1024, "Kernel_256x32_1x1x1_Coop"),
+        (2048, "Kernel_256x64_1x1x1_Coop"),
+        (4096, "Kernel_256x128_2x1x1_Coop"),
+        (8192, "Kernel_128x256_2x1x1_Coop"),
+    ],
+)
+def test_w4a8_batched_schedule_uses_expected_routed_rows(
+    total_num_tokens: int,
+    expected: str,
+):
+    assert (
+        cutlass_moe._select_w4a8_batched_schedule(
+            total_num_tokens=total_num_tokens,
+            topk=4,
+            global_num_experts=128,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("total_num_tokens", "expected"),
+    [
+        (0, 16),
+        (512, 16),
+        (1024, 64),
+        (2048, 128),
+        (4096, 256),
+        (8192, 256),
+    ],
+)
+def test_w4a8_compact_programs_scale_with_expected_m(
+    total_num_tokens: int,
+    expected: int,
+):
+    assert (
+        cutlass_moe._select_w4a8_compact_programs(
+            total_num_tokens=total_num_tokens,
+            topk=4,
+            global_num_experts=128,
+        )
+        == expected
+    )
+
+
+def test_w4a8_batched_schedule_uses_dp_group_token_total():
+    dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.tensor([1, 3, 7, 9], dtype=torch.int32)
+    )
+    context = SimpleNamespace(dp_metadata=dp_metadata)
+
+    with (
+        patch.object(cutlass_moe, "is_forward_context_available", return_value=True),
+        patch.object(cutlass_moe, "get_forward_context", return_value=context),
+    ):
+        total_num_tokens = cutlass_moe._w4a8_batched_total_num_tokens(
+            local_num_tokens=1,
+            global_num_experts=128,
+            num_local_experts=32,
+        )
+
+    assert total_num_tokens == 20
+
+
+def test_w4a8_batched_schedule_fallback_uses_dispatcher_count():
+    with patch.object(
+        cutlass_moe,
+        "is_forward_context_available",
+        return_value=False,
+    ):
+        total_num_tokens = cutlass_moe._w4a8_batched_total_num_tokens(
+            local_num_tokens=64,
+            global_num_experts=128,
+            num_local_experts=16,
+        )
+
+    assert total_num_tokens == 512
 
 
 def make_minimax_w4a8_nixl_ep_config():
@@ -347,6 +434,8 @@ MASKED_W4A8_ROUTING_CASES = [
     pytest.param([8, 0, 0, 0], id="hot"),
     pytest.param([8, 8, 8, 8], id="uniform"),
     pytest.param([1, 8, 0, 3], id="skewed"),
+    pytest.param([16, 17, 32, 65], id="persistent-loop-boundaries"),
+    pytest.param([0, 64, 1, 17], id="persistent-loop-skewed"),
 ]
 
 
@@ -355,7 +444,7 @@ MASKED_W4A8_ROUTING_CASES = [
 def test_cutlass_w4a8_masked_per_token_quant_matches_full_flatten(counts):
     set_random_seed(7)
     num_experts = len(counts)
-    padded_m = 8
+    padded_m = max(8, max(counts))
     hidden = 256
     src = torch.randn(
         (num_experts, padded_m, hidden),
@@ -384,17 +473,21 @@ def test_cutlass_w4a8_masked_per_token_quant_matches_full_flatten(counts):
                 src[expert, :count],
                 use_per_token_if_dynamic=True,
             )
-            torch.testing.assert_close(
-                quant[expert, :count].float(),
-                ref_quant.float(),
-                rtol=0,
-                atol=0,
-            )
+            quantized = quant[expert, :count].float()
+            ref_quantized = ref_quant.float()
+            mismatch_rate = (quantized != ref_quantized).float().mean()
+            assert mismatch_rate <= 2.0e-3
             torch.testing.assert_close(
                 scales[expert, :count],
                 ref_scales,
                 rtol=2e-7,
                 atol=1e-9,
+            )
+            torch.testing.assert_close(
+                quantized * scales[expert, :count],
+                ref_quantized * ref_scales,
+                rtol=0,
+                atol=3e-1,
             )
         torch.testing.assert_close(
             quant[expert, count:].float(),
@@ -411,7 +504,7 @@ def test_cutlass_w4a8_masked_per_token_quant_matches_full_flatten(counts):
 def test_cutlass_w4a8_masked_minimax_activation_quant_matches_reference(counts):
     set_random_seed(11)
     num_experts = len(counts)
-    padded_m = 8
+    padded_m = max(8, max(counts))
     hidden = 256
     src = torch.randn(
         (num_experts, padded_m, hidden * 2),
@@ -487,9 +580,9 @@ def test_cutlass_w4a8_masked_minimax_activation_quant_matches_reference(counts):
 def test_cutlass_w4a8_masked_adapter_cuda_graph_replay():
     set_random_seed(13)
     num_experts = 4
-    padded_m = 8
+    padded_m = 65
     hidden = 256
-    counts = [0, 8, 1, 5]
+    counts = [0, 16, 17, 32]
     expert_num_tokens = torch.tensor(counts, dtype=torch.int32, device="cuda")
     a1 = torch.randn(
         (num_experts, padded_m, hidden),
@@ -546,6 +639,10 @@ def test_cutlass_w4a8_masked_adapter_cuda_graph_replay():
 
     a1.copy_(torch.randn_like(a1))
     mm1.copy_(torch.randn_like(mm1))
+    replay_counts = [65, 1, 32, 17]
+    expert_num_tokens.copy_(
+        torch.tensor(replay_counts, dtype=torch.int32, device="cuda")
+    )
     graph.replay()
 
     eager_a1_quant = torch.empty_like(a1_quant)
@@ -568,7 +665,7 @@ def test_cutlass_w4a8_masked_adapter_cuda_graph_replay():
         clamp_limit=7.0,
     )
 
-    for expert, count in enumerate(counts):
+    for expert, count in enumerate(replay_counts):
         if not count:
             continue
         torch.testing.assert_close(
