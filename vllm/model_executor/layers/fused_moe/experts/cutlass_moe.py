@@ -647,8 +647,13 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
         if self._permute_scratch is None and moe_permute_unpermute_supported():
             max_num_tokens = self.moe_config.max_num_tokens
             if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
-                # Standard DP/EP gathers every rank's tokens before the experts.
-                max_num_tokens *= self.moe_config.dp_size
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
                 max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
@@ -1826,7 +1831,13 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
         if self._permute_scratch is None and moe_permute_unpermute_supported():
             max_num_tokens = self.moe_config.max_num_tokens
             if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
-                max_num_tokens *= self.moe_config.dp_size
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
                 max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,

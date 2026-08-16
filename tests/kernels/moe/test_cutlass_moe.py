@@ -83,13 +83,30 @@ def test_cutlass_moe_supports_gelu_tanh_activation_metadata():
     "experts_cls",
     [CutlassExpertsFp8, CutlassExpertsW4A8Fp8],
 )
-def test_cutlass_permute_scratch_covers_naive_dp_ep_gather(experts_cls):
+@pytest.mark.parametrize(
+    ("parallel_overrides", "expected_dispatchers"),
+    [
+        ({"dp_size": 8, "ep_size": 1, "use_ep": False}, 8),
+        (
+            {
+                "dp_size": 2,
+                "ep_size": 8,
+                "use_ep": True,
+                "all2all_backend": "deepep_high_throughput",
+            },
+            8,
+        ),
+    ],
+)
+def test_cutlass_permute_scratch_covers_standard_dispatch_group(
+    experts_cls,
+    parallel_overrides,
+    expected_dispatchers,
+):
     config = make_dummy_moe_config()
     config.moe_parallel_config = dataclasses.replace(
         config.moe_parallel_config,
-        dp_size=8,
-        ep_size=8,
-        use_ep=True,
+        **parallel_overrides,
     )
     experts = object.__new__(experts_cls)
     object.__setattr__(experts, "moe_config", config)
@@ -112,7 +129,7 @@ def test_cutlass_permute_scratch_covers_naive_dp_ep_gather(experts_cls):
 
     assert result is scratch
     assert scratch_cls.call_args.kwargs["max_num_tokens"] == (
-        config.max_num_tokens * config.dp_size
+        config.max_num_tokens * expected_dispatchers
     )
 
 
