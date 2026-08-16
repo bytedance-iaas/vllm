@@ -2402,7 +2402,8 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
     P_TP_SIZE = 2
     P_TP_RANK = 0
-    LOCAL_BLOCK_LEN = 4096
+    # The fixture model has 12 KV heads, so TP2 owns 6 heads per rank.
+    LOCAL_BLOCK_LEN = 6 * 1024
 
     local_block_len = LOCAL_BLOCK_LEN
     remote_block_len = LOCAL_BLOCK_LEN * P_TP_SIZE // d_tp_size
