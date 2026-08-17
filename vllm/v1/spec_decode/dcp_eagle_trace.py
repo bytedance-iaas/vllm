@@ -148,7 +148,57 @@ def save_eagle_trace(
 
 
 _TARGET_LAYER_TRIPWIRE_CAPTURED = False
-_TRIPWIRE_STAGES = ("A", "B", "C", "D")
+_TRIPWIRE_STAGES = (
+    "A_attention_input",
+    "B_attention_return",
+    "C_ffn_input",
+    "D_ffn_return",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class TargetLayerTripwire:
+    row: int
+    position: int
+    token_id: int
+    max_layer: int
+
+
+def target_layer_tripwire_requested() -> bool:
+    return (
+        _trace_root() is not None
+        and os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION") is not None
+        and not _TARGET_LAYER_TRIPWIRE_CAPTURED
+    )
+
+
+def prepare_target_layer_tripwire(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+) -> TargetLayerTripwire | None:
+    configured_position = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION")
+    if not target_layer_tripwire_requested():
+        return None
+    assert configured_position is not None
+
+    assert input_ids.device.type == "cpu"
+    assert positions.device.type == "cpu"
+    target_position = int(configured_position)
+    rows = (positions == target_position).nonzero(as_tuple=False).flatten()
+    if rows.numel() != 1:
+        return None
+    row = int(rows.item())
+    token_id = int(input_ids[row].item())
+
+    configured_token = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_TOKEN")
+    if configured_token is not None and token_id != int(configured_token):
+        return None
+    return TargetLayerTripwire(
+        row=row,
+        position=target_position,
+        token_id=token_id,
+        max_layer=int(os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_MAX_LAYER", "30")),
+    )
 
 
 def _tripwire_hidden(args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor:
@@ -178,52 +228,40 @@ def _target_decoder_layers(model: Any) -> Any:
 @contextmanager
 def capture_target_layer_tripwire(
     model: Any,
-    input_ids: torch.Tensor | None,
-    positions: torch.Tensor | None,
+    tripwire: TargetLayerTripwire | None,
 ) -> Iterator[None]:
     global _TARGET_LAYER_TRIPWIRE_CAPTURED
 
+    if tripwire is None or _TARGET_LAYER_TRIPWIRE_CAPTURED:
+        yield
+        return
+
+    if not _rank_enabled():
+        try:
+            yield
+        finally:
+            _TARGET_LAYER_TRIPWIRE_CAPTURED = True
+        return
+
     root = _trace_root()
-    configured_position = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION")
-    if (
-        root is None
-        or configured_position is None
-        or _TARGET_LAYER_TRIPWIRE_CAPTURED
-        or not _rank_enabled()
-        or positions is None
-        or positions.ndim != 1
-    ):
-        yield
-        return
-
-    target_position = int(configured_position)
-    rows = (positions == target_position).nonzero(as_tuple=False).flatten()
-    if rows.numel() != 1:
-        yield
-        return
-    row = int(rows.item())
-
-    token_id = None if input_ids is None else int(input_ids[row].item())
-    configured_token = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_TOKEN")
-    if configured_token is not None and token_id != int(configured_token):
-        yield
-        return
-
+    assert root is not None
     layers = _target_decoder_layers(model)
-    max_layer = int(os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_MAX_LAYER", "30"))
+    max_layer = tripwire.max_layer
     if layers is None or len(layers) <= max_layer:
         raise RuntimeError(
             "DCP EAGLE target tripwire could not find the requested decoder layers"
         )
 
     captures: dict[tuple[int, str], torch.Tensor] = {}
+    ffn_output_reduced: list[bool] = []
     handles = []
 
     def record(layer_idx: int, stage: str, tensor: torch.Tensor) -> None:
-        captures[(layer_idx, stage)] = tensor[row].detach().clone()
+        captures[(layer_idx, stage)] = tensor[tripwire.row].detach().clone()
 
     for layer_idx, layer in enumerate(layers[: max_layer + 1]):
         ffn = layer.block_sparse_moe if layer.is_moe_layer else layer.mlp
+        ffn_output_reduced.append(not layer.ffn_all_reduce_deferred)
 
         def attention_pre_hook(
             _module: Any,
@@ -231,7 +269,7 @@ def capture_target_layer_tripwire(
             kwargs: dict[str, Any],
             layer_idx: int = layer_idx,
         ) -> None:
-            record(layer_idx, "A", _tripwire_hidden(args, kwargs))
+            record(layer_idx, "A_attention_input", _tripwire_hidden(args, kwargs))
 
         def attention_hook(
             _module: Any,
@@ -239,7 +277,7 @@ def capture_target_layer_tripwire(
             output: Any,
             layer_idx: int = layer_idx,
         ) -> None:
-            record(layer_idx, "B", _tripwire_output(output))
+            record(layer_idx, "B_attention_return", _tripwire_output(output))
 
         def ffn_pre_hook(
             _module: Any,
@@ -247,7 +285,7 @@ def capture_target_layer_tripwire(
             kwargs: dict[str, Any],
             layer_idx: int = layer_idx,
         ) -> None:
-            record(layer_idx, "C", _tripwire_hidden(args, kwargs))
+            record(layer_idx, "C_ffn_input", _tripwire_hidden(args, kwargs))
 
         def ffn_hook(
             _module: Any,
@@ -255,7 +293,7 @@ def capture_target_layer_tripwire(
             output: Any,
             layer_idx: int = layer_idx,
         ) -> None:
-            record(layer_idx, "D", _tripwire_output(output))
+            record(layer_idx, "D_ffn_return", _tripwire_output(output))
 
         handles.extend(
             (
@@ -299,11 +337,15 @@ def capture_target_layer_tripwire(
         "pid": pid,
         "tp_rank": tp_rank,
         "dcp_rank": dcp_rank,
-        "position": target_position,
-        "token_id": token_id,
+        "position": tripwire.position,
+        "token_id": tripwire.token_id,
         "layer_ids": list(range(max_layer + 1)),
         "checkpoint_names": list(_TRIPWIRE_STAGES),
+        "ffn_output_reduced": ffn_output_reduced,
         "checkpoints": stacked,
     }
-    torch.save(output, rank_dir / f"target-layer-tripwire-pos{target_position}.pt")
+    torch.save(
+        output,
+        rank_dir / f"target-layer-tripwire-pos{tripwire.position}.pt",
+    )
     _TARGET_LAYER_TRIPWIRE_CAPTURED = True

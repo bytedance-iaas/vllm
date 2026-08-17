@@ -196,9 +196,11 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dcp_eagle_trace import (
     capture_target_layer_tripwire,
+    prepare_target_layer_tripwire,
     save_eagle_trace,
     snapshot_attention_metadata,
     snapshot_dcp_topk,
+    target_layer_tripwire_requested,
     trace_enabled,
 )
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -4517,6 +4519,20 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            target_layer_tripwire = None
+            if target_layer_tripwire_requested():
+                tripwire_req_indices = np.repeat(
+                    self.arange_np[:num_reqs],
+                    num_scheduled_tokens_np,
+                )
+                tripwire_positions = (
+                    self.input_batch.num_computed_tokens_cpu[tripwire_req_indices]
+                    + self.query_pos.np[:num_tokens_unpadded]
+                )
+                target_layer_tripwire = prepare_target_layer_tripwire(
+                    self.input_ids.cpu[:num_tokens_unpadded],
+                    torch.from_numpy(tripwire_positions),
+                )
             if self.pcp_world_size > 1:
                 num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
                 num_tokens_unpadded = num_scheduled_tokens
@@ -4549,6 +4565,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                force_eager=target_layer_tripwire is not None,
             )
 
             logger.debug(
@@ -4732,8 +4749,7 @@ class GPUModelRunner(
             ) as kv_connector_output,
             capture_target_layer_tripwire(
                 self.get_model(),
-                input_ids,
-                positions,
+                target_layer_tripwire,
             ),
         ):
             model_output = self._model_forward(

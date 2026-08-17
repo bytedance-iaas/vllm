@@ -127,6 +127,7 @@ class _TripwireLayer(torch.nn.Module):
         self.is_moe_layer = False
         self.self_attn = _TripwireAttention()
         self.mlp = _TripwireFFN()
+        self.ffn_all_reduce_deferred = True
 
     def forward(
         self,
@@ -161,18 +162,27 @@ def test_target_layer_tripwire_captures_four_checkpoints(
     )
     positions = torch.tensor([7])
     hidden_states = torch.tensor([[1.0, 2.0]])
+    tripwire = eagle_trace.prepare_target_layer_tripwire(
+        torch.tensor([11]),
+        positions,
+    )
 
     with eagle_trace.capture_target_layer_tripwire(
         model,
-        torch.tensor([11]),
-        positions,
+        tripwire,
     ):
         output = layer(positions, hidden_states)
 
     assert output.tolist() == [[6.0, 12.0]]
     trace_path = next(tmp_path.glob("*/target-layer-tripwire-pos7.pt"))
     trace = torch.load(trace_path, weights_only=False)
-    assert trace["checkpoint_names"] == ["A", "B", "C", "D"]
+    assert trace["checkpoint_names"] == [
+        "A_attention_input",
+        "B_attention_return",
+        "C_ffn_input",
+        "D_ffn_return",
+    ]
+    assert trace["ffn_output_reduced"] == [False]
     assert trace["checkpoints"].tolist() == [
         [[1.0, 2.0], [2.0, 4.0], [2.0, 4.0], [6.0, 12.0]]
     ]
