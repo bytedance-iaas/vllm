@@ -567,6 +567,16 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        if target_layer_tripwire_requested() and self.use_async_scheduling:
+            raise ValueError(
+                "DCP EAGLE target layer tracing requires --no-async-scheduling "
+                "so CPU token and position metadata match the target forward."
+            )
+        if target_layer_tripwire_requested() and self.pcp_world_size > 1:
+            raise ValueError(
+                "DCP EAGLE target layer tracing does not support prefill "
+                "context parallel token reordering."
+            )
 
         # Sampler
         self.sampler = Sampler(
@@ -4565,6 +4575,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                allow_microbatching=target_layer_tripwire is None,
                 force_eager=target_layer_tripwire is not None,
             )
 
