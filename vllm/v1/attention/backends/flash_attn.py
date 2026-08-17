@@ -9,6 +9,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -918,10 +919,19 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale = layer._v_scale.expand(descale_shape)
 
             if self.dcp_world_size > 1:
+                dcp_query = query[:num_actual_tokens]
+                dcp_key = key[:num_actual_tokens]
+                dcp_value = value[:num_actual_tokens]
+                if (
+                    self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    and dcp_query.dtype == current_platform.fp8_dtype()
+                ):
+                    dcp_key = self._quantize_dcp_live_kv(dcp_key, layer._k_scale)
+                    dcp_value = self._quantize_dcp_live_kv(dcp_value, layer._v_scale)
                 self._forward_with_dcp(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
+                    dcp_query,
+                    dcp_key,
+                    dcp_value,
                     key_cache,
                     value_cache,
                     output[:num_actual_tokens],
@@ -1067,6 +1077,25 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def _quantize_dcp_live_kv(
+        self,
+        tensor: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match live K/V to the FP8 query dtype used by FA3 DCP."""
+        if tensor.dtype == current_platform.fp8_dtype():
+            return tensor
+        assert tensor.ndim == 3
+        original_shape = tensor.shape
+        flat = tensor.contiguous().view(original_shape[0], -1)
+        group_shape = (-1, original_shape[-1]) if scale.numel() > 1 else None
+        quantized, _ = ops.scaled_fp8_quant(
+            flat,
+            scale,
+            group_shape=group_shape,
+        )
+        return quantized.view(original_shape)
 
     def do_kv_cache_update(
         self,
