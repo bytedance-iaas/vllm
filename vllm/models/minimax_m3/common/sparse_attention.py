@@ -21,8 +21,9 @@ from typing import ClassVar
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
@@ -51,9 +52,12 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import (
+    get_cp_local_seq_lens,
     get_kv_cache_layout,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 logger = init_logger(__name__)
@@ -177,6 +181,7 @@ class MiniMaxM3SparseDecodeMetadata:
     seq_lens: torch.Tensor  # [num_decodes] int32
     block_table: torch.Tensor
     decode_query_len: int
+    local_kv_lens: torch.Tensor | None = None  # [num_decode_tokens] int32
 
 
 @dataclass
@@ -215,13 +220,34 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=True,
+            supports_dcp_with_varlen=True,
+        )
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        if self.dcp_world_size > 1:
+            if not current_platform.is_cuda():
+                raise NotImplementedError(
+                    "MiniMax M3 sparse-attention DCP currently supports CUDA only."
+                )
+            if self.cp_kv_cache_interleave_size != SPARSE_BLOCK_SIZE:
+                raise NotImplementedError(
+                    "MiniMax M3 sparse-attention DCP requires block-level KV "
+                    f"interleave ({SPARSE_BLOCK_SIZE}), got "
+                    f"{self.cp_kv_cache_interleave_size}."
+                )
         # Stable context-length buffer for decode cudagraph replays.
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
             device=device,
         )
+        self.global_decode_kv_lens_buffer = torch.empty_like(self.context_len_buffer)
+        self.local_decode_kv_lens_buffer = torch.empty_like(self.context_len_buffer)
 
     def build(
         self,
@@ -290,10 +316,38 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
                 (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
             )
             assert num_decode_tokens == num_decodes * decode_query_len
+            local_kv_lens: torch.Tensor | None = None
+            if self.dcp_world_size > 1:
+                q_offsets = torch.arange(
+                    1,
+                    decode_query_len + 1,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                global_kv_lens = self.global_decode_kv_lens_buffer[:num_decode_tokens]
+                global_kv_lens.copy_(
+                    (
+                        seq_lens[:num_decodes, None]
+                        - decode_query_len
+                        + q_offsets[None, :]
+                    )
+                    .clamp_min(0)
+                    .flatten()
+                )
+                local_kv_lens = self.local_decode_kv_lens_buffer[:num_decode_tokens]
+                local_kv_lens.copy_(
+                    get_cp_local_seq_lens(
+                        global_kv_lens,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+                )
             decode_metadata = MiniMaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
                 decode_query_len=decode_query_len,
+                local_kv_lens=local_kv_lens,
             )
 
         return MiniMaxM3SparseMetadata(
@@ -368,6 +422,28 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
 class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
     """Triton block-sparse attend (``minimax_m3_sparse_attn``) + Triton decode."""
 
+    can_return_lse_for_decode: bool = True
+    lse_base_on_e: bool = False
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        parallel_config = get_current_vllm_config().parallel_config
+        if (
+            self.dcp_world_size > 1
+            and parallel_config.cp_kv_cache_interleave_size != self.block_size
+        ):
+            raise NotImplementedError(
+                "MiniMax M3 Triton sparse-attention DCP requires block-level "
+                f"KV interleave ({self.block_size}), got "
+                f"{parallel_config.cp_kv_cache_interleave_size}."
+            )
+        self.dcp_combine = (
+            dcp_a2a_lse_reduce
+            if parallel_config.dcp_comm_backend == "a2a"
+            else cp_lse_ag_out_rs
+        )
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -406,22 +482,59 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
-            minimax_m3_sparse_attn_decode(
-                q[:nd],
-                kv_cache,
-                topk[:, :nd, :],
-                d.block_table,
-                d.seq_lens,
-                self.num_kv_heads,
-                self.scale,
-                out[:nd],
-                d.decode_query_len,
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+            if self.dcp_world_size > 1:
+                assert d.local_kv_lens is not None
+                decode_q = get_dcp_group().all_gather(q[:nd].contiguous(), dim=1)
+                local_out = torch.empty_like(decode_q)
+                local_topk = topk[:, :nd, :]
+                topk_valid_counts = (local_topk >= 0).sum(dim=-1, dtype=torch.int32)
+                lse = minimax_m3_sparse_attn_decode(
+                    decode_q,
+                    kv_cache,
+                    local_topk,
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    local_out,
+                    d.decode_query_len,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    kv_lens=d.local_kv_lens,
+                    topk_valid_counts=topk_valid_counts,
+                    return_lse=True,
+                )
+                assert lse is not None
+                out[:nd].copy_(
+                    self.dcp_combine(
+                        local_out,
+                        lse,
+                        get_dcp_group(),
+                        is_lse_base_on_e=False,
+                    )
+                )
+            else:
+                minimax_m3_sparse_attn_decode(
+                    q[:nd],
+                    kv_cache,
+                    topk[:, :nd, :],
+                    d.block_table,
+                    d.seq_lens,
+                    self.num_kv_heads,
+                    self.scale,
+                    out[:nd],
+                    d.decode_query_len,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
 
         # Prefill [nd:]: cu_seqlens_q already rebased to 0.
         if main_md.num_prefills > 0:
+            if self.dcp_world_size > 1:
+                raise NotImplementedError(
+                    "MiniMax M3 Triton DCP currently supports decode-only "
+                    "batches; sparse prefill DCP is not implemented."
+                )
             p = main_md.prefill
             assert p is not None
             minimax_m3_sparse_attn(
