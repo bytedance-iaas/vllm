@@ -20,6 +20,7 @@ def test_quantize_dcp_live_kv_uses_static_scale(
     expected_group_shape: tuple[int, int] | None,
 ) -> None:
     calls = []
+    fp8_dtype = flash_attn.current_platform.fp8_dtype()
 
     def fake_scaled_fp8_quant(
         tensor: torch.Tensor,
@@ -36,7 +37,7 @@ def test_quantize_dcp_live_kv_uses_static_scale(
                 group_shape,
             )
         )
-        return torch.empty_like(tensor, dtype=torch.float8_e4m3fn), actual_scale
+        return torch.empty_like(tensor, dtype=fp8_dtype), actual_scale
 
     monkeypatch.setattr(
         flash_attn.ops,
@@ -51,7 +52,7 @@ def test_quantize_dcp_live_kv_uses_static_scale(
     result = impl._quantize_dcp_live_kv(tensor, scale)
 
     assert result.shape == tensor.shape
-    assert result.dtype == torch.float8_e4m3fn
+    assert result.dtype == fp8_dtype
     assert calls == [
         (
             torch.Size([3, 8]),
@@ -75,7 +76,12 @@ def test_quantize_dcp_live_kv_does_not_requantize_fp8(
         fail_if_called,
     )
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    tensor = torch.empty(3, 2, 4, dtype=torch.float8_e4m3fn)
+    tensor = torch.empty(
+        3,
+        2,
+        4,
+        dtype=flash_attn.current_platform.fp8_dtype(),
+    )
 
     result = impl._quantize_dcp_live_kv(tensor, torch.tensor([0.5, 1.5]))
 
