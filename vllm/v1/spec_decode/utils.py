@@ -33,6 +33,9 @@ def eagle_step_slot_mapping_metadata_kernel(
     seq_lens_ptr,  # [batch_size] - read and write
     out_clamped_positions_ptr,  # [batch_size] (output)
     out_slot_mapping_ptr,  # [input_batch_size] (output)
+    dcp_world_size,
+    dcp_rank,
+    cp_kv_cache_interleave_size,
     block_size: tl.constexpr,
     max_model_len: tl.constexpr,
     n_blocks_per_req: tl.constexpr,
@@ -65,14 +68,25 @@ def eagle_step_slot_mapping_metadata_kernel(
     exceeds_max = new_position >= max_model_len
     clamped_position = tl.where(exceeds_max, 0, new_position)
 
-    # Block table lookup: block_number = position // block_size
+    cp_cycle = dcp_world_size * cp_kv_cache_interleave_size
+    owner_rank = (clamped_position % cp_cycle) // cp_kv_cache_interleave_size
+    local_position = (
+        clamped_position // cp_cycle * cp_kv_cache_interleave_size
+        + clamped_position % cp_kv_cache_interleave_size
+    )
+
+    # The block table is compacted to this DCP rank's local token space.
     # Clamp block_number to avoid OOB when position is at max
-    block_number = clamped_position // block_size
+    block_number = local_position // block_size
     block_number = tl.minimum(block_number, n_blocks_per_req - 1)
 
     block_id = tl.load(block_table_ptr + req_idx * block_table_stride + block_number)
-    slot_id = block_id * block_size + (clamped_position % block_size)
-    slot_id = tl.where(exceeds_max, PAD_ID, slot_id)
+    slot_id = block_id * block_size + (local_position % block_size)
+    slot_id = tl.where(
+        exceeds_max | (owner_rank != dcp_rank),
+        PAD_ID,
+        slot_id,
+    )
 
     # Update seq_lens: +1 normally, or 1 if exceeded
     seq_len = tl.load(seq_lens_ptr + req_idx)
@@ -94,6 +108,9 @@ def eagle_step_update_slot_mapping_and_metadata(
     out_clamped_positions: torch.Tensor,
     out_slot_mapping: torch.Tensor,
     input_batch_size: int | None = None,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     """
     Fused update of slot mapping and metadata for one EAGLE autoregressive step.
@@ -125,6 +142,9 @@ def eagle_step_update_slot_mapping_and_metadata(
         seq_lens,
         out_clamped_positions,
         out_slot_mapping,
+        dcp_world_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
         block_size=block_size,
         max_model_len=max_model_len,
         n_blocks_per_req=n_blocks_per_req,
@@ -246,6 +266,9 @@ def compute_new_slot_mapping(
     block_size: int,
     num_new_tokens: int,
     max_model_len: int,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ):
     batch_size, n_blocks_per_req = cad.block_table_tensor.shape
     req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
@@ -257,15 +280,20 @@ def compute_new_slot_mapping(
     # Clamp the positions to prevent an out-of-bounds error when indexing
     # into block_table_tensor.
     clamped_positions = torch.clamp(new_positions, max=max_model_len - 1)
-    block_table_indices = (
-        req_indices * n_blocks_per_req + clamped_positions // block_size
+    cp_cycle = dcp_world_size * cp_kv_cache_interleave_size
+    owner_ranks = clamped_positions.remainder(cp_cycle) // cp_kv_cache_interleave_size
+    local_positions = (
+        clamped_positions // cp_cycle * cp_kv_cache_interleave_size
+        + clamped_positions.remainder(cp_kv_cache_interleave_size)
     )
+    block_table_indices = req_indices * n_blocks_per_req + local_positions // block_size
     block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
-    block_offsets = clamped_positions % block_size
+    block_offsets = local_positions % block_size
     new_slot_mapping = block_nums * block_size + block_offsets
     # Mask out the position ids that exceed the max model length.
     exceeds_max_model_len = new_positions >= max_model_len
     new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+    new_slot_mapping.masked_fill_(owner_ranks != dcp_rank, PADDING_SLOT_ID)
     # Mask out rejected tokens to prevent saves to the KV cache.
     new_slot_mapping.masked_fill_(is_rejected_token_mask, PADDING_SLOT_ID)
     return new_slot_mapping
@@ -290,6 +318,12 @@ def extend_all_queries_by_N(
     new_query_start_loc_cpu = cad.query_start_loc_cpu + N * torch.arange(
         len(cad.query_start_loc_cpu), dtype=torch.int32
     )
+    new_seq_lens_cpu = cad._seq_lens_cpu + N if cad._seq_lens_cpu is not None else None
+    new_seq_lens_cpu_upper_bound = (
+        cad.seq_lens_cpu_upper_bound + N
+        if cad.seq_lens_cpu_upper_bound is not None
+        else None
+    )
     new_cad = cad.replace(
         query_start_loc=new_query_start_loc,
         query_start_loc_cpu=new_query_start_loc_cpu,
@@ -300,6 +334,8 @@ def extend_all_queries_by_N(
         max_query_len=cad.max_query_len + N,
         max_seq_len=cad.max_seq_len + N,
         slot_mapping=new_slot_mapping,
+        _seq_lens_cpu=new_seq_lens_cpu,
+        seq_lens_cpu_upper_bound=new_seq_lens_cpu_upper_bound,
     )
     return new_cad
 

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.vocab_mapping import VocabMapping
 
 from vllm.distributed.eplb.eplb_state import EplbState
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -38,6 +38,7 @@ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+from vllm.v1.attention.backends.utils import get_cp_local_seq_lens
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -59,6 +60,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -85,6 +87,10 @@ class SpecDecodeBaseProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
@@ -676,6 +682,10 @@ class SpecDecodeBaseProposer:
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
+            self._refresh_dcp_local_seq_lens(
+                common_attn_metadata,
+                batch_size,
+            )
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
@@ -792,6 +802,9 @@ class SpecDecodeBaseProposer:
             out_clamped_positions=out_pos,
             out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
             input_batch_size=input_batch_size,
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
         common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:
@@ -816,7 +829,42 @@ class SpecDecodeBaseProposer:
         if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
             common_attn_metadata.seq_lens_cpu_upper_bound += 1
 
+        self._refresh_dcp_local_seq_lens(common_attn_metadata, batch_size)
         return positions
+
+    def _refresh_dcp_local_seq_lens(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_reqs: int,
+    ) -> None:
+        local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        if self.dcp_world_size == 1 or local_seq_lens is None:
+            return
+
+        prepare_dcp_local_seq_lens(
+            local_seq_lens,
+            common_attn_metadata.seq_lens,
+            num_reqs,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+
+        local_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        if local_seq_lens_cpu is None:
+            return
+        if seq_lens_cpu is None:
+            common_attn_metadata.dcp_local_seq_lens_cpu = None
+            return
+        local_seq_lens_cpu[:num_reqs].copy_(
+            get_cp_local_seq_lens(
+                seq_lens_cpu[:num_reqs],
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        )
 
     def set_inputs_first_pass(
         self,
@@ -947,6 +995,9 @@ class SpecDecodeBaseProposer:
                 block_size=self.block_size,
                 num_new_tokens=self.net_num_new_slots_per_request,
                 max_model_len=self.max_model_len,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
             # 3. Update the common attention metadata with the new (meta)data
@@ -956,6 +1007,7 @@ class SpecDecodeBaseProposer:
                 arange=self.arange,
                 new_slot_mapping=new_slot_mapping,
             )
+            self._refresh_dcp_local_seq_lens(new_cad, new_cad.num_reqs)
 
             return total_num_output_tokens, token_indices_to_sample, new_cad
 
@@ -1153,6 +1205,11 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
+        )
+        self._refresh_dcp_local_seq_lens(
+            spec_common_attn_metadata,
+            spec_common_attn_metadata.num_reqs,
         )
 
         return (
@@ -1264,6 +1321,11 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
+        )
+        self._refresh_dcp_local_seq_lens(
+            spec_common_attn_metadata,
+            spec_common_attn_metadata.num_reqs,
         )
 
         return spec_common_attn_metadata, token_indices

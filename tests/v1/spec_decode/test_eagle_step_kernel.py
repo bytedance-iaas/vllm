@@ -25,6 +25,9 @@ def _reference_eagle_step_slot_mapping(
     seq_lens: torch.Tensor,
     block_size: int,
     max_model_len: int,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Python reference for eagle_step_update_slot_mapping_and_metadata."""
     new_positions = positions_1d + 1
@@ -32,16 +35,24 @@ def _reference_eagle_step_slot_mapping(
     clamped_positions = torch.where(
         exceeds_max, torch.zeros_like(positions_1d), new_positions
     )
-    block_numbers = (clamped_positions // block_size).clamp(
+    cp_cycle = dcp_world_size * cp_kv_cache_interleave_size
+    owner_ranks = clamped_positions.remainder(cp_cycle) // cp_kv_cache_interleave_size
+    local_positions = (
+        clamped_positions // cp_cycle * cp_kv_cache_interleave_size
+        + clamped_positions.remainder(cp_kv_cache_interleave_size)
+    )
+    block_numbers = (local_positions // block_size).clamp(
         max=block_table_tensor.shape[1] - 1
     )
     block_ids = block_table_tensor[
         torch.arange(positions_1d.shape[0], device=positions_1d.device),
         block_numbers.long(),
     ].long()
-    slot_mapping = block_ids * block_size + (clamped_positions % block_size)
+    slot_mapping = block_ids * block_size + (local_positions % block_size)
     slot_mapping = torch.where(
-        exceeds_max, torch.full_like(slot_mapping, PADDING_SLOT_ID), slot_mapping
+        exceeds_max | (owner_ranks != dcp_rank),
+        torch.full_like(slot_mapping, PADDING_SLOT_ID),
+        slot_mapping,
     )
     new_seq_lens = torch.where(exceeds_max, torch.ones_like(seq_lens), seq_lens + 1)
     new_seq_lens = new_seq_lens.clamp(max=max_model_len)
@@ -176,3 +187,62 @@ def test_eagle_step_slot_mapping_kernel_cudagraph_padding():
     # Padding slots should be PADDING_SLOT_ID
     for i in range(batch_size, input_batch_size):
         assert out_slot[i].item() == PADDING_SLOT_ID
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_eagle_step_slot_mapping_kernel_dcp_interleave(rank: int):
+    device = torch.device(DEVICE_TYPE)
+    positions = torch.tensor(
+        [126, 127, 254, 255, 382, 383],
+        dtype=torch.int64,
+        device=device,
+    )
+    batch_size = positions.shape[0]
+    input_batch_size = 8
+    block_size = 128
+    interleave = 128
+    block_table = (
+        torch.arange(batch_size * 4, dtype=torch.int32, device=device).view(
+            batch_size, 4
+        )
+        + 100
+    )
+    seq_lens = positions.to(torch.int32) + 1
+
+    ref_positions, ref_slots, ref_seq_lens = _reference_eagle_step_slot_mapping(
+        positions,
+        block_table,
+        seq_lens,
+        block_size,
+        max_model_len=1024,
+        dcp_world_size=2,
+        dcp_rank=rank,
+        cp_kv_cache_interleave_size=interleave,
+    )
+    out_positions = torch.empty_like(positions)
+    out_slots = torch.full(
+        (input_batch_size,),
+        -999,
+        dtype=torch.int64,
+        device=device,
+    )
+    actual_seq_lens = seq_lens.clone()
+
+    eagle_step_update_slot_mapping_and_metadata(
+        positions_1d=positions,
+        block_table_tensor=block_table,
+        seq_lens=actual_seq_lens,
+        block_size=block_size,
+        max_model_len=1024,
+        out_clamped_positions=out_positions,
+        out_slot_mapping=out_slots,
+        input_batch_size=input_batch_size,
+        dcp_world_size=2,
+        dcp_rank=rank,
+        cp_kv_cache_interleave_size=interleave,
+    )
+
+    torch.testing.assert_close(out_positions, ref_positions)
+    torch.testing.assert_close(out_slots[:batch_size], ref_slots)
+    torch.testing.assert_close(actual_seq_lens, ref_seq_lens)
+    assert torch.all(out_slots[batch_size:] == PADDING_SLOT_ID)
