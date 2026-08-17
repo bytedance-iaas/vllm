@@ -820,6 +820,11 @@ class FlashAttentionImpl(AttentionImpl):
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
+        self._cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+            if vllm_config is not None
+            else 1
+        )
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
             self._dcp_max_num_tokens = (
@@ -977,8 +982,16 @@ class FlashAttentionImpl(AttentionImpl):
                         "dcp_context_kv_lens": attn_metadata.dcp_context_kv_lens,
                         "block_table": block_table,
                         "slot_mapping": attn_metadata.slot_mapping,
+                        "cp_kv_cache_interleave_size": (
+                            self._cp_kv_cache_interleave_size
+                        ),
+                        "softmax_scale": self.scale,
+                        "q_scale": layer._q_scale,
                         "k_scale": layer._k_scale,
                         "v_scale": layer._v_scale,
+                        "q_descale": q_descale,
+                        "k_descale": k_descale,
+                        "v_descale": v_descale,
                     }
                 self._forward_with_dcp(
                     dcp_query,
@@ -1148,8 +1161,14 @@ class FlashAttentionImpl(AttentionImpl):
                         seq_lens=seqused_k,
                         block_table=block_table,
                         slot_mapping=attn_metadata.slot_mapping,
+                        cp_kv_cache_interleave_size=(self._cp_kv_cache_interleave_size),
+                        softmax_scale=self.scale,
+                        q_scale=layer._q_scale,
                         k_scale=layer._k_scale,
                         v_scale=layer._v_scale,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
                         production_output=output[:num_actual_tokens],
                         diagnostic_output=trace_out,
                         diagnostic_lse=trace_lse,

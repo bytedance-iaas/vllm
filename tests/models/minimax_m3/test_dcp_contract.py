@@ -22,6 +22,16 @@ class _SM100Platform:
         return family == 100
 
 
+class _SM90Platform:
+    @staticmethod
+    def is_cuda() -> bool:
+        return True
+
+    @staticmethod
+    def is_device_capability_family(family: int) -> bool:
+        return family == 90
+
+
 def test_sm100_dcp_forces_triton_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(decode_context_parallel_size=2)
@@ -107,6 +117,15 @@ class _FakeTraceGroup:
     rank = 0
 
 
+def test_dense_attention_snapshot_preserves_floating_dtype() -> None:
+    source = torch.tensor([1.0, -2.0], dtype=torch.bfloat16)
+
+    snapshot = eagle_trace._exact_snapshot(source)
+
+    assert snapshot.dtype == source.dtype
+    assert torch.equal(snapshot.view(torch.int16), source.view(torch.int16))
+
+
 class _TripwireAttention(torch.nn.Module):
     def forward(
         self,
@@ -149,10 +168,14 @@ def test_target_layer_tripwire_captures_four_checkpoints(
     monkeypatch.setenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION", "7")
     monkeypatch.setenv("VLLM_DCP_EAGLE_TRIPWIRE_TOKEN", "11")
     monkeypatch.setenv("VLLM_DCP_EAGLE_TRIPWIRE_MAX_LAYER", "0")
+    monkeypatch.setenv("VLLM_DCP_EAGLE_ATTN_DECOMP_LAYER", "0")
     monkeypatch.setattr(eagle_trace, "get_tp_group", _FakeTraceGroup)
     monkeypatch.setattr(eagle_trace, "get_dcp_group", _FakeTraceGroup)
     monkeypatch.setattr(eagle_trace, "get_world_group", _FakeTraceGroup)
+    monkeypatch.setattr(eagle_trace, "current_platform", _SM90Platform())
     monkeypatch.setattr(eagle_trace, "_TARGET_LAYER_TRIPWIRE_CAPTURED", False)
+    monkeypatch.setattr(eagle_trace, "_TARGET_LAYER_TRIPWIRE_ACTIVE", False)
+    monkeypatch.setattr(eagle_trace, "_DENSE_ATTN_DECOMP_CAPTURED", False)
 
     layer = _TripwireLayer()
     model = SimpleNamespace(
@@ -166,13 +189,28 @@ def test_target_layer_tripwire_captures_four_checkpoints(
         torch.tensor([11]),
         positions,
     )
+    assert not eagle_trace.dense_attn_decomp_enabled(
+        "model.layers.0.self_attn.attn",
+        max_seq_len=8,
+        num_actual_tokens=1,
+    )
 
     with eagle_trace.capture_target_layer_tripwire(
         model,
         tripwire,
     ):
+        assert eagle_trace.dense_attn_decomp_enabled(
+            "model.layers.0.self_attn.attn",
+            max_seq_len=8,
+            num_actual_tokens=1,
+        )
         output = layer(positions, hidden_states)
 
+    assert not eagle_trace.dense_attn_decomp_enabled(
+        "model.layers.0.self_attn.attn",
+        max_seq_len=8,
+        num_actual_tokens=1,
+    )
     assert output.tolist() == [[6.0, 12.0]]
     trace_path = next(tmp_path.glob("*/target-layer-tripwire-pos7.pt"))
     trace = torch.load(trace_path, weights_only=False)

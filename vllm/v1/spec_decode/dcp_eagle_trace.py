@@ -15,6 +15,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     get_world_group,
 )
+from vllm.platforms import current_platform
 
 _TRACE_FIELDS = {
     "block_table",
@@ -94,6 +95,18 @@ def _snapshot(value: Any) -> Any:
     return repr(value)
 
 
+def _exact_snapshot(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {str(key): _exact_snapshot(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_exact_snapshot(item) for item in value]
+    if isinstance(value, (bool, float, int, str)) or value is None:
+        return value
+    return repr(value)
+
+
 def snapshot_attention_metadata(metadata: Any) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         return {"metadata": _snapshot(metadata)}
@@ -148,6 +161,7 @@ def save_eagle_trace(
 
 
 _TARGET_LAYER_TRIPWIRE_CAPTURED = False
+_TARGET_LAYER_TRIPWIRE_ACTIVE = False
 _DENSE_ATTN_DECOMP_CAPTURED = False
 _TRIPWIRE_STAGES = (
     "A_attention_input",
@@ -177,7 +191,10 @@ def dense_attn_decomp_enabled(
         or configured_layer is None
         or configured_position is None
         or _DENSE_ATTN_DECOMP_CAPTURED
+        or not _TARGET_LAYER_TRIPWIRE_ACTIVE
         or not _rank_enabled()
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(90)
         or num_actual_tokens != 1
         or max_seq_len != int(configured_position) + 1
     ):
@@ -199,7 +216,7 @@ def save_dense_attn_decomp(layer_name: str, **payload: Any) -> None:
         "tp_rank": tp_rank,
         "dcp_rank": dcp_rank,
         "layer_name": layer_name,
-        **{key: _snapshot(value) for key, value in payload.items()},
+        **{key: _exact_snapshot(value) for key, value in payload.items()},
     }
     layer_id = int(os.getenv("VLLM_DCP_EAGLE_ATTN_DECOMP_LAYER", "0"))
     position = int(os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION", "-1"))
@@ -276,16 +293,18 @@ def capture_target_layer_tripwire(
     model: Any,
     tripwire: TargetLayerTripwire | None,
 ) -> Iterator[None]:
-    global _TARGET_LAYER_TRIPWIRE_CAPTURED
+    global _TARGET_LAYER_TRIPWIRE_ACTIVE, _TARGET_LAYER_TRIPWIRE_CAPTURED
 
     if tripwire is None or _TARGET_LAYER_TRIPWIRE_CAPTURED:
         yield
         return
 
     if not _rank_enabled():
+        _TARGET_LAYER_TRIPWIRE_ACTIVE = True
         try:
             yield
         finally:
+            _TARGET_LAYER_TRIPWIRE_ACTIVE = False
             _TARGET_LAYER_TRIPWIRE_CAPTURED = True
         return
 
@@ -352,9 +371,11 @@ def capture_target_layer_tripwire(
             )
         )
 
+    _TARGET_LAYER_TRIPWIRE_ACTIVE = True
     try:
         yield
     finally:
+        _TARGET_LAYER_TRIPWIRE_ACTIVE = False
         for handle in handles:
             handle.remove()
 
