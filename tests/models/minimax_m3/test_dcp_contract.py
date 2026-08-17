@@ -8,6 +8,7 @@ import torch
 
 import vllm.models.minimax_m3.common.indexer as indexer
 import vllm.models.minimax_m3.common.sparse_attention as sparse_attention
+import vllm.models.minimax_m3.nvidia.model as minimax_model
 
 
 class _SM100Platform:
@@ -98,3 +99,90 @@ def test_dcp_global_topk_localizes_selected_owners(
     )
 
     assert result.tolist() == [[expected]]
+
+
+def test_decoder_layer_toggles_dense_and_moe_ffn_reduction() -> None:
+    dense = SimpleNamespace(
+        is_moe_layer=False,
+        mlp=SimpleNamespace(down_proj=SimpleNamespace(reduce_results=False)),
+    )
+    moe = SimpleNamespace(
+        is_moe_layer=True,
+        block_sparse_moe=SimpleNamespace(
+            experts=SimpleNamespace(
+                moe_config=SimpleNamespace(skip_final_all_reduce=True)
+            )
+        ),
+    )
+
+    minimax_model.MiniMaxM3DecoderLayer.set_ffn_all_reduce_deferred(dense, False)
+    minimax_model.MiniMaxM3DecoderLayer.set_ffn_all_reduce_deferred(moe, False)
+    assert dense.mlp.down_proj.reduce_results
+    assert not moe.block_sparse_moe.experts.moe_config.skip_final_all_reduce
+
+    minimax_model.MiniMaxM3DecoderLayer.set_ffn_all_reduce_deferred(dense, True)
+    minimax_model.MiniMaxM3DecoderLayer.set_ffn_all_reduce_deferred(moe, True)
+    assert not dense.mlp.down_proj.reduce_results
+    assert moe.block_sparse_moe.experts.moe_config.skip_final_all_reduce
+
+
+class _FakeDecoderLayer:
+    def __init__(self, deferred: bool) -> None:
+        self.deferred = deferred
+        self.fuse_input_allreduce = False
+
+    @property
+    def ffn_all_reduce_deferred(self) -> bool:
+        return self.deferred
+
+    def set_ffn_all_reduce_deferred(self, defer: bool) -> None:
+        self.deferred = defer
+
+
+def test_eagle_aux_boundaries_reconfigure_deferred_allreduce() -> None:
+    layers = [
+        _FakeDecoderLayer(True),
+        _FakeDecoderLayer(False),
+        _FakeDecoderLayer(True),
+        _FakeDecoderLayer(True),
+    ]
+    model = SimpleNamespace(
+        layers=layers,
+        start_layer=0,
+        end_layer=len(layers),
+        _original_ffn_all_reduce_deferred=(True, False, True, True),
+    )
+    model._configure_deferred_allreduce = lambda boundaries: (
+        minimax_model.MiniMaxM3Model._configure_deferred_allreduce(model, boundaries)
+    )
+
+    minimax_model.MiniMaxM3Model._set_aux_hidden_state_layers(model, (0, 2, 4))
+    assert model.aux_hidden_state_layers == (0, 2, 4)
+    assert [layer.deferred for layer in layers] == [True, False, True, False]
+    assert [layer.fuse_input_allreduce for layer in layers] == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert not model.fuse_final_norm_allreduce
+
+    minimax_model.MiniMaxM3Model._set_aux_hidden_state_layers(model, (1,))
+    assert [layer.deferred for layer in layers] == [False, False, True, True]
+    assert [layer.fuse_input_allreduce for layer in layers] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert model.fuse_final_norm_allreduce
+
+    minimax_model.MiniMaxM3Model._set_aux_hidden_state_layers(model, ())
+    assert [layer.deferred for layer in layers] == [True, False, True, True]
+    assert [layer.fuse_input_allreduce for layer in layers] == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert model.fuse_final_norm_allreduce

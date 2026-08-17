@@ -765,6 +765,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return self.block_sparse_moe.experts.moe_config.skip_final_all_reduce
         return not self.mlp.down_proj.reduce_results
 
+    def set_ffn_all_reduce_deferred(self, defer: bool) -> None:
+        if self.is_moe_layer:
+            self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = defer
+        else:
+            self.mlp.down_proj.reduce_results = not defer
+
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
@@ -828,14 +834,46 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        # Configure cross-layer all-reduce/RMSNorm fusion: a layer whose FFN output
-        # is left un-reduced has that all-reduce fused into the next layer's
-        # input_layernorm (or the final norm).
+        local_layers = self.layers[self.start_layer : self.end_layer]
+        self._original_ffn_all_reduce_deferred = tuple(
+            layer.ffn_all_reduce_deferred for layer in local_layers
+        )
+        self._configure_deferred_allreduce(())
+
+    def _configure_deferred_allreduce(
+        self,
+        materialized_boundaries: tuple[int, ...],
+    ) -> None:
+        local_layers = self.layers[self.start_layer : self.end_layer]
+        assert len(local_layers) == len(self._original_ffn_all_reduce_deferred)
+        materialized = set(materialized_boundaries)
+
         prev_defers = False
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for idx, (layer, originally_deferred) in enumerate(
+            zip(local_layers, self._original_ffn_all_reduce_deferred)
+        ):
+            layer.set_ffn_all_reduce_deferred(
+                originally_deferred and idx + 1 not in materialized
+            )
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        num_local_layers = self.end_layer - self.start_layer
+        if layers and (self.start_layer != 0 or self.end_layer != len(self.layers)):
+            raise NotImplementedError(
+                "MiniMax-M3 EAGLE3 auxiliary states do not support pipeline "
+                "parallel model partitions."
+            )
+        invalid = [idx for idx in layers if idx < 0 or idx > num_local_layers]
+        if invalid:
+            raise ValueError(
+                f"Invalid MiniMax-M3 EAGLE3 auxiliary boundaries: {invalid}."
+            )
+
+        EagleModelMixin._set_aux_hidden_state_layers(self, layers)
+        self._configure_deferred_allreduce(layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
