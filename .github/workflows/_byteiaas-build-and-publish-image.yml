@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      image_formats:
+        description: "CSV of image formats to build and push. Default: oci,zstd,nydus"
+        required: false
+        type: string
+        default: "oci,zstd,nydus"
 
 jobs:
   build-and-publish-image:
@@ -55,6 +60,7 @@ jobs:
       BYTEIAAS_HPC_OPS_REPO: https://github.com/wangyicong52/hpc-ops.git
       BYTEIAAS_HPC_OPS_REF: 915755b437257e1118a80f5cbb07509037faad05
       BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
+      IMAGE_FORMATS: ${{ inputs.image_formats }}
     steps:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
@@ -89,6 +95,7 @@ jobs:
           set -euo pipefail
           resolve_tag() {
             local image_flavor="$1"
+            local format_suffix="${2:-}"
             local tag_args=(
               --mode "${{ inputs.tag_mode }}"
               --image-flavor "${image_flavor}"
@@ -100,15 +107,51 @@ jobs:
             if [ -n "${BYTEIAAS_VLLM_VERSION}" ]; then
               tag_args+=(--vllm-version "${BYTEIAAS_VLLM_VERSION}")
             fi
+            if [ -n "${format_suffix}" ]; then
+              tag_args+=(--format-suffix "${format_suffix}")
+            fi
             python3 scripts/ci/get_byteiaas_image_tag.py "${tag_args[@]}"
           }
 
           OPENAI_IMAGE_TAG="$(resolve_tag openai)"
           OPENAI_DEVEL_IMAGE_TAG="$(resolve_tag openai-devel)"
+          OPENAI_ZSTD_IMAGE_TAG="$(resolve_tag openai zstd)"
+          OPENAI_DEVEL_ZSTD_IMAGE_TAG="$(resolve_tag openai-devel zstd)"
+          OPENAI_NYDUS_IMAGE_TAG="$(resolve_tag openai nydus)"
+          OPENAI_DEVEL_NYDUS_IMAGE_TAG="$(resolve_tag openai-devel nydus)"
           echo "openai_image_tag=${OPENAI_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "openai_devel_image_tag=${OPENAI_DEVEL_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "openai_zstd_image_tag=${OPENAI_ZSTD_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "openai_devel_zstd_image_tag=${OPENAI_DEVEL_ZSTD_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "openai_nydus_image_tag=${OPENAI_NYDUS_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "openai_devel_nydus_image_tag=${OPENAI_DEVEL_NYDUS_IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
           echo "Resolved openai image tag ${OPENAI_IMAGE_TAG}"
           echo "Resolved openai-devel image tag ${OPENAI_DEVEL_IMAGE_TAG}"
+
+      - name: Validate requested image formats
+        id: image-formats
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+
+          raw = os.environ.get("IMAGE_FORMATS", "oci,zstd,nydus")
+          formats = [item.strip() for item in raw.split(",") if item.strip()]
+          if not formats:
+              formats = ["oci", "zstd", "nydus"]
+          allowed = {"oci", "zstd", "nydus"}
+          unknown = sorted(set(formats) - allowed)
+          if unknown:
+              raise SystemExit(
+                  f"unknown image formats: {unknown}; allowed: {sorted(allowed)}"
+              )
+          selected = set(formats)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for image_format in sorted(allowed):
+                  enabled = str(image_format in selected).lower()
+                  output.write(f"{image_format}={enabled}\n")
+          print(f"Requested image formats: {formats}")
+          PY
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         id: buildx
@@ -135,6 +178,8 @@ jobs:
           final_base_image="nvidia/cuda:${{ inputs.cuda_version }}-base-ubuntu${ubuntu_version}"
           openai_metadata_file="/tmp/byteiaas-vllm-openai-image.json"
           openai_devel_metadata_file="/tmp/byteiaas-vllm-openai-devel-image.json"
+          openai_zstd_metadata_file="/tmp/byteiaas-vllm-openai-zstd-image.json"
+          openai_devel_zstd_metadata_file="/tmp/byteiaas-vllm-openai-devel-zstd-image.json"
           build_cpus="$(nproc)"
           build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
           default_nvcc_threads=4
@@ -189,13 +234,29 @@ jobs:
             fi
           }
 
+          buildx_from_local_cache() {
+            local cache_name="$1"
+            shift
+            local cache_dir="${cache_root}/${cache_name}"
+            local cache_args=()
+            if [ -d "${cache_dir}" ]; then
+              cache_args+=(--cache-from "type=local,src=${cache_dir}")
+              echo "Reusing local BuildKit cache: ${cache_dir}"
+            else
+              echo "::error::Expected local BuildKit cache is missing: ${cache_dir}"
+              return 1
+            fi
+            docker buildx build --builder "${{ steps.buildx.outputs.name }}" "${cache_args[@]}" "$@"
+          }
+
           build_vllm_openai() {
-            local output_name="$1"
-            local metadata_path="$2"
-            buildx_with_local_cache openai \
+            local cache_mode="$1"
+            local output_options="$2"
+            local metadata_path="$3"
+            local build_args=(
               --target vllm-openai \
               --platform linux/amd64 \
-              --output "type=image,name=${output_name},push-by-digest=true,name-canonical=true,push=true" \
+              --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}" \
               -f docker/Dockerfile \
               --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
               --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
@@ -228,37 +289,69 @@ jobs:
               --build-arg RUN_WHEEL_CHECK=false \
               --metadata-file "${metadata_path}" \
               .
+            )
+            if [ "${cache_mode}" = "write" ]; then
+              buildx_with_local_cache openai "${build_args[@]}"
+            else
+              buildx_from_local_cache openai "${build_args[@]}"
+            fi
           }
 
-          build_vllm_openai "${IMAGE_REPO}" "${openai_metadata_file}"
+          build_vllm_openai_devel() {
+            local cache_mode="$1"
+            local output_options="$2"
+            local base_digest="$3"
+            local metadata_path="$4"
+            local build_args=(
+              --platform linux/amd64
+              --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}"
+              -f docker/byteiaas-openai-devel.Dockerfile
+              --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${base_digest}"
+              --build-arg CUDA_VERSION=${{ inputs.cuda_version }}
+              --build-arg max_jobs="${build_max_jobs}"
+              --build-arg nvcc_threads="${build_nvcc_threads}"
+              --build-arg HTTP_PROXY="${HTTP_PROXY}"
+              --build-arg HTTPS_PROXY="${HTTPS_PROXY}"
+              --build-arg ALL_PROXY="${ALL_PROXY}"
+              --build-arg NO_PROXY="${NO_PROXY}"
+              --build-arg http_proxy="${HTTP_PROXY}"
+              --build-arg https_proxy="${HTTPS_PROXY}"
+              --build-arg all_proxy="${ALL_PROXY}"
+              --build-arg no_proxy="${NO_PROXY}"
+              --metadata-file "${metadata_path}"
+              .
+            )
+            if [ "${cache_mode}" = "write" ]; then
+              buildx_with_local_cache openai-devel "${build_args[@]}"
+            else
+              buildx_from_local_cache openai-devel "${build_args[@]}"
+            fi
+          }
+
+          build_vllm_openai write "" "${openai_metadata_file}"
           openai_digest="$(python3 -c "import json; print(json.load(open('${openai_metadata_file}'))['containerimage.digest'])")"
           echo "Pushed openai digest: ${openai_digest}"
 
-          buildx_with_local_cache openai-devel \
-            --platform linux/amd64 \
-            --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true" \
-            -f docker/byteiaas-openai-devel.Dockerfile \
-            --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${openai_digest}" \
-            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
-            --build-arg max_jobs="${build_max_jobs}" \
-            --build-arg nvcc_threads="${build_nvcc_threads}" \
-            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
-            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
-            --build-arg ALL_PROXY="${ALL_PROXY}" \
-            --build-arg NO_PROXY="${NO_PROXY}" \
-            --build-arg http_proxy="${HTTP_PROXY}" \
-            --build-arg https_proxy="${HTTPS_PROXY}" \
-            --build-arg all_proxy="${ALL_PROXY}" \
-            --build-arg no_proxy="${NO_PROXY}" \
-            --metadata-file "${openai_devel_metadata_file}" \
-            .
-
+          build_vllm_openai_devel write "" "${openai_digest}" "${openai_devel_metadata_file}"
           openai_devel_digest="$(python3 -c "import json; print(json.load(open('${openai_devel_metadata_file}'))['containerimage.digest'])")"
           echo "Pushed openai-devel digest: ${openai_devel_digest}"
           echo "openai_digest=${openai_digest}" >> "${GITHUB_OUTPUT}"
           echo "openai_devel_digest=${openai_devel_digest}" >> "${GITHUB_OUTPUT}"
 
-      - name: Create Volcengine image tags
+          if [ "${{ steps.image-formats.outputs.zstd }}" = "true" ]; then
+            zstd_output=",compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true"
+            build_vllm_openai read "${zstd_output}" "${openai_zstd_metadata_file}"
+            openai_zstd_digest="$(python3 -c "import json; print(json.load(open('${openai_zstd_metadata_file}'))['containerimage.digest'])")"
+            build_vllm_openai_devel read "${zstd_output}" "${openai_digest}" "${openai_devel_zstd_metadata_file}"
+            openai_devel_zstd_digest="$(python3 -c "import json; print(json.load(open('${openai_devel_zstd_metadata_file}'))['containerimage.digest'])")"
+            echo "Pushed openai zstd digest: ${openai_zstd_digest}"
+            echo "Pushed openai-devel zstd digest: ${openai_devel_zstd_digest}"
+            echo "openai_zstd_digest=${openai_zstd_digest}" >> "${GITHUB_OUTPUT}"
+            echo "openai_devel_zstd_digest=${openai_devel_zstd_digest}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Create Volcengine OCI image tags
+        if: ${{ steps.image-formats.outputs.oci == 'true' }}
         run: |
           set -euo pipefail
           docker buildx imagetools create \
@@ -269,3 +362,94 @@ jobs:
             "${IMAGE_REPO}@${{ steps.build.outputs.openai_devel_digest }}"
           echo "Published openai image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_image_tag }}"
           echo "Published openai-devel image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_image_tag }}"
+
+      - name: Create Volcengine zstd image tags
+        if: ${{ steps.image-formats.outputs.zstd == 'true' }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_zstd_image_tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.openai_zstd_digest }}"
+          docker buildx imagetools create \
+            -t "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_zstd_image_tag }}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.openai_devel_zstd_digest }}"
+          echo "Published openai zstd image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_zstd_image_tag }}"
+          echo "Published openai-devel zstd image: ${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_zstd_image_tag }}"
+
+      - name: Verify pushed zstd images
+        if: ${{ steps.image-formats.outputs.zstd == 'true' }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_byteiaas_image_format.py --format zstd \
+            "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_zstd_image_tag }}" \
+            "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_zstd_image_tag }}"
+
+      - name: Install nydus tooling
+        if: ${{ steps.image-formats.outputs.nydus == 'true' }}
+        env:
+          NYDUS_VERSION: "2.3.0"
+        run: |
+          set -euo pipefail
+          tarball="nydus-static-v${NYDUS_VERSION}-linux-amd64.tgz"
+          url="https://github.com/dragonflyoss/nydus/releases/download/v${NYDUS_VERSION}/${tarball}"
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt ${attempt} failed; sleeping 15s"
+              sleep 15
+            done
+            return 1
+          }
+          retry curl -fL --retry 5 --retry-all-errors --retry-delay 2 \
+            -o "/tmp/${tarball}" "${url}"
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          sudo install -m 0755 /tmp/nydus-static/nydusify /usr/local/bin/nydusify
+          sudo install -m 0755 /tmp/nydus-static/nydus-image /usr/local/bin/nydus-image
+          nydusify --version
+          nydus-image --version
+
+      - name: Convert and push nydus images
+        if: ${{ steps.image-formats.outputs.nydus == 'true' }}
+        run: |
+          set -euo pipefail
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt ${attempt} failed; sleeping 20s"
+              sleep 20
+            done
+            return 1
+          }
+          convert_image() {
+            local source_digest="$1"
+            local target_tag="$2"
+            local source="${IMAGE_REPO}@${source_digest}"
+            local target="${IMAGE_REPO}:${target_tag}"
+            echo "Converting ${source} to ${target}"
+            retry nydusify convert \
+              --nydus-image /usr/local/bin/nydus-image \
+              --source "${source}" \
+              --target "${target}"
+            echo "Published ${target}"
+          }
+          convert_image \
+            "${{ steps.build.outputs.openai_digest }}" \
+            "${{ steps.image-tags.outputs.openai_nydus_image_tag }}"
+          convert_image \
+            "${{ steps.build.outputs.openai_devel_digest }}" \
+            "${{ steps.image-tags.outputs.openai_devel_nydus_image_tag }}"
+
+      - name: Verify pushed nydus images
+        if: ${{ steps.image-formats.outputs.nydus == 'true' }}
+        run: |
+          set -euo pipefail
+          targets=(
+            "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_nydus_image_tag }}"
+            "${IMAGE_REPO}:${{ steps.image-tags.outputs.openai_devel_nydus_image_tag }}"
+          )
+          for target in "${targets[@]}"; do
+            nydusify check --target "${target}"
+            docker buildx imagetools inspect "${target}"
+          done
+          python3 scripts/ci/verify_byteiaas_image_format.py --format nydus \
+            "${targets[@]}"
