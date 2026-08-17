@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     should_launch_bootstrap_server,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+    MOONCAKE_CP_BLOCK_PAIRING_VERSION,
     MooncakeBootstrapServer,
 )
 from vllm.utils.network_utils import get_open_port
@@ -527,6 +528,7 @@ def test_pair_cp_blocks_scatters_global_pages_to_consumer_dcp(dcp_rank: int):
         group_block_size=128,
         producer_interleave_size=128,
         consumer_interleave_size=128,
+        consumer_cp_block_pairing_version=1,
     )
 
     assert error is None
@@ -553,6 +555,7 @@ def test_pair_cp_blocks_maps_consumer_dcp_prefix_suffix(dcp_rank: int):
         group_block_size=128,
         producer_interleave_size=128,
         consumer_interleave_size=128,
+        consumer_cp_block_pairing_version=1,
     )
 
     assert error is None
@@ -578,6 +581,7 @@ def test_pair_cp_blocks_skips_consumer_dcp_rank_without_tokens():
         group_block_size=128,
         producer_interleave_size=128,
         consumer_interleave_size=128,
+        consumer_cp_block_pairing_version=1,
     )
 
     assert result == ([], [], None)
@@ -624,10 +628,36 @@ def test_pair_cp_blocks_rejects_unsupported_topologies(
         group_block_size=128,
         producer_interleave_size=128,
         consumer_interleave_size=consumer_interleave_size,
+        consumer_cp_block_pairing_version=1,
     )
 
     assert error is not None
     assert match in error
+
+
+def test_pair_cp_blocks_rejects_legacy_ambiguous_block_mismatch():
+    _, _, error = _pair_cp_block_ids(
+        list(range(28)),
+        list(range(100, 114)),
+        total_tokens=3563,
+        num_external_tokens=3563,
+        external_start_token=0,
+        producer_pcp_size=1,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        producer_dcp_size=1,
+        producer_dcp_rank=0,
+        consumer_dcp_size=1,
+        consumer_dcp_rank=0,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=1,
+        consumer_cp_block_pairing_version=0,
+    )
+
+    assert error is not None
+    assert "CP block pairing capability" in error
 
 
 @pytest.mark.asyncio
@@ -743,14 +773,25 @@ async def test_build_transfer_params_reassembles_pcp_pages(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("producer_tp_rank", range(4))
 @pytest.mark.parametrize("dcp_rank", [0, 1])
-async def test_build_transfer_params_scatters_consumer_dcp_pages(dcp_rank: int):
+async def test_build_transfer_params_scatters_consumer_dcp_pages(
+    producer_tp_rank: int,
+    dcp_rank: int,
+):
+    layer_name = "model.layers.0.self_attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.shutdown = MagicMock()
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = False
     worker.is_kv_producer = True
-    worker.tp_rank = 0
+    worker.tp_rank = producer_tp_rank
     worker.tp_size = 4
     worker.pcp_rank = 0
     worker.pcp_size = 1
@@ -758,19 +799,23 @@ async def test_build_transfer_params_scatters_consumer_dcp_pages(dcp_rank: int):
     worker.dcp_size = 1
     worker.cp_kv_cache_interleave_size = 128
     worker._physical_blocks_per_logical_kv_block = 1
-    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=4,
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={layer_name: SimpleNamespace(total_num_kv_heads=4)}
+        )
+    )
     worker.kv_cache_config = KVCacheConfig(
         num_blocks=0,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["model.layers.0.self_attn"],
-                FullAttentionSpec(
-                    block_size=128,
-                    num_kv_heads=1,
-                    head_size=16,
-                    dtype=torch.float16,
-                ),
+                [layer_name],
+                layer_spec,
             )
         ],
     )
@@ -780,7 +825,7 @@ async def test_build_transfer_params_scatters_consumer_dcp_pages(dcp_rank: int):
     remote_base = 0xA000
     local_regions = [
         TransferRegion(
-            layer_name="model.layers.0.self_attn",
+            layer_name=layer_name,
             layer_index=0,
             base_addr=local_base,
             block_len=block_len,
@@ -790,7 +835,7 @@ async def test_build_transfer_params_scatters_consumer_dcp_pages(dcp_rank: int):
     ]
     remote_regions = [
         TransferRegion(
-            layer_name="model.layers.0.self_attn",
+            layer_name=layer_name,
             layer_index=0,
             base_addr=remote_base,
             block_len=block_len,
@@ -810,12 +855,13 @@ async def test_build_transfer_params_scatters_consumer_dcp_pages(dcp_rank: int):
         remote_hostname="consumer-host",
         remote_port=54321,
         remote_tp_size=8,
-        remote_tp_rank=dcp_rank,
+        remote_tp_rank=producer_tp_rank * 2 + dcp_rank,
         remote_pcp_size=1,
         remote_pcp_rank=0,
         remote_dcp_size=2,
         remote_dcp_rank=dcp_rank,
         remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         req_blocks={"d-req-dcp": (transfer_id, [remote_blocks])},
         kv_caches_base_addr=[remote_base],
         block_lens=[block_len],
@@ -1157,6 +1203,7 @@ def test_xfer_metadata_decodes_legacy_payload_with_alias_defaults():
     assert metadata.remote_dcp_size == 1
     assert metadata.remote_dcp_rank == 0
     assert metadata.remote_cp_kv_cache_interleave_size == 1
+    assert metadata.remote_cp_block_pairing_version == 0
 
 
 def test_xfer_metadata_round_trips_consumer_dcp_topology():
@@ -1172,6 +1219,7 @@ def test_xfer_metadata_round_trips_consumer_dcp_topology():
         remote_dcp_size=2,
         remote_dcp_rank=1,
         remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
     )
 
     payload = msgspec.msgpack.encode(metadata)
@@ -1180,6 +1228,7 @@ def test_xfer_metadata_round_trips_consumer_dcp_topology():
     assert decoded.remote_dcp_size == 2
     assert decoded.remote_dcp_rank == 1
     assert decoded.remote_cp_kv_cache_interleave_size == 128
+    assert decoded.remote_cp_block_pairing_version == MOONCAKE_CP_BLOCK_PAIRING_VERSION
 
 
 @pytest.mark.asyncio
@@ -1525,6 +1574,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pp_rank": 0,
         "pcp_rank": 0,
         "pcp_size": 2,
+        "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -1539,6 +1589,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pp_rank": 0,
         "pcp_rank": 1,
         "pcp_size": 2,
+        "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         "addr": "tcp://1.1.1.2:1112",
     }
     async with httpx.AsyncClient() as client:
@@ -1552,6 +1603,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pp_rank": 1,
         "pcp_rank": 0,
         "pcp_size": 2,
+        "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
@@ -1567,9 +1619,29 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert "0" in data
         assert data["0"]["engine_id"] == "eng-1"
         assert data["0"]["pcp_size"] == 2
+        assert (
+            data["0"]["cp_block_pairing_version"] == MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        )
         assert data["0"]["worker_addr"]["0"]["0"]["0"] == ("tcp://1.1.1.1:1111")
         assert data["0"]["worker_addr"]["0"]["0"]["1"] == ("tcp://1.1.1.2:1112")
         assert data["0"]["worker_addr"]["0"]["1"]["0"] == ("tcp://2.2.2.2:2222")
+
+    payload_version_mismatch = {
+        "engine_id": "eng-1",
+        "dp_rank": 0,
+        "tp_rank": 1,
+        "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 2,
+        "cp_block_pairing_version": 0,
+        "addr": "tcp://3.3.3.3:3333",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{base_url}/register", json=payload_version_mismatch
+        )
+        assert response.status_code == 400
+        assert "CP block pairing version mismatch" in response.text
 
     # Test failure: re-registering the same worker
     async with httpx.AsyncClient() as client:
@@ -1917,6 +1989,33 @@ async def test_receive_kv_selects_remote_pp_workers(
 
     assert seen_addrs == expected_addrs
     assert pull_metas["d-req-1"].pull_tasks_count == 0
+
+
+def test_receive_kv_rejects_legacy_producer_for_consumer_dcp():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.dcp_size = 2
+    worker._cp_block_pairing_version = {"p-engine": 0}
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=MagicMock())
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    worker.receive_kv_from_single_worker = MagicMock()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-old-producer",
+        transfer_id="xfer-old-producer",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+
+    worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+
+    worker.transfer_topo.handshake_target_ranks.assert_not_called()
+    worker.receive_kv_from_single_worker.assert_not_called()
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
 def test_receive_kv_rejects_consumer_pp_fanout():

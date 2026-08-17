@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+    MOONCAKE_CP_BLOCK_PAIRING_VERSION,
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
 )
@@ -980,6 +981,7 @@ def _pair_cp_block_ids(
     group_block_size: int,
     producer_interleave_size: int,
     consumer_interleave_size: int,
+    consumer_cp_block_pairing_version: int,
 ) -> tuple[list[int], list[int], str | None]:
     """Pair producer and consumer pages for one supported CP topology."""
     if producer_dcp_size <= 0 or consumer_dcp_size <= 0:
@@ -994,6 +996,21 @@ def _pair_cp_block_ids(
         return [], [], "Mooncake consumer PCP and DCP cannot both exceed one"
     if producer_dcp_size > 1:
         return [], [], "Mooncake producer DCP is not supported"
+    if (
+        consumer_cp_block_pairing_version < MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        and consumer_dcp_size > 1
+    ):
+        return [], [], "Mooncake consumer DCP requires CP block pairing capability"
+    if (
+        consumer_cp_block_pairing_version < MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        and producer_pcp_size == consumer_pcp_size == 1
+        and len(local_block_ids) != len(remote_block_ids)
+    ):
+        return (
+            [],
+            [],
+            "Mooncake block count mismatch requires CP block pairing capability",
+        )
 
     if consumer_dcp_size > 1:
         if producer_pcp_size != 1 or consumer_pcp_size != 1:
@@ -1056,6 +1073,7 @@ class MooncakeXferMetadata(
     remote_dcp_size: int = 1
     remote_dcp_rank: int = 0
     remote_cp_kv_cache_interleave_size: int = 1
+    remote_cp_block_pairing_version: int = 0
     req_total_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
     req_num_external_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
     req_external_start_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
@@ -1840,6 +1858,9 @@ class MooncakeConnectorWorker:
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
         self._pcp_size: dict[EngineId, int] = {self.engine_id: self.pcp_size}
+        self._cp_block_pairing_version: dict[EngineId, int] = {
+            self.engine_id: MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        }
         self._layer_specs: dict[str, KVCacheSpec] = {}
         for group in kv_cache_config.kv_cache_groups:
             group_spec = group.kv_cache_spec
@@ -1923,6 +1944,7 @@ class MooncakeConnectorWorker:
             pp_rank=self.pp_rank,
             pcp_rank=self.pcp_rank,
             pcp_size=self.pcp_size,
+            cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
             addr=worker_addr,
         )
         while True:
@@ -2433,6 +2455,9 @@ class MooncakeConnectorWorker:
                     consumer_interleave_size=(
                         agent_meta.remote_cp_kv_cache_interleave_size
                     ),
+                    consumer_cp_block_pairing_version=(
+                        agent_meta.remote_cp_block_pairing_version
+                    ),
                 )
                 if pair_error is not None:
                     logger.error(
@@ -2910,6 +2935,7 @@ class MooncakeConnectorWorker:
             remote_dcp_size=self.dcp_size,
             remote_dcp_rank=self.dcp_rank,
             remote_cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
             req_total_tokens={
                 req_id: pull_meta.total_tokens
                 for req_id, pull_meta in pull_metas.items()
@@ -3057,6 +3083,9 @@ class MooncakeConnectorWorker:
                     }
                     self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
                     self._pcp_size[remote_engine_id] = int(dp_entry.get("pcp_size", 1))
+                    self._cp_block_pairing_version[remote_engine_id] = int(
+                        dp_entry.get("cp_block_pairing_version", 0)
+                    )
         except Exception as e:
             logger.error(
                 "Failed to connect to bootstrap server %s: %s",
@@ -3073,6 +3102,21 @@ class MooncakeConnectorWorker:
         remote_engine_id: EngineId,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        remote_cp_version = getattr(self, "_cp_block_pairing_version", {}).get(
+            remote_engine_id, 0
+        )
+        if (
+            getattr(self, "dcp_size", 1) > 1
+            and remote_cp_version < MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        ):
+            logger.error(
+                "Mooncake producer engine %s does not advertise CP block pairing",
+                remote_engine_id,
+            )
+            for pull_meta in pull_metas.values():
+                pull_meta.pull_failed = True
+                self._mark_pull_failed(pull_meta)
+            return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
