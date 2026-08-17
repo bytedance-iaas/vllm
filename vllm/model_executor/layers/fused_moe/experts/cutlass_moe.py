@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+import json
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.distributed import get_pp_group, get_tp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
@@ -50,6 +54,127 @@ from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+_W4A8_DEBUG_RECORDS = 0
+
+
+def _w4a8_debug_enabled() -> bool:
+    return os.environ.get("VLLM_W4A8_DEBUG_INSTRUMENT", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _w4a8_debug_max_records() -> int:
+    value = os.environ.get("VLLM_W4A8_DEBUG_MAX_RECORDS", "128")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        logger.warning_once("Invalid VLLM_W4A8_DEBUG_MAX_RECORDS=%r", value)
+        return 128
+
+
+def _w4a8_debug_tensor_stats(
+    tensor: torch.Tensor | None,
+    *,
+    token_column: int | None = None,
+) -> dict[str, int | float | None]:
+    if tensor is None:
+        return {}
+
+    if token_column is not None:
+        tensor = tensor[:, token_column]
+    flat = tensor.detach().to(device="cpu", dtype=torch.int64).flatten()
+    if flat.numel() == 0:
+        return {"numel": 0}
+
+    values = flat.tolist()
+    values.sort()
+    numel = len(values)
+    return {
+        "numel": numel,
+        "min": values[0],
+        "p50": values[numel // 2],
+        "p90": values[min(numel - 1, int(numel * 0.9))],
+        "max": values[-1],
+        "sum": sum(values),
+        "mean": float(sum(values)) / numel,
+        "nonzero": sum(1 for value in values if value != 0),
+        "zero": sum(1 for value in values if value == 0),
+    }
+
+
+def _w4a8_debug_rank_info() -> dict[str, int | None]:
+    info: dict[str, int | None] = {
+        "pid": os.getpid(),
+        "pp_rank": None,
+        "pp_size": None,
+        "tp_rank": None,
+        "tp_size": None,
+    }
+    try:
+        pp = get_pp_group()
+        info["pp_rank"] = pp.rank_in_group
+        info["pp_size"] = pp.world_size
+    except (AssertionError, RuntimeError, ValueError):
+        pass
+    try:
+        tp = get_tp_group()
+        info["tp_rank"] = tp.rank_in_group
+        info["tp_size"] = tp.world_size
+    except (AssertionError, RuntimeError, ValueError):
+        pass
+    return info
+
+
+def _w4a8_debug_log_metadata(
+    *,
+    path: str,
+    schedule: str | None,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    local_E: int,
+    global_num_experts: int,
+    K: int,
+    N: int,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    expert_token_counts: torch.Tensor | None,
+) -> None:
+    global _W4A8_DEBUG_RECORDS
+    if not _w4a8_debug_enabled():
+        return
+    if _W4A8_DEBUG_RECORDS >= _w4a8_debug_max_records():
+        return
+    if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+        logger.warning_once(
+            "Skipping W4A8 debug instrumentation during CUDA graph capture."
+        )
+        return
+
+    payload = {
+        "event": "w4a8_debug_metadata",
+        "record": _W4A8_DEBUG_RECORDS,
+        "path": path,
+        "schedule": schedule or "heuristic",
+        "hidden_shape": tuple(hidden_states.shape),
+        "topk_shape": tuple(topk_ids.shape),
+        "topk": topk_ids.size(1),
+        "local_E": local_E,
+        "global_E": global_num_experts,
+        "K": K,
+        "N": N,
+        "expert_tokens": _w4a8_debug_tensor_stats(expert_token_counts),
+        # W4A8 currently builds problem shapes with swap_ab=True in both paths,
+        # so the useful expert M dimension is column 1.
+        "problem_m_mm1": _w4a8_debug_tensor_stats(problem_sizes1, token_column=1),
+        "problem_m_mm2": _w4a8_debug_tensor_stats(problem_sizes2, token_column=1),
+    }
+    payload.update(_w4a8_debug_rank_info())
+    logger.info("W4A8_DEBUG %s", json.dumps(payload, sort_keys=True))
+    _W4A8_DEBUG_RECORDS += 1
 
 
 def _require_w4a8_swigluoai_params(
@@ -1491,12 +1616,16 @@ def run_cutlass_moe_w4a8_fp8(
     problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     schedule = None
+    debug_path = "standard"
+    debug_expert_token_counts: torch.Tensor | None = None
 
     if use_batched_format:
+        debug_path = "batched"
         assert expert_num_tokens is not None
         assert expert_num_tokens.dtype == torch.int32
         assert expert_num_tokens.is_cuda
         assert expert_num_tokens.shape == (local_E,)
+        debug_expert_token_counts = expert_num_tokens
         assert a1q.dim() == 3
         assert a1q.shape[0] == local_E
         assert a1q.shape[2] == K
@@ -1597,6 +1726,23 @@ def run_cutlass_moe_w4a8_fp8(
             expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, True
         )
         expert_offsets = expert_first_token_offset[:-1]
+        debug_expert_token_counts = (
+            expert_first_token_offset[1:] - expert_first_token_offset[:-1]
+        )
+
+    _w4a8_debug_log_metadata(
+        path=debug_path,
+        schedule=schedule,
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        local_E=local_E,
+        global_num_experts=global_num_experts,
+        K=K,
+        N=N,
+        problem_sizes1=problem_sizes1,
+        problem_sizes2=problem_sizes2,
+        expert_token_counts=debug_expert_token_counts,
+    )
 
     ops.cutlass_w4a8_moe_mm(
         mm1_out,
