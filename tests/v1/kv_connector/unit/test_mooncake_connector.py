@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     TransferRegion,
     _align_transfer_regions,
     _compute_sender_transfer_plan,
+    _pair_cp_block_ids,
     _pair_pcp_block_ids,
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
@@ -154,9 +155,7 @@ def test_sender_plan_fully_replicated_tp4_to_tp2(
         remote_kv_block_len=4096,
         producer_cache_replicated=True,
     )
-    assert plan == (
-        (True, 0, 0, 4096) if should_transfer else (False, 0, 0, 4096)
-    )
+    assert plan == ((True, 0, 0, 4096) if should_transfer else (False, 0, 0, 4096))
 
 
 def test_validate_asymmetric_regions_allows_fully_replicated_index_cache():
@@ -271,9 +270,7 @@ def test_sender_plan_replicated_heads_tp4_to_tp2(
         transfer_unique_kv_heads=True,
         total_num_kv_heads=1,
     )
-    assert plan == (
-        (True, 0, 0, 32768) if should_transfer else (False, 0, 0, 0)
-    )
+    assert plan == ((True, 0, 0, 32768) if should_transfer else (False, 0, 0, 0))
 
 
 @pytest.mark.parametrize(
@@ -310,11 +307,7 @@ def test_sender_plan_mimo_equal_region_tp16_to_tp8(local_tp_rank):
         producer_cache_replicated=True,
         transfer_unique_kv_heads=True,
         total_num_kv_heads=8,
-    ) == (
-        (True, 0, 0, 32768)
-        if local_tp_rank % 2 == 0
-        else (False, 0, 0, 0)
-    )
+    ) == ((True, 0, 0, 32768) if local_tp_rank % 2 == 0 else (False, 0, 0, 0))
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -512,6 +505,131 @@ def test_pair_pcp_blocks_fails_closed_for_unsupported_page_geometry():
     assert "interleave" in error
 
 
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_pair_cp_blocks_scatters_global_pages_to_consumer_dcp(dcp_rank: int):
+    local_blocks = list(range(28))
+    remote_blocks = list(range(100 + 100 * dcp_rank, 114 + 100 * dcp_rank))
+
+    paired_local, paired_remote, error = _pair_cp_block_ids(
+        local_blocks,
+        remote_blocks,
+        total_tokens=3563,
+        num_external_tokens=3563,
+        external_start_token=0,
+        producer_pcp_size=1,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        producer_dcp_size=1,
+        producer_dcp_rank=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=dcp_rank,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=128,
+    )
+
+    assert error is None
+    assert paired_local == list(range(dcp_rank, 28, 2))
+    assert paired_remote == remote_blocks
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_pair_cp_blocks_maps_consumer_dcp_prefix_suffix(dcp_rank: int):
+    paired_local, paired_remote, error = _pair_cp_block_ids(
+        [4, 5, 6, 7],
+        [100, 101],
+        total_tokens=1024,
+        num_external_tokens=512,
+        external_start_token=512,
+        producer_pcp_size=1,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        producer_dcp_size=1,
+        producer_dcp_rank=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=dcp_rank,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=128,
+    )
+
+    assert error is None
+    assert paired_local == [4 + dcp_rank, 6 + dcp_rank]
+    assert paired_remote == [100, 101]
+
+
+def test_pair_cp_blocks_skips_consumer_dcp_rank_without_tokens():
+    result = _pair_cp_block_ids(
+        [0],
+        [100],
+        total_tokens=9,
+        num_external_tokens=9,
+        external_start_token=0,
+        producer_pcp_size=1,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        producer_dcp_size=1,
+        producer_dcp_rank=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=1,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=128,
+    )
+
+    assert result == ([], [], None)
+
+
+@pytest.mark.parametrize(
+    (
+        "producer_pcp_size",
+        "producer_dcp_size",
+        "consumer_pcp_size",
+        "consumer_dcp_size",
+        "consumer_interleave_size",
+        "match",
+    ),
+    [
+        (1, 2, 1, 1, 128, "producer DCP"),
+        (1, 1, 2, 2, 128, "consumer PCP and DCP"),
+        (2, 1, 1, 2, 128, "consumer DCP requires"),
+        (1, 1, 1, 2, 96, "interleave"),
+    ],
+)
+def test_pair_cp_blocks_rejects_unsupported_topologies(
+    producer_pcp_size: int,
+    producer_dcp_size: int,
+    consumer_pcp_size: int,
+    consumer_dcp_size: int,
+    consumer_interleave_size: int,
+    match: str,
+):
+    _, _, error = _pair_cp_block_ids(
+        [0, 1],
+        [100],
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        producer_pcp_size=producer_pcp_size,
+        producer_pcp_rank=0,
+        consumer_pcp_size=consumer_pcp_size,
+        consumer_pcp_rank=0,
+        producer_dcp_size=producer_dcp_size,
+        producer_dcp_rank=0,
+        consumer_dcp_size=consumer_dcp_size,
+        consumer_dcp_rank=0,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=consumer_interleave_size,
+    )
+
+    assert error is not None
+    assert match in error
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("group_block_size", [256, 64, 8, 4])
 @pytest.mark.parametrize("pcp_rank", [0, 1])
@@ -622,6 +740,113 @@ async def test_build_transfer_params_reassembles_pcp_pages(
         remote_base + (100 + (2 + pcp_rank) * local_pages_per_chunk) * region_block_len,
     ]
     assert lengths == [region_block_len * local_pages_per_chunk] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+async def test_build_transfer_params_scatters_consumer_dcp_pages(dcp_rank: int):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = False
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 4
+    worker.pcp_rank = 0
+    worker.pcp_size = 1
+    worker.dcp_rank = 0
+    worker.dcp_size = 1
+    worker.cp_kv_cache_interleave_size = 128
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.0.self_attn"],
+                FullAttentionSpec(
+                    block_size=128,
+                    num_kv_heads=1,
+                    head_size=16,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+
+    block_len = 128
+    local_base = 0x1000
+    remote_base = 0xA000
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=local_base,
+            block_len=block_len,
+            kv_block_len=block_len,
+            logical_group_indices=(0,),
+        )
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=remote_base,
+            block_len=block_len,
+            kv_block_len=block_len,
+            logical_group_indices=(0,),
+        )
+    ]
+    transfer_id = "xfer-dcp"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-dcp",
+        transfer_id=transfer_id,
+        local_block_ids=[list(range(28))],
+        ready=asyncio.Event(),
+    )
+    remote_blocks = list(range(100, 114))
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=dcp_rank,
+        remote_pcp_size=1,
+        remote_pcp_rank=0,
+        remote_dcp_size=2,
+        remote_dcp_rank=dcp_rank,
+        remote_cp_kv_cache_interleave_size=128,
+        req_blocks={"d-req-dcp": (transfer_id, [remote_blocks])},
+        kv_caches_base_addr=[remote_base],
+        block_lens=[block_len],
+        kv_block_lens=[block_len],
+        req_total_tokens={"d-req-dcp": 3563},
+        req_num_external_tokens={"d-req-dcp": 3563},
+        req_external_start_tokens={"d-req-dcp": 0},
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-req-dcp", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=local_regions,
+        remote_regions=remote_regions,
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src_ptrs == [
+        local_base + block_id * block_len for block_id in range(dcp_rank, 28, 2)
+    ]
+    assert dst_ptrs == [
+        remote_base + block_id * block_len for block_id in remote_blocks
+    ]
+    assert lengths == [block_len] * 14
 
 
 class FakeMooncakeWrapper:
@@ -929,6 +1154,32 @@ def test_xfer_metadata_decodes_legacy_payload_with_alias_defaults():
     assert metadata.registered_layer_index_aliases == []
     assert metadata.registered_logical_group_indices == []
     assert metadata.registered_alias_group_indices == []
+    assert metadata.remote_dcp_size == 1
+    assert metadata.remote_dcp_rank == 0
+    assert metadata.remote_cp_kv_cache_interleave_size == 1
+
+
+def test_xfer_metadata_round_trips_consumer_dcp_topology():
+    metadata = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=1,
+        req_blocks={"d-req": ("xfer", [[1]])},
+        kv_caches_base_addr=[0x1000],
+        block_lens=[4096],
+        kv_block_lens=[4096],
+        remote_dcp_size=2,
+        remote_dcp_rank=1,
+        remote_cp_kv_cache_interleave_size=128,
+    )
+
+    payload = msgspec.msgpack.encode(metadata)
+    decoded = msgspec.msgpack.decode(payload, type=MooncakeXferMetadata)
+
+    assert decoded.remote_dcp_size == 2
+    assert decoded.remote_dcp_rank == 1
+    assert decoded.remote_cp_kv_cache_interleave_size == 128
 
 
 @pytest.mark.asyncio

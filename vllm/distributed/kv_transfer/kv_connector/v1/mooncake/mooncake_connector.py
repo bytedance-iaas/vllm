@@ -42,6 +42,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
     get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -961,6 +962,76 @@ def _pair_pcp_block_ids(
     return paired_local, paired_remote, None
 
 
+def _pair_cp_block_ids(
+    local_block_ids: list[int],
+    remote_block_ids: list[int],
+    *,
+    total_tokens: int,
+    num_external_tokens: int,
+    external_start_token: int,
+    producer_pcp_size: int,
+    producer_pcp_rank: int,
+    consumer_pcp_size: int,
+    consumer_pcp_rank: int,
+    producer_dcp_size: int,
+    producer_dcp_rank: int,
+    consumer_dcp_size: int,
+    consumer_dcp_rank: int,
+    group_block_size: int,
+    producer_interleave_size: int,
+    consumer_interleave_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Pair producer and consumer pages for one supported CP topology."""
+    if producer_dcp_size <= 0 or consumer_dcp_size <= 0:
+        return [], [], "DCP world sizes must be positive"
+    if not 0 <= producer_dcp_rank < producer_dcp_size:
+        return [], [], "Invalid producer DCP rank"
+    if not 0 <= consumer_dcp_rank < consumer_dcp_size:
+        return [], [], "Invalid consumer DCP rank"
+    if producer_pcp_size > 1 and producer_dcp_size > 1:
+        return [], [], "Mooncake producer PCP and DCP cannot both exceed one"
+    if consumer_pcp_size > 1 and consumer_dcp_size > 1:
+        return [], [], "Mooncake consumer PCP and DCP cannot both exceed one"
+    if producer_dcp_size > 1:
+        return [], [], "Mooncake producer DCP is not supported"
+
+    if consumer_dcp_size > 1:
+        if producer_pcp_size != 1 or consumer_pcp_size != 1:
+            return (
+                [],
+                [],
+                "Mooncake consumer DCP requires producer and consumer PCP size one",
+            )
+        compact_remote, global_local, error = _pair_pcp_block_ids(
+            remote_block_ids,
+            local_block_ids,
+            total_tokens=total_tokens,
+            num_external_tokens=num_external_tokens,
+            external_start_token=external_start_token,
+            producer_pcp_size=consumer_dcp_size,
+            producer_pcp_rank=consumer_dcp_rank,
+            consumer_pcp_size=1,
+            consumer_pcp_rank=0,
+            group_block_size=group_block_size,
+            interleave_size=consumer_interleave_size,
+        )
+        return global_local, compact_remote, error
+
+    return _pair_pcp_block_ids(
+        local_block_ids,
+        remote_block_ids,
+        total_tokens=total_tokens,
+        num_external_tokens=num_external_tokens,
+        external_start_token=external_start_token,
+        producer_pcp_size=producer_pcp_size,
+        producer_pcp_rank=producer_pcp_rank,
+        consumer_pcp_size=consumer_pcp_size,
+        consumer_pcp_rank=consumer_pcp_rank,
+        group_block_size=group_block_size,
+        interleave_size=producer_interleave_size,
+    )
+
+
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
@@ -982,6 +1053,9 @@ class MooncakeXferMetadata(
     kv_block_lens: list[int]
     remote_pcp_size: int = 1
     remote_pcp_rank: int = 0
+    remote_dcp_size: int = 1
+    remote_dcp_rank: int = 0
+    remote_cp_kv_cache_interleave_size: int = 1
     req_total_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
     req_num_external_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
     req_external_start_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
@@ -1692,6 +1766,8 @@ class MooncakeConnectorWorker:
         self.pp_rank = get_pp_group().rank_in_group
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
         self.cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
@@ -2332,7 +2408,7 @@ class MooncakeConnectorWorker:
                         if block_id != NULL_BLOCK_ID
                     ]
 
-                local_group, remote_group, pair_error = _pair_pcp_block_ids(
+                local_group, remote_group, pair_error = _pair_cp_block_ids(
                     local_group,
                     remote_group,
                     total_tokens=agent_meta.req_total_tokens.get(d_req_id, 0),
@@ -2346,12 +2422,21 @@ class MooncakeConnectorWorker:
                     producer_pcp_rank=getattr(self, "pcp_rank", 0),
                     consumer_pcp_size=agent_meta.remote_pcp_size,
                     consumer_pcp_rank=agent_meta.remote_pcp_rank,
+                    producer_dcp_size=getattr(self, "dcp_size", 1),
+                    producer_dcp_rank=getattr(self, "dcp_rank", 0),
+                    consumer_dcp_size=agent_meta.remote_dcp_size,
+                    consumer_dcp_rank=agent_meta.remote_dcp_rank,
                     group_block_size=group_specs[group_index].kv_cache_spec.block_size,
-                    interleave_size=getattr(self, "cp_kv_cache_interleave_size", 1),
+                    producer_interleave_size=getattr(
+                        self, "cp_kv_cache_interleave_size", 1
+                    ),
+                    consumer_interleave_size=(
+                        agent_meta.remote_cp_kv_cache_interleave_size
+                    ),
                 )
                 if pair_error is not None:
                     logger.error(
-                        "req %s: failed to pair PCP blocks for KV group %d: %s",
+                        "req %s: failed to pair CP blocks for KV group %d: %s",
                         d_req_id,
                         group_index,
                         pair_error,
@@ -2366,7 +2451,7 @@ class MooncakeConnectorWorker:
             if has_block_error:
                 err_reqs.append(d_req_id)
                 if err_msg is None:
-                    err_msg = "Failed to pair Mooncake PCP blocks"
+                    err_msg = "Failed to pair Mooncake CP blocks"
                 continue
 
             if not any(local_block_ids_by_group):
@@ -2425,9 +2510,7 @@ class MooncakeConnectorWorker:
                 remote_block_ids,
             ) in selected_region_blocks:
                 layer_spec = self._layer_specs[local_region.layer_name]
-                region_fully_replicated = _spec_transfers_fully_replicated(
-                    layer_spec
-                )
+                region_fully_replicated = _spec_transfers_fully_replicated(layer_spec)
                 # Group by indices within this region's KV-cache group only.
                 group_local_block_ids, group_remote_block_ids = (
                     group_concurrent_contiguous(local_block_ids, remote_block_ids)
@@ -2824,6 +2907,9 @@ class MooncakeConnectorWorker:
             kv_block_lens=self.kv_block_len_per_layer,
             remote_pcp_size=self.pcp_size,
             remote_pcp_rank=self.pcp_rank,
+            remote_dcp_size=self.dcp_size,
+            remote_dcp_rank=self.dcp_rank,
+            remote_cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             req_total_tokens={
                 req_id: pull_meta.total_tokens
                 for req_id, pull_meta in pull_metas.items()
