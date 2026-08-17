@@ -11,7 +11,10 @@ from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 pytestmark = pytest.mark.cpu_test
 
 
-def _make_block_size_config(method: str):
+def _make_block_size_config(
+    method: str,
+    draft_model_type: str | None = None,
+):
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16, mamba_cache_mode="none"),
         parallel_config=SimpleNamespace(
@@ -19,7 +22,12 @@ def _make_block_size_config(method: str):
             dcp_kv_cache_interleave_size=1,
             cp_kv_cache_interleave_size=1,
         ),
-        speculative_config=SimpleNamespace(method=method),
+        speculative_config=SimpleNamespace(
+            method=method,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type=draft_model_type)
+            ),
+        ),
         scheduler_config=SimpleNamespace(),
     )
 
@@ -31,6 +39,26 @@ def test_dcp_rejects_parallel_drafters(method):
     with pytest.raises(
         NotImplementedError,
         match="does not support decode context parallelism",
+    ):
+        VllmConfig.validate_block_size(config)
+
+
+def test_dcp_rejects_draft_model():
+    config = _make_block_size_config("draft_model")
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Draft-model speculative decoding does not support",
+    ):
+        VllmConfig.validate_block_size(config)
+
+
+def test_dcp_rejects_step3_mtp():
+    config = _make_block_size_config("mtp", draft_model_type="step3p5_mtp")
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Step3 MTP speculative decoding does not support",
     ):
         VllmConfig.validate_block_size(config)
 
@@ -66,9 +94,7 @@ def test_dspark_allows_static_k_below_checkpoint_block_size(monkeypatch):
             max_model_len=kwargs["spec_target_max_model_len"],
         )
 
-    monkeypatch.setattr(
-        "vllm.config.speculative.ModelConfig", _fake_draft_model_config
-    )
+    monkeypatch.setattr("vllm.config.speculative.ModelConfig", _fake_draft_model_config)
 
     target_model_config = SimpleNamespace(
         model="deepseek-ai/DeepSeek-V4",

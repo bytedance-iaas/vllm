@@ -2289,15 +2289,40 @@ class VllmConfig:
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
                 f"({self.parallel_config.cp_kv_cache_interleave_size})."
             )
-            if (
-                self.speculative_config is not None
-                and self.speculative_config.method in ("dflash", "dspark")
-            ):
-                raise NotImplementedError(
-                    "DFlash/DSpark speculative decoding does not support "
-                    "decode context parallelism; use "
-                    "decode_context_parallel_size=1 or another speculative method."
+            speculative_config = self.speculative_config
+            if speculative_config is not None:
+                method = speculative_config.method
+                if method in ("dflash", "dspark"):
+                    raise NotImplementedError(
+                        "DFlash/DSpark speculative decoding does not support "
+                        "decode context parallelism; use "
+                        "decode_context_parallel_size=1 or another speculative "
+                        "method."
+                    )
+                if method == "draft_model":
+                    raise NotImplementedError(
+                        "Draft-model speculative decoding does not support "
+                        "decode context parallelism because the draft parallel "
+                        "configuration does not inherit DCP; use "
+                        "decode_context_parallel_size=1 or another speculative "
+                        "method."
+                    )
+
+                draft_model_config = getattr(
+                    speculative_config, "draft_model_config", None
                 )
+                draft_hf_config = getattr(draft_model_config, "hf_config", None)
+                if (
+                    method == "mtp"
+                    and getattr(draft_hf_config, "model_type", None) == "step3p5_mtp"
+                ):
+                    raise NotImplementedError(
+                        "Step3 MTP speculative decoding does not support decode "
+                        "context parallelism because secondary KV-cache groups "
+                        "are not DCP-localized; use "
+                        "decode_context_parallel_size=1 or another speculative "
+                        "method."
+                    )
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":

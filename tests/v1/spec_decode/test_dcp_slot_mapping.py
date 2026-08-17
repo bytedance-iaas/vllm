@@ -69,12 +69,52 @@ def test_compute_new_slot_mapping_localizes_dcp_owner(
     assert slots[3].item() == PADDING_SLOT_ID
 
 
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [
+        (0, [12927, -1, -1, 25728, -1]),
+        (1, [-1, 12800, 12927, -1, -1]),
+    ],
+)
+def test_compute_new_slot_mapping_localizes_expanded_multi_request(
+    rank: int,
+    expected: list[int],
+) -> None:
+    metadata = _metadata(
+        torch.tensor([0, 2, 3], dtype=torch.int32),
+        torch.tensor([256, 384], dtype=torch.int32),
+        torch.tensor(
+            [[100, 101, 102], [200, 201, 202]],
+            dtype=torch.int32,
+        ),
+    )
+
+    slots = compute_new_slot_mapping(
+        cad=metadata,
+        new_positions=torch.tensor([127, 128, 255, 256, 383]),
+        is_rejected_token_mask=torch.tensor([False, False, False, False, True]),
+        block_size=128,
+        num_new_tokens=1,
+        max_model_len=1024,
+        dcp_world_size=2,
+        dcp_rank=rank,
+        cp_kv_cache_interleave_size=128,
+    )
+
+    assert slots.tolist() == expected
+
+
 def test_extend_queries_updates_cpu_sequence_shadows() -> None:
     metadata = _metadata(
         torch.tensor([0, 1, 2], dtype=torch.int32),
         torch.tensor([127, 255], dtype=torch.int32),
         torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
     )
+    metadata.dcp_local_seq_lens_cpu = torch.tensor(
+        [127, 128],
+        dtype=torch.int32,
+    )
+    original_local_seq_lens_cpu = metadata.dcp_local_seq_lens_cpu.clone()
 
     extended = extend_all_queries_by_N(
         metadata,
@@ -89,3 +129,7 @@ def test_extend_queries_updates_cpu_sequence_shadows() -> None:
     assert extended._seq_lens_cpu.tolist() == [130, 258]
     assert extended.seq_lens_cpu_upper_bound is not None
     assert extended.seq_lens_cpu_upper_bound.tolist() == [130, 258]
+    assert extended.dcp_local_seq_lens_cpu is None
+    assert metadata.dcp_local_seq_lens_cpu.tolist() == (
+        original_local_seq_lens_cpu.tolist()
+    )

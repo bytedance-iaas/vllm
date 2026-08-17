@@ -38,7 +38,6 @@ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
-from vllm.v1.attention.backends.utils import get_cp_local_seq_lens
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -822,12 +821,29 @@ class SpecDecodeBaseProposer:
             self.max_model_len,
         )
 
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu += 1
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        seq_lens_cpu_upper_bound = common_attn_metadata.seq_lens_cpu_upper_bound
+        exceeds_max_cpu = None
+        if seq_lens_cpu is not None:
+            exceeds_max_cpu = seq_lens_cpu >= self.max_model_len
+            seq_lens_cpu.add_(1)
+            seq_lens_cpu.masked_fill_(exceeds_max_cpu, 1)
+        elif seq_lens_cpu_upper_bound is not None:
+            exceeds_max_cpu = seq_lens_cpu_upper_bound >= self.max_model_len
+
         if common_attn_metadata._num_computed_tokens_cpu is not None:
-            common_attn_metadata._num_computed_tokens_cpu += 1
-        if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-            common_attn_metadata.seq_lens_cpu_upper_bound += 1
+            num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+            num_computed_tokens_cpu.add_(1)
+            if exceeds_max_cpu is not None:
+                num_computed_tokens_cpu.masked_fill_(exceeds_max_cpu, 0)
+
+        if (
+            seq_lens_cpu_upper_bound is not None
+            and seq_lens_cpu_upper_bound is not seq_lens_cpu
+        ):
+            exceeds_upper_bound = seq_lens_cpu_upper_bound >= self.max_model_len
+            seq_lens_cpu_upper_bound.add_(1)
+            seq_lens_cpu_upper_bound.masked_fill_(exceeds_upper_bound, 1)
 
         self._refresh_dcp_local_seq_lens(common_attn_metadata, batch_size)
         return positions
@@ -849,22 +865,9 @@ class SpecDecodeBaseProposer:
             self.dcp_rank,
             self.cp_kv_cache_interleave_size,
         )
-
-        local_seq_lens_cpu = common_attn_metadata.dcp_local_seq_lens_cpu
-        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-        if local_seq_lens_cpu is None:
-            return
-        if seq_lens_cpu is None:
-            common_attn_metadata.dcp_local_seq_lens_cpu = None
-            return
-        local_seq_lens_cpu[:num_reqs].copy_(
-            get_cp_local_seq_lens(
-                seq_lens_cpu[:num_reqs],
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.cp_kv_cache_interleave_size,
-            )
-        )
+        # This view aliases the runner's pinned H2D staging buffer. Do not
+        # overwrite it while its non-blocking copy may still be in flight.
+        common_attn_metadata.dcp_local_seq_lens_cpu = None
 
     def set_inputs_first_pass(
         self,
@@ -1205,7 +1208,6 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
-            dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
         )
         self._refresh_dcp_local_seq_lens(
             spec_common_attn_metadata,
@@ -1321,7 +1323,6 @@ class SpecDecodeBaseProposer:
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
-            dcp_local_seq_lens_cpu=common_attn_metadata.dcp_local_seq_lens_cpu,
         )
         self._refresh_dcp_local_seq_lens(
             spec_common_attn_metadata,

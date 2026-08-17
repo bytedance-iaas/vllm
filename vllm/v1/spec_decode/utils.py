@@ -336,6 +336,7 @@ def extend_all_queries_by_N(
         slot_mapping=new_slot_mapping,
         _seq_lens_cpu=new_seq_lens_cpu,
         seq_lens_cpu_upper_bound=new_seq_lens_cpu_upper_bound,
+        dcp_local_seq_lens_cpu=None,
     )
     return new_cad
 
