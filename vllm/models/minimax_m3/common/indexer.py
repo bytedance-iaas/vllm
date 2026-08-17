@@ -673,6 +673,22 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
+    dcp_world_size = (
+        get_current_vllm_config().parallel_config.decode_context_parallel_size
+    )
+    if dcp_world_size > 1:
+        if indexer_kv_dtype != "bf16":
+            raise NotImplementedError(
+                "MiniMax M3 DCP requires the BF16 Triton indexer, got "
+                f"indexer_kv_dtype={indexer_kv_dtype!r}."
+            )
+        logger.info_once(
+            "MiniMax M3 indexer: selected Triton for DCP "
+            "[topk_blocks=%d, dcp_world_size=%d]",
+            topk_blocks,
+            dcp_world_size,
+        )
+        return MiniMaxM3IndexerTritonImpl
     is_sm100 = (
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
     )
