@@ -139,6 +139,55 @@ class _FakeDecoderLayer:
         self.deferred = defer
 
 
+class _MutatingFirstLayer:
+    def __call__(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert residual is None
+        residual = hidden_states
+        residual.add_(10)
+        return hidden_states, residual
+
+
+def test_eagle_input_boundary_survives_first_layer_aliasing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        minimax_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    model = SimpleNamespace(
+        aux_hidden_state_layers=(0,),
+        start_layer=0,
+        end_layer=1,
+        layers=[_MutatingFirstLayer()],
+        fuse_final_norm_allreduce=False,
+        norm=lambda hidden_states, residual: (hidden_states, residual),
+    )
+    model._maybe_add_hidden_state = lambda states, idx, hidden, residual: (
+        minimax_model.EagleModelMixin._maybe_add_hidden_state(
+            model, states, idx, hidden, residual
+        )
+    )
+    inputs = torch.tensor([[1.0, 2.0]])
+
+    _, aux_hidden_states = minimax_model.MiniMaxM3Model.forward(
+        model,
+        input_ids=None,
+        positions=torch.zeros(1, dtype=torch.int64),
+        intermediate_tensors=None,
+        inputs_embeds=inputs,
+    )
+
+    assert inputs.tolist() == [[11.0, 12.0]]
+    assert aux_hidden_states[0].tolist() == [[1.0, 2.0]]
+    assert aux_hidden_states[0].data_ptr() != inputs.data_ptr()
+
+
 def test_eagle_aux_boundaries_reconfigure_deferred_allreduce() -> None:
     layers = [
         _FakeDecoderLayer(True),

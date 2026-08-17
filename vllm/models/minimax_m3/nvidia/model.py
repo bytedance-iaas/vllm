@@ -898,6 +898,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        if aux_hidden_states:
+            # The first layer aliases its input as the residual and may mutate it.
+            aux_hidden_states[-1] = aux_hidden_states[-1].clone()
         for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
