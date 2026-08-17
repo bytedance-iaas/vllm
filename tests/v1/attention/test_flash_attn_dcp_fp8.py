@@ -7,6 +7,16 @@ import torch
 import vllm.v1.attention.backends.flash_attn as flash_attn
 
 
+def test_trace_paged_cache_rows_follows_block_table() -> None:
+    cache = torch.arange(3 * 4 * 2).view(3, 4, 1, 2)
+    block_table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+
+    rows = flash_attn._trace_paged_cache_rows(cache, block_table, max_rows=6)
+
+    expected = torch.cat((cache[2], cache[0][:2]))
+    assert torch.equal(rows, expected)
+
+
 @pytest.mark.parametrize(
     ("scale", "expected_group_shape"),
     [

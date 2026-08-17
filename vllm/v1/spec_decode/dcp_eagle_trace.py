@@ -148,6 +148,7 @@ def save_eagle_trace(
 
 
 _TARGET_LAYER_TRIPWIRE_CAPTURED = False
+_DENSE_ATTN_DECOMP_CAPTURED = False
 _TRIPWIRE_STAGES = (
     "A_attention_input",
     "B_attention_return",
@@ -162,6 +163,51 @@ class TargetLayerTripwire:
     position: int
     token_id: int
     max_layer: int
+
+
+def dense_attn_decomp_enabled(
+    layer_name: str,
+    max_seq_len: int,
+    num_actual_tokens: int,
+) -> bool:
+    configured_layer = os.getenv("VLLM_DCP_EAGLE_ATTN_DECOMP_LAYER")
+    configured_position = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION")
+    if (
+        _trace_root() is None
+        or configured_layer is None
+        or configured_position is None
+        or _DENSE_ATTN_DECOMP_CAPTURED
+        or not _rank_enabled()
+        or num_actual_tokens != 1
+        or max_seq_len != int(configured_position) + 1
+    ):
+        return False
+    return f".layers.{int(configured_layer)}.self_attn.attn" in layer_name
+
+
+def save_dense_attn_decomp(layer_name: str, **payload: Any) -> None:
+    global _DENSE_ATTN_DECOMP_CAPTURED
+
+    root = _trace_root()
+    if root is None or _DENSE_ATTN_DECOMP_CAPTURED:
+        return
+    rank_dir, world_rank, pid, tp_rank, dcp_rank = _rank_dir(root)
+    output = {
+        "stage": "dense_attention_decomposition",
+        "world_rank": world_rank,
+        "pid": pid,
+        "tp_rank": tp_rank,
+        "dcp_rank": dcp_rank,
+        "layer_name": layer_name,
+        **{key: _snapshot(value) for key, value in payload.items()},
+    }
+    layer_id = int(os.getenv("VLLM_DCP_EAGLE_ATTN_DECOMP_LAYER", "0"))
+    position = int(os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION", "-1"))
+    torch.save(
+        output,
+        rank_dir / f"dense-attn-decomp-layer{layer_id}-pos{position}.pt",
+    )
+    _DENSE_ATTN_DECOMP_CAPTURED = True
 
 
 def target_layer_tripwire_requested() -> bool:

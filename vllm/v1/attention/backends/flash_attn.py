@@ -59,6 +59,10 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.spec_decode.dcp_eagle_trace import (
+    dense_attn_decomp_enabled,
+    save_dense_attn_decomp,
+)
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
     should_skip_dcp_context_attention,
@@ -67,6 +71,18 @@ from vllm.v1.worker.cp_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _trace_paged_cache_rows(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    max_rows: int,
+) -> torch.Tensor:
+    block_size = cache.shape[1]
+    num_blocks = cdiv(max_rows, block_size)
+    block_ids = block_table[0, :num_blocks].to(torch.long)
+    rows = cache.index_select(0, block_ids).flatten(0, 1)
+    return rows[:max_rows].detach().clone()
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -918,6 +934,11 @@ class FlashAttentionImpl(AttentionImpl):
             )
             k_descale = layer._k_scale.expand(descale_shape)
             v_descale = layer._v_scale.expand(descale_shape)
+            trace_decomp = dense_attn_decomp_enabled(
+                layer.layer_name,
+                attn_metadata.max_seq_len,
+                num_actual_tokens,
+            )
 
             if self.dcp_world_size > 1:
                 dcp_query = query[:num_actual_tokens]
@@ -929,6 +950,36 @@ class FlashAttentionImpl(AttentionImpl):
                 ):
                     dcp_key = self._quantize_dcp_live_kv(dcp_key, layer._k_scale)
                     dcp_value = self._quantize_dcp_live_kv(dcp_value, layer._v_scale)
+                trace_payload = None
+                if trace_decomp:
+                    trace_rows = attn_metadata.max_dcp_context_kv_len
+                    trace_payload = {
+                        "_layer_name": layer.layer_name,
+                        "query": dcp_query.detach().clone(),
+                        "live_key_before_quant": key[:num_actual_tokens]
+                        .detach()
+                        .clone(),
+                        "live_value_before_quant": value[:num_actual_tokens]
+                        .detach()
+                        .clone(),
+                        "live_key": dcp_key.detach().clone(),
+                        "live_value": dcp_value.detach().clone(),
+                        "cache_key_rows": _trace_paged_cache_rows(
+                            key_cache,
+                            block_table,
+                            trace_rows,
+                        ),
+                        "cache_value_rows": _trace_paged_cache_rows(
+                            value_cache,
+                            block_table,
+                            trace_rows,
+                        ),
+                        "dcp_context_kv_lens": attn_metadata.dcp_context_kv_lens,
+                        "block_table": block_table,
+                        "slot_mapping": attn_metadata.slot_mapping,
+                        "k_scale": layer._k_scale,
+                        "v_scale": layer._v_scale,
+                    }
                 self._forward_with_dcp(
                     dcp_query,
                     dcp_key,
@@ -940,6 +991,7 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    trace_payload=trace_payload,
                 )
                 return output
             else:
@@ -1048,6 +1100,60 @@ class FlashAttentionImpl(AttentionImpl):
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
                 )
+                if trace_decomp:
+                    trace_out = torch.empty_like(output[:num_actual_tokens])
+                    trace_out, trace_lse = flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=trace_out,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        dynamic_causal=dynamic_causal,
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                        mask_mod=rswa_mask_mod_fn or mm_mask_mod,
+                        aux_tensors=rswa_aux or mm_aux,
+                        return_softmax_lse=True,
+                    )
+                    save_dense_attn_decomp(
+                        layer.layer_name,
+                        mode="dcp1_full",
+                        query=query[:num_actual_tokens],
+                        live_key_before_quant=key[:num_actual_tokens],
+                        live_value_before_quant=value[:num_actual_tokens],
+                        cache_key_rows=_trace_paged_cache_rows(
+                            key_cache,
+                            block_table,
+                            max_seqlen_k,
+                        ),
+                        cache_value_rows=_trace_paged_cache_rows(
+                            value_cache,
+                            block_table,
+                            max_seqlen_k,
+                        ),
+                        seq_lens=seqused_k,
+                        block_table=block_table,
+                        slot_mapping=attn_metadata.slot_mapping,
+                        k_scale=layer._k_scale,
+                        v_scale=layer._v_scale,
+                        production_output=output[:num_actual_tokens],
+                        diagnostic_output=trace_out,
+                        diagnostic_lse=trace_lse,
+                    )
                 return output
 
         # Cascade attention (rare case).
@@ -1146,6 +1252,7 @@ class FlashAttentionImpl(AttentionImpl):
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        trace_payload: dict[str, object] | None = None,
     ) -> torch.Tensor:
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
@@ -1270,6 +1377,11 @@ class FlashAttentionImpl(AttentionImpl):
                 v_descale=v_descale,
                 num_splits=attn_metadata.max_num_splits,
             )
+        if trace_payload is not None:
+            trace_payload["query_across_dcp"] = query_across_dcp.detach().clone()
+            trace_payload["local_context_output"] = context_attn_out.detach().clone()
+            trace_payload["local_context_lse"] = context_lse.detach().clone()
+
         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
         context_attn_out_cor, context_lse_cor = self.dcp_combine(
             context_attn_out,
@@ -1278,6 +1390,11 @@ class FlashAttentionImpl(AttentionImpl):
             return_lse=True,
         )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
+        if trace_payload is not None:
+            trace_payload["combined_context_output"] = (
+                context_attn_out_cor.detach().clone()
+            )
+            trace_payload["combined_context_lse"] = context_lse_cor.detach().clone()
 
         query_attn_out, query_lse = flash_attn_varlen_func(
             q=query,
@@ -1300,6 +1417,9 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=v_descale,
             num_splits=attn_metadata.max_num_splits,
         )
+        if trace_payload is not None:
+            trace_payload["live_output"] = query_attn_out.detach().clone()
+            trace_payload["live_lse"] = query_lse.detach().clone()
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape
         merge_attn_states(
@@ -1309,6 +1429,14 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+        if trace_payload is not None:
+            trace_layer_name = str(trace_payload.pop("_layer_name"))
+            trace_payload["final_output"] = output.detach().clone()
+            save_dense_attn_decomp(
+                trace_layer_name,
+                mode="dcp_sharded",
+                **trace_payload,
+            )
 
     def _forward_encoder_attention(
         self,
