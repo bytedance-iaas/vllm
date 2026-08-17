@@ -1088,7 +1088,7 @@ class FlashAttentionImpl(AttentionImpl):
             return tensor
         assert tensor.ndim == 3
         original_shape = tensor.shape
-        flat = tensor.contiguous().view(original_shape[0], -1)
+        flat = tensor.view(original_shape[0], -1)
         group_shape = (-1, original_shape[-1]) if scale.numel() > 1 else None
         quantized, _ = ops.scaled_fp8_quant(
             flat,

@@ -27,7 +27,15 @@ def test_quantize_dcp_live_kv_uses_static_scale(
         *,
         group_shape: tuple[int, int] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        calls.append((tensor.shape, actual_scale, group_shape))
+        calls.append(
+            (
+                tensor.shape,
+                tensor.stride(),
+                tensor.is_contiguous(),
+                actual_scale,
+                group_shape,
+            )
+        )
         return torch.empty_like(tensor, dtype=torch.float8_e4m3fn), actual_scale
 
     monkeypatch.setattr(
@@ -36,13 +44,23 @@ def test_quantize_dcp_live_kv_uses_static_scale(
         fake_scaled_fp8_quant,
     )
     impl = object.__new__(flash_attn.FlashAttentionImpl)
-    tensor = torch.randn(3, 2, 4, dtype=torch.bfloat16)
+    qkv = torch.randn(3, 16, dtype=torch.bfloat16)
+    tensor = qkv[:, 4:12].view(3, 2, 4)
+    assert not tensor.is_contiguous()
 
     result = impl._quantize_dcp_live_kv(tensor, scale)
 
     assert result.shape == tensor.shape
     assert result.dtype == torch.float8_e4m3fn
-    assert calls == [(torch.Size([3, 8]), scale, expected_group_shape)]
+    assert calls == [
+        (
+            torch.Size([3, 8]),
+            (16, 1),
+            False,
+            scale,
+            expected_group_shape,
+        )
+    ]
 
 
 def test_quantize_dcp_live_kv_does_not_requantize_fp8(
