@@ -3,6 +3,8 @@
 
 import dataclasses
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,19 @@ def _rank_enabled() -> bool:
     configured = os.getenv("VLLM_DCP_EAGLE_TRACE_TP_RANKS", "0,1")
     ranks = {int(value) for value in configured.split(",") if value}
     return get_tp_group().rank_in_group in ranks
+
+
+def _rank_dir(root: Path) -> tuple[Path, int, int, int, int]:
+    tp_rank = get_tp_group().rank_in_group
+    world_rank = get_world_group().rank
+    try:
+        dcp_rank = get_dcp_group().rank_in_group
+    except AssertionError:
+        dcp_rank = 0
+    pid = os.getpid()
+    rank_dir = root / (f"world{world_rank}-pid{pid}-tp{tp_rank}-dcp{dcp_rank}")
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    return rank_dir, world_rank, pid, tp_rank, dcp_rank
 
 
 def trace_enabled(round_idx: int, batch_size: int) -> bool:
@@ -119,15 +134,7 @@ def save_eagle_trace(
     if root is None or not trace_enabled(round_idx, batch_size):
         return
 
-    tp_rank = get_tp_group().rank_in_group
-    world_rank = get_world_group().rank
-    try:
-        dcp_rank = get_dcp_group().rank_in_group
-    except AssertionError:
-        dcp_rank = 0
-    pid = os.getpid()
-    rank_dir = root / (f"world{world_rank}-pid{pid}-tp{tp_rank}-dcp{dcp_rank}")
-    rank_dir.mkdir(parents=True, exist_ok=True)
+    rank_dir, world_rank, pid, tp_rank, dcp_rank = _rank_dir(root)
     output = {
         "round": round_idx,
         "stage": stage,
@@ -138,3 +145,165 @@ def save_eagle_trace(
         **{key: _snapshot(value) for key, value in payload.items()},
     }
     torch.save(output, rank_dir / f"round-{round_idx:04d}-{stage}.pt")
+
+
+_TARGET_LAYER_TRIPWIRE_CAPTURED = False
+_TRIPWIRE_STAGES = ("A", "B", "C", "D")
+
+
+def _tripwire_hidden(args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor:
+    hidden_states = kwargs.get("hidden_states")
+    if hidden_states is None:
+        hidden_states = args[0]
+    assert isinstance(hidden_states, torch.Tensor)
+    return hidden_states
+
+
+def _tripwire_output(output: Any) -> torch.Tensor:
+    if isinstance(output, tuple):
+        output = output[0]
+    assert isinstance(output, torch.Tensor)
+    return output
+
+
+def _target_decoder_layers(model: Any) -> Any:
+    if hasattr(model, "get_language_model"):
+        model = model.get_language_model()
+    elif hasattr(model, "language_model"):
+        model = model.language_model
+    backbone = getattr(model, "model", None)
+    return getattr(backbone, "layers", None)
+
+
+@contextmanager
+def capture_target_layer_tripwire(
+    model: Any,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor | None,
+) -> Iterator[None]:
+    global _TARGET_LAYER_TRIPWIRE_CAPTURED
+
+    root = _trace_root()
+    configured_position = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION")
+    if (
+        root is None
+        or configured_position is None
+        or _TARGET_LAYER_TRIPWIRE_CAPTURED
+        or not _rank_enabled()
+        or positions is None
+        or positions.ndim != 1
+    ):
+        yield
+        return
+
+    target_position = int(configured_position)
+    rows = (positions == target_position).nonzero(as_tuple=False).flatten()
+    if rows.numel() != 1:
+        yield
+        return
+    row = int(rows.item())
+
+    token_id = None if input_ids is None else int(input_ids[row].item())
+    configured_token = os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_TOKEN")
+    if configured_token is not None and token_id != int(configured_token):
+        yield
+        return
+
+    layers = _target_decoder_layers(model)
+    max_layer = int(os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_MAX_LAYER", "30"))
+    if layers is None or len(layers) <= max_layer:
+        raise RuntimeError(
+            "DCP EAGLE target tripwire could not find the requested decoder layers"
+        )
+
+    captures: dict[tuple[int, str], torch.Tensor] = {}
+    handles = []
+
+    def record(layer_idx: int, stage: str, tensor: torch.Tensor) -> None:
+        captures[(layer_idx, stage)] = tensor[row].detach().clone()
+
+    for layer_idx, layer in enumerate(layers[: max_layer + 1]):
+        ffn = layer.block_sparse_moe if layer.is_moe_layer else layer.mlp
+
+        def attention_pre_hook(
+            _module: Any,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            layer_idx: int = layer_idx,
+        ) -> None:
+            record(layer_idx, "A", _tripwire_hidden(args, kwargs))
+
+        def attention_hook(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            layer_idx: int = layer_idx,
+        ) -> None:
+            record(layer_idx, "B", _tripwire_output(output))
+
+        def ffn_pre_hook(
+            _module: Any,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            layer_idx: int = layer_idx,
+        ) -> None:
+            record(layer_idx, "C", _tripwire_hidden(args, kwargs))
+
+        def ffn_hook(
+            _module: Any,
+            _args: tuple[Any, ...],
+            output: Any,
+            layer_idx: int = layer_idx,
+        ) -> None:
+            record(layer_idx, "D", _tripwire_output(output))
+
+        handles.extend(
+            (
+                layer.self_attn.register_forward_pre_hook(
+                    attention_pre_hook, with_kwargs=True
+                ),
+                layer.self_attn.register_forward_hook(attention_hook),
+                ffn.register_forward_pre_hook(ffn_pre_hook, with_kwargs=True),
+                ffn.register_forward_hook(ffn_hook),
+            )
+        )
+
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    missing = [
+        (layer_idx, stage)
+        for layer_idx in range(max_layer + 1)
+        for stage in _TRIPWIRE_STAGES
+        if (layer_idx, stage) not in captures
+    ]
+    if missing:
+        raise RuntimeError(f"DCP EAGLE target tripwire missed checkpoints: {missing}")
+
+    stacked = torch.stack(
+        [
+            captures[(layer_idx, stage)]
+            for layer_idx in range(max_layer + 1)
+            for stage in _TRIPWIRE_STAGES
+        ]
+    ).view(max_layer + 1, len(_TRIPWIRE_STAGES), -1)
+    stacked = stacked.float().cpu()
+
+    rank_dir, world_rank, pid, tp_rank, dcp_rank = _rank_dir(root)
+    output = {
+        "stage": "target_layer_tripwire",
+        "world_rank": world_rank,
+        "pid": pid,
+        "tp_rank": tp_rank,
+        "dcp_rank": dcp_rank,
+        "position": target_position,
+        "token_id": token_id,
+        "layer_ids": list(range(max_layer + 1)),
+        "checkpoint_names": list(_TRIPWIRE_STAGES),
+        "checkpoints": stacked,
+    }
+    torch.save(output, rank_dir / f"target-layer-tripwire-pos{target_position}.pt")
+    _TARGET_LAYER_TRIPWIRE_CAPTURED = True

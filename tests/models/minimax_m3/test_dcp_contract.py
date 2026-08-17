@@ -9,6 +9,7 @@ import torch
 import vllm.models.minimax_m3.common.indexer as indexer
 import vllm.models.minimax_m3.common.sparse_attention as sparse_attention
 import vllm.models.minimax_m3.nvidia.model as minimax_model
+import vllm.v1.spec_decode.dcp_eagle_trace as eagle_trace
 
 
 class _SM100Platform:
@@ -99,6 +100,82 @@ def test_dcp_global_topk_localizes_selected_owners(
     )
 
     assert result.tolist() == [[expected]]
+
+
+class _FakeTraceGroup:
+    rank_in_group = 0
+    rank = 0
+
+
+class _TripwireAttention(torch.nn.Module):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states * 2
+
+
+class _TripwireFFN(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states * 3
+
+
+class _TripwireLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.is_moe_layer = False
+        self.self_attn = _TripwireAttention()
+        self.mlp = _TripwireFFN()
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        return self.mlp(hidden_states)
+
+
+def test_target_layer_tripwire_captures_four_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("VLLM_DCP_EAGLE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION", "7")
+    monkeypatch.setenv("VLLM_DCP_EAGLE_TRIPWIRE_TOKEN", "11")
+    monkeypatch.setenv("VLLM_DCP_EAGLE_TRIPWIRE_MAX_LAYER", "0")
+    monkeypatch.setattr(eagle_trace, "get_tp_group", _FakeTraceGroup)
+    monkeypatch.setattr(eagle_trace, "get_dcp_group", _FakeTraceGroup)
+    monkeypatch.setattr(eagle_trace, "get_world_group", _FakeTraceGroup)
+    monkeypatch.setattr(eagle_trace, "_TARGET_LAYER_TRIPWIRE_CAPTURED", False)
+
+    layer = _TripwireLayer()
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(layers=torch.nn.ModuleList([layer]))
+        )
+    )
+    positions = torch.tensor([7])
+    hidden_states = torch.tensor([[1.0, 2.0]])
+
+    with eagle_trace.capture_target_layer_tripwire(
+        model,
+        torch.tensor([11]),
+        positions,
+    ):
+        output = layer(positions, hidden_states)
+
+    assert output.tolist() == [[6.0, 12.0]]
+    trace_path = next(tmp_path.glob("*/target-layer-tripwire-pos7.pt"))
+    trace = torch.load(trace_path, weights_only=False)
+    assert trace["checkpoint_names"] == ["A", "B", "C", "D"]
+    assert trace["checkpoints"].tolist() == [
+        [[1.0, 2.0], [2.0, 4.0], [2.0, 4.0], [6.0, 12.0]]
+    ]
 
 
 def test_decoder_layer_toggles_dense_and_moe_ffn_reduction() -> None:

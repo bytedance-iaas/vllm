@@ -195,6 +195,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dcp_eagle_trace import (
+    capture_target_layer_tripwire,
     save_eagle_trace,
     snapshot_attention_metadata,
     snapshot_dcp_topk,
@@ -4729,6 +4730,11 @@ class GPUModelRunner(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            capture_target_layer_tripwire(
+                self.get_model(),
+                input_ids,
+                positions,
+            ),
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
