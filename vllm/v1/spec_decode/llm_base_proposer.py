@@ -49,6 +49,7 @@ from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
+    _advance_cpu_sequence_metadata,
     compute_new_slot_mapping,
     copy_and_expand_eagle_inputs_kernel,
     eagle_prepare_inputs_padded_kernel,
@@ -821,29 +822,10 @@ class SpecDecodeBaseProposer:
             self.max_model_len,
         )
 
-        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-        seq_lens_cpu_upper_bound = common_attn_metadata.seq_lens_cpu_upper_bound
-        exceeds_max_cpu = None
-        if seq_lens_cpu is not None:
-            exceeds_max_cpu = seq_lens_cpu >= self.max_model_len
-            seq_lens_cpu.add_(1)
-            seq_lens_cpu.masked_fill_(exceeds_max_cpu, 1)
-        elif seq_lens_cpu_upper_bound is not None:
-            exceeds_max_cpu = seq_lens_cpu_upper_bound >= self.max_model_len
-
-        if common_attn_metadata._num_computed_tokens_cpu is not None:
-            num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
-            num_computed_tokens_cpu.add_(1)
-            if exceeds_max_cpu is not None:
-                num_computed_tokens_cpu.masked_fill_(exceeds_max_cpu, 0)
-
-        if (
-            seq_lens_cpu_upper_bound is not None
-            and seq_lens_cpu_upper_bound is not seq_lens_cpu
-        ):
-            exceeds_upper_bound = seq_lens_cpu_upper_bound >= self.max_model_len
-            seq_lens_cpu_upper_bound.add_(1)
-            seq_lens_cpu_upper_bound.masked_fill_(exceeds_upper_bound, 1)
+        _advance_cpu_sequence_metadata(
+            common_attn_metadata,
+            self.max_model_len,
+        )
 
         self._refresh_dcp_local_seq_lens(common_attn_metadata, batch_size)
         return positions

@@ -25,6 +25,39 @@ def next_power_of_2(n: int) -> int:
     return n + 1
 
 
+def _advance_cpu_sequence_metadata(
+    metadata: CommonAttentionMetadata,
+    max_model_len: int,
+) -> None:
+    seq_lens = metadata._seq_lens_cpu
+    upper_bound = metadata.seq_lens_cpu_upper_bound
+    exceeds_max = None
+    if seq_lens is not None:
+        exceeds_max = seq_lens >= max_model_len
+        seq_lens.add_(1)
+        seq_lens.masked_fill_(exceeds_max, 1)
+    elif upper_bound is not None:
+        exceeds_max = upper_bound >= max_model_len
+
+    num_computed_tokens = metadata._num_computed_tokens_cpu
+    if num_computed_tokens is not None:
+        num_computed_tokens.add_(1)
+        if exceeds_max is not None:
+            num_computed_tokens.masked_fill_(exceeds_max, 0)
+
+    upper_bound_aliases_seq_lens = (
+        upper_bound is not None
+        and seq_lens is not None
+        and upper_bound.data_ptr() == seq_lens.data_ptr()
+        and upper_bound.shape == seq_lens.shape
+        and upper_bound.stride() == seq_lens.stride()
+    )
+    if upper_bound is not None and not upper_bound_aliases_seq_lens:
+        exceeds_upper_bound = upper_bound >= max_model_len
+        upper_bound.add_(1)
+        upper_bound.masked_fill_(exceeds_upper_bound, 1)
+
+
 @triton.jit
 def eagle_step_slot_mapping_metadata_kernel(
     positions_ptr,  # [batch_size] - current positions (1D view for M-RoPE)

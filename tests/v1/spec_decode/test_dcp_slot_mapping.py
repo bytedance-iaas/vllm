@@ -7,6 +7,7 @@ import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
+    _advance_cpu_sequence_metadata,
     compute_new_slot_mapping,
     extend_all_queries_by_N,
 )
@@ -133,3 +134,29 @@ def test_extend_queries_updates_cpu_sequence_shadows() -> None:
     assert metadata.dcp_local_seq_lens_cpu.tolist() == (
         original_local_seq_lens_cpu.tolist()
     )
+
+
+def test_advance_cpu_sequence_metadata_handles_unpadded_alias() -> None:
+    metadata = _metadata(
+        torch.tensor([0, 1, 2], dtype=torch.int32),
+        torch.tensor([127, 128], dtype=torch.int32),
+        torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+    )
+    shared_seq_lens = torch.tensor([127, 128, 999], dtype=torch.int32)
+    num_computed_tokens = torch.tensor([126, 127, 998], dtype=torch.int32)
+    metadata._seq_lens_cpu = shared_seq_lens
+    metadata.seq_lens_cpu_upper_bound = shared_seq_lens
+    metadata._num_computed_tokens_cpu = num_computed_tokens
+
+    unpadded = metadata.unpadded(num_actual_tokens=2, num_actual_reqs=2)
+    seq_lens = unpadded._seq_lens_cpu
+    upper_bound = unpadded.seq_lens_cpu_upper_bound
+    assert seq_lens is not None
+    assert upper_bound is not None
+    assert seq_lens is not upper_bound
+    assert seq_lens.data_ptr() == upper_bound.data_ptr()
+
+    _advance_cpu_sequence_metadata(unpadded, max_model_len=128)
+
+    assert shared_seq_lens.tolist() == [128, 1, 999]
+    assert num_computed_tokens.tolist() == [127, 0, 998]
