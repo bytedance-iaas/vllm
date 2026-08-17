@@ -7,20 +7,40 @@ import pytest
 import torch
 
 import vllm.models.minimax_m3.common.indexer as indexer
+import vllm.models.minimax_m3.common.sparse_attention as sparse_attention
 
 
-def test_dcp_forces_triton_indexer(monkeypatch: pytest.MonkeyPatch) -> None:
+class _SM100Platform:
+    @staticmethod
+    def is_cuda() -> bool:
+        return True
+
+    @staticmethod
+    def is_device_capability_family(family: int) -> bool:
+        return family == 100
+
+
+def test_sm100_dcp_forces_triton_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(decode_context_parallel_size=2)
     )
     monkeypatch.setattr(indexer, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(sparse_attention, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(indexer, "current_platform", _SM100Platform())
+    monkeypatch.setattr(sparse_attention, "current_platform", _SM100Platform())
 
-    impl_cls = indexer.select_indexer_impl_cls(
+    indexer_impl_cls = indexer.select_indexer_impl_cls(
         topk_blocks=16,
         indexer_kv_dtype="bf16",
     )
+    main_impl_cls = sparse_attention.select_main_impl_cls(
+        topk_blocks=16,
+        kv_cache_dtype="bfloat16",
+        num_kv_heads=1,
+    )
 
-    assert impl_cls is indexer.MiniMaxM3IndexerTritonImpl
+    assert indexer_impl_cls is indexer.MiniMaxM3IndexerTritonImpl
+    assert main_impl_cls is sparse_attention.MiniMaxM3SparseTritonImpl
     with pytest.raises(NotImplementedError, match="requires the BF16 Triton indexer"):
         indexer.select_indexer_impl_cls(
             topk_blocks=16,

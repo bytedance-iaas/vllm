@@ -569,6 +569,22 @@ def select_main_impl_cls(
     back to Triton. The MSA modules are imported lazily avoid import errors
     on unsupported platforms.
     """
+    dcp_world_size = (
+        get_current_vllm_config().parallel_config.decode_context_parallel_size
+    )
+    if dcp_world_size > 1:
+        if not current_platform.is_cuda():
+            raise NotImplementedError(
+                "MiniMax M3 sparse-attention DCP currently supports CUDA only."
+            )
+        logger.info_once(
+            "MiniMax M3 sparse attention selected Triton for DCP "
+            "(kv_cache_dtype=%s, topk_blocks=%s, dcp_world_size=%s)",
+            kv_cache_dtype,
+            topk_blocks,
+            dcp_world_size,
+        )
+        return MiniMaxM3SparseTritonImpl
     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(num_kv_heads)
     use_msa = (
         current_platform.is_cuda()
