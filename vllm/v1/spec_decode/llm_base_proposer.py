@@ -592,6 +592,7 @@ class SpecDecodeBaseProposer:
             self._dcp_eagle_trace_attempt += 1
             self._dcp_eagle_trace_active_attempt = trace_attempt
         self._dcp_eagle_trace_step = 0
+        pre_combine_target_hidden_states = target_hidden_states if trace_on else None
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -626,6 +627,7 @@ class SpecDecodeBaseProposer:
                 batch_size=batch_size,
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
+                pre_combine_target_hidden_states=pre_combine_target_hidden_states,
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
                 common_metadata=common_attn_metadata,
