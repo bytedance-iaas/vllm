@@ -56,6 +56,16 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 _W4A8_DEBUG_RECORDS = 0
+_W4A8_SUPPORTED_SCHEDULES = {
+    "Kernel_128x16_1x1x1_Coop",
+    "Kernel_128x16_2x1x1_Coop",
+    "Kernel_128x256_2x1x1_Coop",
+    "Kernel_256x16_1x1x1_Coop",
+    "Kernel_256x16_2x1x1_Coop",
+    "Kernel_256x32_1x1x1_Coop",
+    "Kernel_256x64_1x1x1_Coop",
+    "Kernel_256x128_2x1x1_Coop",
+}
 
 
 def _w4a8_debug_enabled() -> bool:
@@ -74,6 +84,21 @@ def _w4a8_debug_max_records() -> int:
     except ValueError:
         logger.warning_once("Invalid VLLM_W4A8_DEBUG_MAX_RECORDS=%r", value)
         return 128
+
+
+def _w4a8_debug_schedule_override() -> str | None:
+    schedule = os.environ.get("VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE")
+    if not schedule:
+        return None
+    if schedule == "heuristic":
+        return None
+    if schedule not in _W4A8_SUPPORTED_SCHEDULES:
+        logger.warning_once(
+            "Ignoring unsupported VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE=%r",
+            schedule,
+        )
+        return None
+    return schedule
 
 
 def _w4a8_debug_tensor_stats(
@@ -159,6 +184,7 @@ def _w4a8_debug_log_metadata(
         "record": _W4A8_DEBUG_RECORDS,
         "path": path,
         "schedule": schedule or "heuristic",
+        "schedule_override": os.environ.get("VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE"),
         "hidden_shape": tuple(hidden_states.shape),
         "topk_shape": tuple(topk_ids.shape),
         "topk": topk_ids.size(1),
@@ -1615,7 +1641,7 @@ def run_cutlass_moe_w4a8_fp8(
     topk = topk_ids.size(1)
     problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
     problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
-    schedule = None
+    schedule = _w4a8_debug_schedule_override()
     debug_path = "standard"
     debug_expert_token_counts: torch.Tensor | None = None
 
@@ -1689,11 +1715,12 @@ def run_cutlass_moe_w4a8_fp8(
         # c3x get_group_gemm_starts expects int64 to avoid overflow during
         # offset calculations. W4A8 offsets are physical padded slabs.
         expert_offsets = expert_offsets.to(torch.int64)
-        schedule = _select_w4a8_batched_schedule(
-            total_num_tokens=total_num_tokens,
-            topk=topk,
-            global_num_experts=global_num_experts,
-        )
+        if schedule is None:
+            schedule = _select_w4a8_batched_schedule(
+                total_num_tokens=total_num_tokens,
+                topk=topk,
+                global_num_experts=global_num_experts,
+            )
     else:
         assert expert_num_tokens is None
         assert a1q_scale is not None
