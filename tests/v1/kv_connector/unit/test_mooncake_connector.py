@@ -2219,6 +2219,36 @@ def test_resolve_need_send_accounts_for_remote_tp_fanout():
     assert send_meta.need_send == 2
 
 
+def test_finish_failed_send_attempts_release_after_all_targets():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.reqs_need_send = {}
+    worker.finished_sending_reqs = set()
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-failed",
+        transfer_id="xfer-failed",
+        local_block_ids=[[1]],
+        ready=asyncio.Event(),
+        need_send=2,
+        sending=2,
+    )
+    worker.reqs_need_send[send_meta.transfer_id] = send_meta
+
+    worker._finish_send_attempt(send_meta)
+
+    assert send_meta.sent == 1
+    assert send_meta.sending == 1
+    assert send_meta.transfer_id in worker.reqs_need_send
+    assert worker.finished_sending_reqs == set()
+
+    worker._finish_send_attempt(send_meta)
+
+    assert send_meta.sent == 2
+    assert send_meta.sending == 0
+    assert send_meta.transfer_id not in worker.reqs_need_send
+    assert worker.finished_sending_reqs == {"p-req-failed"}
+
+
 @pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.TransferEngine",
@@ -2272,6 +2302,7 @@ async def test_kv_producer(monkeypatch):
             remote_port=54321,
             remote_tp_size=1,
             remote_tp_rank=0,
+            remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
             req_blocks={"d-req-1": (transfer_id, [[20, 21]])},
             kv_caches_base_addr=[0x2000],
             block_lens=[block_len],

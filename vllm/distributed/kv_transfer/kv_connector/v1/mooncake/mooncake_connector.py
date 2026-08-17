@@ -2305,18 +2305,8 @@ class MooncakeConnectorWorker:
                         err_req_set.add(d_req_id)
                     ok_ready_reqs = []
 
-            for d_req_id, send_meta in ready_reqs:
-                send_meta.sending -= 1
-
-                if d_req_id in err_req_set:
-                    continue
-
-                send_meta.sent += 1
-                if (
-                    send_meta.sent == send_meta.need_send
-                    and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
-                ):
-                    self.finished_sending_reqs.add(send_meta.p_req_id)
+            for _, send_meta in ready_reqs:
+                self._finish_send_attempt(send_meta)
 
             response = MooncakeXferResponse(
                 status=response_status,
@@ -2325,6 +2315,17 @@ class MooncakeConnectorWorker:
                 err_msg=err_msg,
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
+
+    def _finish_send_attempt(self, send_meta: SendBlockMeta) -> None:
+        """Release producer blocks after every target reaches a terminal state."""
+        send_meta.sending -= 1
+        send_meta.sent += 1
+        if (
+            send_meta.sent >= send_meta.need_send
+            and send_meta.sending == 0
+            and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
+        ):
+            self.finished_sending_reqs.add(send_meta.p_req_id)
 
     def resolve_need_send(
         self,
