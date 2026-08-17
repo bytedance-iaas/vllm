@@ -1776,8 +1776,10 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
         if moe_config.intermediate_size_per_partition % 256 != 0:
             return (
                 False,
-                "kernel requires intermediate_size_per_partition to be "
-                "divisible by 256",
+                (
+                    "kernel requires intermediate_size_per_partition to be "
+                    "divisible by 256"
+                ),
             )
 
         if moe_config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
