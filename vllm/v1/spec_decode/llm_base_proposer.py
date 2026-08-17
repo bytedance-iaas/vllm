@@ -98,6 +98,8 @@ class SpecDecodeBaseProposer:
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self._dcp_eagle_trace_active_round = -1
+        self._dcp_eagle_trace_attempt = 0
+        self._dcp_eagle_trace_active_attempt = -1
         self._dcp_eagle_trace_step = 0
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
@@ -463,7 +465,10 @@ class SpecDecodeBaseProposer:
         batch_size = hidden_states.shape[0]
         save_eagle_trace(
             round_idx,
-            f"draft_step_{self._dcp_eagle_trace_step}",
+            (
+                f"proposal_{self._dcp_eagle_trace_active_attempt:04d}_"
+                f"draft_step_{self._dcp_eagle_trace_step}"
+            ),
             batch_size=batch_size,
             hidden_states=hidden_states,
             logits=logits,
@@ -553,6 +558,9 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def set_dcp_eagle_trace_round(self, round_idx: int) -> None:
+        self._dcp_eagle_trace_active_round = round_idx
+
     def propose(
         self,
         num_speculative_tokens,
@@ -572,13 +580,17 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
-        trace_round: int | None = None,
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
-        trace_round = -1 if trace_round is None else trace_round
-        self._dcp_eagle_trace_active_round = trace_round
+        trace_round = self._dcp_eagle_trace_active_round
+        trace_on = trace_enabled(trace_round, batch_size)
+        trace_attempt = -1
+        if trace_on:
+            trace_attempt = self._dcp_eagle_trace_attempt
+            self._dcp_eagle_trace_attempt += 1
+            self._dcp_eagle_trace_active_attempt = trace_attempt
         self._dcp_eagle_trace_step = 0
 
         if self.method in ("eagle3", "dflash"):
@@ -600,16 +612,24 @@ class SpecDecodeBaseProposer:
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        save_eagle_trace(
-            trace_round,
-            "draft_conditioning",
-            batch_size=batch_size,
-            target_token_ids=target_token_ids,
-            target_positions=target_positions,
-            target_hidden_states=target_hidden_states,
-            next_token_ids=next_token_ids,
-            common_metadata=common_attn_metadata,
-        )
+        if trace_on:
+            save_eagle_trace(
+                trace_round,
+                "proposal_manifest",
+                batch_size=batch_size,
+                proposal_attempt=trace_attempt,
+                num_speculative_tokens=num_speculative_tokens,
+            )
+            save_eagle_trace(
+                trace_round,
+                f"proposal_{trace_attempt:04d}_draft_conditioning",
+                batch_size=batch_size,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                common_metadata=common_attn_metadata,
+            )
 
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
@@ -626,10 +646,10 @@ class SpecDecodeBaseProposer:
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
-        if trace_enabled(trace_round, batch_size):
+        if trace_on:
             save_eagle_trace(
                 trace_round,
-                "draft_metadata_step_0",
+                f"proposal_{trace_attempt:04d}_draft_metadata_step_0",
                 batch_size=batch_size,
                 common_metadata=common_attn_metadata,
                 attention_metadata=snapshot_attention_metadata(per_layer_attn_metadata),
@@ -672,10 +692,10 @@ class SpecDecodeBaseProposer:
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
-        if trace_enabled(trace_round, batch_size):
+        if trace_on:
             save_eagle_trace(
                 trace_round,
-                "draft_topk_step_0",
+                f"proposal_{trace_attempt:04d}_draft_topk_step_0",
                 batch_size=batch_size,
                 dcp_topk=snapshot_dcp_topk(self.model),
             )
@@ -689,13 +709,16 @@ class SpecDecodeBaseProposer:
             self.model.model.compact_topk_indices(token_indices_to_sample)
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        sample_input_ids = self.input_ids[token_indices_to_sample]
-        if self.uses_mrope:
-            sample_positions = self.mrope_positions[:, token_indices_to_sample]
-        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-            sample_positions = self.xdrope_positions[:, token_indices_to_sample]
-        else:
-            sample_positions = self.positions[token_indices_to_sample]
+        sample_input_ids = None
+        sample_positions = None
+        if trace_on:
+            sample_input_ids = self.input_ids[token_indices_to_sample]
+            if self.uses_mrope:
+                sample_positions = self.mrope_positions[:, token_indices_to_sample]
+            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+                sample_positions = self.xdrope_positions[:, token_indices_to_sample]
+            else:
+                sample_positions = self.positions[token_indices_to_sample]
 
         # No draft tokens requested (e.g. Dynamic SD decided K=0).
         # The prefill forward pass above already ran to keep the drafter
@@ -722,7 +745,14 @@ class SpecDecodeBaseProposer:
                 ).contiguous()
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
-        positions = sample_positions
+        if sample_positions is not None:
+            positions = sample_positions
+        elif self.uses_mrope:
+            positions = self.mrope_positions[:, token_indices_to_sample]
+        elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+            positions = self.xdrope_positions[:, token_indices_to_sample]
+        else:
+            positions = self.positions[token_indices_to_sample]
         hidden_states = hidden_states[token_indices_to_sample]
 
         if self.constant_draft_positions:
@@ -808,10 +838,13 @@ class SpecDecodeBaseProposer:
                         common_attn_metadata, draft_index=token_index + 1
                     )
                 )
-            if trace_enabled(trace_round, batch_size):
+            if trace_on:
                 save_eagle_trace(
                     trace_round,
-                    f"draft_metadata_step_{token_index + 1}",
+                    (
+                        f"proposal_{trace_attempt:04d}_"
+                        f"draft_metadata_step_{token_index + 1}"
+                    ),
                     batch_size=batch_size,
                     common_metadata=common_attn_metadata,
                     attention_metadata=snapshot_attention_metadata(
@@ -861,10 +894,10 @@ class SpecDecodeBaseProposer:
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
 
-            if trace_enabled(trace_round, batch_size):
+            if trace_on:
                 save_eagle_trace(
                     trace_round,
-                    f"draft_topk_step_{token_index + 1}",
+                    (f"proposal_{trace_attempt:04d}_draft_topk_step_{token_index + 1}"),
                     batch_size=batch_size,
                     dcp_topk=snapshot_dcp_topk(self.model),
                 )

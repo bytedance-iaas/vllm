@@ -559,7 +559,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
             selected_global_ids.new_full((), -1),
         )
         localized = localized.sort(dim=-1, descending=True).values
-        if self._dcp_eagle_trace_enabled:
+        if getattr(self, "_dcp_eagle_trace_enabled", False):
             self._record_dcp_eagle_topk(selected_global_ids, localized)
         out.copy_(localized)
         return out

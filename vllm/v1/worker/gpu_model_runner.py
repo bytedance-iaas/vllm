@@ -196,6 +196,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dcp_eagle_trace import (
     save_eagle_trace,
+    snapshot_attention_metadata,
     snapshot_dcp_topk,
     trace_enabled,
 )
@@ -450,6 +451,7 @@ class ExecuteModelState(NamedTuple):
     logits: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
+    attn_metadata: PerLayerAttnMetadata
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
@@ -4807,6 +4809,7 @@ class GPUModelRunner(
             logits,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
+            attn_metadata,
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
@@ -4858,6 +4861,7 @@ class GPUModelRunner(
             logits,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
+            attn_metadata,
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
@@ -4895,6 +4899,7 @@ class GPUModelRunner(
                 sample_hidden_states=sample_hidden_states,
                 aux_hidden_states=aux_hidden_states,
                 common_metadata=spec_decode_common_attn_metadata,
+                attention_metadata=snapshot_attention_metadata(attn_metadata),
                 draft_token_ids=spec_decode_metadata.draft_token_ids,
                 target_logits_indices=spec_decode_metadata.target_logits_indices,
                 bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
@@ -5600,6 +5605,7 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            self.drafter.set_dcp_eagle_trace_round(self._dcp_eagle_trace_round)
             draft_token_ids = self.drafter.propose(
                 num_speculative_tokens=num_spec_tokens_to_schedule,
                 target_token_ids=target_token_ids,
@@ -5612,7 +5618,6 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
-                trace_round=self._dcp_eagle_trace_round,
             )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
