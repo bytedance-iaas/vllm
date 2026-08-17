@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+from contextlib import nullcontext
 import json
 import os
 
 import torch
+from torch.profiler import record_function
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
@@ -101,6 +103,39 @@ def _w4a8_debug_schedule_override() -> str | None:
     return schedule
 
 
+def _w4a8_debug_profile_phases() -> bool:
+    return os.environ.get("VLLM_W4A8_DEBUG_PROFILE_PHASES", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _w4a8_debug_zero_skip_enabled() -> bool:
+    return os.environ.get("VLLM_W4A8_DEBUG_ZERO_SKIP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _w4a8_debug_active_threshold() -> int:
+    value = os.environ.get("VLLM_W4A8_DEBUG_ACTIVE_THRESHOLD", "4")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        logger.warning_once("Invalid VLLM_W4A8_DEBUG_ACTIVE_THRESHOLD=%r", value)
+        return 4
+
+
+def _w4a8_debug_scope(name: str):
+    if _w4a8_debug_profile_phases():
+        return record_function(name)
+    return nullcontext()
+
+
 def _w4a8_debug_tensor_stats(
     tensor: torch.Tensor | None,
     *,
@@ -129,6 +164,32 @@ def _w4a8_debug_tensor_stats(
         "nonzero": sum(1 for value in values if value != 0),
         "zero": sum(1 for value in values if value == 0),
     }
+
+
+def _w4a8_debug_active_stats(
+    expert_token_counts: torch.Tensor | None,
+) -> dict[str, int | bool | None]:
+    stats: dict[str, int | bool | None] = {
+        "active_threshold": _w4a8_debug_active_threshold(),
+        "active_le_threshold": None,
+        "active_experts": None,
+        "total_tokens": None,
+    }
+    if expert_token_counts is None:
+        return stats
+
+    flat = expert_token_counts.detach().to(device="cpu", dtype=torch.int64).flatten()
+    active_experts = sum(1 for value in flat.tolist() if value != 0)
+    total_tokens = int(flat.sum().item())
+    threshold = _w4a8_debug_active_threshold()
+    stats.update(
+        {
+            "active_experts": active_experts,
+            "total_tokens": total_tokens,
+            "active_le_threshold": active_experts <= threshold,
+        }
+    )
+    return stats
 
 
 def _w4a8_debug_rank_info() -> dict[str, int | None]:
@@ -193,6 +254,7 @@ def _w4a8_debug_log_metadata(
         "K": K,
         "N": N,
         "expert_tokens": _w4a8_debug_tensor_stats(expert_token_counts),
+        "active_stats": _w4a8_debug_active_stats(expert_token_counts),
         # W4A8 currently builds problem shapes with swap_ab=True in both paths,
         # so the useful expert M dimension is column 1.
         "problem_m_mm1": _w4a8_debug_tensor_stats(problem_sizes1, token_column=1),
@@ -1683,13 +1745,14 @@ def run_cutlass_moe_w4a8_fp8(
                 padded_M,
                 K,
             )
-            _masked_per_token_fp8_quant(
-                hidden_states,
-                a1q,
-                a1q_scale,
-                expert_num_tokens,
-                compact_programs,
-            )
+            with _w4a8_debug_scope("w4a8:input_quant"):
+                _masked_per_token_fp8_quant(
+                    hidden_states,
+                    a1q,
+                    a1q_scale,
+                    expert_num_tokens,
+                    compact_programs,
+                )
         else:
             assert a1q.dtype == torch.float8_e4m3fn
             assert a1q_scale is not None
@@ -1698,17 +1761,18 @@ def run_cutlass_moe_w4a8_fp8(
             assert a1q_scale.is_contiguous()
 
         expert_offsets = torch.empty((local_E,), dtype=torch.int32, device=device)
-        ops.get_cutlass_batched_moe_mm_data(
-            expert_offsets,
-            problem_sizes1,
-            problem_sizes2,
-            expert_num_tokens,
-            local_E,
-            padded_M,
-            N,
-            K,
-            True,
-        )
+        with _w4a8_debug_scope("w4a8:problem_sizes"):
+            ops.get_cutlass_batched_moe_mm_data(
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                expert_num_tokens,
+                local_E,
+                padded_M,
+                N,
+                K,
+                True,
+            )
         a1q = a1q.reshape(local_E * padded_M, K)
         assert a1q_scale is not None
         a1q_scale = a1q_scale.reshape(local_E * padded_M, 1)
@@ -1738,20 +1802,22 @@ def run_cutlass_moe_w4a8_fp8(
 
         num_expert = global_num_experts if expert_map is None else expert_map.size(0)
         # permuted a1q reuses workspace2
-        a1q, a1q_scale, expert_first_token_offset, inv_perm, _ = moe_permute(
-            a1q,
-            a1q_scale,
-            topk_ids,
-            num_expert,
-            local_E,
-            expert_map,
-            permuted_hidden_states=a1q_perm,
-            scratch=permute_scratch,
-        )
+        with _w4a8_debug_scope("w4a8:permute"):
+            a1q, a1q_scale, expert_first_token_offset, inv_perm, _ = moe_permute(
+                a1q,
+                a1q_scale,
+                topk_ids,
+                num_expert,
+                local_E,
+                expert_map,
+                permuted_hidden_states=a1q_perm,
+                scratch=permute_scratch,
+            )
         # for RS gemm SwapAB is always enabled (swap logical M, N in the problem shape).
-        ops.get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
-            expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, True
-        )
+        with _w4a8_debug_scope("w4a8:problem_sizes"):
+            ops.get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
+                expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, True
+            )
         expert_offsets = expert_first_token_offset[:-1]
         debug_expert_token_counts = (
             expert_first_token_offset[1:] - expert_first_token_offset[:-1]
@@ -1771,22 +1837,34 @@ def run_cutlass_moe_w4a8_fp8(
         expert_token_counts=debug_expert_token_counts,
     )
 
-    ops.cutlass_w4a8_moe_mm(
-        mm1_out,
-        a1q,
-        w1,
-        a1q_scale,
-        w1_chan_scale,
-        w1_scale,
-        group_size,
-        expert_offsets,
-        problem_sizes1,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        s_strides1,
-        schedule,
-    )
+    if (
+        _w4a8_debug_zero_skip_enabled()
+        and not use_batched_format
+        and debug_expert_token_counts is not None
+        and not torch.cuda.is_current_stream_capturing()
+        and int(torch.count_nonzero(debug_expert_token_counts).item()) == 0
+    ):
+        with _w4a8_debug_scope("w4a8:zero_skip"):
+            output.zero_()
+        return
+
+    with _w4a8_debug_scope("w4a8:mm1"):
+        ops.cutlass_w4a8_moe_mm(
+            mm1_out,
+            a1q,
+            w1,
+            a1q_scale,
+            w1_chan_scale,
+            w1_scale,
+            group_size,
+            expert_offsets,
+            problem_sizes1,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            s_strides1,
+            schedule,
+        )
 
     use_masked_swigluoai = (
         use_batched_format and activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
@@ -1804,16 +1882,17 @@ def run_cutlass_moe_w4a8_fp8(
             padded_M,
             N,
         )
-        _masked_swigluoai_quant(
-            mm1_out.view(local_E, padded_M, N * 2),
-            a2q,
-            a2q_scale,
-            expert_num_tokens,
-            alpha,
-            beta,
-            clamp_limit,
-            compact_programs,
-        )
+        with _w4a8_debug_scope("w4a8:activation_quant"):
+            _masked_swigluoai_quant(
+                mm1_out.view(local_E, padded_M, N * 2),
+                a2q,
+                a2q_scale,
+                expert_num_tokens,
+                alpha,
+                beta,
+                clamp_limit,
+                compact_programs,
+            )
         a2q = a2q.reshape(local_E * padded_M, N)
         a2q_scale = a2q_scale.reshape(local_E * padded_M, 1)
         mm2_out = output[:, :padded_M, :].reshape(local_E * padded_M, K)
@@ -1825,37 +1904,39 @@ def run_cutlass_moe_w4a8_fp8(
                 (local_E * padded_M, N),
             )
             mm2_out = _resize_cache(workspace2, (local_E * padded_M, K))
-        _apply_w4a8_moe_activation(
-            activation,
-            act_out,
-            mm1_out,
-            gemm1_alpha,
-            gemm1_beta,
-            gemm1_clamp_limit,
-        )
-        a2q, a2q_scale = ops.scaled_fp8_quant(
-            act_out,
-            a2_scale,
-            use_per_token_if_dynamic=per_act_token,
-            output=quant_out,
-        )
+        with _w4a8_debug_scope("w4a8:activation_quant"):
+            _apply_w4a8_moe_activation(
+                activation,
+                act_out,
+                mm1_out,
+                gemm1_alpha,
+                gemm1_beta,
+                gemm1_clamp_limit,
+            )
+            a2q, a2q_scale = ops.scaled_fp8_quant(
+                act_out,
+                a2_scale,
+                use_per_token_if_dynamic=per_act_token,
+                output=quant_out,
+            )
 
-    ops.cutlass_w4a8_moe_mm(
-        mm2_out,
-        a2q,
-        w2,
-        a2q_scale,
-        w2_chan_scale,
-        w2_scale,
-        group_size,
-        expert_offsets,
-        problem_sizes2,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides2,
-        schedule,
-    )
+    with _w4a8_debug_scope("w4a8:mm2"):
+        ops.cutlass_w4a8_moe_mm(
+            mm2_out,
+            a2q,
+            w2,
+            a2q_scale,
+            w2_chan_scale,
+            w2_scale,
+            group_size,
+            expert_offsets,
+            problem_sizes2,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides2,
+            schedule,
+        )
 
     if use_batched_format and not use_masked_swigluoai:
         output[:, :padded_M, :].copy_(
@@ -1864,13 +1945,14 @@ def run_cutlass_moe_w4a8_fp8(
     elif not use_batched_format:
         # for non-chunking mode the output is resized from workspace13
         # so we need to make sure mm2_out uses workspace2.
-        moe_unpermute(
-            out=output,
-            permuted_hidden_states=mm2_out,
-            topk_weights=topk_weights,
-            inv_permuted_idx=inv_perm,
-            expert_first_token_offset=expert_first_token_offset,
-        )
+        with _w4a8_debug_scope("w4a8:unpermute"):
+            moe_unpermute(
+                out=output,
+                permuted_hidden_states=mm2_out,
+                topk_weights=topk_weights,
+                inv_permuted_idx=inv_perm,
+                expert_first_token_offset=expert_first_token_offset,
+            )
 
 
 class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
