@@ -60,6 +60,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.spec_decode.dcp_eagle_trace import eagle_trace_configured
 
 logger = init_logger(__name__)
 
@@ -483,6 +484,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self._dcp_eagle_trace_enabled = eagle_trace_configured()
         if (
             self.dcp_world_size > 1
             and self.cp_kv_cache_interleave_size != self.block_size
@@ -492,6 +494,14 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 f"interleave ({self.block_size}), got "
                 f"{self.cp_kv_cache_interleave_size}."
             )
+
+    def _record_dcp_eagle_topk(
+        self,
+        global_topk: torch.Tensor,
+        local_topk: torch.Tensor,
+    ) -> None:
+        self._dcp_eagle_trace_global_topk = global_topk.detach().clone()
+        self._dcp_eagle_trace_local_topk = local_topk.detach().clone()
 
     def _select_dcp_global_topk(
         self,
@@ -549,6 +559,8 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
             selected_global_ids.new_full((), -1),
         )
         localized = localized.sort(dim=-1, descending=True).values
+        if self._dcp_eagle_trace_enabled:
+            self._record_dcp_eagle_topk(selected_global_ids, localized)
         out.copy_(localized)
         return out
 
@@ -624,6 +636,8 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                     d.max_decode_query_len,
                     out=buf_htk,
                 )
+                if self._dcp_eagle_trace_enabled:
+                    self._record_dcp_eagle_topk(decode_topk, decode_topk)
         if index_md.num_prefills > 0:
             if self.dcp_world_size > 1:
                 raise NotImplementedError(

@@ -8,7 +8,11 @@ from typing import Any
 
 import torch
 
-from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_tp_group,
+    get_world_group,
+)
 
 _TRACE_FIELDS = {
     "block_table",
@@ -21,7 +25,9 @@ _TRACE_FIELDS = {
     "global_kv_lens",
     "local_kv_lens",
     "max_dcp_context_kv_len",
+    "max_decode_query_len",
     "max_query_len",
+    "max_seq_len",
     "num_actual_tokens",
     "query_start_loc",
     "seq_lens",
@@ -32,6 +38,10 @@ _TRACE_FIELDS = {
 def _trace_root() -> Path | None:
     value = os.getenv("VLLM_DCP_EAGLE_TRACE_DIR")
     return Path(value) if value else None
+
+
+def eagle_trace_configured() -> bool:
+    return _trace_root() is not None and _rank_enabled()
 
 
 def _rank_enabled() -> bool:
@@ -45,7 +55,7 @@ def trace_enabled(round_idx: int, batch_size: int) -> bool:
     if root is None or batch_size != 1 or not _rank_enabled():
         return False
     max_rounds = int(os.getenv("VLLM_DCP_EAGLE_TRACE_MAX_ROUNDS", "32"))
-    return round_idx < max_rounds
+    return 0 <= round_idx < max_rounds
 
 
 def _snapshot(value: Any) -> Any:
@@ -85,6 +95,20 @@ def snapshot_attention_metadata(metadata: Any) -> dict[str, Any]:
     return result
 
 
+def snapshot_dcp_topk(model: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for module_name, module in model.named_modules():
+        global_topk = getattr(module, "_dcp_eagle_trace_global_topk", None)
+        local_topk = getattr(module, "_dcp_eagle_trace_local_topk", None)
+        if global_topk is None and local_topk is None:
+            continue
+        result[module_name] = {
+            "global_topk": _snapshot(global_topk),
+            "local_topk": _snapshot(local_topk),
+        }
+    return result
+
+
 def save_eagle_trace(
     round_idx: int,
     stage: str,
@@ -96,15 +120,19 @@ def save_eagle_trace(
         return
 
     tp_rank = get_tp_group().rank_in_group
+    world_rank = get_world_group().rank
     try:
         dcp_rank = get_dcp_group().rank_in_group
     except AssertionError:
         dcp_rank = 0
-    rank_dir = root / f"tp{tp_rank}-dcp{dcp_rank}"
+    pid = os.getpid()
+    rank_dir = root / (f"world{world_rank}-pid{pid}-tp{tp_rank}-dcp{dcp_rank}")
     rank_dir.mkdir(parents=True, exist_ok=True)
     output = {
         "round": round_idx,
         "stage": stage,
+        "world_rank": world_rank,
+        "pid": pid,
         "tp_rank": tp_rank,
         "dcp_rank": dcp_rank,
         **{key: _snapshot(value) for key, value in payload.items()},

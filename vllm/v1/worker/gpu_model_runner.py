@@ -194,7 +194,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
-from vllm.v1.spec_decode.dcp_eagle_trace import save_eagle_trace
+from vllm.v1.spec_decode.dcp_eagle_trace import (
+    save_eagle_trace,
+    snapshot_dcp_topk,
+    trace_enabled,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -4871,12 +4875,19 @@ class GPUModelRunner(
             )
 
         trace_round = self._dcp_eagle_trace_round
-        if spec_decode_metadata is not None:
+        trace_batch_size = (
+            len(spec_decode_metadata.num_draft_tokens)
+            if spec_decode_metadata is not None
+            else 0
+        )
+        if spec_decode_metadata is not None and trace_enabled(
+            trace_round, trace_batch_size
+        ):
             num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
             save_eagle_trace(
                 trace_round,
                 "target_pre_sample",
-                batch_size=len(spec_decode_metadata.num_draft_tokens),
+                batch_size=trace_batch_size,
                 input_ids=self.input_ids.gpu[:num_scheduled_tokens],
                 positions=self.positions[:num_scheduled_tokens],
                 logits=logits,
@@ -4888,18 +4899,20 @@ class GPUModelRunner(
                 target_logits_indices=spec_decode_metadata.target_logits_indices,
                 bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
                 logits_indices=spec_decode_metadata.logits_indices,
+                dcp_topk=snapshot_dcp_topk(self.get_model()),
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if spec_decode_metadata is not None:
-            save_eagle_trace(
-                trace_round,
-                "target_post_sample",
-                batch_size=len(spec_decode_metadata.num_draft_tokens),
-                sampled_token_ids=sampler_output.sampled_token_ids,
-            )
+            if trace_enabled(trace_round, trace_batch_size):
+                save_eagle_trace(
+                    trace_round,
+                    "target_post_sample",
+                    batch_size=trace_batch_size,
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                )
             self._dcp_eagle_trace_round += 1
 
         self._update_states_after_model_execute(
@@ -5599,6 +5612,7 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                trace_round=self._dcp_eagle_trace_round,
             )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
