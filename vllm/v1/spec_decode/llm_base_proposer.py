@@ -46,6 +46,11 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.dcp_eagle_trace import (
+    save_eagle_trace,
+    snapshot_attention_metadata,
+    trace_enabled,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -91,6 +96,9 @@ class SpecDecodeBaseProposer:
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self._dcp_eagle_trace_round = 0
+        self._dcp_eagle_trace_active_round = -1
+        self._dcp_eagle_trace_step = 0
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
@@ -435,13 +443,31 @@ class SpecDecodeBaseProposer:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
+        logits = self.model.compute_logits(hidden_states)
         if self.use_heterogeneous_vocab:
-            logits = self.model.compute_logits(hidden_states)
             assert self.vocab_mapping is not None
             logits = self.vocab_mapping.constrain_draft_logits(logits)
             draft_token_ids = logits.argmax(dim=-1)
-            return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+            draft_token_ids = self.vocab_mapping.map_draft_to_target_ids(
+                draft_token_ids
+            )
+        else:
+            draft_token_ids = logits.argmax(dim=-1)
+
+        round_idx = self._dcp_eagle_trace_active_round
+        batch_size = hidden_states.shape[0]
+        save_eagle_trace(
+            round_idx,
+            f"draft_step_{self._dcp_eagle_trace_step}",
+            batch_size=batch_size,
+            hidden_states=hidden_states,
+            logits=logits,
+            chosen_token_ids=draft_token_ids,
+            input_ids=self.input_ids[:batch_size],
+            positions=self._get_positions(batch_size),
+        )
+        self._dcp_eagle_trace_step += 1
+        return draft_token_ids
 
     def _sample_from_logits(
         self,
@@ -528,6 +554,10 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        trace_round = self._dcp_eagle_trace_round
+        self._dcp_eagle_trace_round += 1
+        self._dcp_eagle_trace_active_round = trace_round
+        self._dcp_eagle_trace_step = 0
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -548,6 +578,17 @@ class SpecDecodeBaseProposer:
             )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
+        save_eagle_trace(
+            trace_round,
+            "draft_conditioning",
+            batch_size=batch_size,
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            common_metadata=common_attn_metadata,
+        )
+
         num_tokens, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
                 target_token_ids=target_token_ids,
@@ -563,6 +604,15 @@ class SpecDecodeBaseProposer:
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
+        if trace_enabled(trace_round, batch_size):
+            save_eagle_trace(
+                trace_round,
+                "draft_metadata_step_0",
+                batch_size=batch_size,
+                common_metadata=common_attn_metadata,
+                attention_metadata=snapshot_attention_metadata(per_layer_attn_metadata),
+                token_indices_to_sample=token_indices_to_sample,
+            )
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
@@ -717,6 +767,16 @@ class SpecDecodeBaseProposer:
                     self.build_per_group_and_layer_attn_metadata(
                         common_attn_metadata, draft_index=token_index + 1
                     )
+                )
+            if trace_enabled(trace_round, batch_size):
+                save_eagle_trace(
+                    trace_round,
+                    f"draft_metadata_step_{token_index + 1}",
+                    batch_size=batch_size,
+                    common_metadata=common_attn_metadata,
+                    attention_metadata=snapshot_attention_metadata(
+                        per_layer_attn_metadata
+                    ),
                 )
 
             # copy inputs to buffer for cudagraph
