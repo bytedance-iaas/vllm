@@ -20,6 +20,39 @@ def test_trace_paged_cache_rows_follows_block_table() -> None:
 
 
 @pytest.mark.parametrize(
+    ("world_size", "interleave", "context_len", "max_local_len"),
+    [
+        (2, 1, 7, 4),
+        (2, 2, 11, 6),
+        (4, 1, 13, 4),
+        (4, 2, 19, 6),
+    ],
+)
+def test_restore_dcp_global_context_rows(
+    world_size: int,
+    interleave: int,
+    context_len: int,
+    max_local_len: int,
+) -> None:
+    rows = torch.arange(context_len * 2).view(context_len, 2)
+    gathered = torch.full((world_size * max_local_len, 2), -1)
+    for pos in range(context_len):
+        rank = (pos // interleave) % world_size
+        local_idx = pos // (world_size * interleave) * interleave + pos % interleave
+        gathered[rank * max_local_len + local_idx] = rows[pos]
+
+    restored = flash_attn._restore_dcp_global_context_rows(
+        gathered,
+        context_len=context_len,
+        dcp_world_size=world_size,
+        cp_kv_cache_interleave_size=interleave,
+        max_local_len=max_local_len,
+    )
+
+    torch.testing.assert_close(restored, rows)
+
+
+@pytest.mark.parametrize(
     ("enabled", "layer_name", "max_query_len", "max_context_len", "expected"),
     [
         (True, "language_model.model.layers.0.self_attn.attn", 1, 128, True),
@@ -48,6 +81,59 @@ def test_dcp_eagle_fp32_combine_gate(
     output = torch.empty((1, 8, 128), dtype=torch.bfloat16)
 
     assert impl._use_dcp_eagle_fp32_combine(layer, metadata, output) is expected
+
+
+@pytest.mark.parametrize(
+    (
+        "enabled",
+        "layer_name",
+        "num_reqs",
+        "max_query_len",
+        "max_context_len",
+        "has_context_lens",
+        "is_capturing",
+        "expected",
+    ),
+    [
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, True, False, True),
+        (False, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, True, False, False),
+        (True, "model.layers.0.self_attn.attn", 1, 4, 128, True, False, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 2, 4, 128, True, False, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 5, 128, True, False, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 0, True, False, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, False, False, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, True, True, False),
+    ],
+)
+def test_dcp_eagle_full_context_attn_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    layer_name: str,
+    num_reqs: int,
+    max_query_len: int,
+    max_context_len: int,
+    has_context_lens: bool,
+    is_capturing: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        flash_attn.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: is_capturing,
+    )
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl._dcp_eagle_full_context_attn = enabled
+    impl._dcp_eagle_max_query_len = 4
+    layer = SimpleNamespace(layer_name=layer_name)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.zeros(num_reqs + 1, dtype=torch.int32),
+        max_query_len=max_query_len,
+        max_dcp_context_kv_len=max_context_len,
+        dcp_context_kv_lens=torch.ones(num_reqs) if has_context_lens else None,
+    )
+    output = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+
+    assert impl._use_dcp_eagle_full_context_attn(layer, metadata, output) is expected
 
 
 @pytest.mark.parametrize(
