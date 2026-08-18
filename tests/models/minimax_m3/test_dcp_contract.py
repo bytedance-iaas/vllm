@@ -21,6 +21,10 @@ class _SM100Platform:
     def is_device_capability_family(family: int) -> bool:
         return family == 100
 
+    @staticmethod
+    def is_device_capability(capability: int) -> bool:
+        return capability == 100
+
 
 class _SM90Platform:
     @staticmethod
@@ -30,6 +34,25 @@ class _SM90Platform:
     @staticmethod
     def is_device_capability_family(family: int) -> bool:
         return family == 90
+
+    @staticmethod
+    def is_device_capability(capability: int) -> bool:
+        return capability == 90
+
+
+def test_force_unfused_post_attn_norm_is_sm90_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_MINIMAX_M3_FORCE_UNFUSED_POST_ATTN_NORM", "1")
+    monkeypatch.setattr(minimax_model, "current_platform", _SM90Platform())
+    assert minimax_model._force_unfused_post_attn_norm()
+
+    monkeypatch.setattr(minimax_model, "current_platform", _SM100Platform())
+    assert not minimax_model._force_unfused_post_attn_norm()
+
+    monkeypatch.delenv("VLLM_MINIMAX_M3_FORCE_UNFUSED_POST_ATTN_NORM")
+    monkeypatch.setattr(minimax_model, "current_platform", _SM90Platform())
+    assert not minimax_model._force_unfused_post_attn_norm()
 
 
 def test_sm100_dcp_forces_triton_backends(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,6 +244,7 @@ def test_target_layer_tripwire_captures_four_checkpoints(
         "D_ffn_return",
     ]
     assert trace["ffn_output_reduced"] == [False]
+    assert trace["layer0_post_attention_residual"].tolist() == [1.0, 2.0]
     assert trace["checkpoints"].tolist() == [
         [[1.0, 2.0], [2.0, 4.0], [2.0, 4.0], [6.0, 12.0]]
     ]

@@ -104,6 +104,8 @@ def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
+    *,
+    force_unfused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-reduce ``hidden_states`` + add ``residual`` + GemmaRMSNorm, fused.
 
@@ -117,7 +119,9 @@ def fused_allreduce_gemma_rms_norm(
         # No all-reduce needed; identical to the unfused path.
         return norm(hidden_states, residual)
 
-    ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
+    ok, max_token_num = (
+        (False, 0) if force_unfused else _can_use_flashinfer(hidden_states, tp_size)
+    )
     if ok:
         norm_out = torch.empty_like(hidden_states)
         # With norm_out provided, the kernel writes the new residual

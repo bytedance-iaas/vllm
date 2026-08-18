@@ -320,6 +320,7 @@ def capture_target_layer_tripwire(
     captures: dict[tuple[int, str], torch.Tensor] = {}
     ffn_output_reduced: list[bool] = []
     handles = []
+    layer0_post_attention_residual: torch.Tensor | None = None
 
     def record(layer_idx: int, stage: str, tensor: torch.Tensor) -> None:
         captures[(layer_idx, stage)] = tensor[tripwire.row].detach().clone()
@@ -327,6 +328,29 @@ def capture_target_layer_tripwire(
     for layer_idx, layer in enumerate(layers[: max_layer + 1]):
         ffn = layer.block_sparse_moe if layer.is_moe_layer else layer.mlp
         ffn_output_reduced.append(not layer.ffn_all_reduce_deferred)
+
+        if layer_idx == 0:
+
+            def layer_pre_hook(
+                _module: Any,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+            ) -> None:
+                nonlocal layer0_post_attention_residual
+                hidden_states = kwargs.get("hidden_states")
+                if hidden_states is None:
+                    hidden_states = args[1]
+                residual = kwargs.get("residual")
+                if residual is None and len(args) > 2:
+                    residual = args[2]
+                if residual is None:
+                    residual = hidden_states
+                assert isinstance(residual, torch.Tensor)
+                layer0_post_attention_residual = residual[tripwire.row].detach().clone()
+
+            handles.append(
+                layer.register_forward_pre_hook(layer_pre_hook, with_kwargs=True)
+            )
 
         def attention_pre_hook(
             _module: Any,
@@ -387,6 +411,8 @@ def capture_target_layer_tripwire(
     ]
     if missing:
         raise RuntimeError(f"DCP EAGLE target tripwire missed checkpoints: {missing}")
+    if layer0_post_attention_residual is None:
+        raise RuntimeError("DCP EAGLE target tripwire missed the layer-0 residual")
 
     stacked = torch.stack(
         [
@@ -409,6 +435,9 @@ def capture_target_layer_tripwire(
         "layer_ids": list(range(max_layer + 1)),
         "checkpoint_names": list(_TRIPWIRE_STAGES),
         "ffn_output_reduced": ffn_output_reduced,
+        "layer0_post_attention_residual": (
+            layer0_post_attention_residual.detach().cpu()
+        ),
         "checkpoints": stacked,
     }
     torch.save(

@@ -12,6 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -83,6 +84,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
@@ -109,6 +111,12 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _force_unfused_post_attn_norm() -> bool:
+    return os.getenv(
+        "VLLM_MINIMAX_M3_FORCE_UNFUSED_POST_ATTN_NORM"
+    ) == "1" and current_platform.is_device_capability(90)
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -672,6 +680,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # fused into this layer's input_layernorm.
         # Configured by MiniMaxM3Model.__init__
         self.fuse_input_allreduce = False
+        self.force_unfused_post_attn_norm = _force_unfused_post_attn_norm()
 
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
@@ -751,7 +760,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            force_unfused=self.force_unfused_post_attn_norm,
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
