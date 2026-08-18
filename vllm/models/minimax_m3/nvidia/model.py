@@ -27,7 +27,6 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
@@ -945,7 +944,6 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        full_num_tokens = positions.shape[0]
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -969,12 +967,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
-            if (
-                self.compile_sequence_parallel
-                and residual.shape[0] != full_num_tokens
-            ):
-                residual = tensor_model_parallel_all_gather(residual, dim=0)
-                residual = residual[:full_num_tokens]
+            if self.compile_sequence_parallel:
+                residual = ir.ops.sequence_parallel_boundary(residual)
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
