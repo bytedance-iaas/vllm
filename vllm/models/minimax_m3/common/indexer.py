@@ -61,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.v1.spec_decode.dcp_eagle_trace import eagle_trace_configured
+from vllm.v1.spec_decode.dcp_eagle_trace import save_indexer_score_trace
 
 logger = init_logger(__name__)
 
@@ -612,6 +613,25 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                     d.max_decode_query_len,
                     kv_lens=d.local_kv_lens,
                 )
+                module_name = self.index_cache.prefix.removesuffix(".index_cache")
+                save_indexer_score_trace(
+                    module_name,
+                    score=score,
+                    block_table=d.block_table,
+                    seq_lens=d.seq_lens,
+                    global_kv_lens=d.global_kv_lens,
+                    local_kv_lens=d.local_kv_lens,
+                    dcp_world_size=self.dcp_world_size,
+                    dcp_rank=self.dcp_rank,
+                    cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                    init_blocks=self.init_blocks,
+                    local_blocks=self.local_blocks,
+                    topk_blocks=self.topk_blocks,
+                    decode_query_len=d.decode_query_len,
+                    max_decode_query_len=d.max_decode_query_len,
+                    max_seq_len=d.max_seq_len,
+                    index_query=iq[:nd],
+                )
                 max_local_blocks = (
                     d.max_seq_len + self.block_size - 1
                 ) // self.block_size
@@ -622,6 +642,38 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                     max_local_blocks,
                 )
             else:
+                module_name = self.index_cache.prefix.removesuffix(".index_cache")
+                if self._dcp_eagle_trace_enabled:
+                    score = minimax_m3_index_decode_score(
+                        iq[:nd],
+                        kv,
+                        d.block_table,
+                        d.seq_lens,
+                        d.max_seq_len,
+                        self.init_blocks,
+                        self.local_blocks,
+                        self.num_kv_heads,
+                        d.decode_query_len,
+                        d.max_decode_query_len,
+                    )
+                    save_indexer_score_trace(
+                        module_name,
+                        score=score,
+                        block_table=d.block_table,
+                        seq_lens=d.seq_lens,
+                        dcp_world_size=self.dcp_world_size,
+                        dcp_rank=self.dcp_rank,
+                        cp_kv_cache_interleave_size=(
+                            self.cp_kv_cache_interleave_size
+                        ),
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                        topk_blocks=self.topk_blocks,
+                        decode_query_len=d.decode_query_len,
+                        max_decode_query_len=d.max_decode_query_len,
+                        max_seq_len=d.max_seq_len,
+                        index_query=iq[:nd],
+                    )
                 decode_topk = minimax_m3_index_decode(
                     iq[:nd],
                     kv,

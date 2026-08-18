@@ -163,6 +163,7 @@ def save_eagle_trace(
 _TARGET_LAYER_TRIPWIRE_CAPTURED = False
 _TARGET_LAYER_TRIPWIRE_ACTIVE = False
 _DENSE_ATTN_DECOMP_CAPTURED = False
+_INDEXER_SCORE_TRACE_COUNT = 0
 _TRIPWIRE_STAGES = (
     "A_attention_input",
     "B_attention_return",
@@ -225,6 +226,58 @@ def save_dense_attn_decomp(layer_name: str, **payload: Any) -> None:
         rank_dir / f"dense-attn-decomp-layer{layer_id}-pos{position}.pt",
     )
     _DENSE_ATTN_DECOMP_CAPTURED = True
+
+
+def indexer_score_trace_enabled(module_name: str) -> bool:
+    configured_layer = os.getenv("VLLM_DCP_EAGLE_INDEXER_SCORE_TRACE_LAYER")
+    if (
+        _trace_root() is None
+        or configured_layer is None
+        or not _rank_enabled()
+    ):
+        return False
+    layer_id = int(configured_layer)
+    if layer_id < 0:
+        return True
+    return (
+        f".layers.{layer_id}.self_attn.indexer.impl" in module_name
+        or f".layers.{layer_id}.self_attn.indexer" in module_name
+        or f".layers.{layer_id}.self_attn.attn" in module_name
+    )
+
+
+def save_indexer_score_trace(module_name: str, **payload: Any) -> None:
+    global _INDEXER_SCORE_TRACE_COUNT
+
+    root = _trace_root()
+    if root is None or not indexer_score_trace_enabled(module_name):
+        return
+    max_calls = int(os.getenv("VLLM_DCP_EAGLE_INDEXER_SCORE_TRACE_MAX_CALLS", "16"))
+    if _INDEXER_SCORE_TRACE_COUNT >= max_calls:
+        return
+    call_idx = _INDEXER_SCORE_TRACE_COUNT
+    _INDEXER_SCORE_TRACE_COUNT += 1
+    rank_dir, world_rank, pid, tp_rank, dcp_rank = _rank_dir(root)
+    output = {
+        "stage": "indexer_score_trace",
+        "call_idx": call_idx,
+        "world_rank": world_rank,
+        "pid": pid,
+        "tp_rank": tp_rank,
+        "dcp_rank": dcp_rank,
+        "module_name": module_name,
+        **{key: _exact_snapshot(value) for key, value in payload.items()},
+    }
+    layer_id = int(os.getenv("VLLM_DCP_EAGLE_INDEXER_SCORE_TRACE_LAYER", "-1"))
+    position = int(os.getenv("VLLM_DCP_EAGLE_TRIPWIRE_POSITION", "-1"))
+    safe_module = "".join(
+        c if c.isalnum() else "-" for c in module_name
+    ).strip("-")
+    torch.save(
+        output,
+        rank_dir
+        / f"indexer-score-call{call_idx:04d}-layer{layer_id}-pos{position}-{safe_module}.pt",
+    )
 
 
 def target_layer_tripwire_requested() -> bool:
