@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -15,6 +17,35 @@ def test_trace_paged_cache_rows_follows_block_table() -> None:
 
     expected = torch.cat((cache[2], cache[0][:2]))
     assert torch.equal(rows, expected)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "layer_name", "num_prefill_reqs", "num_prefill_tokens", "expected"),
+    [
+        (True, "language_model.model.layers.0.self_attn.attn", 0, 0, True),
+        (False, "language_model.model.layers.0.self_attn.attn", 0, 0, False),
+        (True, "model.layers.60.self_attn.attn", 0, 0, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 0, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 0, 1, False),
+    ],
+)
+def test_dcp_eagle_fp32_combine_gate(
+    enabled: bool,
+    layer_name: str,
+    num_prefill_reqs: int,
+    num_prefill_tokens: int,
+    expected: bool,
+) -> None:
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl._dcp_eagle_fp32_combine = enabled
+    layer = SimpleNamespace(layer_name=layer_name)
+    metadata = SimpleNamespace(
+        num_prefill_reqs=num_prefill_reqs,
+        num_prefill_tokens=num_prefill_tokens,
+    )
+    output = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+
+    assert impl._use_dcp_eagle_fp32_combine(layer, metadata, output) is expected
 
 
 @pytest.mark.parametrize(

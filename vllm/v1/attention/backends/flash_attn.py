@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -32,7 +33,10 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.worker.workspace import current_workspace_manager
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -820,6 +824,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
+        self._dcp_eagle_fp32_combine = False
         self._cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
             if vllm_config is not None
@@ -830,6 +835,34 @@ class FlashAttentionImpl(AttentionImpl):
             self._dcp_max_num_tokens = (
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
+            speculative_config = vllm_config.speculative_config
+            self._dcp_eagle_fp32_combine = (
+                os.getenv("VLLM_DCP_EAGLE_FP32_COMBINE") == "1"
+                and current_platform.is_device_capability(90)
+                and self.dcp_world_size == 2
+                and vllm_config.parallel_config.dcp_comm_backend == "ag_rs"
+                and speculative_config is not None
+                and speculative_config.use_eagle()
+                and self._dcp_dtype == torch.bfloat16
+                and self.head_size % 4 == 0
+            )
+            if self._dcp_eagle_fp32_combine and is_workspace_manager_initialized():
+                full_shape = (
+                    self._dcp_max_num_tokens,
+                    self.num_heads * self.dcp_world_size,
+                    self.head_size,
+                )
+                local_shape = (
+                    self._dcp_max_num_tokens,
+                    self.num_heads,
+                    self.head_size,
+                )
+                current_workspace_manager().get_simultaneous(
+                    (full_shape, self._dcp_dtype),
+                    (full_shape, torch.float32),
+                    (local_shape, torch.float32),
+                    (local_shape, torch.float32),
+                )
 
     def forward(
         self,
@@ -1005,6 +1038,11 @@ class FlashAttentionImpl(AttentionImpl):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     trace_payload=trace_payload,
+                    fp32_combine=self._use_dcp_eagle_fp32_combine(
+                        layer,
+                        attn_metadata,
+                        output[:num_actual_tokens],
+                    ),
                 )
                 return output
             else:
@@ -1223,6 +1261,20 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return quantized.view(original_shape)
 
+    def _use_dcp_eagle_fp32_combine(
+        self,
+        layer: torch.nn.Module,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> bool:
+        return (
+            self._dcp_eagle_fp32_combine
+            and layer.layer_name.startswith("language_model.model.layers.")
+            and attn_metadata.num_prefill_reqs == 0
+            and attn_metadata.num_prefill_tokens == 0
+            and output.dtype == torch.bfloat16
+        )
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -1272,6 +1324,7 @@ class FlashAttentionImpl(AttentionImpl):
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         trace_payload: dict[str, object] | None = None,
+        fp32_combine: bool = False,
     ) -> torch.Tensor:
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
@@ -1334,10 +1387,27 @@ class FlashAttentionImpl(AttentionImpl):
             ),
             self._dcp_dtype,
         )
-        (dcp_context_out_workspace,) = current_workspace_manager().get_simultaneous(
-            dcp_context_out_spec,
-        )
+        workspace_specs = [dcp_context_out_spec]
+        if fp32_combine:
+            full_shape = dcp_context_out_spec[0]
+            local_shape = (
+                dcp_context_out_tokens,
+                self.num_heads,
+                self.head_size,
+            )
+            workspace_specs.extend(
+                (
+                    (full_shape, torch.float32),
+                    (local_shape, torch.float32),
+                    (local_shape, torch.float32),
+                )
+            )
+        workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
+        dcp_context_out_workspace = workspaces[0]
         dcp_context_out = dcp_context_out_workspace[:n]
+        corrected_context_out = workspaces[1][:n] if fp32_combine else None
+        live_fp32 = workspaces[2][:n] if fp32_combine else None
+        merged_fp32 = workspaces[3][:n] if fp32_combine else None
 
         if split_dcp_context:
             # TODO: Remove this DCP + FA2 mixed decode/prefill workaround once
@@ -1402,12 +1472,24 @@ class FlashAttentionImpl(AttentionImpl):
             trace_payload["local_context_lse"] = context_lse.detach().clone()
 
         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
-        context_attn_out_cor, context_lse_cor = self.dcp_combine(
-            context_attn_out,
-            context_lse.transpose(0, 1),
-            get_dcp_group(),
-            return_lse=True,
-        )
+        if fp32_combine:
+            assert self.dcp_combine is cp_lse_ag_out_rs
+            assert context_lse.dtype == torch.float32
+            assert corrected_context_out is not None
+            context_attn_out_cor, context_lse_cor = cp_lse_ag_out_rs(
+                context_attn_out,
+                context_lse.transpose(0, 1),
+                get_dcp_group(),
+                return_lse=True,
+                corrected_out=corrected_context_out,
+            )
+        else:
+            context_attn_out_cor, context_lse_cor = self.dcp_combine(
+                context_attn_out,
+                context_lse.transpose(0, 1),
+                get_dcp_group(),
+                return_lse=True,
+            )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
         if trace_payload is not None:
             trace_payload["combined_context_output"] = (
@@ -1441,13 +1523,28 @@ class FlashAttentionImpl(AttentionImpl):
             trace_payload["live_lse"] = query_lse.detach().clone()
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape
-        merge_attn_states(
-            output,
-            context_attn_out_cor,
-            context_lse_cor,
-            query_attn_out,
-            query_lse,
-        )
+        if fp32_combine:
+            assert live_fp32 is not None
+            assert merged_fp32 is not None
+            assert context_attn_out_cor.dtype == torch.float32
+            assert query_lse.dtype == torch.float32
+            live_fp32.copy_(query_attn_out)
+            merge_attn_states(
+                merged_fp32,
+                context_attn_out_cor,
+                context_lse_cor,
+                live_fp32,
+                query_lse,
+            )
+            output.copy_(merged_fp32)
+        else:
+            merge_attn_states(
+                output,
+                context_attn_out_cor,
+                context_lse_cor,
+                query_attn_out,
+                query_lse,
+            )
         if trace_payload is not None:
             trace_layer_name = str(trace_payload.pop("_layer_name"))
             trace_payload["final_output"] = output.detach().clone()

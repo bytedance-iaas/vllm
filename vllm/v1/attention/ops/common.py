@@ -15,6 +15,9 @@ def _correct_attn_cp_out_kernel(
     outputs_stride_B,
     outputs_stride_H,
     outputs_stride_D,
+    new_output_stride_B,
+    new_output_stride_H,
+    new_output_stride_D,
     lses_stride_N,
     lses_stride_B,
     lses_stride_H,
@@ -75,6 +78,11 @@ def _correct_attn_cp_out_kernel(
         + head_idx * outputs_stride_H
         + d_offsets * outputs_stride_D
     )
+    new_output_offsets = (
+        batch_idx * new_output_stride_B
+        + head_idx * new_output_stride_H
+        + d_offsets * new_output_stride_D
+    )
 
     # correct output
     lse_offset = (
@@ -92,7 +100,7 @@ def _correct_attn_cp_out_kernel(
     output = output * factor
     output = tl.where(factor == 0.0, 0.0, output)
 
-    tl.store(new_output_ptr + output_offsets, output)
+    tl.store(new_output_ptr + new_output_offsets, output)
 
 
 class CPTritonContext:
@@ -114,6 +122,7 @@ def correct_attn_out(
     cp_rank: int,
     ctx: CPTritonContext,
     is_lse_base_on_e: bool = True,
+    corrected_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
 
@@ -133,6 +142,9 @@ def correct_attn_out(
     if out.ndim == 4 and out.shape[1] == 1:
         out = out.squeeze(1)
     assert out.ndim == 3, f"expected out [B,H,D] or [B,1,H,D], got {tuple(out.shape)}"
+    if corrected_out is not None and corrected_out.ndim == 4:
+        assert corrected_out.shape[1] == 1
+        corrected_out = corrected_out.squeeze(1)
 
     if lses.ndim == 4 and lses.shape[-1] == 1:
         lses = lses.squeeze(-1)
@@ -145,11 +157,16 @@ def correct_attn_out(
 
     B, H, D = out.shape
     N = lses.shape[0]
+    if corrected_out is None:
+        corrected_out = out
+    assert corrected_out.shape == out.shape
+    assert corrected_out.device == out.device
 
     # Strides after we normalized shapes to 3-D views.  The kernel computes
     # offsets for `vlse_ptr` using lses_stride_B/H, so the output buffer must
     # have the same B/H stride layout as a slice of `lses`.
     o_sB, o_sH, o_sD = out.stride()
+    n_sB, n_sH, n_sD = corrected_out.stride()
     l_sN, l_sB, l_sH = lses.stride()
 
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
@@ -163,12 +180,15 @@ def correct_attn_out(
 
     regular_args = (
         out,
-        out,
+        corrected_out,
         lses,
         lse,
         o_sB,
         o_sH,
         o_sD,
+        n_sB,
+        n_sH,
+        n_sD,
         l_sN,
         l_sB,
         l_sH,
@@ -176,7 +196,7 @@ def correct_attn_out(
     )
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
-    return out, lse
+    return corrected_out, lse
 
 
 def _cp_lse_common(
@@ -185,6 +205,7 @@ def _cp_lse_common(
     cp_group: GroupCoordinator,
     ctx: CPTritonContext | None = None,
     is_lse_base_on_e=True,
+    corrected_out: torch.Tensor | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -206,6 +227,7 @@ def _cp_lse_common(
         cp_group.rank_in_group,
         ctx,
         is_lse_base_on_e=is_lse_base_on_e,
+        corrected_out=corrected_out,
     )
     return out, lse
 
@@ -217,13 +239,19 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    corrected_out: torch.Tensor | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
     """
     out, lse = _cp_lse_common(
-        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
+        cp_attn_out,
+        cp_attn_lse,
+        cp_group,
+        ctx=ctx,
+        is_lse_base_on_e=is_lse_base_on_e,
+        corrected_out=corrected_out,
     )
     out = cp_group.reduce_scatter(out, dim=1)
 
