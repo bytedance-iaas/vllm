@@ -19,6 +19,22 @@ def test_trace_paged_cache_rows_follows_block_table() -> None:
     assert torch.equal(rows, expected)
 
 
+def test_pack_paged_cache_rows_follows_each_request_block_table() -> None:
+    cache = torch.arange(4 * 4 * 2).view(4, 4, 1, 2)
+    block_table = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+
+    rows = flash_attn._pack_paged_cache_rows(cache, block_table, max_rows=6)
+
+    expected = torch.stack(
+        (
+            torch.cat((cache[2], cache[0][:2])),
+            torch.cat((cache[1], cache[3][:2])),
+        ),
+        dim=0,
+    )
+    assert torch.equal(rows, expected)
+
+
 @pytest.mark.parametrize(
     ("world_size", "interleave", "context_len", "max_local_len"),
     [
@@ -96,9 +112,11 @@ def test_dcp_eagle_fp32_combine_gate(
     ),
     [
         (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, True, False, True),
+        (True, "language_model.model.layers.2.self_attn.attn", 1, 4, 128, True, False, True),
+        (True, "language_model.model.layers.3.self_attn.attn", 1, 4, 128, True, False, False),
         (False, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, True, False, False),
         (True, "model.layers.0.self_attn.attn", 1, 4, 128, True, False, False),
-        (True, "language_model.model.layers.0.self_attn.attn", 2, 4, 128, True, False, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 2, 4, 128, True, False, True),
         (True, "language_model.model.layers.0.self_attn.attn", 1, 5, 128, True, False, False),
         (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 0, True, False, False),
         (True, "language_model.model.layers.0.self_attn.attn", 1, 4, 128, False, False, False),
@@ -123,13 +141,111 @@ def test_dcp_eagle_full_context_attn_gate(
     )
     impl = object.__new__(flash_attn.FlashAttentionImpl)
     impl._dcp_eagle_full_context_attn = enabled
+    impl._dcp_eagle_full_context_model_ok = True
+    impl._dcp_eagle_full_context_max_batch = 8
+    impl._dcp_eagle_full_context_max_context_tokens = 1024
     impl._dcp_eagle_max_query_len = 4
     layer = SimpleNamespace(layer_name=layer_name)
+    query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32) * max_query_len
     metadata = SimpleNamespace(
-        query_start_loc=torch.zeros(num_reqs + 1, dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        seq_lens=torch.full((num_reqs,), max_query_len + max_context_len),
         max_query_len=max_query_len,
         max_dcp_context_kv_len=max_context_len,
         dcp_context_kv_lens=torch.ones(num_reqs) if has_context_lens else None,
+    )
+    output = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+
+    assert impl._use_dcp_eagle_full_context_attn(layer, metadata, output) is expected
+
+
+@pytest.mark.parametrize(
+    (
+        "query_start_loc",
+        "seq_lens",
+        "max_batch",
+        "max_total_context_tokens",
+        "model_ok",
+        "expected",
+    ),
+    [
+        (
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+            torch.tensor([132, 132]),
+            8,
+            1024,
+            True,
+            True,
+        ),
+        (
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+            torch.tensor([132, 4]),
+            8,
+            1024,
+            True,
+            False,
+        ),
+        (
+            torch.tensor([0, 0, 4], dtype=torch.int32),
+            torch.tensor([128, 132]),
+            8,
+            1024,
+            True,
+            False,
+        ),
+        (
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+            torch.tensor([132, 132]),
+            1,
+            1024,
+            True,
+            False,
+        ),
+        (
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+            torch.tensor([804, 804]),
+            8,
+            1024,
+            True,
+            False,
+        ),
+        (
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+            torch.tensor([132, 132]),
+            8,
+            1024,
+            False,
+            False,
+        ),
+    ],
+)
+def test_dcp_eagle_full_context_attn_fail_closed_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_batch: int,
+    max_total_context_tokens: int,
+    model_ok: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        flash_attn.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: False,
+    )
+    impl = object.__new__(flash_attn.FlashAttentionImpl)
+    impl._dcp_eagle_full_context_attn = True
+    impl._dcp_eagle_full_context_model_ok = model_ok
+    impl._dcp_eagle_full_context_max_batch = max_batch
+    impl._dcp_eagle_full_context_max_context_tokens = max_total_context_tokens
+    impl._dcp_eagle_max_query_len = 4
+    layer = SimpleNamespace(layer_name="language_model.model.layers.0.self_attn.attn")
+    metadata = SimpleNamespace(
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_query_len=4,
+        max_dcp_context_kv_len=128,
+        dcp_context_kv_lens=torch.ones(query_start_loc.shape[0] - 1),
     )
     output = torch.empty((1, 8, 128), dtype=torch.bfloat16)
 

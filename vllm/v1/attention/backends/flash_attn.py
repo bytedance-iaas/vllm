@@ -82,11 +82,33 @@ def _trace_paged_cache_rows(
     block_table: torch.Tensor,
     max_rows: int,
 ) -> torch.Tensor:
+    return _paged_cache_rows(cache, block_table[0], max_rows).detach().clone()
+
+
+def _paged_cache_rows(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    max_rows: int,
+) -> torch.Tensor:
     block_size = cache.shape[1]
     num_blocks = cdiv(max_rows, block_size)
-    block_ids = block_table[0, :num_blocks].to(torch.long)
+    block_ids = block_table_row[:num_blocks].to(torch.long)
     rows = cache.index_select(0, block_ids).flatten(0, 1)
-    return rows[:max_rows].detach().clone()
+    return rows[:max_rows]
+
+
+def _pack_paged_cache_rows(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    max_rows: int,
+) -> torch.Tensor:
+    return torch.stack(
+        [
+            _paged_cache_rows(cache, block_table[req_idx], max_rows)
+            for req_idx in range(block_table.shape[0])
+        ],
+        dim=0,
+    )
 
 
 def _restore_dcp_global_context_rows(
@@ -112,6 +134,37 @@ def _restore_dcp_global_context_rows(
     )
     gathered_idx = owner_rank * max_local_len + local_idx
     return gathered_local_rows.index_select(0, gathered_idx)
+
+
+def _minimax_m3_initial_dense_layer_id(layer_name: str) -> int | None:
+    prefix = "language_model.model.layers."
+    suffix = ".self_attn.attn"
+    if not layer_name.startswith(prefix) or not layer_name.endswith(suffix):
+        return None
+    layer_id_str = layer_name[len(prefix) : -len(suffix)]
+    if not layer_id_str.isdigit():
+        return None
+    layer_id = int(layer_id_str)
+    return layer_id if 0 <= layer_id <= 2 else None
+
+
+def _dcp_eagle_full_context_batch_ok(
+    attn_metadata: "FlashAttentionMetadata",
+    *,
+    max_batch_size: int,
+    max_total_context_tokens: int,
+) -> bool:
+    num_reqs = attn_metadata.query_start_loc.shape[0] - 1
+    if num_reqs <= 0 or num_reqs > max_batch_size:
+        return False
+    query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+    if not bool(torch.all(query_lens > 0).item()):
+        return False
+    seq_lens = attn_metadata.seq_lens[:num_reqs]
+    context_lens = seq_lens - query_lens
+    if not bool(torch.all(context_lens > 0).item()):
+        return False
+    return int(torch.sum(context_lens).item()) <= max_total_context_tokens
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -851,6 +904,9 @@ class FlashAttentionImpl(AttentionImpl):
         self._dcp_max_num_tokens: int = 0
         self._dcp_eagle_fp32_combine = False
         self._dcp_eagle_full_context_attn = False
+        self._dcp_eagle_full_context_model_ok = False
+        self._dcp_eagle_full_context_max_batch = 8
+        self._dcp_eagle_full_context_max_context_tokens = 1_048_576
         self._dcp_eagle_max_query_len = 0
         self._cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
@@ -883,6 +939,20 @@ class FlashAttentionImpl(AttentionImpl):
                 and speculative_config.method == "eagle3"
                 and not vllm_config.parallel_config.use_ubatching
                 and self._dcp_dtype == torch.bfloat16
+            )
+            hf_config = getattr(vllm_config.model_config, "hf_config", None)
+            architectures = getattr(hf_config, "architectures", None) or []
+            self._dcp_eagle_full_context_model_ok = any(
+                "MiniMaxM3" in str(arch) for arch in architectures
+            )
+            self._dcp_eagle_full_context_max_batch = int(
+                os.getenv("VLLM_DCP_EAGLE_FULL_CONTEXT_ATTN_MAX_BATCH", "8")
+            )
+            self._dcp_eagle_full_context_max_context_tokens = int(
+                os.getenv(
+                    "VLLM_DCP_EAGLE_FULL_CONTEXT_ATTN_MAX_CONTEXT_TOKENS",
+                    "1048576",
+                )
             )
             if self._dcp_eagle_fp32_combine:
                 self._dcp_eagle_max_query_len = 1 + int(
@@ -1336,13 +1406,20 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> bool:
         return (
             self._dcp_eagle_full_context_attn
-            and layer.layer_name.startswith("language_model.model.layers.")
-            and attn_metadata.query_start_loc.shape[0] == 2
+            and self._dcp_eagle_full_context_model_ok
+            and _minimax_m3_initial_dense_layer_id(layer.layer_name) is not None
             and 0 < attn_metadata.max_query_len <= self._dcp_eagle_max_query_len
             and attn_metadata.max_dcp_context_kv_len is not None
             and attn_metadata.max_dcp_context_kv_len > 0
             and attn_metadata.dcp_context_kv_lens is not None
             and output.dtype == torch.bfloat16
+            and _dcp_eagle_full_context_batch_ok(
+                attn_metadata,
+                max_batch_size=self._dcp_eagle_full_context_max_batch,
+                max_total_context_tokens=(
+                    self._dcp_eagle_full_context_max_context_tokens
+                ),
+            )
             and not torch.cuda.is_current_stream_capturing()
         )
 
@@ -1659,59 +1736,80 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         assert attn_metadata.max_dcp_context_kv_len is not None
         cu_seqlens_q = attn_metadata.query_start_loc
-        query_len = int((cu_seqlens_q[1] - cu_seqlens_q[0]).item())
-        seq_len = int(attn_metadata.seq_lens[0].item())
-        context_len = seq_len - query_len
-        assert context_len > 0
+        query_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+        seq_lens = attn_metadata.seq_lens[: len(query_lens)].tolist()
+        context_lens = [
+            int(seq_len) - int(query_len)
+            for seq_len, query_len in zip(seq_lens, query_lens)
+        ]
+        assert all(context_len > 0 for context_len in context_lens)
         max_local_len = attn_metadata.max_dcp_context_kv_len
 
-        local_key_rows = _trace_paged_cache_rows(
+        local_key_rows = _pack_paged_cache_rows(
             key_cache,
-            attn_metadata.block_table,
+            attn_metadata.block_table[: len(query_lens)],
             max_local_len,
         )
-        local_value_rows = _trace_paged_cache_rows(
+        local_value_rows = _pack_paged_cache_rows(
             value_cache,
-            attn_metadata.block_table,
+            attn_metadata.block_table[: len(query_lens)],
             max_local_len,
         )
         gathered_key_rows = get_dcp_group().all_gather(
             local_key_rows.contiguous(),
-            dim=0,
+            dim=1,
         )
         gathered_value_rows = get_dcp_group().all_gather(
             local_value_rows.contiguous(),
-            dim=0,
-        )
-        context_key = _restore_dcp_global_context_rows(
-            gathered_key_rows,
-            context_len=context_len,
-            dcp_world_size=self.dcp_world_size,
-            cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
-            max_local_len=max_local_len,
-        )
-        context_value = _restore_dcp_global_context_rows(
-            gathered_value_rows,
-            context_len=context_len,
-            dcp_world_size=self.dcp_world_size,
-            cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
-            max_local_len=max_local_len,
+            dim=1,
         )
 
-        live_key = key.contiguous()
-        live_value = value.contiguous()
-        if context_key.dtype != live_key.dtype:
-            assert self.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            assert k_descale is not None
-            assert v_descale is not None
-            live_key = self._quantize_dcp_live_kv(live_key, k_descale)
-            live_value = self._quantize_dcp_live_kv(live_value, v_descale)
-        full_key = torch.cat((context_key, live_key), dim=0)
-        full_value = torch.cat((context_value, live_value), dim=0)
+        full_keys = []
+        full_values = []
+        cu_seqlens_k_values = [0]
+        for req_idx, (query_len, context_len) in enumerate(
+            zip(query_lens, context_lens)
+        ):
+            context_key = _restore_dcp_global_context_rows(
+                gathered_key_rows[req_idx],
+                context_len=int(context_len),
+                dcp_world_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
+                max_local_len=max_local_len,
+            )
+            context_value = _restore_dcp_global_context_rows(
+                gathered_value_rows[req_idx],
+                context_len=int(context_len),
+                dcp_world_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
+                max_local_len=max_local_len,
+            )
+            query_start = int(cu_seqlens_q[req_idx].item())
+            query_end = int(cu_seqlens_q[req_idx + 1].item())
+            live_key = key[query_start:query_end].contiguous()
+            live_value = value[query_start:query_end].contiguous()
+            if context_key.dtype != live_key.dtype:
+                assert self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+                assert k_descale is not None
+                assert v_descale is not None
+                live_key = self._quantize_dcp_live_kv(live_key, k_descale)
+                live_value = self._quantize_dcp_live_kv(live_value, v_descale)
+            full_keys.append(torch.cat((context_key, live_key), dim=0))
+            full_values.append(torch.cat((context_value, live_value), dim=0))
+            cu_seqlens_k_values.append(
+                cu_seqlens_k_values[-1] + int(context_len) + int(query_len)
+            )
+
+        full_key = torch.cat(full_keys, dim=0)
+        full_value = torch.cat(full_values, dim=0)
         cu_seqlens_k = torch.tensor(
-            [0, context_len + query_len],
+            cu_seqlens_k_values,
             dtype=cu_seqlens_q.dtype,
             device=cu_seqlens_q.device,
+        )
+        max_seqlen_k = max(
+            int(context_len) + int(query_len)
+            for context_len, query_len in zip(context_lens, query_lens)
         )
         full_out = torch.empty(
             query_across_dcp.shape,
@@ -1726,7 +1824,7 @@ class FlashAttentionImpl(AttentionImpl):
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=attn_metadata.max_query_len,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_k=context_len + query_len,
+            max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
             causal=attn_metadata.causal,
             alibi_slopes=self.alibi_slopes,
@@ -1748,8 +1846,9 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         if trace_payload is not None:
-            trace_payload["full_context_key"] = context_key.detach().clone()
-            trace_payload["full_context_value"] = context_value.detach().clone()
+            trace_payload["full_context_key"] = full_key.detach().clone()
+            trace_payload["full_context_value"] = full_value.detach().clone()
+            trace_payload["full_context_cu_seqlens_k"] = cu_seqlens_k.detach().clone()
             trace_payload["full_context_output"] = full_attn_out.detach().clone()
             trace_payload["full_context_lse"] = full_lse.detach().clone()
             trace_layer_name = str(trace_payload.pop("_layer_name"))
