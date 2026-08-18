@@ -20,9 +20,16 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm import _custom_ops as ops
+from vllm import ir
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
@@ -140,6 +147,14 @@ class MiniMAXGemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if torch.compiler.is_compiling():
+            weight = self.weight.float() + 1.0
+            if residual is None:
+                return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+            return ir.ops.fused_add_rms_norm(
+                x, residual, weight, self.variance_epsilon
+            )
+
         from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 
         if residual is None:
@@ -707,10 +722,19 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # Dense layers store the FFN under `mlp`; MoE layers under
         # `block_sparse_moe` -- matching the checkpoint's naming.
         # Leave the FFN output un-reduced so its all-reduce fuses into the
-        # next RMSNorm. MTP blocks add the residual directly and PP sends
-        # hidden states across stages, so both must reduce.
+        # next RMSNorm. MTP blocks add the residual directly and must reduce.
+        # PP normally reduces before boundary send; compile SP materializes
+        # only the local PP stage boundary while keeping internal layers
+        # deferred so residual token-sharding stays consistent across layers.
+        compile_sequence_parallel = bool(
+            vllm_config.compilation_config.pass_config.enable_sp
+        )
         reduce_results = (
-            is_mtp_block or vllm_config.parallel_config.pipeline_parallel_size > 1
+            is_mtp_block
+            or (
+                vllm_config.parallel_config.pipeline_parallel_size > 1
+                and not compile_sequence_parallel
+            )
         )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
@@ -745,9 +769,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_input_allreduce and residual is not None:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
-            )
+            if torch.compiler.is_compiling():
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            else:
+                hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, self.input_layernorm
+                )
         else:
             if residual is None:
                 residual = hidden_states
@@ -759,12 +787,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states,
-            residual,
-            self.post_attention_layernorm,
-            force_unfused=self.force_unfused_post_attn_norm,
-        )
+        if torch.compiler.is_compiling():
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm,
+                force_unfused=self.force_unfused_post_attn_norm,
+            )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
@@ -784,6 +818,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
             self.mlp.down_proj.reduce_results = not defer
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
@@ -793,6 +835,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.compile_sequence_parallel = bool(
+            vllm_config.compilation_config.pass_config.enable_sp
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -850,7 +895,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self._original_ffn_all_reduce_deferred = tuple(
             layer.ffn_all_reduce_deferred for layer in local_layers
         )
-        self._configure_deferred_allreduce(())
+        materialized_boundaries: tuple[int, ...] = ()
+        if self.compile_sequence_parallel and not get_pp_group().is_last_rank:
+            materialized_boundaries = (len(local_layers),)
+        self._configure_deferred_allreduce(materialized_boundaries)
 
     def _configure_deferred_allreduce(
         self,
@@ -897,6 +945,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        full_num_tokens = positions.shape[0]
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -920,14 +969,24 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            if (
+                self.compile_sequence_parallel
+                and residual.shape[0] != full_num_tokens
+            ):
+                residual = tensor_model_parallel_all_gather(residual, dim=0)
+                residual = residual[:full_num_tokens]
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
         if self.fuse_final_norm_allreduce:
-            hidden_states, _ = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.norm
-            )
+            if torch.compiler.is_compiling():
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, _ = self.norm(hidden_states, residual)
+            else:
+                hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, self.norm
+                )
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
 
