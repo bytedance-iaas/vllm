@@ -106,12 +106,13 @@ def get_sequence_parallelism_threshold(
     return int(min_size // (hidden_size * element_size))
 
 
-def get_first_out_wrapper(
+def get_output_wrapper(
     fn: Callable[..., Sequence[torch.Tensor]],
+    index: int,
 ) -> Callable[..., torch.Tensor]:
     @functools.wraps(fn)
     def wrapper(*args: Any) -> torch.Tensor:
-        return fn(*args)[0]
+        return fn(*args)[index]
 
     return wrapper
 
@@ -253,8 +254,15 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
         pm.register_replacement(
-            get_first_out_wrapper(pattern),
-            get_first_out_wrapper(replacement),
+            get_output_wrapper(pattern, 0),
+            get_output_wrapper(replacement, 0),
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+        )
+        pm.register_replacement(
+            get_output_wrapper(pattern, 1),
+            get_output_wrapper(replacement, 1),
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
@@ -366,8 +374,8 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
         )
 
         pm.register_replacement(
-            get_first_out_wrapper(pattern),
-            get_first_out_wrapper(replacement),
+            get_output_wrapper(pattern, 0),
+            get_output_wrapper(replacement, 0),
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,

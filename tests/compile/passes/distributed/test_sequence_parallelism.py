@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import vllm.envs as envs
+import vllm.ir.ops
 from tests.compile.backend import TestBackend
 from tests.utils import TestFP8Layer, multi_gpu_test
 from vllm.compilation.passes.fusion.rms_quant_fusion import RMSNormQuantFusionPass
@@ -94,6 +95,26 @@ class TestAllReduceRMSNormModel(torch.nn.Module):
         ]
 
 
+class TestAllReduceRMSNormResidualOnlyModel(TestAllReduceRMSNormModel):
+    def forward(self, x):
+        z = torch.relu(x)
+        x = resid = tensor_model_parallel_all_reduce(z)
+        y = self.norm[0](x)
+
+        z2 = torch.mm(y, self.w[0])
+        x2 = tensor_model_parallel_all_reduce(z2)
+        y2, resid = self.norm[1](x2, resid)
+
+        z3 = torch.mm(y2, self.w[1])
+        x3 = tensor_model_parallel_all_reduce(z3)
+        y3, resid = self.norm[2](x3, resid)
+
+        z4 = torch.mm(y3, self.w[2])
+        x4 = tensor_model_parallel_all_reduce(z4)
+        _, resid = self.norm[3](x4, resid)
+        return vllm.ir.ops.sequence_parallel_boundary(resid)
+
+
 class TestAllReduceRMSNormStaticQuantFP8Model(torch.nn.Module):
     quant_key = kFp8StaticTensorSym
 
@@ -167,6 +188,8 @@ class TestAllReduceRMSNormStaticQuantFP8Model(torch.nn.Module):
     [
         (TestAllReduceRMSNormModel, "+rms_norm"),
         (TestAllReduceRMSNormModel, "-rms_norm"),
+        (TestAllReduceRMSNormResidualOnlyModel, "+rms_norm"),
+        (TestAllReduceRMSNormResidualOnlyModel, "-rms_norm"),
         (TestAllReduceRMSNormStaticQuantFP8Model, "+rms_norm,+quant_fp8"),
         (TestAllReduceRMSNormStaticQuantFP8Model, "+rms_norm,-quant_fp8"),
         (TestAllReduceRMSNormStaticQuantFP8Model, "-rms_norm,+quant_fp8"),
