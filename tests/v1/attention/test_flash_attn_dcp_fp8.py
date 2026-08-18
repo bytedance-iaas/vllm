@@ -20,28 +20,30 @@ def test_trace_paged_cache_rows_follows_block_table() -> None:
 
 
 @pytest.mark.parametrize(
-    ("enabled", "layer_name", "num_prefill_reqs", "num_prefill_tokens", "expected"),
+    ("enabled", "layer_name", "max_query_len", "max_context_len", "expected"),
     [
-        (True, "language_model.model.layers.0.self_attn.attn", 0, 0, True),
-        (False, "language_model.model.layers.0.self_attn.attn", 0, 0, False),
-        (True, "model.layers.60.self_attn.attn", 0, 0, False),
-        (True, "language_model.model.layers.0.self_attn.attn", 1, 0, False),
-        (True, "language_model.model.layers.0.self_attn.attn", 0, 1, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 1, 128, True),
+        (True, "language_model.model.layers.0.self_attn.attn", 4, 128, True),
+        (False, "language_model.model.layers.0.self_attn.attn", 4, 128, False),
+        (True, "model.layers.60.self_attn.attn", 4, 128, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 5, 128, False),
+        (True, "language_model.model.layers.0.self_attn.attn", 4, 0, False),
     ],
 )
 def test_dcp_eagle_fp32_combine_gate(
     enabled: bool,
     layer_name: str,
-    num_prefill_reqs: int,
-    num_prefill_tokens: int,
+    max_query_len: int,
+    max_context_len: int,
     expected: bool,
 ) -> None:
     impl = object.__new__(flash_attn.FlashAttentionImpl)
     impl._dcp_eagle_fp32_combine = enabled
+    impl._dcp_eagle_max_query_len = 4
     layer = SimpleNamespace(layer_name=layer_name)
     metadata = SimpleNamespace(
-        num_prefill_reqs=num_prefill_reqs,
-        num_prefill_tokens=num_prefill_tokens,
+        max_query_len=max_query_len,
+        max_dcp_context_kv_len=max_context_len,
     )
     output = torch.empty((1, 8, 128), dtype=torch.bfloat16)
 

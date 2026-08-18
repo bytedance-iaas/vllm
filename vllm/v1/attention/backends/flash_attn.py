@@ -825,6 +825,7 @@ class FlashAttentionImpl(AttentionImpl):
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
         self._dcp_eagle_fp32_combine = False
+        self._dcp_eagle_max_query_len = 0
         self._cp_kv_cache_interleave_size = (
             vllm_config.parallel_config.cp_kv_cache_interleave_size
             if vllm_config is not None
@@ -842,10 +843,15 @@ class FlashAttentionImpl(AttentionImpl):
                 and self.dcp_world_size == 2
                 and vllm_config.parallel_config.dcp_comm_backend == "ag_rs"
                 and speculative_config is not None
-                and speculative_config.use_eagle()
+                and speculative_config.method == "eagle3"
+                and not vllm_config.parallel_config.use_ubatching
                 and self._dcp_dtype == torch.bfloat16
                 and self.head_size % 4 == 0
             )
+            if self._dcp_eagle_fp32_combine:
+                self._dcp_eagle_max_query_len = 1 + int(
+                    speculative_config.num_speculative_tokens
+                )
             if self._dcp_eagle_fp32_combine and is_workspace_manager_initialized():
                 full_shape = (
                     self._dcp_max_num_tokens,
@@ -1270,8 +1276,9 @@ class FlashAttentionImpl(AttentionImpl):
         return (
             self._dcp_eagle_fp32_combine
             and layer.layer_name.startswith("language_model.model.layers.")
-            and attn_metadata.num_prefill_reqs == 0
-            and attn_metadata.num_prefill_tokens == 0
+            and 0 < attn_metadata.max_query_len <= self._dcp_eagle_max_query_len
+            and attn_metadata.max_dcp_context_kv_len is not None
+            and attn_metadata.max_dcp_context_kv_len > 0
             and output.dtype == torch.bfloat16
         )
 

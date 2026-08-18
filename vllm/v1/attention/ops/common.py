@@ -108,10 +108,19 @@ class CPTritonContext:
 
     def __init__(self):
         self.inner_kernel = None
+        self.specialization_key = None
 
-    def call_kernel(self, kernel, grid, *regular_args, **const_args):
-        if self.inner_kernel is None:
+    def call_kernel(
+        self,
+        kernel,
+        grid,
+        *regular_args,
+        specialization_key=None,
+        **const_args,
+    ):
+        if self.inner_kernel is None or self.specialization_key != specialization_key:
             self.inner_kernel = kernel[grid](*regular_args, **const_args)
+            self.specialization_key = specialization_key
         else:
             self.inner_kernel[grid](*regular_args)
 
@@ -195,7 +204,21 @@ def correct_attn_out(
         cp_rank,
     )
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
-    ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
+    specialization_key = (
+        out.dtype,
+        corrected_out.dtype,
+        lses.dtype,
+        D,
+        N,
+        is_lse_base_on_e,
+    )
+    ctx.call_kernel(
+        _correct_attn_cp_out_kernel,
+        grid,
+        *regular_args,
+        specialization_key=specialization_key,
+        **const_args,
+    )
     return corrected_out, lse
 
 
