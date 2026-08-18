@@ -837,6 +837,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self.compile_sequence_parallel = bool(
             vllm_config.compilation_config.pass_config.enable_sp
         )
+        self._intermediate_residual_key = (
+            "residual_full" if self.compile_sequence_parallel else "residual"
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -887,7 +890,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states", self._intermediate_residual_key], config.hidden_size
         )
 
         local_layers = self.layers[self.start_layer : self.end_layer]
@@ -953,7 +956,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            residual = intermediate_tensors[self._intermediate_residual_key]
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
@@ -970,7 +973,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             if self.compile_sequence_parallel:
                 residual = ir.ops.sequence_parallel_boundary(residual)
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    self._intermediate_residual_key: residual,
+                }
             )
 
         if self.fuse_final_norm_allreduce:
