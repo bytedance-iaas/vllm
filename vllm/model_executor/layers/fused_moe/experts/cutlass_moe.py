@@ -4,6 +4,7 @@
 
 from contextlib import nullcontext
 import json
+import math
 import os
 
 import torch
@@ -70,6 +71,13 @@ _W4A8_SUPPORTED_SCHEDULES = {
 }
 
 
+def _w4a8_debug_schedule_override_value() -> str | None:
+    schedule = os.environ.get("VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE")
+    if not schedule:
+        return None
+    return schedule.strip()
+
+
 def _w4a8_debug_enabled() -> bool:
     return os.environ.get("VLLM_W4A8_DEBUG_INSTRUMENT", "").lower() in (
         "1",
@@ -89,7 +97,7 @@ def _w4a8_debug_max_records() -> int:
 
 
 def _w4a8_debug_schedule_override() -> str | None:
-    schedule = os.environ.get("VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE")
+    schedule = _w4a8_debug_schedule_override_value()
     if not schedule:
         return None
     if schedule == "heuristic":
@@ -101,6 +109,19 @@ def _w4a8_debug_schedule_override() -> str | None:
         )
         return None
     return schedule
+
+
+def _w4a8_debug_force_heuristic() -> bool:
+    return _w4a8_debug_schedule_override_value() == "heuristic"
+
+
+def _w4a8_float_eq(value: float | None, expected: float) -> bool:
+    return value is not None and math.isclose(
+        value,
+        expected,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    )
 
 
 def _w4a8_debug_profile_phases() -> bool:
@@ -320,6 +341,37 @@ def _select_w4a8_batched_schedule(
     if m_expert <= 128:
         return "Kernel_256x128_2x1x1_Coop"
     return "Kernel_128x256_2x1x1_Coop"
+
+
+def _select_w4a8_standard_schedule(
+    *,
+    input_tokens: int,
+    topk: int,
+    local_num_experts: int,
+    global_num_experts: int,
+    n: int,
+    k: int,
+    activation: MoEActivation,
+    gemm1_alpha: float | None,
+    gemm1_beta: float | None,
+    gemm1_clamp_limit: float | None,
+) -> str | None:
+    # MiniMax-M3's full long-prefill chunks favor the narrower N tile. Keep the
+    # specialization within the exact model semantics and chunk size measured.
+    if (
+        input_tokens == 8192
+        and topk == 4
+        and local_num_experts == 32
+        and global_num_experts == 128
+        and n == 3072
+        and k == 6144
+        and activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and _w4a8_float_eq(gemm1_alpha, 1.702)
+        and _w4a8_float_eq(gemm1_beta, 1.0)
+        and _w4a8_float_eq(gemm1_clamp_limit, 7.0)
+    ):
+        return "Kernel_256x32_1x1x1_Coop"
+    return None
 
 
 def _select_w4a8_compact_programs(
@@ -1822,6 +1874,19 @@ def run_cutlass_moe_w4a8_fp8(
         debug_expert_token_counts = (
             expert_first_token_offset[1:] - expert_first_token_offset[:-1]
         )
+        if schedule is None and not _w4a8_debug_force_heuristic():
+            schedule = _select_w4a8_standard_schedule(
+                input_tokens=hidden_states.size(0),
+                topk=topk,
+                local_num_experts=local_E,
+                global_num_experts=global_num_experts,
+                n=N,
+                k=K,
+                activation=activation,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_beta=gemm1_beta,
+                gemm1_clamp_limit=gemm1_clamp_limit,
+            )
 
     _w4a8_debug_log_metadata(
         path=debug_path,

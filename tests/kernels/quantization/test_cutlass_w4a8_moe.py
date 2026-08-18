@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+    _select_w4a8_standard_schedule,
+    _w4a8_debug_force_heuristic,
+    _w4a8_debug_schedule_override,
     run_cutlass_moe_w4a8_fp8,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -101,6 +104,57 @@ TEST_SHAPES = [
     (128, 8192, 4096),  # test overflow int32
 ]
 ALIGNMENT = 16  # torch._scaled_mm alignment for M, needed for reference check
+
+
+def test_w4a8_minimax_standard_schedule_guard():
+    schedule = _select_w4a8_standard_schedule(
+        input_tokens=8192,
+        topk=4,
+        local_num_experts=32,
+        global_num_experts=128,
+        n=3072,
+        k=6144,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        gemm1_alpha=1.7020001,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+    assert schedule == "Kernel_256x32_1x1x1_Coop"
+
+    common_kwargs = {
+        "input_tokens": 8192,
+        "topk": 4,
+        "local_num_experts": 32,
+        "global_num_experts": 128,
+        "n": 3072,
+        "k": 6144,
+        "activation": MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        "gemm1_alpha": 1.702,
+        "gemm1_beta": 1.0,
+        "gemm1_clamp_limit": 7.0,
+    }
+    assert _select_w4a8_standard_schedule(
+        **{**common_kwargs, "input_tokens": 4096}
+    ) is None
+    assert _select_w4a8_standard_schedule(
+        **{**common_kwargs, "local_num_experts": 16}
+    ) is None
+    assert _select_w4a8_standard_schedule(
+        **{**common_kwargs, "activation": MoEActivation.SILU}
+    ) is None
+
+
+def test_w4a8_heuristic_schedule_override(monkeypatch):
+    monkeypatch.setenv("VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE", " heuristic ")
+    assert _w4a8_debug_schedule_override() is None
+    assert _w4a8_debug_force_heuristic()
+
+    monkeypatch.setenv(
+        "VLLM_W4A8_DEBUG_SCHEDULE_OVERRIDE",
+        "Kernel_256x32_1x1x1_Coop",
+    )
+    assert _w4a8_debug_schedule_override() == "Kernel_256x32_1x1x1_Coop"
+    assert not _w4a8_debug_force_heuristic()
 
 
 @dataclass
