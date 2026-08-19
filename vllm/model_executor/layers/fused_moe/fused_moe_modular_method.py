@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -115,4 +115,26 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             expert_map=layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_chunked_finalize_rs(
+        self,
+        layer: "RoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        chunked_finalize_rs: Any,
+    ) -> torch.Tensor:
+        assert self.moe_kernel is not None
+        return self.moe_kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            expert_map=layer.expert_map,
+            chunked_finalize_rs=chunked_finalize_rs,
         )

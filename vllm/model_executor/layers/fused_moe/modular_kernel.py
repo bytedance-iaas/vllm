@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
-from typing import final
+from typing import Any, cast, final
 
 import torch
 
@@ -1248,6 +1248,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        chunked_finalize_rs: Any | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1278,7 +1279,9 @@ class FusedMoEKernelModularImpl:
 
         # Implementations that already reduce into the final shape can write
         # directly to caller output and skip TopKWeightAndReduceNoOP.copy_.
-        use_output_alias = self.fused_experts.supports_output_alias()
+        use_output_alias = (
+            chunked_finalize_rs is None and self.fused_experts.supports_output_alias()
+        )
         if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1294,7 +1297,7 @@ class FusedMoEKernelModularImpl:
         ):
             fused_out = output_alias
 
-        self.fused_experts.apply(
+        apply_kwargs = dict(
             output=fused_out,
             hidden_states=a1q,
             w1=w1,
@@ -1311,6 +1314,17 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta=expert_tokens_meta,
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
+        if chunked_finalize_rs is None:
+            self.fused_experts.apply(**apply_kwargs)
+        else:
+            apply_chunked = cast(Any, self.fused_experts.apply)
+            result = apply_chunked(
+                **apply_kwargs,
+                chunked_finalize_rs=chunked_finalize_rs,
+            )
+            if not isinstance(result, torch.Tensor):
+                raise RuntimeError("Chunked MoE finalization did not return a tensor.")
+            return result
 
         return fused_out
 
@@ -1395,6 +1409,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool = False,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        chunked_finalize_rs: Any | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1461,10 +1476,14 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
+            chunked_finalize_rs=chunked_finalize_rs,
         )
 
         if lora_ctx is not None:
             lora_ctx.original_hidden_states = None
+
+        if chunked_finalize_rs is not None:
+            return fused_out
 
         return self._finalize(
             output,
@@ -1664,6 +1683,7 @@ class FusedMoEKernel:
         apply_router_weight_on_input: bool,
         shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        chunked_finalize_rs: Any | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1678,4 +1698,5 @@ class FusedMoEKernel:
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            chunked_finalize_rs=chunked_finalize_rs,
         )
