@@ -279,31 +279,5 @@ def moe_unpermute(
     )
 
 
-def moe_unpermute_range(
-    out: torch.Tensor,
-    permuted_hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    inv_permuted_idx: torch.Tensor,
-    expert_first_token_offset: torch.Tensor | None,
-    token_start: int,
-) -> None:
-    token_count = out.shape[0]
-    topk = topk_weights.shape[1]
-    token_end = token_start + token_count
-    if token_start < 0 or token_end > topk_weights.shape[0]:
-        raise ValueError(
-            f"Invalid token range [{token_start}, {token_end}) for "
-            f"{topk_weights.shape[0]} tokens."
-        )
-
-    moe_unpermute(
-        out=out,
-        permuted_hidden_states=permuted_hidden_states,
-        topk_weights=topk_weights[token_start:token_end],
-        inv_permuted_idx=inv_permuted_idx[token_start * topk : token_end * topk],
-        expert_first_token_offset=expert_first_token_offset,
-    )
-
-
 def moe_permute_unpermute_supported():
     return torch.ops._moe_C.moe_permute_unpermute_supported()

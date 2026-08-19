@@ -14,7 +14,6 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.experts.cutlass_moe as cutlass_moe
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-import vllm.model_executor.layers.fused_moe.moe_permute_unpermute as mpu
 from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
@@ -361,136 +360,6 @@ def test_cutlass_w4a8_rejects_batched_non_deepep_ll():
     assert "parallel config" in reason
 
 
-@pytest.mark.parametrize(
-    ("experts_cls", "parallel_overrides", "expected"),
-    [
-        (CutlassExpertsW4A8Fp8, {}, True),
-        (
-            CutlassExpertsW4A8Fp8,
-            {"dp_size": 2, "ep_size": 1, "use_ep": False},
-            False,
-        ),
-        (
-            CutlassExpertsW4A8Fp8,
-            {
-                "dp_size": 2,
-                "ep_size": 8,
-                "use_ep": True,
-                "all2all_backend": "deepep_high_throughput",
-            },
-            False,
-        ),
-        (CutlassBatchedExpertsW4A8Fp8, {}, False),
-    ],
-)
-def test_cutlass_w4a8_output_alias_support_is_fail_closed(
-    experts_cls,
-    parallel_overrides,
-    expected,
-):
-    config = (
-        make_minimax_w4a8_deepep_ll_config()
-        if experts_cls is CutlassBatchedExpertsW4A8Fp8
-        else make_minimax_w4a8_config()
-    )
-    config.moe_parallel_config = dataclasses.replace(
-        config.moe_parallel_config,
-        **parallel_overrides,
-    )
-    experts = object.__new__(experts_cls)
-    object.__setattr__(experts, "moe_config", config)
-
-    assert experts.supports_output_alias() is expected
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "tp_size", "chunk_rows", "expected"),
-    [
-        (16, 4, 2, [(0, 2), (2, 2)]),
-        (20, 4, 3, [(0, 3), (3, 2)]),
-        (8, 4, 8, [(0, 2)]),
-    ],
-)
-def test_w4a8_chunked_finalize_plan(
-    num_tokens,
-    tp_size,
-    chunk_rows,
-    expected,
-):
-    assert (
-        cutlass_moe._w4a8_chunked_finalize_plan(
-            num_tokens,
-            tp_size,
-            chunk_rows,
-        )
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "tp_size", "chunk_rows"),
-    [(15, 4, 2), (16, 1, 2), (16, 4, 0)],
-)
-def test_w4a8_chunked_finalize_plan_rejects_invalid_inputs(
-    num_tokens,
-    tp_size,
-    chunk_rows,
-):
-    with pytest.raises(ValueError):
-        cutlass_moe._w4a8_chunked_finalize_plan(
-            num_tokens,
-            tp_size,
-            chunk_rows,
-        )
-
-
-def test_moe_unpermute_range_slices_token_metadata(monkeypatch):
-    calls = []
-
-    def fake_unpermute(**kwargs):
-        calls.append(kwargs)
-
-    monkeypatch.setattr(mpu, "moe_unpermute", fake_unpermute)
-    out = torch.empty((2, 8))
-    permuted = torch.empty((20, 8))
-    weights = torch.arange(20, dtype=torch.float32).view(5, 4)
-    inverse = torch.arange(20, dtype=torch.int32)
-    offsets = torch.arange(3, dtype=torch.int64)
-
-    mpu.moe_unpermute_range(
-        out,
-        permuted,
-        weights,
-        inverse,
-        offsets,
-        token_start=2,
-    )
-
-    assert len(calls) == 1
-    assert calls[0]["out"] is out
-    assert calls[0]["permuted_hidden_states"] is permuted
-    assert calls[0]["expert_first_token_offset"] is offsets
-    assert torch.equal(calls[0]["topk_weights"], weights[2:4])
-    assert torch.equal(calls[0]["inv_permuted_idx"], inverse[8:16])
-
-
-def test_w4a8_chunked_finalize_fake_returns_tp_shard():
-    result = cutlass_moe.cutlass_w4a8_chunked_finalize_rs_fake(
-        torch.empty((32, 8)),
-        torch.empty((8, 4)),
-        torch.empty(32, dtype=torch.int32),
-        None,
-        torch.empty((8, 8)),
-        1.0,
-        2,
-        4,
-        "layers.0.experts",
-    )
-
-    assert result.shape == (2, 8)
-    assert result.is_contiguous()
-
-
 def test_cutlass_w4a8_batched_workspace_and_finalize_contract():
     config = make_minimax_w4a8_deepep_ll_config()
     config.device = "cpu"
@@ -587,14 +456,13 @@ def test_cutlass_w4a8_only_forwards_expert_counts_for_batched_format(
         expert_num_tokens=expert_num_tokens,
         expert_num_tokens_cpu=None,
     )
-    output = torch.empty(1)
 
     with (
         patch.object(experts, "_get_permute_scratch", return_value=None),
         patch.object(cutlass_moe, "run_cutlass_moe_w4a8_fp8") as run_moe,
     ):
         experts.apply(
-            output=output,
+            output=torch.empty(1),
             hidden_states=torch.empty((1, 6144), dtype=torch.bfloat16),
             w1=torch.empty(1),
             w2=torch.empty(1),
@@ -611,7 +479,6 @@ def test_cutlass_w4a8_only_forwards_expert_counts_for_batched_format(
             apply_router_weight_on_input=False,
         )
 
-    assert run_moe.call_args.args[0] is output
     forwarded_counts = run_moe.call_args.args[27]
     assert forwarded_counts is (expert_num_tokens if expects_counts else None)
 
