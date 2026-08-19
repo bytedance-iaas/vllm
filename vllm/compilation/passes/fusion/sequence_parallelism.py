@@ -656,36 +656,6 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
             and rmsnorm.args[0] in new_reduce_scatters
         )
 
-    @staticmethod
-    def _is_materialized_sharded_boundary_input(
-        node: fx.Node,
-        new_reduce_scatters: set[fx.Node],
-    ) -> bool:
-        if (
-            is_func(node, operator.getitem)
-            and isinstance(node.args[0], fx.Node)
-            and isinstance(node.args[1], slice)
-        ):
-            base = node.args[0]
-            input_val = base.meta.get("val")
-            output_val = node.meta.get("val")
-            if (
-                isinstance(input_val, torch.Tensor)
-                and isinstance(output_val, torch.Tensor)
-                and input_val.shape == output_val.shape
-            ):
-                node = base
-
-        if not (
-            is_func(node, torch.ops.vllm.all_gather.default)
-            and len(node.args) >= 1
-            and isinstance(node.args[0], fx.Node)
-        ):
-            return False
-        return SequenceParallelismPass._is_known_sharded_boundary_input(
-            node.args[0], new_reduce_scatters
-        )
-
     def _rewrite_sequence_parallel_boundaries(
         self,
         graph: fx.Graph,
@@ -698,13 +668,6 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         for marker in markers:
             assert len(marker.args) == 1 and isinstance(marker.args[0], fx.Node)
             boundary_input = marker.args[0]
-            if self._is_materialized_sharded_boundary_input(
-                boundary_input, new_reduce_scatters
-            ):
-                marker.replace_all_uses_with(boundary_input)
-                graph.erase_node(marker)
-                rewritten += 1
-                continue
             if not self._is_known_sharded_boundary_input(
                 boundary_input, new_reduce_scatters
             ):

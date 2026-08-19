@@ -1141,7 +1141,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
-        if self.use_sparse_attn_rs_candidate:
+        if self.use_sparse_attn_rs_candidate and not torch.compiler.is_compiling():
             hidden_states, residual = self._post_attention_rs_norm_all_gather(
                 hidden_states,
                 residual,
