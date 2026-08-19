@@ -12,6 +12,7 @@ that the comparison plumbing catches mismatches through:
 * main sparse-attention output;
 * rank-local o_proj-style output;
 * global all-reduced o_proj-style output;
+* sequence-parallel reduce-scattered o_proj-style output;
 * post-attention RMSNorm output;
 * a synthetic logit probe derived from the post-attention hidden state.
 
@@ -108,7 +109,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-exact", action="store_true")
     parser.add_argument(
         "--inject-mismatch",
-        choices=("none", "attn_output", "topk", "global_o_proj"),
+        choices=(
+            "none",
+            "attn_output",
+            "topk",
+            "global_o_proj",
+            "o_proj_reduce_scatter",
+        ),
         default="none",
     )
     parser.add_argument("--output", required=True)
@@ -348,6 +355,51 @@ def gemma_rms_norm(hidden: torch.Tensor, residual: torch.Tensor, weight: torch.T
     return out.to(hidden.dtype), added
 
 
+def pad_dim0_for_world_size(
+    tensor: torch.Tensor,
+    world_size: int,
+) -> tuple[torch.Tensor, int]:
+    pad = (-tensor.shape[0]) % world_size
+    if pad == 0:
+        return tensor, 0
+    padded = torch.cat(
+        [
+            tensor,
+            tensor.new_zeros((pad, *tensor.shape[1:])),
+        ],
+        dim=0,
+    )
+    return padded, pad
+
+
+def rank_shard_dim0(
+    tensor: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[torch.Tensor, int]:
+    padded, pad = pad_dim0_for_world_size(tensor, world_size)
+    local_len = padded.shape[0] // world_size
+    start = rank * local_len
+    return padded[start : start + local_len].contiguous(), pad
+
+
+def reduce_scatter_dim0(
+    tensor: torch.Tensor,
+    *,
+    world_size: int,
+) -> tuple[torch.Tensor, int]:
+    padded, pad = pad_dim0_for_world_size(tensor, world_size)
+    local_len = padded.shape[0] // world_size
+    output = torch.empty(
+        (local_len, *tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    dist.reduce_scatter_tensor(output, padded.contiguous(), op=dist.ReduceOp.SUM)
+    return output, pad
+
+
 def run_main_sparse_attn(
     *,
     impl: Any,
@@ -497,6 +549,21 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
     candidate_global = candidate_local.clone()
     dist.all_reduce(baseline_global, op=dist.ReduceOp.SUM)
     dist.all_reduce(candidate_global, op=dist.ReduceOp.SUM)
+    baseline_global_shard, rs_pad = rank_shard_dim0(
+        baseline_global,
+        rank=rank,
+        world_size=world_size,
+    )
+    candidate_rs, candidate_rs_pad = reduce_scatter_dim0(
+        candidate_local,
+        world_size=world_size,
+    )
+    if candidate_rs_pad != rs_pad:
+        raise RuntimeError(
+            "Mismatched reduce-scatter padding between baseline and candidate"
+        )
+    if args.inject_mismatch == "o_proj_reduce_scatter":
+        candidate_rs.flatten()[0].add_(1.0)
 
     generator.manual_seed(rank_seed + 3)
     residual = torch.randn(
@@ -515,6 +582,25 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         )
         * 0.01
     )
+    residual_shard, residual_pad = rank_shard_dim0(
+        residual,
+        rank=rank,
+        world_size=world_size,
+    )
+    if residual_pad != rs_pad:
+        raise RuntimeError(
+            "Mismatched reduce-scatter padding between hidden and residual"
+        )
+    baseline_post_rs, _ = gemma_rms_norm(
+        baseline_global_shard,
+        residual_shard.clone(),
+        norm_weight,
+    )
+    candidate_post_rs, _ = gemma_rms_norm(
+        candidate_rs,
+        residual_shard.clone(),
+        norm_weight,
+    )
     baseline_post, _ = gemma_rms_norm(baseline_global, residual.clone(), norm_weight)
     candidate_post, _ = gemma_rms_norm(candidate_global, residual.clone(), norm_weight)
 
@@ -531,6 +617,8 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
     )
     baseline_probe = baseline_post @ logit_probe_weight
     candidate_probe = candidate_post @ logit_probe_weight
+    baseline_probe_rs = baseline_post_rs @ logit_probe_weight
+    candidate_probe_rs = candidate_post_rs @ logit_probe_weight
 
     num_tokens = batch.num_tokens
     metrics = {
@@ -550,13 +638,25 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             baseline_global[:num_tokens],
             candidate_global[:num_tokens],
         ),
+        "o_proj_reduce_scatter": tensor_stats(
+            baseline_global_shard,
+            candidate_rs,
+        ),
         "post_attention_hidden": tensor_stats(
             baseline_post[:num_tokens],
             candidate_post[:num_tokens],
         ),
+        "post_attention_hidden_rs": tensor_stats(
+            baseline_post_rs,
+            candidate_post_rs,
+        ),
         "synthetic_logit_probe": tensor_stats(
             baseline_probe[:num_tokens],
             candidate_probe[:num_tokens],
+        ),
+        "synthetic_logit_probe_rs": tensor_stats(
+            baseline_probe_rs,
+            candidate_probe_rs,
         ),
     }
     exact = all(metric.get("exact", False) for metric in metrics.values())
@@ -576,6 +676,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "num_padded_tokens": batch.num_tokens,
         "local_q_heads": local_q_heads,
         "local_kv_heads": local_kv_heads,
+        "reduce_scatter_padding": rs_pad,
         "metrics": metrics,
         "passed": exact,
     }
@@ -596,6 +697,11 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "boundary": (
                 "main sparse attention output only; qkv/rope/kv_insert/indexer excluded"
+            ),
+            "reduce_scatter": (
+                "o_proj_reduce_scatter compares all_reduce(o_proj_local) rank "
+                "shard with direct reduce_scatter(o_proj_local); dim0 is padded "
+                "when token count is not divisible by world_size."
             ),
         },
     }
