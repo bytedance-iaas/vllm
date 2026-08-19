@@ -6,6 +6,7 @@ import json
 import math
 import os
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 from torch.profiler import record_function
@@ -29,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     moe_permute,
     moe_permute_unpermute_supported,
     moe_unpermute,
+    moe_unpermute_range,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
@@ -55,6 +57,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -1688,6 +1691,15 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
         )
 
 
+@dataclass(frozen=True)
+class W4A8ChunkedFinalizeRSContext:
+    shared_out: torch.Tensor
+    routed_scale: float
+    chunk_rows_per_destination: int
+    tp_size: int
+    state_key: str
+
+
 # W4A8
 def run_cutlass_moe_w4a8_fp8(
     output: torch.Tensor,
@@ -1725,7 +1737,8 @@ def run_cutlass_moe_w4a8_fp8(
     topk_weights: torch.Tensor | None,
     group_size: int,
     permute_scratch: MoEPermuteScratch | None,
-):
+    chunked_finalize_rs: W4A8ChunkedFinalizeRSContext | None = None,
+) -> torch.Tensor | None:
     a1q = hidden_states
     local_E = w1.size(0)
     device = a1q.device
@@ -1905,13 +1918,14 @@ def run_cutlass_moe_w4a8_fp8(
     if (
         _w4a8_debug_zero_skip_enabled()
         and not use_batched_format
+        and chunked_finalize_rs is None
         and debug_expert_token_counts is not None
         and not torch.cuda.is_current_stream_capturing()
         and int(torch.count_nonzero(debug_expert_token_counts).item()) == 0
     ):
         with _w4a8_debug_scope("w4a8:zero_skip"):
             output.zero_()
-        return
+        return None
 
     with _w4a8_debug_scope("w4a8:mm1"):
         ops.cutlass_w4a8_moe_mm(
@@ -2010,14 +2024,277 @@ def run_cutlass_moe_w4a8_fp8(
     elif not use_batched_format:
         # for non-chunking mode the output is resized from workspace13
         # so we need to make sure mm2_out uses workspace2.
-        with _w4a8_debug_scope("w4a8:unpermute"):
-            moe_unpermute(
-                out=output,
+        if chunked_finalize_rs is None:
+            with _w4a8_debug_scope("w4a8:unpermute"):
+                moe_unpermute(
+                    out=output,
+                    permuted_hidden_states=mm2_out,
+                    topk_weights=topk_weights,
+                    inv_permuted_idx=inv_perm,
+                    expert_first_token_offset=expert_first_token_offset,
+                )
+        else:
+            return cutlass_w4a8_chunked_finalize_rs(
+                mm2_out,
+                topk_weights,
+                inv_perm,
+                expert_first_token_offset,
+                chunked_finalize_rs.shared_out,
+                chunked_finalize_rs.routed_scale,
+                chunked_finalize_rs.chunk_rows_per_destination,
+                chunked_finalize_rs.tp_size,
+                chunked_finalize_rs.state_key,
+            )
+    return None
+
+
+class _W4A8ChunkedFinalizeRSState:
+    def __init__(
+        self,
+        tp_size: int,
+        chunk_rows: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.comm_stream = torch.cuda.Stream(device=device)
+        self.stage = [
+            torch.empty(
+                (tp_size, chunk_rows, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(2)
+        ]
+        self.tail = [
+            torch.empty(
+                (chunk_rows, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(2)
+        ]
+        self.ready = [torch.cuda.Event() for _ in range(2)]
+        self.done = [torch.cuda.Event() for _ in range(2)]
+        self.busy = [False, False]
+
+
+_W4A8_CHUNKED_FINALIZE_RS_STATES: dict[
+    tuple[str, str, int, int, int, int, torch.dtype], _W4A8ChunkedFinalizeRSState
+] = {}
+
+
+def _get_w4a8_chunked_finalize_rs_state(
+    state_key: str,
+    group_name: str,
+    tp_size: int,
+    chunk_rows: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> _W4A8ChunkedFinalizeRSState:
+    key = (
+        state_key,
+        group_name,
+        device.index or 0,
+        tp_size,
+        chunk_rows,
+        hidden_size,
+        dtype,
+    )
+    state = _W4A8_CHUNKED_FINALIZE_RS_STATES.get(key)
+    if state is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "W4A8 chunked finalize-RS state must be initialized before "
+                "CUDA graph capture."
+            )
+        state = _W4A8ChunkedFinalizeRSState(
+            tp_size,
+            chunk_rows,
+            hidden_size,
+            dtype,
+            device,
+        )
+        _W4A8_CHUNKED_FINALIZE_RS_STATES[key] = state
+    return state
+
+
+def _w4a8_chunked_finalize_plan(
+    num_tokens: int,
+    tp_size: int,
+    chunk_rows_per_destination: int,
+) -> list[tuple[int, int]]:
+    if tp_size <= 1 or num_tokens % tp_size != 0:
+        raise ValueError("Token count must be divisible by TP size.")
+    if chunk_rows_per_destination <= 0:
+        raise ValueError("chunk_rows_per_destination must be positive.")
+    local_rows = num_tokens // tp_size
+    return [
+        (
+            row_start,
+            min(chunk_rows_per_destination, local_rows - row_start),
+        )
+        for row_start in range(0, local_rows, chunk_rows_per_destination)
+    ]
+
+
+def cutlass_w4a8_chunked_finalize_rs(
+    mm2_out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    expert_first_token_offset: torch.Tensor | None,
+    shared_out: torch.Tensor,
+    routed_scale: float,
+    chunk_rows_per_destination: int,
+    tp_size: int,
+    state_key: str,
+) -> torch.Tensor:
+    if not mm2_out.is_cuda:
+        raise RuntimeError("W4A8 chunked finalize-RS requires CUDA tensors.")
+    if mm2_out.ndim != 2 or shared_out.ndim != 2 or topk_weights.ndim != 2:
+        raise RuntimeError("W4A8 chunked finalize-RS requires rank-2 inputs.")
+    if (
+        mm2_out.dtype != torch.bfloat16
+        or shared_out.dtype != torch.bfloat16
+        or topk_weights.dtype != torch.float32
+    ):
+        raise RuntimeError(
+            "W4A8 chunked finalize-RS requires BF16 outputs and FP32 routing weights."
+        )
+    if (
+        not mm2_out.is_contiguous()
+        or not shared_out.is_contiguous()
+        or not topk_weights.is_contiguous()
+        or not inv_permuted_idx.is_contiguous()
+    ):
+        raise RuntimeError(
+            "W4A8 chunked finalize-RS requires contiguous input tensors."
+        )
+    if mm2_out.device != shared_out.device or topk_weights.device != mm2_out.device:
+        raise RuntimeError(
+            "W4A8 chunked finalize-RS inputs must be on the same device."
+        )
+    if inv_permuted_idx.device != mm2_out.device:
+        raise RuntimeError(
+            "W4A8 chunked finalize-RS inverse mapping must be on the same device."
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "W4A8 chunked finalize-RS does not support CUDA graph capture."
+        )
+
+    num_tokens, hidden_size = shared_out.shape
+    topk = topk_weights.shape[1]
+    if topk_weights.shape[0] != num_tokens:
+        raise RuntimeError("Routing weights and shared output token counts differ.")
+    if mm2_out.shape != (num_tokens * topk, hidden_size):
+        raise RuntimeError(
+            "MM2 output must have shape [num_tokens * topk, hidden_size]."
+        )
+    if inv_permuted_idx.numel() != num_tokens * topk:
+        raise RuntimeError("Inverse permutation has an incompatible size.")
+    try:
+        chunk_plan = _w4a8_chunked_finalize_plan(
+            num_tokens,
+            tp_size,
+            chunk_rows_per_destination,
+        )
+    except ValueError as error:
+        raise RuntimeError(f"W4A8 chunked finalize-RS: {error}") from error
+
+    tp_group = get_tp_group()
+    if tp_group.world_size != tp_size:
+        raise RuntimeError("Requested TP size does not match the active TP group.")
+    device_comm = tp_group.device_communicator
+    pynccl_comm = (
+        None if device_comm is None else getattr(device_comm, "pynccl_comm", None)
+    )
+    if pynccl_comm is None or pynccl_comm.disabled:
+        raise RuntimeError("W4A8 chunked finalize-RS requires active PyNccl.")
+
+    local_rows = num_tokens // tp_size
+    output = shared_out.new_empty((local_rows, hidden_size))
+    state = _get_w4a8_chunked_finalize_rs_state(
+        state_key,
+        tp_group.unique_name,
+        tp_size,
+        chunk_rows_per_destination,
+        hidden_size,
+        shared_out.dtype,
+        shared_out.device,
+    )
+    compute_stream = current_stream()
+    last_slot = 0
+
+    for chunk_idx, (row_start, valid_rows) in enumerate(chunk_plan):
+        slot = chunk_idx % 2
+        last_slot = slot
+        if state.busy[slot]:
+            compute_stream.wait_event(state.done[slot])
+
+        stage = state.stage[slot]
+        if valid_rows != chunk_rows_per_destination:
+            stage[:, valid_rows:].zero_()
+
+        for destination in range(tp_size):
+            token_start = destination * local_rows + row_start
+            destination_out = stage[destination, :valid_rows]
+            moe_unpermute_range(
+                out=destination_out,
                 permuted_hidden_states=mm2_out,
                 topk_weights=topk_weights,
-                inv_permuted_idx=inv_perm,
+                inv_permuted_idx=inv_permuted_idx,
                 expert_first_token_offset=expert_first_token_offset,
+                token_start=token_start,
             )
+            if routed_scale != 1.0:
+                destination_out.mul_(routed_scale)
+            destination_out.add_(shared_out[token_start : token_start + valid_rows])
+
+        state.ready[slot].record(compute_stream)
+        state.comm_stream.wait_event(state.ready[slot])
+        rs_output = (
+            output[row_start : row_start + valid_rows]
+            if valid_rows == chunk_rows_per_destination
+            else state.tail[slot]
+        )
+        pynccl_comm.reduce_scatter(
+            rs_output,
+            stage.view(tp_size * chunk_rows_per_destination, hidden_size),
+            stream=state.comm_stream,
+        )
+        if valid_rows != chunk_rows_per_destination:
+            with torch.cuda.stream(state.comm_stream):
+                output[row_start : row_start + valid_rows].copy_(rs_output[:valid_rows])
+        state.done[slot].record(state.comm_stream)
+        state.busy[slot] = True
+
+    compute_stream.wait_event(state.done[last_slot])
+    return output
+
+
+def cutlass_w4a8_chunked_finalize_rs_fake(
+    mm2_out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    expert_first_token_offset: torch.Tensor | None,
+    shared_out: torch.Tensor,
+    routed_scale: float,
+    chunk_rows_per_destination: int,
+    tp_size: int,
+    state_key: str,
+) -> torch.Tensor:
+    return shared_out.new_empty((shared_out.shape[0] // tp_size, shared_out.shape[1]))
+
+
+direct_register_custom_op(
+    op_name="cutlass_w4a8_chunked_finalize_rs",
+    op_func=cutlass_w4a8_chunked_finalize_rs,
+    mutates_args=[],
+    fake_impl=cutlass_w4a8_chunked_finalize_rs_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
