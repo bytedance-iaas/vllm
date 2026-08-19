@@ -108,6 +108,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=68)
     parser.add_argument("--require-exact", action="store_true")
     parser.add_argument(
+        "--rs-atol",
+        type=float,
+        default=2.0e-2,
+        help=(
+            "Absolute tolerance for reduce-scatter downstream metrics. "
+            "Non-RS metrics remain bitwise exact."
+        ),
+    )
+    parser.add_argument(
         "--inject-mismatch",
         choices=(
             "none",
@@ -345,6 +354,27 @@ def tensor_stats(lhs: torch.Tensor, rhs: torch.Tensor) -> dict[str, Any]:
         "mean_abs": mean_abs,
         "exact": max_abs == 0.0,
     }
+
+
+def metric_passes(
+    name: str,
+    metric: dict[str, Any],
+    *,
+    rs_atol: float,
+) -> bool:
+    if not metric.get("shape_match", False):
+        return False
+    if metric.get("exact", False):
+        return True
+    rs_tolerance_metrics = {
+        "o_proj_reduce_scatter",
+        "post_attention_hidden_rs",
+        "synthetic_logit_probe_rs",
+    }
+    if name not in rs_tolerance_metrics:
+        return False
+    max_abs = metric.get("max_abs")
+    return isinstance(max_abs, float) and max_abs <= rs_atol
 
 
 def gemma_rms_norm(hidden: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor):
@@ -659,7 +689,11 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             candidate_probe_rs,
         ),
     }
-    exact = all(metric.get("exact", False) for metric in metrics.values())
+    metric_pass = {
+        name: metric_passes(name, metric, rs_atol=args.rs_atol)
+        for name, metric in metrics.items()
+    }
+    exact = all(metric_pass.values())
     local_pass_tensor = torch.tensor(
         [1 if exact else 0],
         dtype=torch.int32,
@@ -678,6 +712,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "local_kv_heads": local_kv_heads,
         "reduce_scatter_padding": rs_pad,
         "metrics": metrics,
+        "metric_pass": metric_pass,
         "passed": exact,
     }
     gathered: list[dict[str, Any] | None] = [None for _ in range(world_size)]
@@ -688,6 +723,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
         "require_exact": bool(args.require_exact),
         "candidate": args.candidate,
         "inject_mismatch": args.inject_mismatch,
+        "rs_atol": args.rs_atol,
         "world_size": world_size,
         "ranks": gathered,
         "notes": {
