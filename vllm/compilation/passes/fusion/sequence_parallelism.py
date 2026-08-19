@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import json
 import operator
+import os
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -637,6 +640,103 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         return False
 
     @staticmethod
+    def _node_name(value: Any) -> Any:
+        if isinstance(value, fx.Node):
+            return value.name
+        if isinstance(value, dict):
+            return {
+                key: SequenceParallelismPass._node_name(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(SequenceParallelismPass._node_name(item) for item in value)
+        if isinstance(value, list):
+            return [SequenceParallelismPass._node_name(item) for item in value]
+        return repr(value)
+
+    @staticmethod
+    def _node_record(
+        node: fx.Node,
+        *,
+        new_reduce_scatters: set[fx.Node],
+        boundary_ancestors: set[fx.Node],
+    ) -> dict[str, Any]:
+        val = node.meta.get("val")
+        record: dict[str, Any] = {
+            "name": node.name,
+            "op": node.op,
+            "target": str(node.target),
+            "args": SequenceParallelismPass._node_name(node.args),
+            "kwargs": SequenceParallelismPass._node_name(node.kwargs),
+            "users": [user.name for user in node.users],
+            "is_new_reduce_scatter": node in new_reduce_scatters,
+            "is_boundary_ancestor": node in boundary_ancestors,
+        }
+        if isinstance(val, torch.Tensor):
+            record["meta_val"] = {
+                "shape": [str(dim) for dim in val.shape],
+                "dtype": str(val.dtype),
+                "device": str(val.device),
+            }
+        elif val is not None:
+            record["meta_val"] = repr(val)
+        return record
+
+    @staticmethod
+    def _collect_node_ancestors(node: fx.Node, seen: set[fx.Node]) -> None:
+        if node in seen:
+            return
+        seen.add(node)
+        for value in (node.args, node.kwargs):
+            SequenceParallelismPass._collect_node_ancestors_from_value(value, seen)
+
+    @staticmethod
+    def _collect_node_ancestors_from_value(value: Any, seen: set[fx.Node]) -> None:
+        if isinstance(value, fx.Node):
+            SequenceParallelismPass._collect_node_ancestors(value, seen)
+        elif isinstance(value, dict):
+            for item in value.values():
+                SequenceParallelismPass._collect_node_ancestors_from_value(item, seen)
+        elif isinstance(value, tuple | list):
+            for item in value:
+                SequenceParallelismPass._collect_node_ancestors_from_value(item, seen)
+
+    def _dump_unsupported_boundary(
+        self,
+        graph: fx.Graph,
+        marker: fx.Node,
+        boundary_input: fx.Node,
+        new_reduce_scatters: set[fx.Node],
+    ) -> None:
+        dump_dir = os.getenv("VLLM_SP_BOUNDARY_DUMP_DIR")
+        if not dump_dir:
+            return
+        boundary_ancestors: set[fx.Node] = set()
+        self._collect_node_ancestors(boundary_input, boundary_ancestors)
+        records = [
+            self._node_record(
+                node,
+                new_reduce_scatters=new_reduce_scatters,
+                boundary_ancestors=boundary_ancestors,
+            )
+            for node in graph.nodes
+        ]
+        payload = {
+            "pass_name": self.pass_name,
+            "pid": os.getpid(),
+            "marker": marker.name,
+            "boundary_input": boundary_input.name,
+            "new_reduce_scatters": [node.name for node in new_reduce_scatters],
+            "boundary_ancestors": [node.name for node in boundary_ancestors],
+            "graph": str(graph),
+            "nodes": records,
+        }
+        path = Path(dump_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        output = path / f"sp_boundary_pid{os.getpid()}_{marker.name}.json"
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+    @staticmethod
     def _is_known_sharded_boundary_input(
         node: fx.Node,
         new_reduce_scatters: set[fx.Node],
@@ -674,6 +774,9 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
                 if self._depends_on_new_reduce_scatter(
                     boundary_input, new_reduce_scatters
                 ):
+                    self._dump_unsupported_boundary(
+                        graph, marker, boundary_input, new_reduce_scatters
+                    )
                     raise RuntimeError(
                         "Sequence-parallel boundary depends on a newly inserted "
                         "reduce-scatter through an unsupported graph path."
