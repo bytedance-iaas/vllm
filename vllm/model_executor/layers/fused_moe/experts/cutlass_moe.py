@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
-from contextlib import nullcontext
 import json
 import math
 import os
+from contextlib import nullcontext
 
 import torch
 from torch.profiler import record_function
@@ -253,7 +253,7 @@ def _w4a8_debug_log_metadata(
     global _W4A8_DEBUG_RECORDS
     if not _w4a8_debug_enabled():
         return
-    if _W4A8_DEBUG_RECORDS >= _w4a8_debug_max_records():
+    if _w4a8_debug_max_records() <= _W4A8_DEBUG_RECORDS:
         return
     if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
         logger.warning_once(
@@ -2066,6 +2066,14 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
+
+    def supports_output_alias(self) -> bool:
+        parallel_config = self.moe_config.moe_parallel_config
+        return (
+            self.activation_format() == mk.FusedMoEActivationFormat.Standard
+            and parallel_config.dp_size == 1
+            and not parallel_config.use_all2all_kernels
+        )
 
     @staticmethod
     def is_supported_config(

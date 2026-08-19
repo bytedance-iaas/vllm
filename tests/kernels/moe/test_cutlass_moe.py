@@ -360,6 +360,48 @@ def test_cutlass_w4a8_rejects_batched_non_deepep_ll():
     assert "parallel config" in reason
 
 
+@pytest.mark.parametrize(
+    ("experts_cls", "parallel_overrides", "expected"),
+    [
+        (CutlassExpertsW4A8Fp8, {}, True),
+        (
+            CutlassExpertsW4A8Fp8,
+            {"dp_size": 2, "ep_size": 1, "use_ep": False},
+            False,
+        ),
+        (
+            CutlassExpertsW4A8Fp8,
+            {
+                "dp_size": 2,
+                "ep_size": 8,
+                "use_ep": True,
+                "all2all_backend": "deepep_high_throughput",
+            },
+            False,
+        ),
+        (CutlassBatchedExpertsW4A8Fp8, {}, False),
+    ],
+)
+def test_cutlass_w4a8_output_alias_support_is_fail_closed(
+    experts_cls,
+    parallel_overrides,
+    expected,
+):
+    config = (
+        make_minimax_w4a8_deepep_ll_config()
+        if experts_cls is CutlassBatchedExpertsW4A8Fp8
+        else make_minimax_w4a8_config()
+    )
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        **parallel_overrides,
+    )
+    experts = object.__new__(experts_cls)
+    object.__setattr__(experts, "moe_config", config)
+
+    assert experts.supports_output_alias() is expected
+
+
 def test_cutlass_w4a8_batched_workspace_and_finalize_contract():
     config = make_minimax_w4a8_deepep_ll_config()
     config.device = "cpu"
@@ -456,13 +498,14 @@ def test_cutlass_w4a8_only_forwards_expert_counts_for_batched_format(
         expert_num_tokens=expert_num_tokens,
         expert_num_tokens_cpu=None,
     )
+    output = torch.empty(1)
 
     with (
         patch.object(experts, "_get_permute_scratch", return_value=None),
         patch.object(cutlass_moe, "run_cutlass_moe_w4a8_fp8") as run_moe,
     ):
         experts.apply(
-            output=torch.empty(1),
+            output=output,
             hidden_states=torch.empty((1, 6144), dtype=torch.bfloat16),
             w1=torch.empty(1),
             w2=torch.empty(1),
@@ -479,6 +522,7 @@ def test_cutlass_w4a8_only_forwards_expert_counts_for_batched_format(
             apply_router_weight_on_input=False,
         )
 
+    assert run_moe.call_args.args[0] is output
     forwarded_counts = run_moe.call_args.args[27]
     assert forwarded_counts is (expert_num_tokens if expects_counts else None)
 
