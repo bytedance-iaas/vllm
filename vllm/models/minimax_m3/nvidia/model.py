@@ -92,7 +92,13 @@ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -150,9 +156,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
             weight = self.weight.float() + 1.0
             if residual is None:
                 return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-            return ir.ops.fused_add_rms_norm(
-                x, residual, weight, self.variance_epsilon
-            )
+            return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
         from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 
@@ -590,66 +594,130 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
+        attn_output = qkv.new_empty((qkv.shape[0], self.q_size))
+        torch.ops.vllm.minimax_m3_sparse_attention_with_output(
+            qkv,
+            positions,
+            attn_output,
+            _encode_layer_name(self.layer_name),
+        )
+        output, _ = self.o_proj(attn_output)
+        return output
 
+    def _run_sparse_attention_core(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
         # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
         # main (q/k) and index (index_q/index_k) branches, all read straight out
-        # of the single fused ``qkv`` tensor (the "5 results").  Once the paged
-        # caches are bound the kernel also inserts k/v and the index key into
-        # them; the initial memory-profiling run (caches unbound, no slot_mapping)
-        # short-circuits to zeros below. k/v and index_k are rewritten in place
-        # inside qkv (and scatter-inserted into the caches); q and index_q are
-        # de-interleaved
-        # straight into the dedicated contiguous ``q``/``index_q`` buffers below.
-
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
-        rotary_dim = self.rotary_emb.rotary_dim
-        eps = self.q_norm.variance_epsilon
+        # of the single fused ``qkv`` tensor. The kernel also inserts k/v and
+        # the index key into their paged caches.
         num_tokens = qkv.shape[0]
+        expected_qkv_size = (
+            self.q_size + 2 * self.kv_size + self.index_q_size + self.idx_head_dim
+        )
+        if qkv.ndim != 2 or qkv.shape[1] != expected_qkv_size:
+            raise RuntimeError(
+                "MiniMax M3 sparse attention received incompatible qkv shape "
+                f"{tuple(qkv.shape)}; expected [T, {expected_qkv_size}]."
+            )
+        if not qkv.is_contiguous():
+            raise RuntimeError("MiniMax M3 sparse attention requires contiguous qkv.")
+        if (
+            output.ndim != 2
+            or output.shape[0] != num_tokens
+            or output.shape[1] != self.q_size
+        ):
+            raise RuntimeError(
+                "MiniMax M3 sparse attention received incompatible output shape "
+                f"{tuple(output.shape)}; expected [{num_tokens}, {self.q_size}]."
+            )
+        if not output.is_contiguous():
+            raise RuntimeError(
+                "MiniMax M3 sparse attention requires contiguous output."
+            )
+        if output.device != qkv.device or output.dtype != qkv.dtype:
+            raise RuntimeError(
+                "MiniMax M3 sparse attention requires qkv and output to have "
+                "the same device and dtype."
+            )
+        if positions.ndim != 1 or positions.shape[0] != num_tokens:
+            raise RuntimeError(
+                "MiniMax M3 sparse attention requires one position per token."
+            )
 
         fwd_slot_mapping = get_forward_context().slot_mapping
-        if (
-            not isinstance(fwd_slot_mapping, dict)
-            or self.layer_name not in fwd_slot_mapping
-        ):
-            # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+        index_cache = self.indexer.index_cache
+        main_cache_bound = self.kv_cache.numel() != 0
+        index_cache_bound = index_cache.kv_cache.numel() != 0
+        has_main_mapping = (
+            isinstance(fwd_slot_mapping, dict) and self.layer_name in fwd_slot_mapping
+        )
+        has_index_mapping = (
+            isinstance(fwd_slot_mapping, dict)
+            and index_cache.prefix in fwd_slot_mapping
+        )
 
+        if not main_cache_bound and not index_cache_bound:
+            if not has_main_mapping and not has_index_mapping:
+                # Memory profiling runs before either cache is bound.
+                output.zero_()
+                return
+            raise RuntimeError(
+                "MiniMax M3 sparse attention received slot mappings before "
+                "its KV caches were bound."
+            )
+        if not main_cache_bound or not index_cache_bound:
+            raise RuntimeError(
+                "MiniMax M3 sparse attention requires both main and index KV "
+                "caches to be bound."
+            )
+        if not has_main_mapping or not has_index_mapping:
+            raise RuntimeError(
+                "MiniMax M3 sparse attention requires both main and index "
+                "slot mappings at runtime."
+            )
+        if self.topk_indices_buffer is None:
+            raise RuntimeError(
+                "MiniMax M3 sparse attention requires a persistent top-k buffer."
+            )
+
+        assert isinstance(fwd_slot_mapping, dict)
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+        index_slot_mapping = fwd_slot_mapping[index_cache.prefix]
         q = qkv.new_empty((num_tokens, self.q_size))
         # index_q matches the index-K cache dtype (e4m3 for the fp8 score path);
         # the fused kernel emits fp8 directly when this buffer is e4m3.
         index_q = qkv.new_empty(
             (num_tokens, self.index_q_size),
-            dtype=self.indexer.index_cache.dtype,
+            dtype=index_cache.dtype,
         )
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
-            cos_sin_cache,
+            self.rotary_emb.cos_sin_cache,
             positions,
             self.num_heads,
             self.num_kv_heads,
-            rotary_dim,
-            eps,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
             self.index_q_norm.weight,
             self.index_k_norm.weight,
             self.num_idx_heads,
             main_slot_mapping,
             index_slot_mapping,
             self.kv_cache,
-            self.indexer.index_cache.kv_cache,
+            index_cache.kv_cache,
             self.kv_cache.size(2),  # paged-cache block size
             q,
             index_q,
             self.kv_cache_dtype,
         )
 
-        output = torch.empty_like(q)
-        attn_output = self._run_attention(q, index_q, output)
-        output, _ = self.o_proj(attn_output)
-        return output
+        self._run_attention(q, index_q, output)
 
     @eager_break_during_capture
     def _run_attention(
@@ -663,6 +731,40 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
         self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, output)
+
+
+@eager_break_during_capture
+def minimax_m3_sparse_attention_with_output(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    resolved_layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers.get(resolved_layer_name)
+    if not isinstance(layer, MiniMaxM3SparseAttention):
+        raise RuntimeError(
+            "MiniMax M3 sparse attention layer is missing or has an "
+            f"incompatible type: {resolved_layer_name}."
+        )
+    layer._run_sparse_attention_core(qkv, positions, output)
+
+
+def minimax_m3_sparse_attention_with_output_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sparse_attention_with_output",
+    op_func=minimax_m3_sparse_attention_with_output,
+    mutates_args=["qkv", "output"],
+    fake_impl=minimax_m3_sparse_attention_with_output_fake,
+)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -728,12 +830,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         compile_sequence_parallel = bool(
             vllm_config.compilation_config.pass_config.enable_sp
         )
-        reduce_results = (
-            is_mtp_block
-            or (
-                vllm_config.parallel_config.pipeline_parallel_size > 1
-                and not compile_sequence_parallel
-            )
+        reduce_results = is_mtp_block or (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and not compile_sequence_parallel
         )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
