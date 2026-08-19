@@ -12,8 +12,10 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import json
 import os
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -23,7 +25,13 @@ from vllm import _custom_ops as ops
 from vllm import ir
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CacheConfig,
+    CompilationMode,
+    CUDAGraphMode,
+    VllmConfig,
+    get_current_vllm_config,
+)
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -119,6 +127,168 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
+_SPARSE_EQ_RECORDS: dict[str, int] = {}
+_SPARSE_EQ_CONFIG: dict[str, object] | None = None
+_SPARSE_EQ_DEFAULT_CONFIG_PATH = "/tmp/minimax_m3_sparse_eq_config.json"
+
+
+def _sparse_eq_config() -> dict[str, object]:
+    global _SPARSE_EQ_CONFIG
+    if _SPARSE_EQ_CONFIG is not None:
+        return _SPARSE_EQ_CONFIG
+
+    config: dict[str, object] = {}
+    config_path = os.getenv(
+        "VLLM_MINIMAX_M3_SPARSE_EQ_CONFIG",
+        _SPARSE_EQ_DEFAULT_CONFIG_PATH,
+    )
+    try:
+        path = Path(config_path)
+        if path.is_file():
+            loaded = json.loads(path.read_text())
+            if isinstance(loaded, dict):
+                config.update(loaded)
+    except Exception:
+        config = {}
+
+    env_dir = os.getenv("VLLM_MINIMAX_M3_SPARSE_EQ_DIR")
+    env_layer = os.getenv("VLLM_MINIMAX_M3_SPARSE_EQ_LAYER")
+    env_max_records = os.getenv("VLLM_MINIMAX_M3_SPARSE_EQ_MAX_RECORDS")
+    if env_dir:
+        config["dir"] = env_dir
+    if env_layer:
+        config["layer"] = env_layer
+    if env_max_records:
+        config["max_records"] = env_max_records
+
+    _SPARSE_EQ_CONFIG = config
+    return config
+
+
+def _sparse_eq_capture_dir(
+    config: dict[str, object] | None = None,
+) -> str | None:
+    config = _sparse_eq_config() if config is None else config
+    value = config.get("dir")
+    return str(value) if value else None
+
+
+def _sparse_eq_layer_matches(
+    layer_name: str,
+    config: dict[str, object] | None = None,
+) -> bool:
+    config = _sparse_eq_config() if config is None else config
+    capture_dir = _sparse_eq_capture_dir(config)
+    if not capture_dir:
+        return False
+    layer_filter = config.get("layer")
+    return layer_filter is None or str(layer_filter) in layer_name
+
+
+def _sparse_eq_max_records(
+    config: dict[str, object] | None = None,
+) -> int:
+    config = _sparse_eq_config() if config is None else config
+    value = config.get("max_records", 1)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 1
+    if isinstance(value, float) and value.is_integer():
+        return max(0, int(value))
+    return 1
+
+
+def _sparse_eq_armed_file(
+    config: dict[str, object] | None = None,
+) -> str | None:
+    config = _sparse_eq_config() if config is None else config
+    value = config.get("armed_file")
+    if value:
+        return str(value)
+    capture_dir = _sparse_eq_capture_dir(config)
+    if not capture_dir:
+        return None
+    return str(Path(capture_dir) / ".armed")
+
+
+def _minimax_m3_torch_compile_enabled(_vllm_config: VllmConfig) -> bool:
+    del _vllm_config
+    # The sparse-equivalence diagnostic is intentionally eager-only because it
+    # performs host logging and double-runs attention kernels for one layer.
+    return _sparse_eq_capture_dir() is None
+
+
+def _sparse_eq_tensor_stats(tensor: torch.Tensor) -> dict[str, object]:
+    detached = tensor.detach()
+    stats: dict[str, object] = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+    }
+    if detached.numel() == 0:
+        return stats
+    if detached.is_floating_point():
+        values = detached.float()
+        stats.update(
+            {
+                "abs_max": float(values.abs().max().item()),
+                "mean": float(values.mean().item()),
+            }
+        )
+    else:
+        stats.update(
+            {
+                "min": int(detached.min().item()),
+                "max": int(detached.max().item()),
+            }
+        )
+    return stats
+
+
+def _sparse_eq_numeric_diff(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+) -> dict[str, object]:
+    if lhs.shape != rhs.shape:
+        return {
+            "shape_match": False,
+            "lhs_shape": list(lhs.shape),
+            "rhs_shape": list(rhs.shape),
+        }
+    diff = lhs.detach().float() - rhs.detach().float()
+    abs_diff = diff.abs()
+    return {
+        "shape_match": True,
+        "max_abs": float(abs_diff.max().item()) if abs_diff.numel() else 0.0,
+        "mean_abs": float(abs_diff.mean().item()) if abs_diff.numel() else 0.0,
+    }
+
+
+def _sparse_eq_exact_diff(
+    lhs: torch.Tensor | None,
+    rhs: torch.Tensor | None,
+) -> dict[str, object]:
+    if lhs is None or rhs is None:
+        return {"available": False}
+    if lhs.shape != rhs.shape:
+        return {
+            "available": True,
+            "shape_match": False,
+            "lhs_shape": list(lhs.shape),
+            "rhs_shape": list(rhs.shape),
+        }
+    mismatch = lhs.detach() != rhs.detach()
+    return {
+        "available": True,
+        "shape_match": True,
+        "mismatch_count": int(mismatch.sum().item()),
+    }
+
+
 def _force_unfused_post_attn_norm() -> bool:
     return os.getenv(
         "VLLM_MINIMAX_M3_FORCE_UNFUSED_POST_ATTN_NORM"
@@ -150,9 +320,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
             weight = self.weight.float() + 1.0
             if residual is None:
                 return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-            return ir.ops.fused_add_rms_norm(
-                x, residual, weight, self.variance_epsilon
-            )
+            return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
         from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 
@@ -509,6 +677,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Attention-backend wiring.
         vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
+        sparse_eq_config = _sparse_eq_config()
+        self._sparse_eq_capture_dir = _sparse_eq_capture_dir(sparse_eq_config)
+        self._sparse_eq_armed_file = _sparse_eq_armed_file(sparse_eq_config)
+        self._sparse_eq_layer_match = _sparse_eq_layer_matches(
+            self.layer_name,
+            sparse_eq_config,
+        )
+        self._sparse_eq_max_records = _sparse_eq_max_records(sparse_eq_config)
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
         )
@@ -560,6 +736,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
             topk_indices_buffer=topk_indices_buffer,
+        )
+        self._sparse_eq_dcp_disabled = (
+            getattr(self.impl, "dcp_world_size", 1) > 1
+            or getattr(self.indexer, "dcp_world_size", 1) > 1
         )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
@@ -646,10 +826,120 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype,
         )
 
+        if self._sparse_eq_enabled():
+            return self._run_attention_equivalence_check(q, index_q)
+
         output = torch.empty_like(q)
         attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _sparse_eq_enabled(self) -> bool:
+        if not self._sparse_eq_layer_match:
+            return False
+        fwd_context = get_forward_context()
+        if fwd_context.cudagraph_runtime_mode != CUDAGraphMode.NONE:
+            return False
+        if self._sparse_eq_dcp_disabled:
+            return False
+        if (
+            self._sparse_eq_armed_file
+            and not Path(self._sparse_eq_armed_file).is_file()
+        ):
+            return False
+        count = _SPARSE_EQ_RECORDS.get(self.layer_name, 0)
+        return count < self._sparse_eq_max_records
+
+    def _topk_snapshot(self, num_tokens: int) -> torch.Tensor | None:
+        topk = self.topk_indices_buffer
+        if topk is None:
+            return None
+        return topk[:num_tokens].detach().clone()
+
+    def _sparse_eq_num_actual_tokens(self, fallback: int) -> int:
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            layer_metadata = attn_metadata.get(self.layer_name)
+            num_actual_tokens = getattr(layer_metadata, "num_actual_tokens", None)
+            if isinstance(num_actual_tokens, int):
+                return min(fallback, num_actual_tokens)
+        return fallback
+
+    def _write_sparse_eq_record(
+        self,
+        record: dict[str, object],
+    ) -> None:
+        capture_dir = self._sparse_eq_capture_dir
+        if not capture_dir:
+            return
+        count = _SPARSE_EQ_RECORDS.get(self.layer_name, 0)
+        _SPARSE_EQ_RECORDS[self.layer_name] = count + 1
+        path = Path(capture_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        safe_layer_name = self.layer_name.replace(".", "_").replace("/", "_")
+        safe_host_name = os.uname().nodename.replace(".", "_").replace("/", "_")
+        file_path = path / (
+            f"{safe_host_name}_pid{os.getpid()}_{safe_layer_name}_{count:03d}.json"
+        )
+        record.update(
+            {
+                "layer_name": self.layer_name,
+                "host_name": os.uname().nodename,
+                "pid": os.getpid(),
+                "record_index": count,
+            }
+        )
+        file_path.write_text(json.dumps(record, indent=2, sort_keys=True))
+
+    def _run_attention_equivalence_check(
+        self,
+        query: torch.Tensor,
+        index_query: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = self._sparse_eq_num_actual_tokens(query.shape[0])
+        baseline_attn = torch.empty_like(query)
+        self._run_attention(query, index_query, baseline_attn)
+        baseline_topk = self._topk_snapshot(num_tokens)
+        baseline_output, _ = self.o_proj(baseline_attn)
+
+        candidate_attn = torch.empty_like(query)
+        self._run_attention(query, index_query, candidate_attn)
+        candidate_topk = self._topk_snapshot(num_tokens)
+
+        self._write_sparse_eq_record(
+            {
+                "num_tokens": num_tokens,
+                "num_padded_tokens": query.shape[0],
+                "q": _sparse_eq_tensor_stats(query[:num_tokens]),
+                "index_q": _sparse_eq_tensor_stats(index_query[:num_tokens]),
+                "topk": _sparse_eq_exact_diff(baseline_topk, candidate_topk),
+                "attn_output": _sparse_eq_numeric_diff(
+                    baseline_attn[:num_tokens],
+                    candidate_attn[:num_tokens],
+                ),
+                "layer_output": {
+                    "available": False,
+                    "reason": (
+                        "skipped to avoid an extra tensor-parallel "
+                        "collective in debug serving"
+                    ),
+                },
+            }
+        )
+        return baseline_output
+
+    def _run_indexer(
+        self,
+        index_query: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.indexer(index_query)
+
+    def _run_main_sparse_attn(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.impl.forward(self, query, self.kv_cache, output)
 
     @eager_break_during_capture
     def _run_attention(
@@ -661,8 +951,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Single eager break around both: their split-K kernels read per-request
         # metadata and can't be captured into a cudagraph. The indexer writes its
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
-        self.indexer(index_query)
-        return self.impl.forward(self, query, self.kv_cache, output)
+        self._run_indexer(index_query)
+        return self._run_main_sparse_attn(query, output)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -728,12 +1018,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         compile_sequence_parallel = bool(
             vllm_config.compilation_config.pass_config.enable_sp
         )
-        reduce_results = (
-            is_mtp_block
-            or (
-                vllm_config.parallel_config.pipeline_parallel_size > 1
-                and not compile_sequence_parallel
-            )
+        reduce_results = is_mtp_block or (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and not compile_sequence_parallel
         )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
@@ -823,7 +1110,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
         "positions": 0,
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
-    }
+    },
+    enable_if=_minimax_m3_torch_compile_enabled,
 )
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
@@ -834,6 +1122,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         self.config = config
+        if _sparse_eq_capture_dir() is not None:
+            # Sparse equivalence capture double-runs one attention layer and
+            # writes JSON on host, so it must stay out of all compile/cudagraph
+            # paths, including stock torch.compile on the outer model.
+            vllm_config.compilation_config.mode = CompilationMode.NONE
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         self.compile_sequence_parallel = bool(
             vllm_config.compilation_config.pass_config.enable_sp
         )
