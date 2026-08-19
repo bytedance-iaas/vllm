@@ -911,9 +911,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
     def set_ffn_all_reduce_deferred(self, defer: bool) -> None:
         if self.is_moe_layer:
-            experts = self.block_sparse_moe.experts
-            experts.moe_config.skip_final_all_reduce = defer
-            experts.w4a8_chunked_finalize_rs_materialized_boundary = False
+            self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = defer
         else:
             self.mlp.down_proj.reduce_results = not defer
 
@@ -1015,20 +1013,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         for idx, (layer, originally_deferred) in enumerate(
             zip(local_layers, self._original_ffn_all_reduce_deferred)
         ):
-            terminal_pp_boundary = (
-                getattr(self, "compile_sequence_parallel", False)
-                and not get_pp_group().is_last_rank
-                and idx + 1 == len(local_layers)
-                and idx + 1 in materialized
-            )
             layer.set_ffn_all_reduce_deferred(
                 originally_deferred and idx + 1 not in materialized
             )
-            if getattr(layer, "is_moe_layer", False):
-                experts = layer.block_sparse_moe.experts
-                experts.w4a8_chunked_finalize_rs_materialized_boundary = (
-                    originally_deferred and terminal_pp_boundary
-                )
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers

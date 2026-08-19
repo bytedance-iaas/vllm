@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import operator
 from collections.abc import Callable
 from contextlib import suppress
 
@@ -12,7 +11,7 @@ import torch.fx as fx
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import (
@@ -903,52 +902,6 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config, pass_name="async_tp_pass")
 
-        self.w4a8_chunked_layers: dict[str, float] = {}
-        self.w4a8_chunked_wildcard_scale: float | None = None
-        if (
-            config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-            and self.model_dtype == torch.bfloat16
-            and get_tensor_model_parallel_world_size() == 4
-        ):
-            all_moe_layer_names = config.compilation_config.static_all_moe_layers
-            all_moe_layers = set(all_moe_layer_names)
-            materialized_boundaries: set[str] = set()
-            for layer_name in all_moe_layers:
-                layer = config.compilation_config.static_forward_context.get(layer_name)
-                if layer is None:
-                    continue
-                supports = getattr(
-                    layer,
-                    "supports_w4a8_chunked_finalize_rs",
-                    None,
-                )
-                if supports is not None and supports():
-                    self.w4a8_chunked_layers[layer_name] = layer.routed_scaling_factor
-                    continue
-                is_boundary = getattr(
-                    layer,
-                    "is_w4a8_chunked_finalize_rs_materialized_boundary",
-                    None,
-                )
-                if is_boundary is not None and is_boundary():
-                    materialized_boundaries.add(layer_name)
-            scales = set(self.w4a8_chunked_layers.values())
-            if (
-                all_moe_layers
-                and len(all_moe_layers) == len(all_moe_layer_names)
-                and set(self.w4a8_chunked_layers) | materialized_boundaries
-                == all_moe_layers
-                and scales == {1.0}
-            ):
-                self.w4a8_chunked_wildcard_scale = 1.0
-            logger.debug(
-                "Eligible W4A8 chunked finalize-RS layers: %s/%s "
-                "(materialized boundaries: %s)",
-                len(self.w4a8_chunked_layers),
-                len(all_moe_layers),
-                len(materialized_boundaries),
-            )
-
         enable_symm_mem_for_group(get_tp_group().device_group.group_name)
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.pm_pass)
 
@@ -1020,117 +973,6 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
 
         self.dump_patterns(config, self.pm_pass)
 
-    @staticmethod
-    def _resolve_hoisted_layer_name(layer_name: object) -> str | None:
-        value = layer_name
-        if isinstance(value, fx.Node):
-            value = value.meta.get("val")
-        real_obj = getattr(value, "real_obj", None)
-        if real_obj is not None:
-            value = real_obj
-        resolved = getattr(value, "value", value)
-        return resolved if isinstance(resolved, str) else None
-
-    def _rewrite_w4a8_chunked_finalize_rs(self, graph: fx.Graph) -> int:
-        if not self.w4a8_chunked_layers:
-            return 0
-
-        tp_group = get_tp_group()
-        matched = 0
-        for reduce_scatter in list(graph.nodes):
-            if (
-                reduce_scatter.op != "call_function"
-                or reduce_scatter.target != torch.ops.vllm.reduce_scatter.default
-                or len(reduce_scatter.args) < 4
-            ):
-                continue
-            add, dim, world_size, group_name = reduce_scatter.args[:4]
-            if (
-                not isinstance(add, fx.Node)
-                or dim != 0
-                or world_size != 4
-                or group_name != tp_group.unique_name
-                or len(add.users) != 1
-                or add.op != "call_function"
-                or add.target != torch.ops.aten.add.Tensor
-                or add.kwargs.get("alpha", 1) != 1
-                or len(add.args) < 2
-            ):
-                continue
-
-            lhs, rhs = add.args[:2]
-            if not isinstance(lhs, fx.Node) or not isinstance(rhs, fx.Node):
-                continue
-            if (
-                lhs.op != "call_function"
-                or rhs.op != "call_function"
-                or lhs.target is not operator.getitem
-                or rhs.target is not operator.getitem
-                or len(lhs.args) != 2
-                or len(rhs.args) != 2
-                or {lhs.args[1], rhs.args[1]} != {0, 1}
-                or lhs.args[0] is not rhs.args[0]
-                or len(lhs.users) != 1
-                or len(rhs.users) != 1
-            ):
-                continue
-
-            moe = lhs.args[0]
-            if (
-                not isinstance(moe, fx.Node)
-                or moe.op != "call_function"
-                or moe.target != torch.ops.vllm.moe_forward_shared.default
-                or set(moe.users) != {lhs, rhs}
-                or len(moe.args) != 6
-                or moe.args[0] is not moe.args[2]
-                or moe.args[3] is not None
-                or moe.args[5] != 0
-            ):
-                continue
-
-            layer_name = self._resolve_hoisted_layer_name(moe.args[4])
-            routed_scale = (
-                self.w4a8_chunked_layers.get(layer_name)
-                if layer_name is not None
-                else self.w4a8_chunked_wildcard_scale
-            )
-            if routed_scale is None:
-                continue
-
-            output_meta = reduce_scatter.meta.get("val")
-            if (
-                output_meta is None
-                or getattr(output_meta, "dtype", None) != torch.bfloat16
-                or getattr(output_meta, "ndim", None) != 2
-                or output_meta.shape[1] != 6144
-            ):
-                continue
-
-            with graph.inserting_before(reduce_scatter):
-                replacement = graph.call_function(
-                    torch.ops.vllm.moe_forward_shared_w4a8_chunked_finalize_rs.default,
-                    args=(
-                        *moe.args,
-                        routed_scale,
-                        256,
-                        4,
-                        "compiler_sp_async_tp_w4a8",
-                    ),
-                )
-                replacement.meta = dict(reduce_scatter.meta)
-
-            reduce_scatter.replace_all_uses_with(replacement)
-            graph.erase_node(reduce_scatter)
-            graph.erase_node(add)
-            graph.erase_node(lhs)
-            graph.erase_node(rhs)
-            graph.erase_node(moe)
-            matched += 1
-
-        if matched:
-            graph.lint()
-        return matched
-
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         # This pass is applied on top of the sequence parallelism pass,
         # which is only supported in fullgraph compilation mode.
@@ -1142,8 +984,6 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        w4a8_matches = self._rewrite_w4a8_chunked_finalize_rs(graph)
-        self.matched_count = w4a8_matches + self.pm_pass.apply(graph)
+        self.matched_count = self.pm_pass.apply(graph)
         VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
-        logger.debug("Replaced %s W4A8 MoE finalize-RS patterns", w4a8_matches)
         logger.debug("Replaced %s patterns", self.matched_count)

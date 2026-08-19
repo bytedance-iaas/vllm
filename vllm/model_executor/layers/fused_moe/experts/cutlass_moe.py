@@ -5,7 +5,6 @@
 import json
 import math
 import os
-import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -1699,7 +1698,6 @@ class W4A8ChunkedFinalizeRSContext:
     chunk_rows_per_destination: int
     tp_size: int
     state_key: str
-    shared_ready_stream: torch.cuda.Stream | None = None
 
 
 # W4A8
@@ -2036,10 +2034,6 @@ def run_cutlass_moe_w4a8_fp8(
                     expert_first_token_offset=expert_first_token_offset,
                 )
         else:
-            if chunked_finalize_rs.shared_ready_stream is not None:
-                compute_stream = current_stream()
-                chunked_finalize_rs.shared_out.record_stream(compute_stream)
-                compute_stream.wait_stream(chunked_finalize_rs.shared_ready_stream)
             return cutlass_w4a8_chunked_finalize_rs(
                 mm2_out,
                 topk_weights,
@@ -2083,7 +2077,6 @@ class _W4A8ChunkedFinalizeRSState:
         self.ready = [torch.cuda.Event() for _ in range(2)]
         self.done = [torch.cuda.Event() for _ in range(2)]
         self.busy = [False, False]
-        self.lock = threading.Lock()
 
 
 _W4A8_CHUNKED_FINALIZE_RS_STATES: dict[
@@ -2232,55 +2225,52 @@ def cutlass_w4a8_chunked_finalize_rs(
         shared_out.device,
     )
     compute_stream = current_stream()
+    last_slot = 0
 
-    with state.lock:
-        last_slot = 0
-        for chunk_idx, (row_start, valid_rows) in enumerate(chunk_plan):
-            slot = chunk_idx % 2
-            last_slot = slot
-            if state.busy[slot]:
-                compute_stream.wait_event(state.done[slot])
+    for chunk_idx, (row_start, valid_rows) in enumerate(chunk_plan):
+        slot = chunk_idx % 2
+        last_slot = slot
+        if state.busy[slot]:
+            compute_stream.wait_event(state.done[slot])
 
-            stage = state.stage[slot]
-            if valid_rows != chunk_rows_per_destination:
-                stage[:, valid_rows:].zero_()
+        stage = state.stage[slot]
+        if valid_rows != chunk_rows_per_destination:
+            stage[:, valid_rows:].zero_()
 
-            for destination in range(tp_size):
-                token_start = destination * local_rows + row_start
-                destination_out = stage[destination, :valid_rows]
-                moe_unpermute_range(
-                    out=destination_out,
-                    permuted_hidden_states=mm2_out,
-                    topk_weights=topk_weights,
-                    inv_permuted_idx=inv_permuted_idx,
-                    expert_first_token_offset=expert_first_token_offset,
-                    token_start=token_start,
-                )
-                if routed_scale != 1.0:
-                    destination_out.mul_(routed_scale)
-                destination_out.add_(shared_out[token_start : token_start + valid_rows])
-
-            state.ready[slot].record(compute_stream)
-            state.comm_stream.wait_event(state.ready[slot])
-            rs_output = (
-                output[row_start : row_start + valid_rows]
-                if valid_rows == chunk_rows_per_destination
-                else state.tail[slot]
+        for destination in range(tp_size):
+            token_start = destination * local_rows + row_start
+            destination_out = stage[destination, :valid_rows]
+            moe_unpermute_range(
+                out=destination_out,
+                permuted_hidden_states=mm2_out,
+                topk_weights=topk_weights,
+                inv_permuted_idx=inv_permuted_idx,
+                expert_first_token_offset=expert_first_token_offset,
+                token_start=token_start,
             )
-            pynccl_comm.reduce_scatter(
-                rs_output,
-                stage.view(tp_size * chunk_rows_per_destination, hidden_size),
-                stream=state.comm_stream,
-            )
-            if valid_rows != chunk_rows_per_destination:
-                with torch.cuda.stream(state.comm_stream):
-                    output[row_start : row_start + valid_rows].copy_(
-                        rs_output[:valid_rows]
-                    )
-            state.done[slot].record(state.comm_stream)
-            state.busy[slot] = True
+            if routed_scale != 1.0:
+                destination_out.mul_(routed_scale)
+            destination_out.add_(shared_out[token_start : token_start + valid_rows])
 
-        compute_stream.wait_event(state.done[last_slot])
+        state.ready[slot].record(compute_stream)
+        state.comm_stream.wait_event(state.ready[slot])
+        rs_output = (
+            output[row_start : row_start + valid_rows]
+            if valid_rows == chunk_rows_per_destination
+            else state.tail[slot]
+        )
+        pynccl_comm.reduce_scatter(
+            rs_output,
+            stage.view(tp_size * chunk_rows_per_destination, hidden_size),
+            stream=state.comm_stream,
+        )
+        if valid_rows != chunk_rows_per_destination:
+            with torch.cuda.stream(state.comm_stream):
+                output[row_start : row_start + valid_rows].copy_(rs_output[:valid_rows])
+        state.done[slot].record(state.comm_stream)
+        state.busy[slot] = True
+
+    compute_stream.wait_event(state.done[last_slot])
     return output
 
 
@@ -2498,8 +2488,7 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor | None,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
-        chunked_finalize_rs: W4A8ChunkedFinalizeRSContext | None = None,
-    ) -> torch.Tensor | None:
+    ):
         assert self.w1_zp is None, "w1_zp is not supported in CUTLASS MoE"
         assert self.w2_zp is None, "w2_zp is not supported in CUTLASS MoE"
 
@@ -2512,7 +2501,7 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
         in_dtype = hidden_states.dtype
 
-        return run_cutlass_moe_w4a8_fp8(
+        run_cutlass_moe_w4a8_fp8(
             output,
             hidden_states,
             w1,
@@ -2548,7 +2537,6 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
             topk_weights,
             self.group_size,
             self._get_permute_scratch(),
-            chunked_finalize_rs,
         )
 
 

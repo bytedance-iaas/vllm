@@ -12,7 +12,6 @@ from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -54,7 +53,6 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
-from vllm.v1.worker.ubatching import dbo_enabled
 
 logger = init_logger(__name__)
 
@@ -192,56 +190,6 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
-def _moe_forward_shared_w4a8_chunked_finalize_rs(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    shared_experts_input: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
-    layer_name: _layer_name_type,
-    hidden_dim_unpadded: int,
-    routed_scale: float,
-    chunk_rows_per_destination: int,
-    tp_size: int,
-    state_key: str,
-) -> torch.Tensor:
-    layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    if not isinstance(layer, MoERunner):
-        raise RuntimeError("Chunked W4A8 finalization requires a MoERunner.")
-    return layer._forward_w4a8_chunked_finalize_rs_impl(
-        hidden_states,
-        router_logits,
-        shared_experts_input,
-        input_ids,
-        hidden_dim_unpadded,
-        routed_scale,
-        chunk_rows_per_destination,
-        tp_size,
-        state_key,
-    )
-
-
-def _moe_forward_shared_w4a8_chunked_finalize_rs_fake(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    shared_experts_input: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
-    layer_name: _layer_name_type,
-    hidden_dim_unpadded: int,
-    routed_scale: float,
-    chunk_rows_per_destination: int,
-    tp_size: int,
-    state_key: str,
-) -> torch.Tensor:
-    if shared_experts_input is None:
-        raise RuntimeError("Chunked W4A8 finalization requires shared experts.")
-    return shared_experts_input.new_empty(
-        (
-            shared_experts_input.shape[0] // tp_size,
-            shared_experts_input.shape[1],
-        )
-    )
-
-
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
@@ -257,14 +205,6 @@ direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
     fake_impl=_moe_forward_shared_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
-)
-
-direct_register_custom_op(
-    op_name="moe_forward_shared_w4a8_chunked_finalize_rs",
-    op_func=_moe_forward_shared_w4a8_chunked_finalize_rs,
-    mutates_args=[],
-    fake_impl=_moe_forward_shared_w4a8_chunked_finalize_rs_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -325,7 +265,6 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
-        self.w4a8_chunked_finalize_rs_materialized_boundary = False
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -843,157 +782,6 @@ class MoERunner(MoERunnerInterface):
             return shared_output, hidden_states
         else:
             return hidden_states
-
-    def _supports_w4a8_chunked_finalize_rs_structure(self) -> bool:
-        from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
-            CutlassExpertsW4A8Fp8,
-        )
-        from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
-            MoEPrepareAndFinalizeNoDPEPModular,
-        )
-
-        quant_method = self._quant_method
-        apply_chunked = getattr(quant_method, "apply_chunked_finalize_rs", None)
-        moe_kernel = quant_method.moe_kernel
-        if not callable(apply_chunked) or moe_kernel is None:
-            return False
-
-        fused_experts = moe_kernel.fused_experts
-        prepare_finalize = moe_kernel.prepare_finalize
-        parallel = self.moe_config.moe_parallel_config
-        device_comm = get_tp_group().device_communicator
-        pynccl_comm = (
-            None if device_comm is None else getattr(device_comm, "pynccl_comm", None)
-        )
-        return (
-            type(fused_experts) is CutlassExpertsW4A8Fp8
-            and type(prepare_finalize) is MoEPrepareAndFinalizeNoDPEPModular
-            and self._shared_experts is not None
-            and self.shared_expert_gate is None
-            and self.gate is None
-            and self.routed_input_transform is None
-            and self.routed_output_transform is None
-            and not isinstance(self.router, ZeroExpertRouter)
-            and not self.enable_dbo
-            and not self.moe_config.is_lora_enabled
-            and getattr(fused_experts, "_lora_context", None) is None
-            and not self._quant_method.has_unpadded_output
-            and self.moe_config.hidden_dim_unpadded == self.moe_config.hidden_dim
-            and self.moe_config.in_dtype == torch.bfloat16
-            and self.moe_config.experts_per_token == 4
-            and self.routed_scaling_factor == 1.0
-            and parallel.tp_size == 1
-            and parallel.pcp_size == 1
-            and parallel.dp_size == 1
-            and parallel.ep_size == get_tp_group().world_size
-            and parallel.sp_size == 1
-            and parallel.use_ep
-            and not parallel.use_all2all_kernels
-            and get_tp_group().world_size == 4
-            and pynccl_comm is not None
-            and not pynccl_comm.disabled
-        )
-
-    def supports_w4a8_chunked_finalize_rs(self) -> bool:
-        eligible = (
-            self._supports_w4a8_chunked_finalize_rs_structure()
-            and self.moe_config.skip_final_all_reduce
-        )
-        if not eligible:
-            logger.debug_once(
-                "W4A8 chunked finalize-RS rejected: structural=%s skip_ar=%s",
-                self._supports_w4a8_chunked_finalize_rs_structure(),
-                self.moe_config.skip_final_all_reduce,
-            )
-        return eligible
-
-    def is_w4a8_chunked_finalize_rs_materialized_boundary(self) -> bool:
-        return (
-            self.w4a8_chunked_finalize_rs_materialized_boundary
-            and not self.moe_config.skip_final_all_reduce
-            and self._supports_w4a8_chunked_finalize_rs_structure()
-        )
-
-    def _forward_w4a8_chunked_finalize_rs_impl(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
-        input_ids: torch.Tensor | None,
-        hidden_dim_unpadded: int,
-        routed_scale: float,
-        chunk_rows_per_destination: int,
-        tp_size: int,
-        state_key: str,
-    ) -> torch.Tensor:
-        from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
-            W4A8ChunkedFinalizeRSContext,
-        )
-
-        if not self.supports_w4a8_chunked_finalize_rs():
-            raise RuntimeError(
-                "MoE layer is not eligible for chunked W4A8 finalization."
-            )
-        if dbo_enabled():
-            raise RuntimeError("Chunked W4A8 finalization does not support DBO.")
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Chunked W4A8 finalization does not support CUDA graph capture."
-            )
-        if shared_experts_input is None or input_ids is not None:
-            raise RuntimeError("Chunked W4A8 finalization requires shared input only.")
-        if hidden_dim_unpadded != 0:
-            raise RuntimeError("Chunked W4A8 finalization does not support truncation.")
-        if (
-            hidden_states.shape != shared_experts_input.shape
-            or hidden_states.data_ptr() != shared_experts_input.data_ptr()
-        ):
-            raise RuntimeError("Routed and shared inputs must alias.")
-        if routed_scale != self.routed_scaling_factor:
-            raise RuntimeError("Routed scaling factor does not match the MoE layer.")
-        if tp_size != get_tp_group().world_size:
-            raise RuntimeError("Requested TP size does not match the active TP group.")
-        if hidden_states.shape[0] % tp_size != 0:
-            raise RuntimeError("Token count must be divisible by TP size.")
-
-        quant_method = self._quant_method
-        apply_chunked = getattr(quant_method, "apply_chunked_finalize_rs", None)
-        if not callable(apply_chunked):
-            raise RuntimeError(
-                "W4A8 quantization method lacks chunked finalization support."
-            )
-
-        self.routed_experts._ensure_moe_quant_config_init()
-        assert self._shared_experts is not None
-        shared_out, shared_ready_stream = (
-            self._shared_experts.launch_for_chunked_finalize(shared_experts_input)
-        )
-
-        with self._sequence_parallel_context():
-            hidden_states, router_logits = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
-            )
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=quant_method.topk_indices_dtype,
-                input_ids=None,
-            )
-            return apply_chunked(
-                layer=self.routed_experts,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                chunked_finalize_rs=W4A8ChunkedFinalizeRSContext(
-                    shared_out=shared_out,
-                    routed_scale=routed_scale,
-                    chunk_rows_per_destination=chunk_rows_per_destination,
-                    tp_size=tp_size,
-                    state_key=state_key,
-                    shared_ready_stream=shared_ready_stream,
-                ),
-            )
 
     def _forward_impl(
         self,

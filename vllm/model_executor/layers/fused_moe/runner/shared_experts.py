@@ -141,28 +141,6 @@ class SharedExperts(torch.nn.Module):
 
         return output
 
-    def launch_for_chunked_finalize(
-        self,
-        shared_experts_input: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.cuda.Stream | None]:
-        if self.enable_dbo:
-            raise RuntimeError("Chunked MoE finalization does not support DBO.")
-
-        experts_order = self._determine_shared_experts_order(shared_experts_input)
-        if experts_order == SharedExpertsOrder.NO_OVERLAP:
-            return self._layer(shared_experts_input), None
-        if experts_order != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
-            raise RuntimeError(
-                "Chunked MoE finalization requires external shared experts."
-            )
-
-        assert self._stream is not None
-        shared_experts_input.record_stream(self._stream)
-        self._stream.wait_stream(current_stream())
-        with torch.cuda.stream(self._stream):
-            output = self._layer(shared_experts_input)
-        return output, self._stream
-
     @property
     def _output_idx(self) -> int:
         return dbo_current_ubatch_id() if self.enable_dbo else 0
