@@ -931,7 +931,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         baseline_attn = torch.empty_like(query)
         self._run_attention(query, index_query, baseline_attn)
         baseline_topk = self._topk_snapshot(num_tokens)
-        baseline_output, _ = self.o_proj(baseline_attn)
 
         candidate_attn = torch.empty_like(query)
         self._run_attention(query, index_query, candidate_attn)
@@ -957,7 +956,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 },
             }
         )
-        return baseline_output
+        return baseline_attn
 
     def _run_indexer(
         self,
