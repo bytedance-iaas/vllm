@@ -1122,6 +1122,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return self.post_attention_layernorm(hidden_states, residual)
 
         num_tokens = hidden_states.shape[0]
+        residual_is_full = residual.shape[0] == num_tokens
         pad = (-num_tokens) % tp_size
         if pad:
             hidden_states = torch.cat(
@@ -1131,13 +1132,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 ],
                 dim=0,
             )
-            residual = torch.cat(
-                [
-                    residual,
-                    residual.new_zeros((pad, residual.shape[1])),
-                ],
-                dim=0,
-            )
+            if residual_is_full:
+                residual = torch.cat(
+                    [
+                        residual,
+                        residual.new_zeros((pad, residual.shape[1])),
+                    ],
+                    dim=0,
+                )
 
         tp_group = get_tp_group()
         local_hidden = torch.ops.vllm.reduce_scatter.default(
@@ -1147,10 +1149,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             tp_group.unique_name,
         )
         local_len = local_hidden.shape[0]
-        tp_rank = get_tensor_model_parallel_rank()
-        local_residual = residual[
-            tp_rank * local_len : tp_rank * local_len + local_len, ...
-        ].contiguous()
+        if residual_is_full:
+            tp_rank = get_tensor_model_parallel_rank()
+            local_residual = residual[
+                tp_rank * local_len : tp_rank * local_len + local_len, ...
+            ].contiguous()
+        else:
+            local_residual = residual.contiguous()
         local_hidden, local_residual = self.post_attention_layernorm(
             local_hidden,
             local_residual,
