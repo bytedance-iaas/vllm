@@ -221,7 +221,10 @@ def _minimax_m3_torch_compile_enabled(_vllm_config: VllmConfig) -> bool:
     del _vllm_config
     # The sparse-equivalence diagnostic is intentionally eager-only because it
     # performs host logging and double-runs attention kernels for one layer.
-    return _sparse_eq_capture_dir() is None
+    return (
+        _sparse_eq_capture_dir() is None
+        and os.getenv("VLLM_MINIMAX_M3_DISABLE_TORCH_COMPILE") != "1"
+    )
 
 
 def _sparse_eq_tensor_stats(tensor: torch.Tensor) -> dict[str, object]:
