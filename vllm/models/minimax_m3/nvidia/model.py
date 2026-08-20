@@ -102,7 +102,13 @@ from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -780,6 +786,23 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
 
+        num_tokens = qkv.shape[0]
+        output = qkv.new_empty((num_tokens, self.q_size))
+        torch.ops.vllm.minimax_m3_sparse_attention_with_output(
+            qkv,
+            positions,
+            output,
+            _encode_layer_name(self.layer_name),
+        )
+        output, _ = self.o_proj(output)
+        return output
+
+    def _run_sparse_attention_with_output(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
         # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
         # main (q/k) and index (index_q/index_k) branches, all read straight out
         # of the single fused ``qkv`` tensor (the "5 results").  Once the paged
@@ -801,7 +824,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+            output.zero_()
+            return
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
@@ -836,12 +860,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
 
         if self._sparse_eq_enabled():
-            return self._run_attention_equivalence_check(q, index_q)
+            output.copy_(self._run_attention_equivalence_check(q, index_q))
+            return
 
-        output = torch.empty_like(q)
-        attn_output = self._run_attention(q, index_q, output)
-        output, _ = self.o_proj(attn_output)
-        return output
+        self._run_attention(q, index_q, output)
 
     def _sparse_eq_enabled(self) -> bool:
         if not self._sparse_eq_layer_match:
@@ -962,6 +984,34 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
         self._run_indexer(index_query)
         return self._run_main_sparse_attn(query, output)
+
+
+def _minimax_m3_sparse_attention_with_output(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer._run_sparse_attention_with_output(qkv, positions, output)
+
+
+def _minimax_m3_sparse_attention_with_output_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sparse_attention_with_output",
+    op_func=_minimax_m3_sparse_attention_with_output,
+    mutates_args=["qkv", "output"],
+    fake_impl=_minimax_m3_sparse_attention_with_output_fake,
+)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
