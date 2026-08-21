@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -645,6 +648,90 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm.all_gather(symm_output, input_)
         return symm_output
 
+    def _record_batched_ag_shape_stats(
+        self,
+        group_key: tuple[tuple[tuple[int, ...], str, str], ...],
+        tensors: list[dict[str, object]],
+        total_bytes: int,
+    ) -> None:
+        stats_path = envs.VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH
+        if not stats_path or self.__dict__.get("_batched_ag_stats_disabled"):
+            return
+
+        try:
+            stats = self.__dict__.setdefault(
+                "_batched_ag_shape_stats",
+                {
+                    "calls": 0,
+                    "simulated_hits": 0,
+                    "simulated_misses": 0,
+                    "simulated_promotes": 0,
+                    "groups": {},
+                },
+            )
+            stats["calls"] += 1
+            threshold = max(1, envs.VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD)
+            key = repr(group_key)
+            groups = stats["groups"]
+            group = groups.setdefault(
+                key,
+                {
+                    "count": 0,
+                    "bytes": total_bytes,
+                    "tensors": tensors,
+                    "first_call": stats["calls"],
+                    "last_call": stats["calls"],
+                },
+            )
+            group["count"] += 1
+            group["last_call"] = stats["calls"]
+
+            if group["count"] < threshold:
+                stats["simulated_misses"] += 1
+            elif group["count"] == threshold:
+                stats["simulated_promotes"] += 1
+            else:
+                stats["simulated_hits"] += 1
+
+            topk = max(1, envs.VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK)
+            top_groups = sorted(
+                groups.items(), key=lambda item: item[1]["count"], reverse=True
+            )[:topk]
+            payload = {
+                "rank": self.rank_in_group,
+                "world_size": self.world_size,
+                "pid": os.getpid(),
+                "hot_threshold": threshold,
+                "calls": stats["calls"],
+                "unique_groups": len(groups),
+                "simulated_hits": stats["simulated_hits"],
+                "simulated_misses": stats["simulated_misses"],
+                "simulated_promotes": stats["simulated_promotes"],
+                "top_groups": [
+                    {
+                        "key": group_key,
+                        **group_stats,
+                    }
+                    for group_key, group_stats in top_groups
+                ],
+                "groups": groups,
+            }
+            os.makedirs(stats_path, exist_ok=True)
+            output_path = os.path.join(
+                stats_path,
+                f"batched_ag_rank{self.rank_in_group}_pid{os.getpid()}.json",
+            )
+            tmp_path = f"{output_path}.tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp_path, output_path)
+        except Exception:
+            self.__dict__["_batched_ag_stats_disabled"] = True
+            logger.warning(
+                "Failed to record batched symmetric-memory AllGather stats",
+                exc_info=True,
+            )
+
     def _all_gather_batched_symm_mem(
         self, inputs: list[torch.Tensor]
     ) -> list[torch.Tensor]:
@@ -662,12 +749,35 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert pynccl_comm is not None
         world_size = self.world_size
 
+        output_specs: list[tuple[tuple[int, ...], torch.dtype, torch.device]] = []
+        stats_tensors = []
+        total_bytes = 0
+        for inp in inputs:
+            out_size = (inp.size(0) * world_size,) + tuple(inp.size()[1:])
+            output_specs.append((out_size, inp.dtype, inp.device))
+            numel = 1
+            for dim_size in out_size:
+                numel *= dim_size
+            tensor_bytes = numel * inp.element_size()
+            total_bytes += tensor_bytes
+            stats_tensors.append(
+                {
+                    "shape": list(out_size),
+                    "dtype": str(inp.dtype),
+                    "device": str(inp.device),
+                    "bytes": tensor_bytes,
+                }
+            )
+        group_key = tuple(
+            (shape, str(dtype), str(device)) for shape, dtype, device in output_specs
+        )
+        self._record_batched_ag_shape_stats(group_key, stats_tensors, total_bytes)
+
         symm_outputs = []
         with nccl_symm_mem_context(pynccl_comm):
-            for inp in inputs:
-                out_size = (inp.size(0) * world_size,) + inp.size()[1:]
+            for out_size, dtype, device in output_specs:
                 symm_outputs.append(
-                    torch.empty(out_size, dtype=inp.dtype, device=inp.device)
+                    torch.empty(out_size, dtype=dtype, device=device)
                 )
 
         pynccl_comm.group_start()

@@ -243,6 +243,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = False
+    VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH: str | None = None
+    VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK: int = 20
+    VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD: int = 3
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1769,6 +1772,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))
     ),
+    # Optional debug output for batched symmetric-memory AllGather shape stats.
+    "VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH": lambda: os.getenv(
+        "VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH", None
+    ),
+    "VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK": lambda: int(
+        os.getenv("VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK", "20")
+    ),
+    "VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD": lambda: int(
+        os.getenv("VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD", "3")
+    ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2147,6 +2160,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
+        "VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH",
+        "VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK",
+        "VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
