@@ -311,134 +311,6 @@ def fused_all_gather_flashinfer_fp4_matmul(
     return output
 
 
-def _cutlass_w4a8_schedule(m: int, k: int, n: int) -> str:
-    if m <= 16:
-        return "256x16_1x1x1" if k == 16384 and n == 18432 else "128x16_1x1x1"
-    if m <= 32:
-        return "256x32_1x1x1" if k == 16384 and n == 18432 else "128x32_1x1x1"
-    if m <= 64:
-        if k == 16384 and n == 18432:
-            return "256x64_1x1x1"
-        return "128x32_1x1x1" if n <= 8192 and k <= 8192 else "128x64_1x1x1"
-    if m <= 128:
-        if k == 16384 and n == 18432:
-            return "256x128_1x1x1"
-        return "128x64_1x1x1" if n <= 8192 else "128x128_1x1x1"
-    if m <= 256:
-        if n <= 4096:
-            return "128x64_1x1x1"
-        if n <= 8192:
-            return "128x128_1x1x1"
-        return "128x256_1x1x1"
-    if m <= 512 and n <= 4096:
-        return "128x128_1x1x1"
-    if m <= 1024:
-        return "128x256_1x1x1"
-    return "128x256_2x1x1"
-
-
-def _cutlass_w4a8_mm_out(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    *,
-    scale_a: torch.Tensor,
-    b_group_scales: torch.Tensor,
-    b_group_size: int,
-    b_channel_scales: torch.Tensor,
-    out: torch.Tensor,
-    out_dtype: torch.dtype | None = None,
-    maybe_schedule: str | None = None,
-) -> None:
-    result = torch.ops._C.cutlass_w4a8_mm.default(
-        A,
-        B,
-        b_group_scales,
-        b_group_size,
-        b_channel_scales,
-        scale_a,
-        out_dtype,
-        maybe_schedule,
-    )
-    out.copy_(result)
-
-
-def fused_cutlass_w4a8_matmul_reduce_scatter_fake(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    b_group_scales: torch.Tensor,
-    b_group_size: int,
-    b_channel_scales: torch.Tensor,
-    a_token_scales: torch.Tensor,
-    reduce_op: str,
-    orig_scatter_dim: int,
-    scatter_dim_after_maybe_reshape: int,
-    group_name: str,
-    output_shape: list[int],
-    out_dtype: torch.dtype | None = None,
-    maybe_schedule: str | None = None,
-) -> torch.Tensor:
-    del b_group_scales, b_group_size, b_channel_scales, a_token_scales
-    del reduce_op, scatter_dim_after_maybe_reshape, maybe_schedule
-    world_size = c10d._resolve_process_group(group_name).size()
-    result_shape = list(output_shape)
-    result_shape[orig_scatter_dim] //= world_size
-    return torch.empty(
-        result_shape,
-        dtype=out_dtype or torch.bfloat16,
-        device=A.device,
-    )
-
-
-def fused_cutlass_w4a8_matmul_reduce_scatter(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    b_group_scales: torch.Tensor,
-    b_group_size: int,
-    b_channel_scales: torch.Tensor,
-    a_token_scales: torch.Tensor,
-    reduce_op: str,
-    orig_scatter_dim: int,
-    scatter_dim_after_maybe_reshape: int,
-    group_name: str,
-    output_shape: list[int],
-    out_dtype: torch.dtype | None = None,
-    maybe_schedule: str | None = None,
-) -> torch.Tensor:
-    assert orig_scatter_dim == 0 and scatter_dim_after_maybe_reshape == 0, (
-        "CUTLASS W4A8 symm_mem adapter currently only supports scatter_dim=0"
-    )
-    assert A.ndim == 2 and B.ndim == 2, (
-        "CUTLASS W4A8 symm_mem adapter expects 2D inputs"
-    )
-    world_size = c10d._resolve_process_group(group_name).size()
-    assert A.shape[0] % world_size == 0, (
-        "CUTLASS W4A8 symm_mem adapter expects M divisible by world size"
-    )
-    if maybe_schedule is None:
-        maybe_schedule = _cutlass_w4a8_schedule(A.shape[0], A.shape[1], B.shape[1])
-
-    kwargs = {
-        "b_group_scales": b_group_scales,
-        "b_group_size": b_group_size,
-        "b_channel_scales": b_channel_scales,
-        "out_dtype": out_dtype,
-        "maybe_schedule": maybe_schedule,
-    }
-    return torch.distributed._symmetric_memory._fused_scaled_matmul_reduce_scatter_impl(
-        mm_out_op=_cutlass_w4a8_mm_out,
-        A=A,
-        B=B,
-        A_scale=a_token_scales,
-        kwargs=kwargs,
-        out_dtype=out_dtype,
-        reduce_op=reduce_op,
-        orig_scatter_dim=orig_scatter_dim,
-        scatter_dim_after_maybe_reshape=scatter_dim_after_maybe_reshape,
-        group_name=group_name,
-        output_shape=output_shape,
-    )
-
-
 direct_register_custom_op(
     op_name="fused_flashinfer_scaled_matmul_reduce_scatter",
     op_func=fused_flashinfer_scaled_matmul_reduce_scatter,
@@ -455,12 +327,6 @@ direct_register_custom_op(
     op_name="fused_all_gather_flashinfer_fp4_matmul",
     op_func=fused_all_gather_flashinfer_fp4_matmul,
     fake_impl=fused_all_gather_flashinfer_fp4_matmul_fake,
-)
-
-direct_register_custom_op(
-    op_name="fused_cutlass_w4a8_matmul_reduce_scatter",
-    op_func=fused_cutlass_w4a8_matmul_reduce_scatter,
-    fake_impl=fused_cutlass_w4a8_matmul_reduce_scatter_fake,
 )
 
 
@@ -737,69 +603,6 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
             )
 
             return gemm_rs
-
-        pm.register_replacement(
-            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
-
-
-class CutlassW4A8ReduceScatterPattern(BasePattern):
-    def get_inputs(self) -> list[torch.Tensor]:
-        input = torch.empty([16, 128], device=self.device, dtype=FP8_DTYPE)
-        weight = torch.empty([16, 128], device=self.device, dtype=torch.int32)
-        group_scales = torch.empty([16], device=self.device, dtype=FP8_DTYPE)
-        channel_scales = torch.empty([128], device=self.device, dtype=torch.float32)
-        token_scales = torch.empty([16, 1], device=self.device, dtype=torch.float32)
-        return [input, weight, group_scales, channel_scales, token_scales]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            group_scales: torch.Tensor,
-            channel_scales: torch.Tensor,
-            token_scales: torch.Tensor,
-        ) -> torch.Tensor:
-            mm = torch.ops._C.cutlass_w4a8_mm.default(
-                input,
-                weight,
-                group_scales,
-                128,
-                channel_scales,
-                token_scales,
-                None,
-                None,
-            )
-            return torch.ops.vllm.reduce_scatter.default(
-                mm,
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
-
-        def replacement(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            group_scales: torch.Tensor,
-            channel_scales: torch.Tensor,
-            token_scales: torch.Tensor,
-        ) -> torch.Tensor:
-            output_shape = [*input.shape[:-1], weight.shape[1]]
-            return torch.ops.vllm.fused_cutlass_w4a8_matmul_reduce_scatter.default(
-                input,
-                weight,
-                group_scales,
-                128,
-                channel_scales,
-                token_scales,
-                "sum",
-                0,
-                0,
-                self.tp.device_group.group_name,
-                output_shape,
-                self.dtype,
-                None,
-            )
 
         pm.register_replacement(
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
@@ -1121,10 +924,6 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
                 AllGatherCutlassScaledMMPattern(self.model_dtype, self.device).register(
                     self.pm_pass
                 )
-            if hasattr(torch.ops._C, "cutlass_w4a8_mm"):
-                CutlassW4A8ReduceScatterPattern(
-                    self.model_dtype, self.device
-                ).register(self.pm_pass)
             with suppress(ImportError):
                 import vllm.utils.flashinfer  # noqa: F401
             if hasattr(torch.ops.vllm, "bmm_fp8"):
