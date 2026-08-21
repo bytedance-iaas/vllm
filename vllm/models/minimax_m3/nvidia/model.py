@@ -324,12 +324,14 @@ _PIPELINED_AG_GATE_ELIGIBILITY: dict[tuple[object, ...], bool] = {}
 def _uniform_pipelined_ag_gate_eligibility(
     tp_group,
     gate: GateLinear,
+    model_dtype: torch.dtype,
 ) -> bool:
     key = (
         tp_group.device_group.group_name,
         tuple(gate.weight.shape),
         gate.weight.dtype,
         gate.out_dtype,
+        model_dtype,
     )
     cached = _PIPELINED_AG_GATE_ELIGIBILITY.get(key)
     if cached is not None:
@@ -348,6 +350,7 @@ def _uniform_pipelined_ag_gate_eligibility(
         and gate.weight.dtype == torch.float32
         and gate.weight.shape == (128, 6144)
         and gate.weight.is_contiguous()
+        and model_dtype == torch.bfloat16
     )
     eligibility = torch.tensor(
         int(local_eligible),
@@ -516,6 +519,19 @@ def _minimax_m3_pipelined_ag_gate(
     vllm_group_name: str,
     c10d_group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        hidden.ndim != 2
+        or residual.ndim != 2
+        or hidden.shape != residual.shape
+        or hidden.shape[1] != 6144
+        or hidden.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+        or hidden.device != residual.device
+        or not hidden.is_contiguous()
+        or not residual.is_contiguous()
+    ):
+        raise RuntimeError("Invalid MiniMax-M3 pipelined AG+gate inputs")
+
     if hidden.shape[0] < 629:
         with torch.cuda.nvtx.range(
             _nvtx_range_name("pipelined_ag_gate_fallback", hidden)
@@ -540,19 +556,6 @@ def _minimax_m3_pipelined_ag_gate(
                 )
             )
             return gathered_hidden, gathered_residual, router_logits
-
-    if (
-        hidden.ndim != 2
-        or residual.ndim != 2
-        or hidden.shape != residual.shape
-        or hidden.shape[1] != 6144
-        or hidden.dtype != torch.bfloat16
-        or residual.dtype != torch.bfloat16
-        or hidden.device != residual.device
-        or not hidden.is_contiguous()
-        or not residual.is_contiguous()
-    ):
-        raise RuntimeError("Invalid MiniMax-M3 pipelined AG+gate inputs")
 
     global_rows = hidden.shape[0] * world_size
     gathered_hidden = hidden.new_empty((global_rows, hidden.shape[1]))
@@ -1422,7 +1425,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
             and self.is_moe_layer
             and not is_mtp_block
             and gate is not None
-            and _uniform_pipelined_ag_gate_eligibility(tp_group, gate)
+            and _uniform_pipelined_ag_gate_eligibility(
+                tp_group,
+                gate,
+                vllm_config.model_config.dtype,
+            )
         )
         self.pipelined_ag_gate_vllm_group_name = (
             tp_group.unique_name if self.use_pipelined_ag_gate else ""
