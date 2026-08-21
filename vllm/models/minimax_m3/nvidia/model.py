@@ -1187,7 +1187,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 tp_size,
                 tp_group.unique_name,
             )
-        return gathered_hidden[:num_tokens], gathered_residual[:num_tokens]
+        return (
+            gathered_hidden[:num_tokens].contiguous(),
+            gathered_residual[:num_tokens].contiguous(),
+        )
 
     def forward(
         self,
