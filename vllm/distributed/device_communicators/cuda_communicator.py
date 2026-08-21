@@ -2,9 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-import json
-import os
-
 import torch
 from torch.distributed import ProcessGroup
 
@@ -480,52 +477,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             cache[key] = buf
         return buf
 
-    def _get_batched_ag_hot_scratch(
-        self,
-        output_specs: list[tuple[tuple[int, ...], torch.dtype, torch.device]],
-        total_bytes: int,
-    ) -> list[torch.Tensor] | None:
-        if not envs.VLLM_SYMM_MEM_BATCHED_AG_HOT_CACHE:
-            return None
-
-        group_key = tuple(output_specs)
-        counts = self.__dict__.setdefault("_symm_batched_ag_shape_counts", {})
-        count = counts.get(group_key, 0) + 1
-        counts[group_key] = count
-
-        threshold = max(1, envs.VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD)
-        if count < threshold:
-            return None
-
-        cache = self.__dict__.setdefault("_symm_batched_ag_scratch_bufs", {})
-        cached = cache.get(group_key)
-        if cached is not None:
-            return cached
-
-        max_entries = envs.VLLM_SYMM_MEM_BATCHED_AG_MAX_ENTRIES
-        if max_entries > 0 and len(cache) >= max_entries:
-            return None
-
-        cache_bytes = self.__dict__.setdefault("_symm_batched_ag_scratch_bytes", 0)
-        max_bytes = envs.VLLM_SYMM_MEM_BATCHED_AG_MAX_BYTES
-        if max_bytes > 0 and cache_bytes + total_bytes > max_bytes:
-            return None
-
-        from vllm.distributed.device_communicators.pynccl_allocator import (
-            nccl_symm_mem_context,
-        )
-
-        pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
-        with nccl_symm_mem_context(pynccl_comm):
-            outputs = [
-                torch.empty(shape, dtype=dtype, device=device)
-                for shape, dtype, device in output_specs
-            ]
-        cache[group_key] = outputs
-        self.__dict__["_symm_batched_ag_scratch_bytes"] = cache_bytes + total_bytes
-        return outputs
-
     def _reduce_scatter_symm_mem(
         self,
         input_tensor: torch.Tensor,
@@ -686,23 +637,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert pynccl_comm is not None
 
         out_size = (input_.size(0) * self.world_size,) + tuple(input_.size()[1:])
-        numel = 1
-        for dim_size in out_size:
-            numel *= dim_size
-        tensor_bytes = numel * input_.element_size()
-        self._record_symm_ag_shape_stats(
-            "single",
-            ((out_size, str(input_.dtype), str(input_.device)),),
-            [
-                {
-                    "shape": list(out_size),
-                    "dtype": str(input_.dtype),
-                    "device": str(input_.device),
-                    "bytes": tensor_bytes,
-                }
-            ],
-            tensor_bytes,
-        )
         # Persistent pre-registered scratch avoids the per-call symm-mem context
         # snapshot/registration overhead (see _get_symm_scratch).
         symm_output = self._get_symm_scratch(
@@ -710,93 +644,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         pynccl_comm.all_gather(symm_output, input_)
         return symm_output
-
-    def _record_symm_ag_shape_stats(
-        self,
-        kind: str,
-        group_key: tuple[tuple[tuple[int, ...], str, str], ...],
-        tensors: list[dict[str, object]],
-        total_bytes: int,
-    ) -> None:
-        stats_path = envs.VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH
-        if not stats_path or self.__dict__.get("_symm_ag_stats_disabled"):
-            return
-
-        try:
-            stats_key = f"_symm_ag_shape_stats_{kind}"
-            stats = self.__dict__.setdefault(
-                stats_key,
-                {
-                    "calls": 0,
-                    "simulated_hits": 0,
-                    "simulated_misses": 0,
-                    "simulated_promotes": 0,
-                    "groups": {},
-                },
-            )
-            stats["calls"] += 1
-            threshold = max(1, envs.VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD)
-            key = repr(group_key)
-            groups = stats["groups"]
-            group = groups.setdefault(
-                key,
-                {
-                    "count": 0,
-                    "bytes": total_bytes,
-                    "tensors": tensors,
-                    "first_call": stats["calls"],
-                    "last_call": stats["calls"],
-                },
-            )
-            group["count"] += 1
-            group["last_call"] = stats["calls"]
-
-            if group["count"] < threshold:
-                stats["simulated_misses"] += 1
-            elif group["count"] == threshold:
-                stats["simulated_promotes"] += 1
-            else:
-                stats["simulated_hits"] += 1
-
-            topk = max(1, envs.VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK)
-            top_groups = sorted(
-                groups.items(), key=lambda item: item[1]["count"], reverse=True
-            )[:topk]
-            payload = {
-                "kind": kind,
-                "rank": self.rank_in_group,
-                "world_size": self.world_size,
-                "pid": os.getpid(),
-                "hot_threshold": threshold,
-                "calls": stats["calls"],
-                "unique_groups": len(groups),
-                "simulated_hits": stats["simulated_hits"],
-                "simulated_misses": stats["simulated_misses"],
-                "simulated_promotes": stats["simulated_promotes"],
-                "top_groups": [
-                    {
-                        "key": group_key,
-                        **group_stats,
-                    }
-                    for group_key, group_stats in top_groups
-                ],
-                "groups": groups,
-            }
-            os.makedirs(stats_path, exist_ok=True)
-            output_path = os.path.join(
-                stats_path,
-                f"{kind}_ag_rank{self.rank_in_group}_pid{os.getpid()}.json",
-            )
-            tmp_path = f"{output_path}.tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(payload, f, indent=2)
-            os.replace(tmp_path, output_path)
-        except Exception:
-            self.__dict__["_symm_ag_stats_disabled"] = True
-            logger.warning(
-                "Failed to record symmetric-memory AllGather stats",
-                exc_info=True,
-            )
 
     def _all_gather_batched_symm_mem(
         self, inputs: list[torch.Tensor]
@@ -815,40 +662,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert pynccl_comm is not None
         world_size = self.world_size
 
-        output_specs: list[tuple[tuple[int, ...], torch.dtype, torch.device]] = []
-        stats_tensors = []
-        total_bytes = 0
-        for inp in inputs:
-            out_size = (inp.size(0) * world_size,) + tuple(inp.size()[1:])
-            output_specs.append((out_size, inp.dtype, inp.device))
-            numel = 1
-            for dim_size in out_size:
-                numel *= dim_size
-            tensor_bytes = numel * inp.element_size()
-            total_bytes += tensor_bytes
-            stats_tensors.append(
-                {
-                    "shape": list(out_size),
-                    "dtype": str(inp.dtype),
-                    "device": str(inp.device),
-                    "bytes": tensor_bytes,
-                }
-            )
-        group_key = tuple(
-            (shape, str(dtype), str(device)) for shape, dtype, device in output_specs
-        )
-        self._record_symm_ag_shape_stats(
-            "batched", group_key, stats_tensors, total_bytes
-        )
-
-        symm_outputs = self._get_batched_ag_hot_scratch(output_specs, total_bytes)
-        if symm_outputs is None:
-            symm_outputs = []
-            with nccl_symm_mem_context(pynccl_comm):
-                for out_size, dtype, device in output_specs:
-                    symm_outputs.append(
-                        torch.empty(out_size, dtype=dtype, device=device)
-                    )
+        symm_outputs = []
+        with nccl_symm_mem_context(pynccl_comm):
+            for inp in inputs:
+                out_size = (inp.size(0) * world_size,) + inp.size()[1:]
+                symm_outputs.append(
+                    torch.empty(out_size, dtype=inp.dtype, device=inp.device)
+                )
 
         pynccl_comm.group_start()
         for symm_out, inp in zip(symm_outputs, inputs):
