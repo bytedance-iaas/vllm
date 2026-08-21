@@ -640,6 +640,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert pynccl_comm is not None
 
         out_size = (input_.size(0) * self.world_size,) + tuple(input_.size()[1:])
+        numel = 1
+        for dim_size in out_size:
+            numel *= dim_size
+        tensor_bytes = numel * input_.element_size()
+        self._record_symm_ag_shape_stats(
+            "single",
+            ((out_size, str(input_.dtype), str(input_.device)),),
+            [
+                {
+                    "shape": list(out_size),
+                    "dtype": str(input_.dtype),
+                    "device": str(input_.device),
+                    "bytes": tensor_bytes,
+                }
+            ],
+            tensor_bytes,
+        )
         # Persistent pre-registered scratch avoids the per-call symm-mem context
         # snapshot/registration overhead (see _get_symm_scratch).
         symm_output = self._get_symm_scratch(
@@ -648,19 +665,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm.all_gather(symm_output, input_)
         return symm_output
 
-    def _record_batched_ag_shape_stats(
+    def _record_symm_ag_shape_stats(
         self,
+        kind: str,
         group_key: tuple[tuple[tuple[int, ...], str, str], ...],
         tensors: list[dict[str, object]],
         total_bytes: int,
     ) -> None:
         stats_path = envs.VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH
-        if not stats_path or self.__dict__.get("_batched_ag_stats_disabled"):
+        if not stats_path or self.__dict__.get("_symm_ag_stats_disabled"):
             return
 
         try:
+            stats_key = f"_symm_ag_shape_stats_{kind}"
             stats = self.__dict__.setdefault(
-                "_batched_ag_shape_stats",
+                stats_key,
                 {
                     "calls": 0,
                     "simulated_hits": 0,
@@ -698,6 +717,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 groups.items(), key=lambda item: item[1]["count"], reverse=True
             )[:topk]
             payload = {
+                "kind": kind,
                 "rank": self.rank_in_group,
                 "world_size": self.world_size,
                 "pid": os.getpid(),
@@ -719,16 +739,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             os.makedirs(stats_path, exist_ok=True)
             output_path = os.path.join(
                 stats_path,
-                f"batched_ag_rank{self.rank_in_group}_pid{os.getpid()}.json",
+                f"{kind}_ag_rank{self.rank_in_group}_pid{os.getpid()}.json",
             )
             tmp_path = f"{output_path}.tmp"
             with open(tmp_path, "w") as f:
                 json.dump(payload, f, indent=2)
             os.replace(tmp_path, output_path)
         except Exception:
-            self.__dict__["_batched_ag_stats_disabled"] = True
+            self.__dict__["_symm_ag_stats_disabled"] = True
             logger.warning(
-                "Failed to record batched symmetric-memory AllGather stats",
+                "Failed to record symmetric-memory AllGather stats",
                 exc_info=True,
             )
 
@@ -771,7 +791,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         group_key = tuple(
             (shape, str(dtype), str(device)) for shape, dtype, device in output_specs
         )
-        self._record_batched_ag_shape_stats(group_key, stats_tensors, total_bytes)
+        self._record_symm_ag_shape_stats(
+            "batched", group_key, stats_tensors, total_bytes
+        )
 
         symm_outputs = []
         with nccl_symm_mem_context(pynccl_comm):
