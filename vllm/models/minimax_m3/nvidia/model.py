@@ -1159,18 +1159,34 @@ class MiniMaxM3DecoderLayer(nn.Module):
             local_hidden,
             local_residual,
         )
-        gathered_hidden = torch.ops.vllm.all_gather.default(
-            local_hidden,
-            0,
-            tp_size,
-            tp_group.unique_name,
-        )
-        gathered_residual = torch.ops.vllm.all_gather.default(
-            local_residual,
-            0,
-            tp_size,
-            tp_group.unique_name,
-        )
+        if (
+            local_hidden.shape == local_residual.shape
+            and local_hidden.dtype == local_residual.dtype
+            and local_hidden.device == local_residual.device
+        ):
+            packed_local = torch.cat((local_hidden, local_residual), dim=-1)
+            gathered_pair = torch.ops.vllm.all_gather.default(
+                packed_local,
+                0,
+                tp_size,
+                tp_group.unique_name,
+            )
+            gathered_hidden, gathered_residual = gathered_pair.split(
+                local_hidden.shape[-1], dim=-1
+            )
+        else:
+            gathered_hidden = torch.ops.vllm.all_gather.default(
+                local_hidden,
+                0,
+                tp_size,
+                tp_group.unique_name,
+            )
+            gathered_residual = torch.ops.vllm.all_gather.default(
+                local_residual,
+                0,
+                tp_size,
+                tp_group.unique_name,
+            )
         return gathered_hidden[:num_tokens], gathered_residual[:num_tokens]
 
     def forward(
