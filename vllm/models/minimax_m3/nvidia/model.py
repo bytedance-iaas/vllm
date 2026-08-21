@@ -310,6 +310,154 @@ def _sparse_attn_rs_candidate_enabled() -> bool:
     return os.getenv("VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE") == "1"
 
 
+def _profile_post_attn_rs_enabled() -> bool:
+    return os.getenv("VLLM_MINIMAX_M3_PROFILE_POST_ATTN_RS") == "1"
+
+
+def _nvtx_range_name(label: str, x: torch.Tensor) -> str:
+    shape = "x".join(str(dim) for dim in x.shape)
+    return f"minimax_m3_post_attn_rs::{label}::{shape}::{x.dtype}"
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride = 1
+    strides = []
+    for size in reversed(shape):
+        strides.append(stride)
+        stride *= size
+    return tuple(reversed(strides))
+
+
+def _minimax_m3_profile_residual_contiguous(
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    with torch.cuda.nvtx.range(_nvtx_range_name("residual_contiguous", residual)):
+        return residual.contiguous()
+
+
+def _minimax_m3_profile_residual_contiguous_fake(
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    output_shape = tuple(residual.shape)
+    return torch.empty_strided(
+        output_shape,
+        _contiguous_strides(output_shape),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+
+
+def _minimax_m3_profile_pack_cat(
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    with torch.cuda.nvtx.range(_nvtx_range_name("pack_cat", hidden)):
+        return torch.cat((hidden, residual), dim=-1)
+
+
+def _minimax_m3_profile_pack_cat_fake(
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    output_shape = tuple(hidden.shape[:-1]) + (
+        hidden.shape[-1] + residual.shape[-1],
+    )
+    return torch.empty_strided(
+        output_shape,
+        _contiguous_strides(output_shape),
+        dtype=hidden.dtype,
+        device=hidden.device,
+    )
+
+
+def _minimax_m3_profile_packed_all_gather(
+    packed: torch.Tensor,
+    dim: int,
+    world_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    with torch.cuda.nvtx.range(_nvtx_range_name("packed_all_gather", packed)):
+        return torch.ops.vllm.all_gather.default(
+            packed,
+            dim,
+            world_size,
+            group_name,
+        )
+
+
+def _minimax_m3_profile_packed_all_gather_fake(
+    packed: torch.Tensor,
+    dim: int,
+    world_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    del group_name
+    output_shape = list(packed.shape)
+    output_shape[dim] *= world_size
+    return packed.new_empty(tuple(output_shape))
+
+
+def _minimax_m3_profile_split_contiguous(
+    gathered: torch.Tensor,
+    split_size: int,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.cuda.nvtx.range(_nvtx_range_name("split_contiguous", gathered)):
+        hidden, residual = gathered.split(split_size, dim=-1)
+        return hidden[:num_tokens].contiguous(), residual[:num_tokens].contiguous()
+
+
+def _minimax_m3_profile_split_contiguous_fake(
+    gathered: torch.Tensor,
+    split_size: int,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_shape = (num_tokens,) + tuple(gathered.shape[1:-1]) + (split_size,)
+    return (
+        torch.empty_strided(
+            output_shape,
+            _contiguous_strides(output_shape),
+            dtype=gathered.dtype,
+            device=gathered.device,
+        ),
+        torch.empty_strided(
+            output_shape,
+            _contiguous_strides(output_shape),
+            dtype=gathered.dtype,
+            device=gathered.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_profile_residual_contiguous",
+    op_func=_minimax_m3_profile_residual_contiguous,
+    mutates_args=[],
+    fake_impl=_minimax_m3_profile_residual_contiguous_fake,
+)
+
+direct_register_custom_op(
+    op_name="minimax_m3_profile_pack_cat",
+    op_func=_minimax_m3_profile_pack_cat,
+    mutates_args=[],
+    fake_impl=_minimax_m3_profile_pack_cat_fake,
+)
+
+direct_register_custom_op(
+    op_name="minimax_m3_profile_packed_all_gather",
+    op_func=_minimax_m3_profile_packed_all_gather,
+    mutates_args=[],
+    fake_impl=_minimax_m3_profile_packed_all_gather_fake,
+)
+
+direct_register_custom_op(
+    op_name="minimax_m3_profile_split_contiguous",
+    op_func=_minimax_m3_profile_split_contiguous,
+    mutates_args=[],
+    fake_impl=_minimax_m3_profile_split_contiguous_fake,
+)
+
+
 class MiniMAXGemmaRMSNorm(nn.Module):
     """Gemma-style RMS normalization backed by FlashInfer kernels.
 
@@ -1043,6 +1191,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # Configured by MiniMaxM3Model.__init__
         self.fuse_input_allreduce = False
         self.force_unfused_post_attn_norm = _force_unfused_post_attn_norm()
+        self.profile_post_attn_rs = _profile_post_attn_rs_enabled()
 
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
@@ -1152,28 +1301,53 @@ class MiniMaxM3DecoderLayer(nn.Module):
             tp_rank = get_tensor_model_parallel_rank()
             local_residual = residual[
                 tp_rank * local_len : tp_rank * local_len + local_len, ...
-            ].contiguous()
+            ]
         else:
-            local_residual = residual.contiguous()
+            local_residual = residual
+        if self.profile_post_attn_rs:
+            local_residual = torch.ops.vllm.minimax_m3_profile_residual_contiguous.default(  # noqa: E501
+                local_residual
+            )
+        else:
+            local_residual = local_residual.contiguous()
         local_hidden, local_residual = self.post_attention_layernorm(
             local_hidden,
             local_residual,
         )
+        profiled_split_contiguous = False
         if (
             local_hidden.shape == local_residual.shape
             and local_hidden.dtype == local_residual.dtype
             and local_hidden.device == local_residual.device
         ):
-            packed_local = torch.cat((local_hidden, local_residual), dim=-1)
-            gathered_pair = torch.ops.vllm.all_gather.default(
-                packed_local,
-                0,
-                tp_size,
-                tp_group.unique_name,
-            )
-            gathered_hidden, gathered_residual = gathered_pair.split(
-                local_hidden.shape[-1], dim=-1
-            )
+            if self.profile_post_attn_rs:
+                packed_local = torch.ops.vllm.minimax_m3_profile_pack_cat.default(
+                    local_hidden,
+                    local_residual,
+                )
+                gathered_pair = torch.ops.vllm.minimax_m3_profile_packed_all_gather.default(  # noqa: E501
+                    packed_local,
+                    0,
+                    tp_size,
+                    tp_group.unique_name,
+                )
+                gathered_hidden, gathered_residual = torch.ops.vllm.minimax_m3_profile_split_contiguous.default(  # noqa: E501
+                    gathered_pair,
+                    local_hidden.shape[-1],
+                    num_tokens,
+                )
+                profiled_split_contiguous = True
+            else:
+                packed_local = torch.cat((local_hidden, local_residual), dim=-1)
+                gathered_pair = torch.ops.vllm.all_gather.default(
+                    packed_local,
+                    0,
+                    tp_size,
+                    tp_group.unique_name,
+                )
+                gathered_hidden, gathered_residual = gathered_pair.split(
+                    local_hidden.shape[-1], dim=-1
+                )
         else:
             gathered_hidden = torch.ops.vllm.all_gather.default(
                 local_hidden,
@@ -1187,6 +1361,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 tp_size,
                 tp_group.unique_name,
             )
+        if profiled_split_contiguous:
+            return gathered_hidden, gathered_residual
         return (
             gathered_hidden[:num_tokens].contiguous(),
             gathered_residual[:num_tokens].contiguous(),
