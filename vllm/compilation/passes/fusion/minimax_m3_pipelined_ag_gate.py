@@ -108,3 +108,10 @@ class MiniMaxM3PipelinedAGGateExpansionPass(VllmInductorPass):
             "Expanded %d MiniMax-M3 small AG+gate nodes",
             self.matched_count,
         )
+
+    def uuid(self) -> str:
+        return VllmInductorPass.hash_source(
+            self,
+            _minimax_m3_small_ag_gate,
+            str(MINIMAX_M3_PIPELINED_AG_GATE_SMALL_RANGE_END),
+        )
