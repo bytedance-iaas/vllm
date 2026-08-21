@@ -47,6 +47,10 @@ if current_platform.is_cuda_alike():
 if current_platform.is_cuda():
     from .fusion.allreduce_rms_fusion import AllReduceFusionPass
     from .fusion.collective_fusion import AsyncTPPass
+    from .fusion.minimax_m3_pipelined_ag_gate import (
+        MiniMaxM3PipelinedAGGateExpansionPass,
+        minimax_m3_pipelined_ag_gate_compile_enabled,
+    )
 
 if current_platform.is_xpu():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
@@ -141,6 +145,12 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
         # Set the current vllm config to allow tracing CustomOp instances
         with set_current_vllm_config(config, check_compile=False):
+            if (
+                current_platform.is_cuda()
+                and minimax_m3_pipelined_ag_gate_compile_enabled(config)
+            ):
+                self.passes += [MiniMaxM3PipelinedAGGateExpansionPass(config)]
+
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
 

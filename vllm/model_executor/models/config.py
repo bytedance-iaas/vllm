@@ -826,6 +826,23 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class MiniMaxM3SparseConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.compilation.passes.fusion.minimax_m3_pipelined_ag_gate import (
+            MINIMAX_M3_PIPELINED_AG_GATE_SMALL_RANGE_END,
+            minimax_m3_pipelined_ag_gate_compile_enabled,
+        )
+
+        if not minimax_m3_pipelined_ag_gate_compile_enabled(vllm_config):
+            return
+
+        compilation_config = vllm_config.compilation_config
+        endpoints = list(compilation_config.compile_ranges_endpoints or ())
+        endpoints.append(MINIMAX_M3_PIPELINED_AG_GATE_SMALL_RANGE_END)
+        compilation_config.compile_ranges_endpoints = endpoints
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -840,6 +857,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
+    "MiniMaxM3SparseForCausalLM": MiniMaxM3SparseConfig,
+    "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3SparseConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
     "GteNewModel": GteNewModelConfig,
