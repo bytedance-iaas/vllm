@@ -318,6 +318,52 @@ def _pipelined_ag_gate_enabled() -> bool:
     return envs.VLLM_MINIMAX_M3_PIPELINED_AG_GATE
 
 
+_PIPELINED_AG_GATE_ELIGIBILITY: dict[tuple[object, ...], bool] = {}
+
+
+def _uniform_pipelined_ag_gate_eligibility(
+    tp_group,
+    gate: GateLinear,
+) -> bool:
+    key = (
+        tp_group.device_group.group_name,
+        tuple(gate.weight.shape),
+        gate.weight.dtype,
+        gate.out_dtype,
+    )
+    cached = _PIPELINED_AG_GATE_ELIGIBILITY.get(key)
+    if cached is not None:
+        return cached
+
+    local_eligible = (
+        _pipelined_ag_gate_enabled()
+        and get_tensor_model_parallel_world_size() == 8
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(90)
+        and "h20" in current_platform.get_device_name().lower()
+        and torch.distributed.get_backend(tp_group.device_group) == "nccl"
+        and gate.__class__ is GateLinear
+        and gate.bias is None
+        and gate.out_dtype == torch.float32
+        and gate.weight.dtype == torch.float32
+        and gate.weight.shape == (128, 6144)
+        and gate.weight.is_contiguous()
+    )
+    eligibility = torch.tensor(
+        int(local_eligible),
+        dtype=torch.int32,
+        device=tp_group.device,
+    )
+    torch.distributed.all_reduce(
+        eligibility,
+        op=torch.distributed.ReduceOp.MIN,
+        group=tp_group.device_group,
+    )
+    result = bool(eligibility.item())
+    _PIPELINED_AG_GATE_ELIGIBILITY[key] = result
+    return result
+
+
 def _nvtx_range_name(label: str, x: torch.Tensor) -> str:
     shape = "x".join(str(dim) for dim in x.shape)
     return f"minimax_m3_post_attn_rs::{label}::{shape}::{x.dtype}"
@@ -467,8 +513,47 @@ def _minimax_m3_pipelined_ag_gate(
     residual: torch.Tensor,
     gate_weight: torch.Tensor,
     world_size: int,
-    group_name: str,
+    vllm_group_name: str,
+    c10d_group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if hidden.shape[0] < 629:
+        with torch.cuda.nvtx.range(
+            _nvtx_range_name("pipelined_ag_gate_fallback", hidden)
+        ):
+            packed = torch.cat((hidden, residual), dim=-1)
+            gathered = torch.ops.vllm.all_gather.default(
+                packed,
+                0,
+                world_size,
+                vllm_group_name,
+            )
+            gathered_hidden, gathered_residual = gathered.split(
+                hidden.shape[1], dim=-1
+            )
+            gathered_hidden = gathered_hidden.contiguous()
+            gathered_residual = gathered_residual.contiguous()
+            router_logits = (
+                torch.ops.vllm.fp32_router_gemm_dispatch.default(
+                    gathered_hidden,
+                    gate_weight,
+                    False,
+                )
+            )
+            return gathered_hidden, gathered_residual, router_logits
+
+    if (
+        hidden.ndim != 2
+        or residual.ndim != 2
+        or hidden.shape != residual.shape
+        or hidden.shape[1] != 6144
+        or hidden.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+        or hidden.device != residual.device
+        or not hidden.is_contiguous()
+        or not residual.is_contiguous()
+    ):
+        raise RuntimeError("Invalid MiniMax-M3 pipelined AG+gate inputs")
+
     global_rows = hidden.shape[0] * world_size
     gathered_hidden = hidden.new_empty((global_rows, hidden.shape[1]))
     gathered_residual = residual.new_empty((global_rows, residual.shape[1]))
@@ -496,7 +581,7 @@ def _minimax_m3_pipelined_ag_gate(
             [hidden, residual],
             gate_consumer,
             [gathered_hidden, gathered_residual],
-            group_name,
+            c10d_group_name,
             True,
         )
     return gathered_hidden, gathered_residual, router_logits
@@ -507,9 +592,10 @@ def _minimax_m3_pipelined_ag_gate_fake(
     residual: torch.Tensor,
     gate_weight: torch.Tensor,
     world_size: int,
-    group_name: str,
+    vllm_group_name: str,
+    c10d_group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del group_name
+    del vllm_group_name, c10d_group_name
     global_rows = hidden.shape[0] * world_size
     return (
         hidden.new_empty((global_rows, hidden.shape[1])),
@@ -1332,24 +1418,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
         tp_group = get_tp_group()
         gate = self.block_sparse_moe.gate if self.is_moe_layer else None
         self.use_pipelined_ag_gate = (
-            _pipelined_ag_gate_enabled()
-            and self.use_sparse_attn_rs_candidate
+            self.use_sparse_attn_rs_candidate
             and self.is_moe_layer
             and not is_mtp_block
-            and get_tensor_model_parallel_world_size() == 8
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability(90)
-            and "h20" in current_platform.get_device_name().lower()
-            and torch.distributed.get_backend(tp_group.device_group) == "nccl"
             and gate is not None
-            and gate.__class__ is GateLinear
-            and gate.bias is None
-            and gate.out_dtype == torch.float32
-            and gate.weight.dtype == torch.float32
-            and gate.weight.shape == (128, 6144)
-            and gate.weight.is_contiguous()
+            and _uniform_pipelined_ag_gate_eligibility(tp_group, gate)
         )
-        self.pipelined_ag_gate_group_name = (
+        self.pipelined_ag_gate_vllm_group_name = (
+            tp_group.unique_name if self.use_pipelined_ag_gate else ""
+        )
+        self.pipelined_ag_gate_c10d_group_name = (
             tp_group.device_group.group_name if self.use_pipelined_ag_gate else ""
         )
 
@@ -1418,19 +1496,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             local_hidden,
             local_residual,
         )
-        if (
-            self.use_pipelined_ag_gate
-            and local_hidden.shape[0] >= 629
-            and local_hidden.ndim == 2
-            and local_residual.ndim == 2
-            and local_hidden.shape == local_residual.shape
-            and local_hidden.shape[1] == 6144
-            and local_hidden.dtype == torch.bfloat16
-            and local_residual.dtype == torch.bfloat16
-            and local_hidden.device == local_residual.device
-            and local_hidden.is_contiguous()
-            and local_residual.is_contiguous()
-        ):
+        if self.use_pipelined_ag_gate:
             gate_weight = self.block_sparse_moe.gate.weight
             gathered_hidden, gathered_residual, router_logits = (
                 torch.ops.vllm.minimax_m3_pipelined_ag_gate.default(
@@ -1438,7 +1504,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     local_residual,
                     gate_weight,
                     tp_size,
-                    self.pipelined_ag_gate_group_name,
+                    self.pipelined_ag_gate_vllm_group_name,
+                    self.pipelined_ag_gate_c10d_group_name,
                 )
             )
             return (
