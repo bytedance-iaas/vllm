@@ -414,6 +414,7 @@ def fused_cutlass_w4a8_matmul_reduce_scatter(
     assert A.shape[0] % world_size == 0, (
         "CUTLASS W4A8 symm_mem adapter expects M divisible by world size"
     )
+    out_dtype = out_dtype or torch.bfloat16
     if maybe_schedule is None:
         maybe_schedule = _cutlass_w4a8_schedule(A.shape[0], A.shape[1], B.shape[1])
 
