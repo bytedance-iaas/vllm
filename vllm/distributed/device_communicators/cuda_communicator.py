@@ -480,6 +480,52 @@ class CudaCommunicator(DeviceCommunicatorBase):
             cache[key] = buf
         return buf
 
+    def _get_batched_ag_hot_scratch(
+        self,
+        output_specs: list[tuple[tuple[int, ...], torch.dtype, torch.device]],
+        total_bytes: int,
+    ) -> list[torch.Tensor] | None:
+        if not envs.VLLM_SYMM_MEM_BATCHED_AG_HOT_CACHE:
+            return None
+
+        group_key = tuple(output_specs)
+        counts = self.__dict__.setdefault("_symm_batched_ag_shape_counts", {})
+        count = counts.get(group_key, 0) + 1
+        counts[group_key] = count
+
+        threshold = max(1, envs.VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD)
+        if count < threshold:
+            return None
+
+        cache = self.__dict__.setdefault("_symm_batched_ag_scratch_bufs", {})
+        cached = cache.get(group_key)
+        if cached is not None:
+            return cached
+
+        max_entries = envs.VLLM_SYMM_MEM_BATCHED_AG_MAX_ENTRIES
+        if max_entries > 0 and len(cache) >= max_entries:
+            return None
+
+        cache_bytes = self.__dict__.setdefault("_symm_batched_ag_scratch_bytes", 0)
+        max_bytes = envs.VLLM_SYMM_MEM_BATCHED_AG_MAX_BYTES
+        if max_bytes > 0 and cache_bytes + total_bytes > max_bytes:
+            return None
+
+        from vllm.distributed.device_communicators.pynccl_allocator import (
+            nccl_symm_mem_context,
+        )
+
+        pynccl_comm = self.pynccl_comm
+        assert pynccl_comm is not None
+        with nccl_symm_mem_context(pynccl_comm):
+            outputs = [
+                torch.empty(shape, dtype=dtype, device=device)
+                for shape, dtype, device in output_specs
+            ]
+        cache[group_key] = outputs
+        self.__dict__["_symm_batched_ag_scratch_bytes"] = cache_bytes + total_bytes
+        return outputs
+
     def _reduce_scatter_symm_mem(
         self,
         input_tensor: torch.Tensor,
@@ -795,12 +841,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "batched", group_key, stats_tensors, total_bytes
         )
 
-        symm_outputs = []
-        with nccl_symm_mem_context(pynccl_comm):
-            for out_size, dtype, device in output_specs:
-                symm_outputs.append(
-                    torch.empty(out_size, dtype=dtype, device=device)
-                )
+        symm_outputs = self._get_batched_ag_hot_scratch(output_specs, total_bytes)
+        if symm_outputs is None:
+            symm_outputs = []
+            with nccl_symm_mem_context(pynccl_comm):
+                for out_size, dtype, device in output_specs:
+                    symm_outputs.append(
+                        torch.empty(out_size, dtype=dtype, device=device)
+                    )
 
         pynccl_comm.group_start()
         for symm_out, inp in zip(symm_outputs, inputs):

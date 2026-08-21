@@ -246,6 +246,9 @@ if TYPE_CHECKING:
     VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH: str | None = None
     VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK: int = 20
     VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD: int = 3
+    VLLM_SYMM_MEM_BATCHED_AG_HOT_CACHE: bool = True
+    VLLM_SYMM_MEM_BATCHED_AG_MAX_ENTRIES: int = 16
+    VLLM_SYMM_MEM_BATCHED_AG_MAX_BYTES: int = 2 * 1024 * 1024 * 1024
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1782,6 +1785,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD": lambda: int(
         os.getenv("VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD", "3")
     ),
+    "VLLM_SYMM_MEM_BATCHED_AG_HOT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_SYMM_MEM_BATCHED_AG_HOT_CACHE", "1"))
+    ),
+    "VLLM_SYMM_MEM_BATCHED_AG_MAX_ENTRIES": lambda: int(
+        os.getenv("VLLM_SYMM_MEM_BATCHED_AG_MAX_ENTRIES", "16")
+    ),
+    "VLLM_SYMM_MEM_BATCHED_AG_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_SYMM_MEM_BATCHED_AG_MAX_BYTES", str(2 * 1024 * 1024 * 1024))
+    ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
@@ -2163,6 +2175,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SYMM_MEM_BATCHED_AG_STATS_PATH",
         "VLLM_SYMM_MEM_BATCHED_AG_STATS_TOPK",
         "VLLM_SYMM_MEM_BATCHED_AG_HOT_THRESHOLD",
+        "VLLM_SYMM_MEM_BATCHED_AG_HOT_CACHE",
+        "VLLM_SYMM_MEM_BATCHED_AG_MAX_ENTRIES",
+        "VLLM_SYMM_MEM_BATCHED_AG_MAX_BYTES",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
