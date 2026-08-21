@@ -654,18 +654,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
         Only the output needs to be in symmetric memory (see
         _all_gather_symm_mem).
         """
+        from vllm.distributed.device_communicators.pynccl_allocator import (
+            nccl_symm_mem_context,
+        )
+
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
         world_size = self.world_size
 
         symm_outputs = []
-        for idx, inp in enumerate(inputs):
-            out_size = (inp.size(0) * world_size,) + tuple(inp.size()[1:])
-            symm_outputs.append(
-                self._get_symm_scratch(
-                    f"ag_batched_out_{idx}", out_size, inp.dtype, inp.device
+        with nccl_symm_mem_context(pynccl_comm):
+            for inp in inputs:
+                out_size = (inp.size(0) * world_size,) + inp.size()[1:]
+                symm_outputs.append(
+                    torch.empty(out_size, dtype=inp.dtype, device=inp.device)
                 )
-            )
 
         pynccl_comm.group_start()
         for symm_out, inp in zip(symm_outputs, inputs):
