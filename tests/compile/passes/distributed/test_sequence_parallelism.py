@@ -182,6 +182,32 @@ class TestAllReduceRMSNormStaticQuantFP8Model(torch.nn.Module):
             ]
 
 
+def test_materialized_sequence_parallel_boundary_is_removed():
+    graph = torch.fx.Graph()
+    residual = graph.placeholder("residual")
+    marker = graph.call_function(
+        vllm.ir.ops.sequence_parallel_materialized_boundary.torch_op,
+        args=(residual,),
+    )
+    graph.output(marker)
+
+    sequence_parallelism_pass = object.__new__(SequenceParallelismPass)
+    rewritten = sequence_parallelism_pass._rewrite_sequence_parallel_boundaries(
+        graph,
+        set(),
+    )
+
+    assert rewritten == 1
+    assert not graph.find_nodes(
+        op="call_function",
+        target=vllm.ir.ops.sequence_parallel_materialized_boundary.torch_op,
+    )
+    assert not graph.find_nodes(
+        op="call_function",
+        target=torch.ops.vllm.all_gather.default,
+    )
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize(
     "test_model_cls, custom_ops",

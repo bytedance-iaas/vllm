@@ -12,7 +12,6 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
-import os
 from collections.abc import Iterable
 
 import torch
@@ -20,7 +19,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm import _custom_ops as ops
-from vllm import ir
+from vllm import envs, ir
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -92,6 +91,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -127,7 +127,156 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
 
 
 def _sparse_attn_rs_candidate_enabled() -> bool:
-    return os.getenv("VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE") == "1"
+    return envs.VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE
+
+
+def _pipelined_ag_gate_enabled() -> bool:
+    return envs.VLLM_MINIMAX_M3_PIPELINED_AG_GATE
+
+
+_PIPELINED_AG_GATE_ELIGIBILITY: dict[tuple[object, ...], bool] = {}
+
+
+def _uniform_pipelined_ag_gate_eligibility(
+    tp_group,
+    gate: GateLinear,
+    model_dtype: torch.dtype,
+) -> bool:
+    key = (
+        tp_group.device_group.group_name,
+        tuple(gate.weight.shape),
+        gate.weight.dtype,
+        gate.out_dtype,
+        model_dtype,
+    )
+    cached = _PIPELINED_AG_GATE_ELIGIBILITY.get(key)
+    if cached is not None:
+        return cached
+
+    local_eligible = (
+        _pipelined_ag_gate_enabled()
+        and get_tensor_model_parallel_world_size() == 8
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(90)
+        and "h20" in current_platform.get_device_name().lower()
+        and torch.distributed.get_backend(tp_group.device_group) == "nccl"
+        and gate.__class__ is GateLinear
+        and gate.bias is None
+        and gate.out_dtype == torch.float32
+        and gate.weight.dtype == torch.float32
+        and gate.weight.shape == (128, 6144)
+        and gate.weight.is_contiguous()
+        and model_dtype == torch.bfloat16
+    )
+    eligibility = torch.tensor(
+        int(local_eligible),
+        dtype=torch.int32,
+        device=tp_group.device,
+    )
+    torch.distributed.all_reduce(
+        eligibility,
+        op=torch.distributed.ReduceOp.MIN,
+        group=tp_group.device_group,
+    )
+    result = bool(eligibility.item())
+    _PIPELINED_AG_GATE_ELIGIBILITY[key] = result
+    return result
+
+
+def _minimax_m3_pipelined_ag_gate(
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+    gate_weight: torch.Tensor,
+    world_size: int,
+    vllm_group_name: str,
+    c10d_group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        hidden.ndim != 2
+        or residual.ndim != 2
+        or hidden.shape != residual.shape
+        or hidden.shape[1] != 6144
+        or hidden.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+        or hidden.device != residual.device
+        or not hidden.is_contiguous()
+        or not residual.is_contiguous()
+    ):
+        raise RuntimeError("Invalid MiniMax-M3 pipelined AG+gate inputs")
+
+    if hidden.shape[0] < 629:
+        packed = torch.cat((hidden, residual), dim=-1)
+        gathered = torch.ops.vllm.all_gather.default(
+            packed,
+            0,
+            world_size,
+            vllm_group_name,
+        )
+        gathered_hidden, gathered_residual = gathered.split(hidden.shape[1], dim=-1)
+        gathered_hidden = gathered_hidden.contiguous()
+        gathered_residual = gathered_residual.contiguous()
+        router_logits = torch.ops.vllm.fp32_router_gemm_dispatch.default(
+            gathered_hidden,
+            gate_weight,
+            False,
+        )
+        return gathered_hidden, gathered_residual, router_logits
+
+    global_rows = hidden.shape[0] * world_size
+    gathered_hidden = hidden.new_empty((global_rows, hidden.shape[1]))
+    gathered_residual = residual.new_empty((global_rows, residual.shape[1]))
+    router_logits = hidden.new_empty(
+        (global_rows, gate_weight.shape[0]),
+        dtype=torch.float32,
+    )
+    router_chunks = router_logits.chunk(world_size)
+    gate_weight_t = gate_weight.t()
+
+    def gate_consumer(shards: list[torch.Tensor], src_rank: int) -> None:
+        torch.mm(
+            shards[0].float(),
+            gate_weight_t,
+            out=router_chunks[src_rank],
+        )
+
+    import torch.distributed._symmetric_memory as symm_mem
+
+    symm_mem._pipelined_multi_all_gather_and_consume(
+        [hidden, residual],
+        gate_consumer,
+        [gathered_hidden, gathered_residual],
+        c10d_group_name,
+        True,
+    )
+    return gathered_hidden, gathered_residual, router_logits
+
+
+def _minimax_m3_pipelined_ag_gate_fake(
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+    gate_weight: torch.Tensor,
+    world_size: int,
+    vllm_group_name: str,
+    c10d_group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del vllm_group_name, c10d_group_name
+    global_rows = hidden.shape[0] * world_size
+    return (
+        hidden.new_empty((global_rows, hidden.shape[1])),
+        residual.new_empty((global_rows, residual.shape[1])),
+        hidden.new_empty(
+            (global_rows, gate_weight.shape[0]),
+            dtype=torch.float32,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_pipelined_ag_gate",
+    op_func=_minimax_m3_pipelined_ag_gate,
+    mutates_args=[],
+    fake_impl=_minimax_m3_pipelined_ag_gate_fake,
+)
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -155,9 +304,7 @@ class MiniMAXGemmaRMSNorm(nn.Module):
             weight = self.weight.float() + 1.0
             if residual is None:
                 return ir.ops.rms_norm(x, weight, self.variance_epsilon)
-            return ir.ops.fused_add_rms_norm(
-                x, residual, weight, self.variance_epsilon
-            )
+            return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
         from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 
@@ -300,11 +447,17 @@ class MiniMaxM3MoE(nn.Module):
         param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        router_logits, _ = self.gate(hidden_states)
+        return self.forward_with_router_logits(hidden_states, router_logits)
+
+    def forward_with_router_logits(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-
-        # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = router_logits.view(num_tokens, -1)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -779,12 +932,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         compile_sequence_parallel = bool(
             vllm_config.compilation_config.pass_config.enable_sp
         )
-        reduce_results = (
-            is_mtp_block
-            or (
-                vllm_config.parallel_config.pipeline_parallel_size > 1
-                and not compile_sequence_parallel
-            )
+        reduce_results = is_mtp_block or (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and not compile_sequence_parallel
         )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
@@ -804,6 +954,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 reduce_results=reduce_results,
             )
 
+        tp_group = get_tp_group()
+        gate = self.block_sparse_moe.gate if self.is_moe_layer else None
+        self.use_pipelined_ag_gate = (
+            self.use_sparse_attn_rs_candidate
+            and self.is_moe_layer
+            and not is_mtp_block
+            and gate is not None
+            and _uniform_pipelined_ag_gate_eligibility(
+                tp_group,
+                gate,
+                vllm_config.model_config.dtype,
+            )
+        )
+        self.pipelined_ag_gate_vllm_group_name = (
+            tp_group.unique_name if self.use_pipelined_ag_gate else ""
+        )
+        self.pipelined_ag_gate_c10d_group_name = (
+            tp_group.device_group.group_name if self.use_pipelined_ag_gate else ""
+        )
+
         # config.use_gemma_norm is True for M3 -> Gemma-style RMSNorm.
         self.input_layernorm = MiniMAXGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -816,10 +986,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size == 1:
-            return self.post_attention_layernorm(hidden_states, residual)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            return hidden_states, residual, None
 
         num_tokens = hidden_states.shape[0]
         residual_is_full = residual.shape[0] == num_tokens
@@ -860,6 +1033,24 @@ class MiniMaxM3DecoderLayer(nn.Module):
             local_hidden,
             local_residual,
         )
+        if self.use_pipelined_ag_gate:
+            gate_weight = self.block_sparse_moe.gate.weight
+            gathered_hidden, gathered_residual, router_logits = (
+                torch.ops.vllm.minimax_m3_pipelined_ag_gate.default(
+                    local_hidden,
+                    local_residual,
+                    gate_weight,
+                    tp_size,
+                    self.pipelined_ag_gate_vllm_group_name,
+                    self.pipelined_ag_gate_c10d_group_name,
+                )
+            )
+            return (
+                gathered_hidden[:num_tokens],
+                gathered_residual[:num_tokens],
+                router_logits[:num_tokens],
+            )
+
         if (
             local_hidden.shape == local_residual.shape
             and local_hidden.dtype == local_residual.dtype
@@ -891,6 +1082,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return (
             gathered_hidden[:num_tokens].contiguous(),
             gathered_residual[:num_tokens].contiguous(),
+            None,
         )
 
     def forward(
@@ -918,10 +1110,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
+        router_logits = None
         if self.use_sparse_attn_rs_candidate:
-            hidden_states, residual = self._post_attention_rs_norm_all_gather(
-                hidden_states,
-                residual,
+            hidden_states, residual, router_logits = (
+                self._post_attention_rs_norm_all_gather(
+                    hidden_states,
+                    residual,
+                )
             )
         elif torch.compiler.is_compiling():
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -933,7 +1128,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states, residual, self.post_attention_layernorm
             )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
+        if router_logits is not None:
+            assert self.is_moe_layer
+            hidden_states = self.block_sparse_moe.forward_with_router_logits(
+                hidden_states,
+                router_logits,
+            )
+        else:
+            hidden_states = ffn(hidden_states)
         return hidden_states, residual
 
     @property
@@ -1031,6 +1233,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         # is left un-reduced has that all-reduce fused into the next layer's
         # input_layernorm (or the final norm).
         local_layers = self.layers[self.start_layer : self.end_layer]
+        self._sp_residual_materialized_at_pp_boundary = bool(
+            local_layers and local_layers[-1].use_sparse_attn_rs_candidate
+        )
         prev_defers = False
         for idx, layer in enumerate(local_layers):
             materialize_pp_boundary = (
@@ -1076,7 +1281,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             if self.compile_sequence_parallel:
-                residual = ir.ops.sequence_parallel_boundary(residual)
+                if self._sp_residual_materialized_at_pp_boundary:
+                    residual = ir.ops.sequence_parallel_materialized_boundary(residual)
+                else:
+                    residual = ir.ops.sequence_parallel_boundary(residual)
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,

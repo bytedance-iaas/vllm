@@ -682,9 +682,24 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         graph: fx.Graph,
         new_reduce_scatters: set[fx.Node],
     ) -> int:
+        materialized_marker_op = (
+            vllm.ir.ops.sequence_parallel_materialized_boundary.torch_op
+        )
+        materialized_markers = list(
+            graph.find_nodes(
+                op="call_function",
+                target=materialized_marker_op,
+            )
+        )
+        rewritten = 0
+        for marker in materialized_markers:
+            assert len(marker.args) == 1 and isinstance(marker.args[0], fx.Node)
+            marker.replace_all_uses_with(marker.args[0])
+            graph.erase_node(marker)
+            rewritten += 1
+
         marker_op = vllm.ir.ops.sequence_parallel_boundary.torch_op
         markers = list(graph.find_nodes(op="call_function", target=marker_op))
-        rewritten = 0
 
         for marker in markers:
             assert len(marker.args) == 1 and isinstance(marker.args[0], fx.Node)

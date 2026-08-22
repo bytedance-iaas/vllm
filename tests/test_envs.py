@@ -44,6 +44,23 @@ def test_mooncake_pd_trace_env() -> None:
         assert environment_variables["VLLM_MOONCAKE_PD_TRACE"]() is True
 
 
+def test_minimax_m3_candidate_flags_are_compile_factors() -> None:
+    candidate = "VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE"
+    pipelined = "VLLM_MINIMAX_M3_PIPELINED_AG_GATE"
+    with patch.dict(
+        os.environ,
+        {
+            candidate: "1",
+            pipelined: "1",
+        },
+        clear=True,
+    ):
+        envs.validate_environ(hard_fail=True)
+        factors = envs.compile_factors()
+        assert factors[candidate] is True
+        assert factors[pipelined] is True
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

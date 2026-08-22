@@ -266,6 +266,8 @@ if TYPE_CHECKING:
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
+    VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE: bool = False
+    VLLM_MINIMAX_M3_PIPELINED_AG_GATE: bool = False
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
@@ -1887,6 +1889,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable NCCL symmetric memory allocation and registration
     "VLLM_USE_NCCL_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))
+    ),
+    "VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE", "0"))
+    ),
+    # Pipeline MiniMax-M3 post-attention hidden/residual all-gather with
+    # router-gate computation. Experimental and H20 TP8-only.
+    "VLLM_MINIMAX_M3_PIPELINED_AG_GATE": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_PIPELINED_AG_GATE", "0"))
     ),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),

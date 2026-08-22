@@ -20,3 +20,18 @@ def _sequence_parallel_boundary_input_generator(
     dtype: torch.dtype,
 ) -> tuple[Tensor]:
     return (torch.randn(num_tokens, hidden_size, dtype=dtype),)
+
+
+@register_op
+def sequence_parallel_materialized_boundary(x: Tensor) -> Tensor:
+    """Mark a tensor already materialized before an SP graph boundary."""
+    return x
+
+
+@sequence_parallel_materialized_boundary.register_input_generator
+def _sequence_parallel_materialized_boundary_input_generator(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+) -> tuple[Tensor]:
+    return (torch.randn(num_tokens, hidden_size, dtype=dtype),)
