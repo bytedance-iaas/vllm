@@ -1963,6 +1963,23 @@ class VllmConfig:
         if compile_range_end is not None:
             computed_compile_ranges_endpoints.append(compile_range_end)
 
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda():
+            from vllm.compilation.passes.fusion.minimax_m3_pipelined_ag_gate import (
+                MINIMAX_M3_PIPELINED_AG_GATE_SMALL_RANGE_END,
+                minimax_m3_pipelined_ag_gate_compile_enabled,
+            )
+
+            if (
+                minimax_m3_pipelined_ag_gate_compile_enabled(self)
+                and compile_range_end is not None
+                and compile_range_end > MINIMAX_M3_PIPELINED_AG_GATE_SMALL_RANGE_END
+            ):
+                computed_compile_ranges_endpoints.append(
+                    MINIMAX_M3_PIPELINED_AG_GATE_SMALL_RANGE_END
+                )
+
         # Add the compile ranges for flashinfer/aiter.
         if compilation_config.pass_config.fuse_allreduce_rms:
             tp_size = self.parallel_config.tensor_parallel_size
