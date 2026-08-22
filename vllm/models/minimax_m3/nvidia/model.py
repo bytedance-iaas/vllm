@@ -761,10 +761,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # Dense layers store the FFN under `mlp`; MoE layers under
         # `block_sparse_moe` -- matching the checkpoint's naming.
         # Leave the FFN output un-reduced so its all-reduce fuses into the
-        # next RMSNorm. MTP blocks add the residual directly and PP sends
-        # hidden states across stages, so both must reduce.
+        # next RMSNorm. MTP blocks add the residual directly and must reduce.
+        # Compile SP materializes only the local PP stage boundary while
+        # keeping internal residuals token-sharded.
+        compile_sequence_parallel = bool(
+            vllm_config.compilation_config.pass_config.enable_sp
+        )
         reduce_results = (
-            is_mtp_block or vllm_config.parallel_config.pipeline_parallel_size > 1
+            is_mtp_block
+            or (
+                vllm_config.parallel_config.pipeline_parallel_size > 1
+                and not compile_sequence_parallel
+            )
         )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
@@ -838,6 +846,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return self.block_sparse_moe.experts.moe_config.skip_final_all_reduce
         return not self.mlp.down_proj.reduce_results
 
+    def set_ffn_all_reduce_deferred(self, defer: bool) -> None:
+        if self.is_moe_layer:
+            self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = defer
+        else:
+            self.mlp.down_proj.reduce_results = not defer
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -856,6 +870,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.compile_sequence_parallel = bool(
+            vllm_config.compilation_config.pass_config.enable_sp
+        )
+        self._intermediate_residual_key = (
+            "residual_full" if self.compile_sequence_parallel else "residual"
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -906,14 +926,23 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states", self._intermediate_residual_key], config.hidden_size
         )
 
         # Configure cross-layer all-reduce/RMSNorm fusion: a layer whose FFN output
         # is left un-reduced has that all-reduce fused into the next layer's
         # input_layernorm (or the final norm).
+        local_layers = self.layers[self.start_layer : self.end_layer]
         prev_defers = False
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for idx, layer in enumerate(local_layers):
+            materialize_pp_boundary = (
+                self.compile_sequence_parallel
+                and not get_pp_group().is_last_rank
+                and idx + 1 == len(local_layers)
+            )
+            layer.set_ffn_all_reduce_deferred(
+                layer.ffn_all_reduce_deferred and not materialize_pp_boundary
+            )
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
@@ -937,7 +966,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            residual = intermediate_tensors[self._intermediate_residual_key]
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
@@ -948,8 +977,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            if self.compile_sequence_parallel:
+                residual = ir.ops.sequence_parallel_boundary(residual)
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    self._intermediate_residual_key: residual,
+                }
             )
 
         if self.fuse_final_norm_allreduce:

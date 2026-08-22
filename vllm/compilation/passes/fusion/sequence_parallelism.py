@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import operator
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
 
+from ..fx_utils import is_func
 from ..inductor_pass import enable_fake_mode
 from ..utility.noop_elimination import NoOpEliminationPass
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
@@ -104,12 +106,13 @@ def get_sequence_parallelism_threshold(
     return int(min_size // (hidden_size * element_size))
 
 
-def get_first_out_wrapper(
+def get_output_wrapper(
     fn: Callable[..., Sequence[torch.Tensor]],
+    index: int,
 ) -> Callable[..., torch.Tensor]:
     @functools.wraps(fn)
     def wrapper(*args: Any) -> torch.Tensor:
-        return fn(*args)[0]
+        return fn(*args)[index]
 
     return wrapper
 
@@ -251,8 +254,15 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
         pm.register_replacement(
-            get_first_out_wrapper(pattern),
-            get_first_out_wrapper(replacement),
+            get_output_wrapper(pattern, 0),
+            get_output_wrapper(replacement, 0),
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+        )
+        pm.register_replacement(
+            get_output_wrapper(pattern, 1),
+            get_output_wrapper(replacement, 1),
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
@@ -364,8 +374,8 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
         )
 
         pm.register_replacement(
-            get_first_out_wrapper(pattern),
-            get_first_out_wrapper(replacement),
+            get_output_wrapper(pattern, 0),
+            get_output_wrapper(replacement, 0),
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
@@ -534,6 +544,8 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
+        self.tp_group = get_tp_group()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         # Get min_token_num threshold
         # Read min_token_num from config (calculated during config init)
@@ -589,6 +601,138 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
 
         self.dump_patterns(config, self.patterns)
 
+    @staticmethod
+    def _depends_on_new_reduce_scatter(
+        value: Any,
+        new_reduce_scatters: set[fx.Node],
+        seen: set[fx.Node] | None = None,
+    ) -> bool:
+        if isinstance(value, fx.Node):
+            if value in new_reduce_scatters:
+                return True
+            if seen is None:
+                seen = set()
+            if value in seen:
+                return False
+            seen.add(value)
+            return SequenceParallelismPass._depends_on_new_reduce_scatter(
+                value.args, new_reduce_scatters, seen
+            ) or SequenceParallelismPass._depends_on_new_reduce_scatter(
+                value.kwargs, new_reduce_scatters, seen
+            )
+        if isinstance(value, dict):
+            return any(
+                SequenceParallelismPass._depends_on_new_reduce_scatter(
+                    item, new_reduce_scatters, seen
+                )
+                for item in value.values()
+            )
+        if isinstance(value, tuple | list):
+            return any(
+                SequenceParallelismPass._depends_on_new_reduce_scatter(
+                    item, new_reduce_scatters, seen
+                )
+                for item in value
+            )
+        return False
+
+    @staticmethod
+    def _is_known_sharded_boundary_input(
+        node: fx.Node,
+        new_reduce_scatters: set[fx.Node],
+    ) -> bool:
+        if node in new_reduce_scatters:
+            return True
+        if not (
+            is_func(node, operator.getitem)
+            and node.args[1] == 1
+            and isinstance(node.args[0], fx.Node)
+        ):
+            return False
+        rmsnorm = node.args[0]
+        return (
+            is_func(rmsnorm, vllm.ir.ops.fused_add_rms_norm.torch_op)
+            and isinstance(rmsnorm.args[0], fx.Node)
+            and rmsnorm.args[0] in new_reduce_scatters
+        )
+
+    @staticmethod
+    def _is_tp_dim0_all_gather(node: fx.Node) -> bool:
+        return (
+            is_func(node, torch.ops.vllm.all_gather.default)
+            and len(node.args) >= 4
+            and node.args[1] == 0
+        )
+
+    @staticmethod
+    def _is_materialized_boundary_input(node: fx.Node) -> bool:
+        if SequenceParallelismPass._is_tp_dim0_all_gather(node):
+            return True
+        return (
+            is_func(node, torch.ops.aten.slice.Tensor)
+            and len(node.args) >= 4
+            and isinstance(node.args[0], fx.Node)
+            and SequenceParallelismPass._is_tp_dim0_all_gather(node.args[0])
+            and node.args[1] == 0
+            and node.args[2] == 0
+        )
+
+    def _rewrite_sequence_parallel_boundaries(
+        self,
+        graph: fx.Graph,
+        new_reduce_scatters: set[fx.Node],
+    ) -> int:
+        marker_op = vllm.ir.ops.sequence_parallel_boundary.torch_op
+        markers = list(graph.find_nodes(op="call_function", target=marker_op))
+        rewritten = 0
+
+        for marker in markers:
+            assert len(marker.args) == 1 and isinstance(marker.args[0], fx.Node)
+            boundary_input = marker.args[0]
+            if self._is_materialized_boundary_input(boundary_input):
+                marker.replace_all_uses_with(boundary_input)
+                graph.erase_node(marker)
+                rewritten += 1
+                continue
+            if not self._is_known_sharded_boundary_input(
+                boundary_input, new_reduce_scatters
+            ):
+                if self._depends_on_new_reduce_scatter(
+                    boundary_input, new_reduce_scatters
+                ):
+                    raise RuntimeError(
+                        "Sequence-parallel boundary depends on a newly inserted "
+                        "reduce-scatter through an unsupported graph path."
+                    )
+                continue
+
+            input_val = boundary_input.meta.get("val")
+            output_val = marker.meta.get("val")
+            if isinstance(input_val, torch.Tensor) and isinstance(
+                output_val, torch.Tensor
+            ):
+                local_tokens = input_val.shape[0]
+                full_tokens = output_val.shape[0]
+                if isinstance(local_tokens, int) and isinstance(full_tokens, int):
+                    assert local_tokens * self.tp_size == full_tokens
+
+            with graph.inserting_before(marker):
+                all_gather = graph.call_function(
+                    torch.ops.vllm.all_gather.default,
+                    args=(
+                        boundary_input,
+                        0,
+                        self.tp_size,
+                        self.tp_group.unique_name,
+                    ),
+                )
+            all_gather.meta = marker.meta.copy()
+            marker.replace_all_uses_with(all_gather)
+            graph.erase_node(marker)
+            rewritten += 1
+
+        return rewritten
+
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         """
         Determines if sequence parallelism should be applied for the given
@@ -617,7 +761,19 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        reduce_scatter_op = torch.ops.vllm.reduce_scatter.default
+        existing_reduce_scatters = set(
+            graph.find_nodes(op="call_function", target=reduce_scatter_op)
+        )
         self.matched_count = self.patterns.apply(graph)
+        new_reduce_scatters = (
+            set(graph.find_nodes(op="call_function", target=reduce_scatter_op))
+            - existing_reduce_scatters
+        )
+        boundary_count = self._rewrite_sequence_parallel_boundaries(
+            graph, new_reduce_scatters
+        )
         logger.debug("Replaced %s patterns", self.matched_count)
+        logger.debug("Materialized %s sequence-parallel boundaries", boundary_count)
         # Clean up reshape nodes
         self.noop_cleanup(graph)
