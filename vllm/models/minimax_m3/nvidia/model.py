@@ -19,9 +19,15 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm import _custom_ops as ops
+from vllm import ir
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
@@ -84,7 +90,13 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -132,6 +144,14 @@ class MiniMAXGemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if torch.compiler.is_compiling():
+            weight = self.weight.float() + 1.0
+            if residual is None:
+                return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+            return ir.ops.fused_add_rms_norm(
+                x, residual, weight, self.variance_epsilon
+            )
+
         from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
 
         if residual is None:
@@ -569,6 +589,23 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
 
+        num_tokens = qkv.shape[0]
+        output = qkv.new_empty((num_tokens, self.q_size))
+        torch.ops.vllm.minimax_m3_sparse_attention_with_output(
+            qkv,
+            positions,
+            output,
+            _encode_layer_name(self.layer_name),
+        )
+        output, _ = self.o_proj(output)
+        return output
+
+    def _run_sparse_attention_with_output(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
         # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
         # main (q/k) and index (index_q/index_k) branches, all read straight out
         # of the single fused ``qkv`` tensor (the "5 results").  Once the paged
@@ -590,7 +627,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+            output.zero_()
+            return
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
@@ -624,10 +662,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype,
         )
 
-        output = torch.empty_like(q)
-        attn_output = self._run_attention(q, index_q, output)
-        output, _ = self.o_proj(attn_output)
-        return output
+        self._run_attention(q, index_q, output)
 
     @eager_break_during_capture
     def _run_attention(
@@ -641,6 +676,34 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
         self.indexer(index_query)
         return self.impl.forward(self, query, self.kv_cache, output)
+
+
+def _minimax_m3_sparse_attention_with_output(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer._run_sparse_attention_with_output(qkv, positions, output)
+
+
+def _minimax_m3_sparse_attention_with_output_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_sparse_attention_with_output",
+    op_func=_minimax_m3_sparse_attention_with_output,
+    mutates_args=["qkv", "output"],
+    fake_impl=_minimax_m3_sparse_attention_with_output_fake,
+)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -736,9 +799,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_input_allreduce and residual is not None:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
-            )
+            if torch.compiler.is_compiling():
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            else:
+                hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, self.input_layernorm
+                )
         else:
             if residual is None:
                 residual = hidden_states
@@ -750,9 +817,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
-        )
+        if torch.compiler.is_compiling():
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
@@ -766,6 +839,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         return not self.mlp.down_proj.reduce_results
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
 
@@ -872,9 +953,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
 
         if self.fuse_final_norm_allreduce:
-            hidden_states, _ = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.norm
-            )
+            if torch.compiler.is_compiling():
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, _ = self.norm(hidden_states, residual)
+            else:
+                hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                    hidden_states, residual, self.norm
+                )
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
 

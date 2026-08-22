@@ -69,6 +69,22 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
 
 
 @pytest.mark.parametrize(
+    ("architecture", "is_rocm", "expected"),
+    [
+        ("DeepseekV4ForCausalLM", False, True),
+        ("InklingForConditionalGeneration", True, True),
+        ("MiniMaxM3SparseForCausalLM", False, False),
+        ("MiniMaxM3SparseForConditionalGeneration", False, False),
+        ("MiniMaxM3SparseForCausalLM", True, True),
+        ("MiniMaxM3SparseForConditionalGeneration", True, True),
+    ],
+)
+def test_breakable_cudagraph_model_architectures(architecture, is_rocm, expected):
+    should_enable = vllm_config_module._should_auto_enable_breakable_cudagraph
+    assert should_enable([architecture], is_rocm=is_rocm) is expected
+
+
+@pytest.mark.parametrize(
     ("use_v2_model_runner", "expected_capture_sizes"),
     [
         (False, [4, 8, 12, 16]),

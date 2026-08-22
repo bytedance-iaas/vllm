@@ -76,6 +76,33 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 
+BREAKABLE_CUDAGRAPH_MODEL_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "InklingForCausalLM",
+        "InklingForConditionalGeneration",
+    }
+)
+
+ROCM_BREAKABLE_CUDAGRAPH_MODEL_ARCHITECTURES = frozenset(
+    {
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+def _should_auto_enable_breakable_cudagraph(
+    architectures: Iterable[str],
+    *,
+    is_rocm: bool,
+) -> bool:
+    breakable_architectures = BREAKABLE_CUDAGRAPH_MODEL_ARCHITECTURES
+    if is_rocm:
+        breakable_architectures |= ROCM_BREAKABLE_CUDAGRAPH_MODEL_ARCHITECTURES
+    return not breakable_architectures.isdisjoint(architectures)
+
 
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
@@ -1199,17 +1226,9 @@ class VllmConfig:
         if (
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
+            and _should_auto_enable_breakable_cudagraph(
+                self.model_config.architectures,
+                is_rocm=current_platform.is_rocm(),
             )
         ):
             os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
