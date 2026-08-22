@@ -12,6 +12,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -25,7 +26,9 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
@@ -121,6 +124,10 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _sparse_attn_rs_candidate_enabled() -> bool:
+    return os.getenv("VLLM_MINIMAX_M3_SPARSE_ATTN_RS_CANDIDATE") == "1"
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -739,6 +746,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
         )
+        self.use_sparse_attn_rs_candidate = (
+            is_sparse_attention_layer
+            and not is_mtp_block
+            and _sparse_attn_rs_candidate_enabled()
+        )
 
         if is_sparse_attention_layer:
             self.self_attn = MiniMaxM3SparseAttention(
@@ -800,6 +812,87 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+    def _post_attention_rs_norm_all_gather(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return self.post_attention_layernorm(hidden_states, residual)
+
+        num_tokens = hidden_states.shape[0]
+        residual_is_full = residual.shape[0] == num_tokens
+        pad = (-num_tokens) % tp_size
+        if pad:
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    hidden_states.new_zeros((pad, hidden_states.shape[1])),
+                ],
+                dim=0,
+            )
+            if residual_is_full:
+                residual = torch.cat(
+                    [
+                        residual,
+                        residual.new_zeros((pad, residual.shape[1])),
+                    ],
+                    dim=0,
+                )
+
+        tp_group = get_tp_group()
+        local_hidden = torch.ops.vllm.reduce_scatter.default(
+            hidden_states,
+            0,
+            tp_size,
+            tp_group.unique_name,
+        )
+        local_len = local_hidden.shape[0]
+        if residual_is_full:
+            tp_rank = get_tensor_model_parallel_rank()
+            local_residual = residual[
+                tp_rank * local_len : tp_rank * local_len + local_len, ...
+            ].contiguous()
+        else:
+            local_residual = residual.contiguous()
+        local_hidden, local_residual = self.post_attention_layernorm(
+            local_hidden,
+            local_residual,
+        )
+        if (
+            local_hidden.shape == local_residual.shape
+            and local_hidden.dtype == local_residual.dtype
+            and local_hidden.device == local_residual.device
+        ):
+            packed_local = torch.cat((local_hidden, local_residual), dim=-1)
+            gathered_pair = torch.ops.vllm.all_gather.default(
+                packed_local,
+                0,
+                tp_size,
+                tp_group.unique_name,
+            )
+            gathered_hidden, gathered_residual = gathered_pair.split(
+                local_hidden.shape[-1], dim=-1
+            )
+        else:
+            gathered_hidden = torch.ops.vllm.all_gather.default(
+                local_hidden,
+                0,
+                tp_size,
+                tp_group.unique_name,
+            )
+            gathered_residual = torch.ops.vllm.all_gather.default(
+                local_residual,
+                0,
+                tp_size,
+                tp_group.unique_name,
+            )
+        return (
+            gathered_hidden[:num_tokens].contiguous(),
+            gathered_residual[:num_tokens].contiguous(),
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -825,7 +918,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
-        if torch.compiler.is_compiling():
+        if self.use_sparse_attn_rs_candidate:
+            hidden_states, residual = self._post_attention_rs_norm_all_gather(
+                hidden_states,
+                residual,
+            )
+        elif torch.compiler.is_compiling():
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
