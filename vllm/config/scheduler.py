@@ -64,13 +64,13 @@ class SchedulerConfig:
 
     enable_prefill_token_bucket_schedule: bool = False
     """If True, apply an experimental prompt-length bucket policy to prefill
-    chunks. Prompts shorter than 4096 tokens are not additionally capped, prompts
-    below 16384 tokens are capped at 4096 scheduled tokens per chunk, and longer
-    prompts are capped at 8192 scheduled tokens per chunk."""
+    scheduler steps. A step that schedules local prefill work uses the first
+    eligible prefill request as its bucket anchor and only admits prefills from
+    that bucket. Decode requests may still be scheduled in the same step."""
 
     prefill_token_bucket_schedule: str = ""
-    """Comma-separated prompt length to prefill chunk token budget buckets.
-    Each bucket is formatted as ``max_prompt_tokens:max_chunk_tokens``. Use -1
+    """Comma-separated prompt length to prefill step token budget buckets.
+    Each bucket is formatted as ``max_prompt_tokens:max_step_tokens``. Use -1
     as the last max prompt token for a catch-all bucket. Example:
     ``4095:8192,16383:4096,-1:8192``."""
 
