@@ -748,7 +748,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         gauge_prefill_chunks = self._gauge_cls(
-            name="vllm:prefill_chunks",
+            name="vllm:prefill_chunks_per_iteration",
             documentation=(
                 "Number of prefill chunks scheduled in the latest iteration."
             ),
