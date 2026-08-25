@@ -228,6 +228,43 @@ def test_schedule_multimodal_requests():
         assert len(encoder_input) == 1
 
 
+@pytest.mark.parametrize(
+    ("num_prompt_tokens", "expected_first_chunk"),
+    [
+        (3500, 3500),
+        (8000, 4096),
+        (16383, 4096),
+        (16384, 8192),
+        (32000, 8192),
+    ],
+)
+def test_prefill_token_bucket_schedule(num_prompt_tokens, expected_first_chunk):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=num_prompt_tokens)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == expected_first_chunk
+    assert output.prefill_chunk_stats is not None
+    assert output.prefill_chunk_stats.num_chunks == 1
+    assert output.prefill_chunk_stats.chunk_tokens == [expected_first_chunk]
+
+
+def test_prefill_token_bucket_schedule_disabled_by_default():
+    scheduler = create_scheduler(max_num_batched_tokens=8192, max_model_len=65536)
+    (request,) = create_requests(num_requests=1, num_tokens=8000)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 8000
+
+
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
     """Async scheduling + PP: allow multi-step in-flight scheduling per request"""
     scheduler = create_scheduler(async_scheduling=True, pipeline_parallel_size=2)

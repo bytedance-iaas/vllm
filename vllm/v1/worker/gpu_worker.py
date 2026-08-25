@@ -1034,6 +1034,11 @@ class Worker(WorkerBase):
             annotation = "".join(
                 [
                     "execute_",
+                    "pp",
+                    str(get_pp_group().rank_in_group),
+                    "_tp",
+                    str(get_tp_group().rank_in_group),
+                    "_",
                     str(total_scheduled_tokens),
                     "_context_",
                     str(iteration_details.num_ctx_requests),
@@ -1062,6 +1067,11 @@ class Worker(WorkerBase):
             annotation = "".join(
                 [
                     "execute_context_",
+                    "pp",
+                    str(get_pp_group().rank_in_group),
+                    "_tp",
+                    str(get_tp_group().rank_in_group),
+                    "_",
                     str(iteration_details.num_ctx_requests),
                     "(",
                     str(iteration_details.num_ctx_tokens),

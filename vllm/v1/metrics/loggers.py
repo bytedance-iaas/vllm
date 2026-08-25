@@ -178,12 +178,25 @@ class LoggingStatLogger(StatLoggerBase):
                 f", encoder inputs: {details.num_encoder_inputs}, "
                 f"encoder output embeddings: {details.num_encoder_output_tokens}"
             )
+        prefill_chunk_msg = ""
+        if details.prefill_chunks:
+            prefill_chunk_msg = (
+                f", prefill chunks: {details.prefill_chunks}, "
+                f"prefill chunk tokens: {details.prefill_chunk_tokens}, "
+                f"max prefill chunk tokens: {details.max_prefill_chunk_tokens}"
+            )
+        pp_queue_msg = ""
+        if details.pp_queue_capacity:
+            pp_queue_msg = (
+                f", PP queue occupancy: {details.pp_queue_len}/"
+                f"{details.pp_queue_capacity}"
+            )
 
         logger.info(
             "%sIteration(%d): %d context requests, %d context tokens, "
             "%d generation requests, %d generation tokens, "
             "iteration elapsed time: %.2f ms%s, "
-            "GPU KV cache usage: %.1f%%%s",
+            "GPU KV cache usage: %.1f%%%s%s%s",
             self._log_prefix_for_engine(engine_idx),
             details.iteration_index,
             details.num_ctx_requests,
@@ -194,6 +207,8 @@ class LoggingStatLogger(StatLoggerBase):
             " (dummy)" if details.is_dummy else "",
             scheduler_stats.kv_cache_usage * 100,
             encoder_msg,
+            prefill_chunk_msg,
+            pp_queue_msg,
         )
 
     def record(
@@ -568,6 +583,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        gauge_pp_batch_queue_occupancy = self._gauge_cls(
+            name="vllm:pp_batch_queue_occupancy",
+            documentation=(
+                "Number of in-flight batches in the pipeline-parallel batch queue."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_pp_batch_queue_occupancy = create_metric_per_engine(
+            gauge_pp_batch_queue_occupancy, per_engine_labelvalues
+        )
+
+        gauge_pp_batch_queue_capacity = self._gauge_cls(
+            name="vllm:pp_batch_queue_capacity",
+            documentation="Capacity of the pipeline-parallel batch queue.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_pp_batch_queue_capacity = create_metric_per_engine(
+            gauge_pp_batch_queue_capacity, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -710,6 +747,27 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_generation_tokens, per_engine_labelvalues
         )
 
+        gauge_prefill_chunks = self._gauge_cls(
+            name="vllm:prefill_chunks",
+            documentation=(
+                "Number of prefill chunks scheduled in the latest iteration."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_prefill_chunks = create_metric_per_engine(
+            gauge_prefill_chunks, per_engine_labelvalues
+        )
+
+        counter_prefill_chunks = self._counter_cls(
+            name="vllm:prefill_chunks_total",
+            documentation="Cumulative number of scheduled prefill chunks.",
+            labelnames=labelnames,
+        )
+        self.counter_prefill_chunks = create_metric_per_engine(
+            counter_prefill_chunks, per_engine_labelvalues
+        )
+
         self.counter_request_success: dict[FinishReason, dict[int, Counter]] = {}
         counter_request_success_base = self._counter_cls(
             name="vllm:request_success",
@@ -758,6 +816,41 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.histogram_iteration_tokens = create_metric_per_engine(
             histogram_iteration_tokens, per_engine_labelvalues
+        )
+
+        histogram_prefill_chunk_tokens = self._histogram_cls(
+            name="vllm:prefill_chunk_tokens",
+            documentation="Histogram of tokens per scheduled prefill chunk.",
+            buckets=[1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+            labelnames=labelnames,
+        )
+        self.histogram_prefill_chunk_tokens = create_metric_per_engine(
+            histogram_prefill_chunk_tokens, per_engine_labelvalues
+        )
+
+        histogram_engine_step_latency = self._histogram_cls(
+            name="vllm:engine_step_latency_seconds",
+            documentation="Histogram of scheduler-visible engine step latency.",
+            buckets=[
+                0.001,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+            ],
+            labelnames=labelnames,
+        )
+        self.histogram_engine_step_latency = create_metric_per_engine(
+            histogram_engine_step_latency, per_engine_labelvalues
         )
 
         histogram_max_num_generation_tokens_request = self._histogram_cls(
@@ -1121,6 +1214,24 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            if scheduler_stats.iteration_details is not None:
+                details = scheduler_stats.iteration_details
+                self.gauge_pp_batch_queue_occupancy[engine_idx].set(
+                    details.pp_queue_len
+                )
+                self.gauge_pp_batch_queue_capacity[engine_idx].set(
+                    details.pp_queue_capacity
+                )
+                self.gauge_prefill_chunks[engine_idx].set(details.prefill_chunks)
+                self.counter_prefill_chunks[engine_idx].inc(details.prefill_chunks)
+                for chunk_tokens in details.prefill_chunk_token_counts:
+                    self.histogram_prefill_chunk_tokens[engine_idx].observe(
+                        chunk_tokens
+                    )
+                if details.elapsed_ms:
+                    self.histogram_engine_step_latency[engine_idx].observe(
+                        details.elapsed_ms / 1000.0
+                    )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

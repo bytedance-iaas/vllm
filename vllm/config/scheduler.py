@@ -62,6 +62,18 @@ class SchedulerConfig:
     max_num_scheduled_tokens_auto_derived: bool = False
     """Whether max_num_scheduled_tokens was derived by vLLM rather than user-set."""
 
+    enable_prefill_token_bucket_schedule: bool = False
+    """If True, apply an experimental prompt-length bucket policy to prefill
+    chunks. Prompts shorter than 4096 tokens are not additionally capped, prompts
+    below 16384 tokens are capped at 4096 scheduled tokens per chunk, and longer
+    prompts are capped at 8192 scheduled tokens per chunk."""
+
+    prefill_token_bucket_schedule: str = ""
+    """Comma-separated prompt length to prefill chunk token budget buckets.
+    Each bucket is formatted as ``max_prompt_tokens:max_chunk_tokens``. Use -1
+    as the last max prompt token for a catch-all bucket. Example:
+    ``4095:8192,16383:4096,-1:8192``."""
+
     max_num_seqs: int = Field(default=DEFAULT_MAX_NUM_SEQS, ge=1)
     """Maximum number of sequences to be processed in a single iteration.
 

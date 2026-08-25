@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    PrefillChunkStats,
+    ScheduledEncoderInputStats,
+    SchedulerOutput,
+)
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import (
     IterationStats,
@@ -29,6 +33,12 @@ def test_scheduler_iteration_details_serialization():
         elapsed_ms=6.7,
         num_encoder_inputs=2,
         num_encoder_output_tokens=392,
+        prefill_chunks=3,
+        prefill_chunk_tokens=12288,
+        max_prefill_chunk_tokens=4096,
+        prefill_chunk_token_counts=[4096, 4096, 4096],
+        pp_queue_len=2,
+        pp_queue_capacity=2,
     )
     outputs = EngineCoreOutputs(
         scheduler_stats=SchedulerStats(
@@ -56,6 +66,23 @@ def test_compute_iteration_details_includes_encoder_stats():
 
     assert iteration_details.num_encoder_inputs == 2
     assert iteration_details.num_encoder_output_tokens == 392
+
+
+def test_compute_iteration_details_includes_prefill_chunk_stats():
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.prefill_chunk_stats = PrefillChunkStats(
+        num_chunks=2,
+        total_tokens=8192,
+        max_tokens=4096,
+        chunk_tokens=[4096, 4096],
+    )
+
+    iteration_details = compute_iteration_details(scheduler_output)
+
+    assert iteration_details.prefill_chunks == 2
+    assert iteration_details.prefill_chunk_tokens == 8192
+    assert iteration_details.max_prefill_chunk_tokens == 4096
+    assert iteration_details.prefill_chunk_token_counts == [4096, 4096]
 
 
 def test_prefill_kv_computed_with_cache():

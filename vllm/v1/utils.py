@@ -784,6 +784,10 @@ class IterationDetails:
     num_generation_tokens: int
     num_encoder_inputs: int = 0
     num_encoder_output_tokens: int = 0
+    prefill_chunks: int = 0
+    prefill_chunk_tokens: int = 0
+    max_prefill_chunk_tokens: int = 0
+    prefill_chunk_token_counts: list[int] | None = None
 
     def __repr__(self) -> str:
         return f"IterationDetails(num_ctx_requests={self.num_ctx_requests},\
@@ -791,7 +795,11 @@ class IterationDetails:
                  num_generation_requests={self.num_generation_requests}, \
                  num_generation_tokens={self.num_generation_tokens}, \
                  num_encoder_inputs={self.num_encoder_inputs}, \
-                 num_encoder_output_tokens={self.num_encoder_output_tokens})"
+                 num_encoder_output_tokens={self.num_encoder_output_tokens}, \
+                 prefill_chunks={self.prefill_chunks}, \
+                 prefill_chunk_tokens={self.prefill_chunk_tokens}, \
+                 max_prefill_chunk_tokens={self.max_prefill_chunk_tokens}, \
+                 prefill_chunk_token_counts={self.prefill_chunk_token_counts})"
 
 
 def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDetails:
@@ -828,6 +836,16 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
     if scheduled_encoder_input_stats is not None:
         num_encoder_inputs = scheduled_encoder_input_stats.num_inputs
         num_encoder_output_tokens = scheduled_encoder_input_stats.output_tokens
+    prefill_chunk_stats = scheduler_output.prefill_chunk_stats
+    prefill_chunks = 0
+    prefill_chunk_tokens = 0
+    max_prefill_chunk_tokens = 0
+    prefill_chunk_token_counts = None
+    if prefill_chunk_stats is not None:
+        prefill_chunks = prefill_chunk_stats.num_chunks
+        prefill_chunk_tokens = prefill_chunk_stats.total_tokens
+        max_prefill_chunk_tokens = prefill_chunk_stats.max_tokens
+        prefill_chunk_token_counts = prefill_chunk_stats.chunk_tokens
 
     return IterationDetails(
         num_context_requests,
@@ -836,4 +854,8 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         num_generation_tokens,
         num_encoder_inputs,
         num_encoder_output_tokens,
+        prefill_chunks,
+        prefill_chunk_tokens,
+        max_prefill_chunk_tokens,
+        prefill_chunk_token_counts,
     )
