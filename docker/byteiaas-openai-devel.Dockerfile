@@ -3,7 +3,6 @@ FROM ${VLLM_OPENAI_DEVEL_BASE_IMAGE}
 
 ARG CUDA_VERSION=13.0.2
 ARG UBUNTU_MIRROR=http://mirrors.byted.org/ubuntu
-ARG UBUNTU_MIRROR_HOSTS="10.8.6.125 mirrors.byted.org"
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG ALL_PROXY
@@ -16,9 +15,6 @@ ARG no_proxy
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
-    if [ -n "${UBUNTU_MIRROR_HOSTS}" ]; then \
-        echo "${UBUNTU_MIRROR_HOSTS}" >> /etc/hosts; \
-    fi; \
     if [ -n "${UBUNTU_MIRROR}" ]; then \
         if [ -f /etc/apt/sources.list ]; then \
             sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
