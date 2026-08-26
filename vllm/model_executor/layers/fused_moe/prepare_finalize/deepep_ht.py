@@ -61,6 +61,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
         self.sync_dbo_comm = current_platform.is_rocm()
+        self.num_rdma_ranks = buffer.runtime.get_num_rdma_ranks()
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -115,6 +116,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         has_scales = token_scales is not None
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing and self.num_rdma_ranks > 1:
+            raise RuntimeError(
+                "DeepEP high-throughput CUDA graph capture only supports "
+                "intranode transport"
+            )
 
         # Capture a DeepEP event on the compute stream before yielding.
         # This must happen before the yield so the event only covers this
@@ -145,6 +152,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
+        num_worst_tokens = 0
+        if is_capturing:
+            # Avoid the CPU receive-count sync during CUDA graph capture.
+            # Every dispatcher can route all of its tokens to this EP rank.
+            num_worst_tokens = tokens.shape[0] * self.num_dispatchers_
+
         (
             token_data,
             expert_topk_ids,
@@ -164,6 +177,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             # expert_alignment rounds the number of tokens per expert
             # to this value.
             expert_alignment=1,
+            num_worst_tokens=num_worst_tokens,
             config=self._get_dispatch_config(),
             previous_event=previous_event,
             async_finish=self.async_prepare and not dbo_enabled(),
@@ -233,8 +247,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # Makes a GPU-CPU copy.
         # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
         # on GPU.
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            expert_num_tokens_per_expert_list, device=expert_x.device
+        expert_tokens_meta = (
+            mk.ExpertTokensMetadata.make_from_list(
+                expert_num_tokens_per_expert_list, device=expert_x.device
+            )
+            if expert_num_tokens_per_expert_list
+            else None
         )
 
         # * For non-block quant, dispatch in b16 and quantize now as
@@ -245,12 +263,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             # Quantize after dispatch.
             expert_x_scale = None
             if expert_x.numel() != 0:
-                # TODO: support per_act_token_quant,
                 expert_x, expert_x_scale = moe_kernel_quantize_input(
                     expert_x,
                     a1_scale,
                     quant_dtype=quant_config.quant_dtype,
-                    per_act_token_quant=False,
+                    per_act_token_quant=quant_config.per_act_token_quant,
                     block_shape=quant_config.block_shape,
                     is_scale_swizzled=quant_config.is_scale_swizzled,
                 )

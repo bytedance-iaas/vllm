@@ -1986,6 +1986,8 @@ def test_kv_connector_hybrid_dense_hit_requires_remote_prefill():
 
     assert queried_local_hits == [0]
     assert scheduler_output.num_scheduled_tokens[local_req.request_id] == 1280
+
+
 @pytest.mark.parametrize("is_async", [False, True])
 def test_kv_connector_basic(is_async: bool):
     """
@@ -4789,6 +4791,33 @@ def test_abort_request_finished_recving():
     # verify request is deleted
     assert request.request_id not in scheduler.requests
     assert not scheduler.finished_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("completion_kind", ["recv", "send"])
+def test_late_kv_completion_after_abort_is_ignored(completion_kind: str):
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert request.request_id not in scheduler.requests
+
+    completion = {request.request_id}
+    kv_connector_output = (
+        KVConnectorOutput(finished_recving=completion)
+        if completion_kind == "recv"
+        else KVConnectorOutput(finished_sending=completion)
+    )
+    scheduler_output = scheduler.schedule()
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        kv_connector_output=kv_connector_output,
+    )
+
+    scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert request.request_id not in scheduler.requests
 
 
 def test_delayed_kv_connector_free_keeps_scheduler_active():

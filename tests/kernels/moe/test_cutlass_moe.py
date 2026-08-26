@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import dataclasses
+import importlib
+import sys
 from math import prod
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -25,6 +28,8 @@ from vllm.model_executor.layers.fused_moe.config import (
     fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+    CutlassBatchedExpertsFp8,
+    CutlassBatchedExpertsW4A8Fp8,
     CutlassExpertsFp4,
     CutlassExpertsFp8,
     CutlassExpertsW4A8Fp8,
@@ -34,6 +39,10 @@ from vllm.model_executor.layers.fused_moe.oracle.w4a8 import (
     W4A8MoeBackend,
     make_w4a8_moe_quant_config,
     select_w4a8_moe_backend,
+)
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceDelegate,
+    TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -72,6 +81,85 @@ def test_cutlass_moe_supports_gelu_tanh_activation_metadata():
     assert CutlassExpertsFp4._supports_activation(MoEActivation.GELU_TANH_NO_MUL)
 
 
+@pytest.mark.parametrize(
+    "experts_cls",
+    [CutlassExpertsFp8, CutlassExpertsW4A8Fp8],
+)
+@pytest.mark.parametrize(
+    ("parallel_overrides", "expected_dispatchers"),
+    [
+        ({"dp_size": 8, "ep_size": 1, "use_ep": False}, 8),
+        (
+            {
+                "dp_size": 2,
+                "ep_size": 8,
+                "use_ep": True,
+                "all2all_backend": "deepep_high_throughput",
+            },
+            8,
+        ),
+    ],
+)
+def test_cutlass_permute_scratch_covers_standard_dispatch_group(
+    experts_cls,
+    parallel_overrides,
+    expected_dispatchers,
+):
+    config = make_dummy_moe_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        **parallel_overrides,
+    )
+    experts = object.__new__(experts_cls)
+    object.__setattr__(experts, "moe_config", config)
+    object.__setattr__(experts, "_permute_scratch", None)
+    scratch = object()
+
+    with (
+        patch.object(
+            cutlass_moe,
+            "moe_permute_unpermute_supported",
+            return_value=True,
+        ),
+        patch.object(
+            cutlass_moe,
+            "MoEPermuteScratch",
+            return_value=scratch,
+        ) as scratch_cls,
+    ):
+        result = experts._get_permute_scratch()
+
+    assert result is scratch
+    assert scratch_cls.call_args.kwargs["max_num_tokens"] == (
+        config.max_num_tokens * expected_dispatchers
+    )
+
+
+def test_cutlass_batched_permute_scratch_keeps_per_rank_capacity():
+    config = make_dummy_moe_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        dp_size=8,
+        ep_size=8,
+        use_ep=True,
+    )
+    experts = object.__new__(CutlassBatchedExpertsFp8)
+    object.__setattr__(experts, "moe_config", config)
+    object.__setattr__(experts, "_permute_scratch", None)
+
+    with (
+        patch.object(
+            cutlass_moe,
+            "moe_permute_unpermute_supported",
+            return_value=True,
+        ),
+        patch.object(cutlass_moe, "MoEPermuteScratch") as scratch_cls,
+    ):
+        experts._get_permute_scratch()
+
+    assert scratch_cls.call_args.kwargs["max_num_tokens"] == config.max_num_tokens
+
+
 def make_minimax_w4a8_config(intermediate_size: int = 3072):
     config = make_dummy_moe_config(
         num_experts=128,
@@ -92,6 +180,116 @@ def make_minimax_w4a8_config(intermediate_size: int = 3072):
     return config
 
 
+def make_minimax_w4a8_deepep_ll_config():
+    config = make_minimax_w4a8_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        dp_size=8,
+        ep_size=8,
+        use_ep=True,
+        all2all_backend="deepep_low_latency",
+    )
+    return config
+
+
+@pytest.mark.parametrize(
+    ("total_num_tokens", "expected"),
+    [
+        (0, "Kernel_128x16_1x1x1_Coop"),
+        (8, "Kernel_128x16_1x1x1_Coop"),
+        (128, "Kernel_256x16_1x1x1_Coop"),
+        (512, "Kernel_256x16_1x1x1_Coop"),
+        (1024, "Kernel_256x32_1x1x1_Coop"),
+        (2048, "Kernel_256x64_1x1x1_Coop"),
+        (4096, "Kernel_256x128_2x1x1_Coop"),
+        (8192, "Kernel_128x256_2x1x1_Coop"),
+    ],
+)
+def test_w4a8_batched_schedule_uses_expected_routed_rows(
+    total_num_tokens: int,
+    expected: str,
+):
+    assert (
+        cutlass_moe._select_w4a8_batched_schedule(
+            total_num_tokens=total_num_tokens,
+            topk=4,
+            global_num_experts=128,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("total_num_tokens", "expected"),
+    [
+        (0, 16),
+        (512, 16),
+        (1024, 64),
+        (2048, 128),
+        (4096, 256),
+        (8192, 256),
+    ],
+)
+def test_w4a8_compact_programs_scale_with_expected_m(
+    total_num_tokens: int,
+    expected: int,
+):
+    assert (
+        cutlass_moe._select_w4a8_compact_programs(
+            total_num_tokens=total_num_tokens,
+            topk=4,
+            global_num_experts=128,
+        )
+        == expected
+    )
+
+
+def test_w4a8_batched_schedule_uses_dp_group_token_total():
+    dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.tensor([1, 3, 7, 9], dtype=torch.int32)
+    )
+    context = SimpleNamespace(dp_metadata=dp_metadata)
+
+    with (
+        patch.object(cutlass_moe, "is_forward_context_available", return_value=True),
+        patch.object(cutlass_moe, "get_forward_context", return_value=context),
+    ):
+        total_num_tokens = cutlass_moe._w4a8_batched_total_num_tokens(
+            local_num_tokens=1,
+            global_num_experts=128,
+            num_local_experts=32,
+        )
+
+    assert total_num_tokens == 20
+
+
+def test_w4a8_batched_schedule_fallback_uses_dispatcher_count():
+    with patch.object(
+        cutlass_moe,
+        "is_forward_context_available",
+        return_value=False,
+    ):
+        total_num_tokens = cutlass_moe._w4a8_batched_total_num_tokens(
+            local_num_tokens=64,
+            global_num_experts=128,
+            num_local_experts=16,
+        )
+
+    assert total_num_tokens == 512
+
+
+def make_minimax_w4a8_nixl_ep_config():
+    config = make_minimax_w4a8_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        dp_size=8,
+        ep_size=8,
+        use_ep=True,
+        all2all_backend="nixl_ep",
+    )
+    return config
+
+
 def get_w4a8_support(config):
     with patch.object(
         CutlassExpertsW4A8Fp8,
@@ -104,6 +302,21 @@ def get_w4a8_support(config):
             kInt4Static,
             kFp8DynamicTokenSym,
             mk.FusedMoEActivationFormat.Standard,
+        )
+
+
+def get_batched_w4a8_support(config):
+    with patch.object(
+        CutlassExpertsW4A8Fp8,
+        "_supports_current_device",
+        return_value=True,
+    ):
+        return CutlassBatchedExpertsW4A8Fp8.is_supported_config(
+            CutlassBatchedExpertsW4A8Fp8,
+            config,
+            kInt4Static,
+            kFp8DynamicTokenSym,
+            mk.FusedMoEActivationFormat.BatchedExperts,
         )
 
 
@@ -121,6 +334,600 @@ def test_cutlass_w4a8_supports_minimax_uninterleaved_swiglu_with_ep():
         backend, experts_cls = select_w4a8_moe_backend(config)
     assert backend is W4A8MoeBackend.CUTLASS
     assert experts_cls is CutlassExpertsW4A8Fp8
+
+
+def test_cutlass_w4a8_selects_batched_experts_for_deepep_ll():
+    config = make_minimax_w4a8_deepep_ll_config()
+    supported, reason = get_batched_w4a8_support(config)
+
+    assert supported
+    assert reason is None
+    with patch.object(
+        CutlassExpertsW4A8Fp8,
+        "_supports_current_device",
+        return_value=True,
+    ):
+        backend, experts_cls = select_w4a8_moe_backend(config)
+    assert backend is W4A8MoeBackend.CUTLASS
+    assert experts_cls is CutlassBatchedExpertsW4A8Fp8
+
+
+def test_cutlass_w4a8_rejects_batched_non_deepep_ll():
+    supported, reason = get_batched_w4a8_support(make_minimax_w4a8_nixl_ep_config())
+
+    assert not supported
+    assert reason is not None
+    assert "parallel config" in reason
+
+
+def test_cutlass_w4a8_batched_workspace_and_finalize_contract():
+    config = make_minimax_w4a8_deepep_ll_config()
+    config.device = "cpu"
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(16, 1, dtype=torch.float8_e4m3fn),
+        w2_scale=torch.empty(16, 1, dtype=torch.float8_e4m3fn),
+        g1_alphas=torch.empty(16, 6144, dtype=torch.float32),
+        g2_alphas=torch.empty(16, 6144, dtype=torch.float32),
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+    experts = CutlassBatchedExpertsW4A8Fp8(
+        moe_config=config,
+        quant_config=quant_config,
+        b_strides1=torch.empty(16, dtype=torch.int64),
+        b_strides2=torch.empty(16, dtype=torch.int64),
+        group_size=128,
+        max_num_tokens=64,
+        num_dispatchers=2,
+    )
+
+    assert isinstance(
+        experts.finalize_weight_and_reduce_impl(), TopKWeightAndReduceDelegate
+    )
+    assert experts.expects_unquantized_inputs
+    assert experts._get_permute_scratch() is None
+    assert isinstance(
+        CutlassExpertsW4A8Fp8(
+            moe_config=config,
+            quant_config=quant_config,
+            b_strides1=torch.empty(16, dtype=torch.int64),
+            b_strides2=torch.empty(16, dtype=torch.int64),
+            group_size=128,
+        ).finalize_weight_and_reduce_impl(),
+        TopKWeightAndReduceNoOP,
+    )
+    assert experts.workspace_shapes(
+        M=64,
+        N=3072 * 2,
+        K=6144,
+        topk=4,
+        global_num_experts=128,
+        local_num_experts=16,
+        expert_tokens_meta=None,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    ) == (
+        (16, 128, 6144),
+        (16, 128, 6144),
+        (16, 128, 6144),
+    )
+
+
+@pytest.mark.parametrize(
+    ("experts_cls", "config_factory", "expects_counts"),
+    [
+        (CutlassExpertsW4A8Fp8, make_minimax_w4a8_config, False),
+        (
+            CutlassBatchedExpertsW4A8Fp8,
+            make_minimax_w4a8_deepep_ll_config,
+            True,
+        ),
+    ],
+)
+def test_cutlass_w4a8_only_forwards_expert_counts_for_batched_format(
+    experts_cls,
+    config_factory,
+    expects_counts,
+):
+    config = config_factory()
+    config.device = "cpu"
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(16, 1, dtype=torch.float8_e4m3fn),
+        w2_scale=torch.empty(16, 1, dtype=torch.float8_e4m3fn),
+        g1_alphas=torch.empty(16, 6144, dtype=torch.float32),
+        g2_alphas=torch.empty(16, 6144, dtype=torch.float32),
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+    batched_kwargs = (
+        {"max_num_tokens": 64, "num_dispatchers": 2} if expects_counts else {}
+    )
+    experts = experts_cls(
+        moe_config=config,
+        quant_config=quant_config,
+        b_strides1=torch.empty(16, dtype=torch.int64),
+        b_strides2=torch.empty(16, dtype=torch.int64),
+        group_size=128,
+        **batched_kwargs,
+    )
+    expert_num_tokens = torch.arange(16, dtype=torch.int32)
+    metadata = mk.ExpertTokensMetadata(
+        expert_num_tokens=expert_num_tokens,
+        expert_num_tokens_cpu=None,
+    )
+
+    with (
+        patch.object(experts, "_get_permute_scratch", return_value=None),
+        patch.object(cutlass_moe, "run_cutlass_moe_w4a8_fp8") as run_moe,
+    ):
+        experts.apply(
+            output=torch.empty(1),
+            hidden_states=torch.empty((1, 6144), dtype=torch.bfloat16),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            topk_weights=torch.empty((1, 4)),
+            topk_ids=torch.empty((1, 4), dtype=torch.int64),
+            activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            global_num_experts=128,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=torch.empty(1),
+            workspace2=torch.empty(1),
+            expert_tokens_meta=metadata,
+            apply_router_weight_on_input=False,
+        )
+
+    forwarded_counts = run_moe.call_args.args[27]
+    assert forwarded_counts is (expert_num_tokens if expects_counts else None)
+
+
+def test_deepep_ll_receiver_defers_batched_w4a8_input_quant():
+    pytest.importorskip("deep_ep")
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
+        DeepEPLLPrepareAndFinalize,
+    )
+
+    prepare_finalize = object.__new__(DeepEPLLPrepareAndFinalize)
+    prepare_finalize.use_fp8_dispatch = False
+    expert_x = torch.randn((4, 8, 256), dtype=torch.bfloat16)
+    expert_num_tokens = torch.tensor([0, 8, 1, 3], dtype=torch.int32)
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+        g1_alphas=torch.empty(1),
+        g2_alphas=torch.empty(1),
+    )
+
+    result = prepare_finalize._receiver(
+        expert_x,
+        expert_num_tokens,
+        a1_scale=None,
+        a1_dtype=torch.bfloat16,
+        quant_config=quant_config,
+        defer_input_quant=True,
+    )
+
+    received_x, received_scale, metadata, topk_ids, topk_weights = result
+    assert received_x is expert_x
+    assert received_scale is None
+    assert metadata.expert_num_tokens is expert_num_tokens
+    assert metadata.expert_num_tokens_cpu is None
+    assert topk_ids is None
+    assert topk_weights is None
+
+
+def test_deepep_ht_receiver_preserves_per_token_quant_contract():
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht"
+    with patch.dict(sys.modules, {"deep_ep": MagicMock()}):
+        deepep_ht = importlib.import_module(module_name)
+
+    prepare_finalize = object.__new__(deepep_ht.DeepEPHTPrepareAndFinalize)
+    prepare_finalize.rank_expert_offset = 0
+    expert_x = torch.randn((2, 256), dtype=torch.bfloat16)
+    expert_topk_ids = torch.tensor([[0], [1]], dtype=torch.int64)
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+        g1_alphas=torch.empty(1),
+        g2_alphas=torch.empty(1),
+    )
+    expected_scale = torch.empty((2, 1), dtype=torch.float32)
+
+    with patch.object(
+        deepep_ht,
+        "moe_kernel_quantize_input",
+        return_value=(expert_x, expected_scale),
+    ) as quantize:
+        result = prepare_finalize._receiver(
+            event=SimpleNamespace(event=None),
+            has_scales=False,
+            token_data=expert_x,
+            expert_topk_ids=expert_topk_ids,
+            num_experts=4,
+            expert_num_tokens_per_expert_list=[1, 1],
+            expert_topk_weights=torch.ones((2, 1)),
+            a1_scale=None,
+            quant_config=quant_config,
+            defer_input_quant=False,
+        )
+
+    assert quantize.call_args.kwargs["per_act_token_quant"] is True
+    assert result[1] is expected_scale
+    sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize(
+    ("is_capturing", "expected_worst_tokens"),
+    [(False, 0), (True, 16)],
+)
+def test_deepep_ht_dispatch_uses_static_capacity_during_capture(
+    is_capturing,
+    expected_worst_tokens,
+):
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht"
+    with patch.dict(sys.modules, {"deep_ep": MagicMock()}):
+        deepep_ht = importlib.import_module(module_name)
+
+    prepare_finalize = object.__new__(deepep_ht.DeepEPHTPrepareAndFinalize)
+    prepare_finalize.buffer = MagicMock()
+    prepare_finalize.num_dispatchers_ = 8
+    prepare_finalize.rank_expert_offset = 0
+    prepare_finalize.async_prepare = True
+    prepare_finalize.sync_dbo_comm = False
+    prepare_finalize.num_rdma_ranks = 1
+    prepare_finalize.handles = [None, None]
+
+    tokens = torch.empty((2, 16), dtype=torch.bfloat16)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int64)
+    topk_weights = torch.ones((2, 1))
+    prepare_finalize.buffer.get_dispatch_layout.return_value = (
+        MagicMock(),
+        None,
+        MagicMock(),
+        MagicMock(),
+        SimpleNamespace(event=None),
+    )
+    prepare_finalize.buffer.dispatch.return_value = (
+        tokens,
+        topk_ids,
+        topk_weights,
+        [],
+        MagicMock(),
+        SimpleNamespace(event=None),
+    )
+
+    with (
+        patch.object(
+            torch.cuda,
+            "is_current_stream_capturing",
+            return_value=is_capturing,
+        ),
+        patch.object(
+            deepep_ht.DeepEPHTPrepareAndFinalize,
+            "_get_dispatch_config",
+            return_value=None,
+        ),
+    ):
+        receiver = prepare_finalize._do_dispatch(
+            tokens=tokens,
+            token_scales=None,
+            rank_topk_ids=topk_ids,
+            rank_topk_weights=topk_weights,
+            num_experts=8,
+            a1_scale=None,
+            quant_config=MagicMock(is_block_quantized=False),
+            defer_input_quant=True,
+        )
+
+    assert (
+        prepare_finalize.buffer.dispatch.call_args.kwargs["num_worst_tokens"]
+        == expected_worst_tokens
+    )
+    assert receiver()[2] is None
+    sys.modules.pop(module_name, None)
+
+
+def test_deepep_ht_dispatch_rejects_internode_capture():
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht"
+    with patch.dict(sys.modules, {"deep_ep": MagicMock()}):
+        deepep_ht = importlib.import_module(module_name)
+
+    prepare_finalize = object.__new__(deepep_ht.DeepEPHTPrepareAndFinalize)
+    prepare_finalize.buffer = MagicMock()
+    prepare_finalize.num_dispatchers_ = 8
+    prepare_finalize.num_rdma_ranks = 2
+
+    with (
+        patch.object(
+            torch.cuda,
+            "is_current_stream_capturing",
+            return_value=True,
+        ),
+        pytest.raises(
+            RuntimeError,
+            match="only supports intranode transport",
+        ),
+    ):
+        prepare_finalize._do_dispatch(
+            tokens=torch.empty((2, 16), dtype=torch.bfloat16),
+            token_scales=None,
+            rank_topk_ids=torch.zeros((2, 1), dtype=torch.int64),
+            rank_topk_weights=torch.ones((2, 1)),
+            num_experts=8,
+            a1_scale=None,
+            quant_config=MagicMock(is_block_quantized=False),
+            defer_input_quant=True,
+        )
+
+    prepare_finalize.buffer.dispatch.assert_not_called()
+    sys.modules.pop(module_name, None)
+
+
+MASKED_W4A8_ROUTING_CASES = [
+    pytest.param([0, 0, 0, 0], id="empty"),
+    pytest.param([8, 0, 0, 0], id="hot"),
+    pytest.param([8, 8, 8, 8], id="uniform"),
+    pytest.param([1, 8, 0, 3], id="skewed"),
+    pytest.param([16, 17, 32, 65], id="persistent-loop-boundaries"),
+    pytest.param([0, 64, 1, 17], id="persistent-loop-skewed"),
+]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("counts", MASKED_W4A8_ROUTING_CASES)
+def test_cutlass_w4a8_masked_per_token_quant_matches_full_flatten(counts):
+    set_random_seed(7)
+    num_experts = len(counts)
+    padded_m = max(8, max(counts))
+    hidden = 256
+    src = torch.randn(
+        (num_experts, padded_m, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    quant = torch.full_like(src, 1.0, dtype=torch.float8_e4m3fn)
+    scales = torch.full(
+        (num_experts, padded_m, 1),
+        -1.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expert_num_tokens = torch.tensor(counts, dtype=torch.int32, device="cuda")
+
+    cutlass_moe._masked_per_token_fp8_quant(
+        src,
+        quant,
+        scales,
+        expert_num_tokens,
+    )
+
+    for expert, count in enumerate(counts):
+        if count:
+            ref_quant, ref_scales = ops.scaled_fp8_quant(
+                src[expert, :count],
+                use_per_token_if_dynamic=True,
+            )
+            quantized = quant[expert, :count].float()
+            ref_quantized = ref_quant.float()
+            mismatch_rate = (quantized != ref_quantized).float().mean()
+            assert mismatch_rate <= 2.0e-3
+            torch.testing.assert_close(
+                scales[expert, :count],
+                ref_scales,
+                rtol=2e-7,
+                atol=1e-9,
+            )
+            torch.testing.assert_close(
+                quantized * scales[expert, :count],
+                ref_quantized * ref_scales,
+                rtol=0,
+                atol=3e-1,
+            )
+        torch.testing.assert_close(
+            quant[expert, count:].float(),
+            torch.ones_like(quant[expert, count:].float()),
+        )
+        torch.testing.assert_close(
+            scales[expert, count:],
+            -torch.ones_like(scales[expert, count:]),
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("counts", MASKED_W4A8_ROUTING_CASES)
+def test_cutlass_w4a8_masked_minimax_activation_quant_matches_reference(counts):
+    set_random_seed(11)
+    num_experts = len(counts)
+    padded_m = max(8, max(counts))
+    hidden = 256
+    src = torch.randn(
+        (num_experts, padded_m, hidden * 2),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    quant = torch.full(
+        (num_experts, padded_m, hidden),
+        1.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    scales = torch.full(
+        (num_experts, padded_m, 1),
+        -1.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expert_num_tokens = torch.tensor(counts, dtype=torch.int32, device="cuda")
+
+    cutlass_moe._masked_swigluoai_quant(
+        src,
+        quant,
+        scales,
+        expert_num_tokens,
+        alpha=1.702,
+        beta=1.0,
+        clamp_limit=7.0,
+    )
+
+    for expert, count in enumerate(counts):
+        if count:
+            ref_activation = torch.empty(
+                (count, hidden),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            cutlass_moe._apply_w4a8_moe_activation(
+                MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+                ref_activation,
+                src[expert, :count],
+                gemm1_alpha=1.702,
+                gemm1_beta=1.0,
+                gemm1_clamp_limit=7.0,
+            )
+            ref_quant, ref_scales = ops.scaled_fp8_quant(
+                ref_activation,
+                use_per_token_if_dynamic=True,
+            )
+            torch.testing.assert_close(
+                scales[expert, :count],
+                ref_scales,
+                rtol=5e-3,
+                atol=1e-6,
+            )
+            torch.testing.assert_close(
+                quant[expert, :count].float() * scales[expert, :count],
+                ref_quant.float() * ref_scales,
+                rtol=5e-3,
+                atol=3e-2,
+            )
+        torch.testing.assert_close(
+            quant[expert, count:].float(),
+            torch.ones_like(quant[expert, count:].float()),
+        )
+        torch.testing.assert_close(
+            scales[expert, count:],
+            -torch.ones_like(scales[expert, count:]),
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+def test_cutlass_w4a8_masked_adapter_cuda_graph_replay():
+    set_random_seed(13)
+    num_experts = 4
+    padded_m = 65
+    hidden = 256
+    counts = [0, 16, 17, 32]
+    expert_num_tokens = torch.tensor(counts, dtype=torch.int32, device="cuda")
+    a1 = torch.randn(
+        (num_experts, padded_m, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    mm1 = torch.randn(
+        (num_experts, padded_m, hidden * 2),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    a1_quant = torch.empty_like(a1, dtype=torch.float8_e4m3fn)
+    a1_scales = torch.empty(
+        (num_experts, padded_m, 1),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    a2_quant = torch.empty_like(a1_quant)
+    a2_scales = torch.empty_like(a1_scales)
+
+    cutlass_moe._masked_per_token_fp8_quant(
+        a1,
+        a1_quant,
+        a1_scales,
+        expert_num_tokens,
+    )
+    cutlass_moe._masked_swigluoai_quant(
+        mm1,
+        a2_quant,
+        a2_scales,
+        expert_num_tokens,
+        alpha=1.702,
+        beta=1.0,
+        clamp_limit=7.0,
+    )
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=stream):
+        cutlass_moe._masked_per_token_fp8_quant(
+            a1,
+            a1_quant,
+            a1_scales,
+            expert_num_tokens,
+        )
+        cutlass_moe._masked_swigluoai_quant(
+            mm1,
+            a2_quant,
+            a2_scales,
+            expert_num_tokens,
+            alpha=1.702,
+            beta=1.0,
+            clamp_limit=7.0,
+        )
+
+    a1.copy_(torch.randn_like(a1))
+    mm1.copy_(torch.randn_like(mm1))
+    replay_counts = [65, 1, 32, 17]
+    expert_num_tokens.copy_(
+        torch.tensor(replay_counts, dtype=torch.int32, device="cuda")
+    )
+    graph.replay()
+
+    eager_a1_quant = torch.empty_like(a1_quant)
+    eager_a1_scales = torch.empty_like(a1_scales)
+    eager_a2_quant = torch.empty_like(a2_quant)
+    eager_a2_scales = torch.empty_like(a2_scales)
+    cutlass_moe._masked_per_token_fp8_quant(
+        a1,
+        eager_a1_quant,
+        eager_a1_scales,
+        expert_num_tokens,
+    )
+    cutlass_moe._masked_swigluoai_quant(
+        mm1,
+        eager_a2_quant,
+        eager_a2_scales,
+        expert_num_tokens,
+        alpha=1.702,
+        beta=1.0,
+        clamp_limit=7.0,
+    )
+
+    for expert, count in enumerate(replay_counts):
+        if not count:
+            continue
+        torch.testing.assert_close(
+            a1_quant[expert, :count].float(),
+            eager_a1_quant[expert, :count].float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            a1_scales[expert, :count],
+            eager_a1_scales[expert, :count],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            a2_quant[expert, :count].float(),
+            eager_a2_quant[expert, :count].float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            a2_scales[expert, :count],
+            eager_a2_scales[expert, :count],
+            rtol=0,
+            atol=0,
+        )
 
 
 @pytest.mark.parametrize("missing", ["swiglu_alpha", "swiglu_beta", "swiglu_limit"])
