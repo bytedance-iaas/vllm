@@ -17,7 +17,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.w4a8 import (
+    W4A8MoeBackend,
+    convert_to_humming_w4a8_moe_kernel_format,
     convert_to_w4a8_moe_kernel_format,
+    make_humming_w4a8_moe_kernel,
     make_w4a8_moe_kernel,
     make_w4a8_moe_quant_config,
     select_w4a8_moe_backend,
@@ -165,6 +168,33 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if self.w4a8_backend == W4A8MoeBackend.HUMMING:
+            from vllm.model_executor.layers.quantization.utils.humming_utils import (
+                get_humming_moe_quant_config,
+            )
+
+            convert_to_humming_w4a8_moe_kernel_format(
+                layer=layer,
+                weight_quant=self.weight_quant,
+                input_quant=self.input_quant,
+            )
+            self.moe_quant_config = get_humming_moe_quant_config(
+                layer,
+                gemm1_alpha=self.moe.swiglu_alpha,
+                gemm1_beta=self.moe.swiglu_beta,
+                gemm1_clamp_limit=self.moe.swiglu_limit,
+            )
+            assert self.moe_quant_config is not None
+            assert self.experts_cls is not None
+            self.moe_kernel = make_humming_w4a8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                layer=layer,
+                routing_tables=layer._expert_routing_tables(),
+            )
+            return
+
         (
             w13_weight_packed,
             w2_weight_packed,
@@ -205,6 +235,9 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+        if self.w4a8_backend == W4A8MoeBackend.HUMMING:
+            return self.moe_quant_config
+
         return make_w4a8_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
@@ -226,10 +259,16 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+        if self.w4a8_backend == W4A8MoeBackend.HUMMING:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+        else:
+            w1 = layer.w13_weight_packed
+            w2 = layer.w2_weight_packed
         return self.moe_kernel.apply(
             hidden_states=x,
-            w1=layer.w13_weight_packed,
-            w2=layer.w2_weight_packed,
+            w1=w1,
+            w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=layer.activation,

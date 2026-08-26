@@ -251,6 +251,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SWIGLUSTEP,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
@@ -504,6 +505,15 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         swiglu_limit = self.quant_config.gemm1_clamp_limit
         if activation == MoEActivation.SILU and swiglu_limit is not None:
             swiglu_limit_func(output=output, input=input, swiglu_limit=swiglu_limit)
+        elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            self.activation(
+                activation=activation,
+                input=input,
+                output=output,
+                clamp_limit=swiglu_limit,
+                alpha=self.quant_config.gemm1_alpha or 1.0,
+                beta=self.quant_config.gemm1_beta or 0.0,
+            )
         else:
             self.activation(activation=activation, input=input, output=output)
 
