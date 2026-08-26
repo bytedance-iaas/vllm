@@ -2,6 +2,7 @@ ARG VLLM_OPENAI_DEVEL_BASE_IMAGE
 FROM ${VLLM_OPENAI_DEVEL_BASE_IMAGE}
 
 ARG CUDA_VERSION=13.0.2
+ARG UBUNTU_MIRROR=http://mirrors.byted.org/ubuntu
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG ALL_PROXY
@@ -13,7 +14,16 @@ ARG no_proxy
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN CUDA_VERSION_DASH="$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr "." "-")" \
+RUN set -eux; \
+    if [ -n "${UBUNTU_MIRROR}" ]; then \
+        if [ -f /etc/apt/sources.list ]; then \
+            sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
+        fi; \
+        find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) \
+            -exec sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" {} +; \
+    fi; \
+    rm -f /etc/apt/sources.list.d/*deadsnakes*; \
+    CUDA_VERSION_DASH="$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr "." "-")" \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends \
         build-essential \
