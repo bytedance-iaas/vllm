@@ -135,8 +135,17 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
+            max_num_tokens = self.moe_config.max_num_tokens
+            if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
-                max_num_tokens=self.moe_config.max_num_tokens,
+                max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
@@ -251,6 +260,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SWIGLUSTEP,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
@@ -490,6 +500,16 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             activation_format,
         )
 
+        if supported and moe_config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            params = {
+                "swiglu_alpha": moe_config.swiglu_alpha,
+                "swiglu_beta": moe_config.swiglu_beta,
+                "swiglu_limit": moe_config.swiglu_limit,
+            }
+            missing = [name for name, value in params.items() if value is None]
+            if missing:
+                return False, "Humming requires " + ", ".join(missing)
+
         if supported:
             assert hasattr(cls, "humming_gemm_type")
             gemm_type = cls.humming_gemm_type().value.lower()
@@ -512,6 +532,17 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         swiglu_limit = self.quant_config.gemm1_clamp_limit
         if activation == MoEActivation.SILU and swiglu_limit is not None:
             swiglu_limit_func(output=output, input=input, swiglu_limit=swiglu_limit)
+        elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            alpha = self.quant_config.gemm1_alpha
+            beta = self.quant_config.gemm1_beta
+            self.activation(
+                activation=activation,
+                input=input,
+                output=output,
+                clamp_limit=swiglu_limit,
+                alpha=1.0 if alpha is None else alpha,
+                beta=0.0 if beta is None else beta,
+            )
         else:
             self.activation(activation=activation, input=input, output=output)
 

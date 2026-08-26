@@ -1044,6 +1044,7 @@ def test_compressed_tensors_w4a8_propagates_minimax_swiglu_params():
     method = object.__new__(
         compressed_tensors_moe_w4a8_fp8.CompressedTensorsW4A8Fp8MoEMethod
     )
+    object.__setattr__(method, "w4a8_backend", W4A8MoeBackend.CUTLASS)
     object.__setattr__(
         method,
         "moe",
