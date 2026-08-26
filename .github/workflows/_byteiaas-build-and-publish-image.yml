@@ -304,7 +304,6 @@ jobs:
             local metadata_path="$4"
             local build_args=(
               --platform linux/amd64
-              --add-host mirrors.byted.org:10.8.6.125
               --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}"
               -f docker/byteiaas-openai-devel.Dockerfile
               --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${base_digest}"

@@ -2,7 +2,7 @@ ARG VLLM_OPENAI_DEVEL_BASE_IMAGE
 FROM ${VLLM_OPENAI_DEVEL_BASE_IMAGE}
 
 ARG CUDA_VERSION=13.0.2
-ARG UBUNTU_MIRROR=http://mirrors.byted.org/ubuntu
+ARG UBUNTU_MIRROR=
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG ALL_PROXY
@@ -24,8 +24,8 @@ RUN set -eux; \
     fi; \
     rm -f /etc/apt/sources.list.d/*deadsnakes*; \
     CUDA_VERSION_DASH="$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr "." "-")" \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::Retries=5 update -y \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         cuda-libraries-dev-${CUDA_VERSION_DASH} \
