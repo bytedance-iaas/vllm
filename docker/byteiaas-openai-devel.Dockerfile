@@ -3,6 +3,7 @@ FROM ${VLLM_OPENAI_DEVEL_BASE_IMAGE}
 
 ARG CUDA_VERSION=13.0.2
 ARG UBUNTU_MIRROR=http://mirrors.volces.com/ubuntu
+ARG HUMMING_KERNELS_VERSION=0.1.10
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG ALL_PROXY
@@ -45,5 +46,15 @@ RUN set -eux; \
         vim \
         wget \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    CUDA_MAJOR="$(echo "${CUDA_VERSION}" | cut -d. -f1)"; \
+    if [ "${CUDA_MAJOR}" = "12" ]; then \
+        HUMMING_CUDA_EXTRA="cu12"; \
+    else \
+        HUMMING_CUDA_EXTRA="cu13"; \
+    fi; \
+    uv pip install --system "humming-kernels[${HUMMING_CUDA_EXTRA}]==${HUMMING_KERNELS_VERSION}"; \
+    python3 -c "import humming; print('Humming kernels verified:', humming.__file__)"
 
 WORKDIR /workspace

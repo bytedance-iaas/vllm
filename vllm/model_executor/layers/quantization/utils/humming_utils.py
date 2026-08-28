@@ -587,13 +587,13 @@ def get_humming_moe_quant_config(
     weight_group_shape: tuple[int, ...] = ()
     if weight_scale_group_size_n > 1:
         weight_group_shape = GroupShape(
-            row=weight_scale_group_size,
-            col=weight_scale_group_size_n,
+            row=weight_scale_group_size_n,
+            col=weight_scale_group_size,
         )
     elif weight_scale_group_size == 0:
         weight_group_shape = GroupShape(row=-1, col=1)
     else:
-        weight_group_shape = GroupShape(row=weight_scale_group_size, col=1)
+        weight_group_shape = GroupShape(row=1, col=weight_scale_group_size)
 
     return make_humming_moe_quant_config(
         quant_dtype=q_dtype,
@@ -607,6 +607,9 @@ def get_humming_moe_quant_config(
         w2_gscale=getattr(layer, "w2_global_scale", None),
         w2_zp=getattr(layer, "w2_zero_point", None),
         w2_bias=getattr(layer, "w2_bias", None),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
