@@ -12,7 +12,7 @@ upstream `v0.27.0`.
 | Target tag | `v0.27.0` |
 | Target commit | `4bdc8a788d2e2ce9165d552b3d4d8b72604626bf` |
 | Work branch | `wyc/iaas-v0.27.0` |
-| Implementation head before this update | `90aecd5ad3` |
+| Implementation head before this update | `f911556cb6` |
 | Merge base | `dcfebf93f4eccf30f71872283331eee757915daf` |
 
 The raw range `v0.27.0..iaas_main` contains 82 commits because the release
@@ -65,8 +65,8 @@ Disposition terms:
 
 ### 3.1 Current Execution Status
 
-The CPU/static migration is implemented through `90aecd5ad3`. The branch has
-42 target-native commits after `v0.27.0`, including this document's initial
+The CPU/static migration is implemented through `f911556cb6`. The branch has
+46 target-native commits after `v0.27.0`, including this document's initial
 planning commit.
 
 | Area | Status | Target commits |
@@ -79,7 +79,7 @@ planning commit.
 | MiniMax HPC | Complete, image/GPU pending | `6120c51141`, `deb0b32e0d` |
 | CUTLASS W4A8 and DeepEP | Complete, GPU/multi-rank pending | `099caa830f` through `90b13c90e1` |
 | Humming W4A8 | Complete, GPU pending | `19d96bcbfa` |
-| ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `90aecd5ad3` |
+| ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `f911556cb6` |
 | MRV2 direct-Mooncake PCP | Hold | No safe target-native implementation yet |
 | DSpark K below block size | Hold | `0d6fd1c83c` intentionally not migrated |
 | MiniMax indexer E5M2 removal | Hold | Existing top-k layout is upstream; dtype removal lacks evidence |
@@ -453,9 +453,9 @@ behavior.
 | `2bee42cda6` | Upstream `requirements/cuda.txt` | Already covered |
 
 Target-only hardening commits such as `e3f14d2e48`, `90b13c90e1`,
-`16d786bc7b`, `7bac341c97`, `ac36a3ee3b`, `f798a87ca3`, and `90aecd5ad3`
-close review findings discovered during the migration rather than correspond
-to one source commit.
+`16d786bc7b`, `7bac341c97`, `ac36a3ee3b`, `f798a87ca3`, `90aecd5ad3`, and
+`4a1bd81125`, `138e061e38`, and `f911556cb6` close review findings discovered
+during the migration rather than correspond to one source commit.
 
 ## 8. Validation Matrix
 
@@ -530,6 +530,7 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 - The final Humming W4A8 review approved `19d96bcbfa`.
 - The final CUTLASS W4A8/DeepEP review approved
   `099caa830f^..90b13c90e1`.
+- The final ByteIAAS source review approved `f8040e5a16^..f911556cb6`.
 - ByteIAAS helper tests pass with 18 cases, including mixed child/layer,
   attestation, shared-DAG, cycle, tag-length, and ASCII validation.
 - Actionlint 1.7.7 passes all ByteIAAS workflows.
@@ -560,7 +561,7 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 | No upstream-equivalent or merge-only commit is replayed | Complete |
 | Retained code is rebased onto `v0.27.0` APIs | Complete |
 | Focused CPU/static tests pass | Complete for implemented stacks |
-| Final source-to-target review has no unexplained behavior loss | Pending |
+| Final source-to-target review has no unexplained behavior loss | Complete, with explicit holds |
 | GPU/distributed validation covers affected topology | Pending |
 | Built images prove DeepGEMM, HPC-Ops, Humming, zstd, and nydus contracts | Pending |
 
