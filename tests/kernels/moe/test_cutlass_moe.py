@@ -85,6 +85,30 @@ def test_cutlass_moe_supports_gelu_tanh_activation_metadata():
 
 
 @pytest.mark.parametrize(
+    ("major", "generic_supported", "expected"),
+    [(9, True, True), (9, False, False), (10, True, False), (12, True, False)],
+)
+def test_cutlass_w4a8_device_support_is_sm90_only(
+    major,
+    generic_supported,
+    expected,
+):
+    with (
+        patch.object(
+            cutlass_moe.current_platform,
+            "get_device_capability",
+            return_value=SimpleNamespace(major=major),
+        ),
+        patch.object(
+            cutlass_moe,
+            "cutlass_group_gemm_supported",
+            return_value=generic_supported,
+        ),
+    ):
+        assert CutlassExpertsW4A8Fp8._supports_current_device() is expected
+
+
+@pytest.mark.parametrize(
     "experts_cls",
     [CutlassExpertsFp8, CutlassExpertsW4A8Fp8],
 )

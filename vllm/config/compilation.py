@@ -1131,10 +1131,15 @@ class CompilationConfig:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 
     def set_splitting_ops_for_v1(
-        self, all2all_backend: str, data_parallel_size: int = 1
+        self,
+        all2all_backend: str,
+        data_parallel_size: int = 1,
+        use_all2all: bool | None = None,
     ):
+        if use_all2all is None:
+            use_all2all = data_parallel_size > 1
         uses_deepep_ht = (
-            all2all_backend == "deepep_high_throughput" and data_parallel_size > 1
+            all2all_backend == "deepep_high_throughput" and use_all2all
         )
 
         def disable_unsupported_deepep_ht_cudagraphs():

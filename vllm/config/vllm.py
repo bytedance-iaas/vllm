@@ -1529,6 +1529,10 @@ class VllmConfig:
         self.compilation_config.set_splitting_ops_for_v1(
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
+            use_all2all=(
+                self.model_config is None or self.model_config.is_moe
+            )
+            and self.parallel_config.use_all2all,
         )
 
         if self.compilation_config.pass_config.enable_sp:

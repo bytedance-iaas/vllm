@@ -368,6 +368,26 @@ def test_deepep_ht_piecewise_requires_forced_intranode(monkeypatch, mode):
     assert enabled.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
+def test_deepep_ht_pcp_only_all2all_disables_unforced_piecewise(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
+        raising=False,
+    )
+    config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.PIECEWISE,
+    )
+
+    # DP1 + PCP2 activates MoE all-to-all even though data_parallel_size is 1.
+    config.set_splitting_ops_for_v1(
+        all2all_backend="deepep_high_throughput",
+        data_parallel_size=1,
+        use_all2all=True,
+    )
+
+    assert config.cudagraph_mode == CUDAGraphMode.NONE
+
+
 def test_deepep_ht_full_cudagraph_stays_disabled(monkeypatch):
     monkeypatch.setenv(
         "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
