@@ -258,6 +258,24 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
     _kimi_symm_buffer_cache: dict[tuple[object, ...], object] = {}
     _synchronized_ep_groups: set[tuple[int, int]] = set()
 
+    @staticmethod
+    def _resolve_mega_moe_decode_capacity(
+        vllm_config: VllmConfig,
+        sequence_parallel_size: int = 1,
+    ) -> int:
+        # Kimi's custom forward path still uses one full-size symmetric buffer.
+        del sequence_parallel_size
+        return vllm_config.scheduler_config.max_num_batched_tokens
+
+    def _check_runtime_supported(self) -> None:
+        device = self.w13_weight.device
+        if (
+            device.type != "cuda"
+            or torch.cuda.get_device_capability(device)[0] != 10
+        ):
+            raise NotImplementedError("Kimi K3 MegaMoE requires SM100 GPUs.")
+        super()._check_runtime_supported()
+
     def __init__(
         self,
         *args,
