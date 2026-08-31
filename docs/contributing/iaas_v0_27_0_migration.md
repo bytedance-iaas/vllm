@@ -1,9 +1,9 @@
-# IAAS `v0.27.0` Migration Plan
+# IAAS `v0.27.0` Migration Plan and Status
 
 ## 1. Scope and Baseline
 
-This document plans the migration of `iaas_main` onto upstream `v0.27.0`.
-It does not perform the migration.
+This document defines and tracks the selective migration of `iaas_main` onto
+upstream `v0.27.0`.
 
 | Item | Revision |
 | --- | --- |
@@ -12,7 +12,7 @@ It does not perform the migration.
 | Target tag | `v0.27.0` |
 | Target commit | `4bdc8a788d2e2ce9165d552b3d4d8b72604626bf` |
 | Work branch | `wyc/iaas-v0.27.0` |
-| Work branch current head | `4bdc8a788d2e2ce9165d552b3d4d8b72604626bf` |
+| Implementation head before this update | `90aecd5ad3` |
 | Merge base | `dcfebf93f4eccf30f71872283331eee757915daf` |
 
 The raw range `v0.27.0..iaas_main` contains 82 commits because the release
@@ -62,6 +62,27 @@ Disposition terms:
 | PCP | Upstream MRV2 virtual-batch PCP exists | Only DSV4 hybrid-backend and direct Mooncake gaps | Do not port legacy PCP implementation wholesale |
 | MiniMax HPC | Generic HPC backend exists | MiniMax-M3 MXFP8 K32 path, BF16 fused path, workspaces | Port as one backend stack |
 | MiniMax W4A8 | Basic CUTLASS W4A8 exists | SwiGLU parameters, DeepEP LL/HT, scheduling, Humming W4A8 | Port in dependency order |
+
+### 3.1 Current Execution Status
+
+The CPU/static migration is implemented through `90aecd5ad3`. The branch has
+42 target-native commits after `v0.27.0`, including this document's initial
+planning commit.
+
+| Area | Status | Target commits |
+| --- | --- | --- |
+| DFlash/DSpark foundation | Complete | `aa5a75d799`, `86ec283e47`, `0c142e5b8e`, `66bf65058d` |
+| DSV4 correctness and IndexCache | Complete | `549942052e`, `effe7093cf` |
+| SM90 MegaMoE | Complete, GPU pending | `78dea35eb9`, `b84298dbe1` |
+| Dynamic SD | Complete, GPU/DP pending | `9e006972e2` through `d00896ae74` |
+| Mooncake | Complete except direct PCP | `cca9a49550`, `5b701d086f`, `f00de7548e`, `4324aa0125`, `d5115b2da8` |
+| MiniMax HPC | Complete, image/GPU pending | `6120c51141`, `deb0b32e0d` |
+| CUTLASS W4A8 and DeepEP | Complete, GPU/multi-rank pending | `099caa830f` through `90b13c90e1` |
+| Humming W4A8 | Complete, GPU pending | `19d96bcbfa` |
+| ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `90aecd5ad3` |
+| MRV2 direct-Mooncake PCP | Hold | No safe target-native implementation yet |
+| DSpark K below block size | Hold | `0d6fd1c83c` intentionally not migrated |
+| MiniMax indexer E5M2 removal | Hold | Existing top-k layout is upstream; dtype removal lacks evidence |
 
 ## 4. Changes Already Covered Upstream
 
@@ -118,15 +139,24 @@ Migration rules:
 
 - Add the ByteIAAS workflow files and CI helper scripts without restoring
   deleted or renamed upstream workflow infrastructure.
-- Rework `docker/Dockerfile` changes by stage and argument. Do not replace the
-  whole file with the `v0.26.0` version.
-- Preserve the `v0.27.0` vendored DeepGEMM build model in
-  `cmake/external_projects/deepgemm.cmake`; add fork/ref overrides and SM90 API
-  validation around it.
-- Fold the five apt-mirror commits into the final known-good Dockerfile state.
-- Keep zstd and nydus publication plus child-manifest validation together.
-- Install and validate HPC-Ops and Humming only after their runtime backends
-  have been ported.
+- Rework `docker/Dockerfile` by stage and argument rather than replacing it
+  with the `v0.26.0` file.
+- Preserve the `v0.27.0` vendored DeepGEMM build model and use its existing
+  exact source/ref and required-symbol validation. Do not install the old
+  external CPython-specific DeepGEMM wheel.
+- Build HPC-Ops from its exact commit in an isolated stage, install it with
+  `--no-deps`, and statically verify the ABI3 binary and required APIs.
+- Reuse the `humming-kernels[cu13]==0.1.10` target dependency; do not reinstall
+  Humming in the devel image.
+- Resolve requested refs to one immutable SHA in `iaas_main` history before
+  launching wheel and image jobs. Require the versioned ByteIAAS build
+  contract and limit registry credentials to the login step.
+- Build CUDA 13.0.3 OpenAI/devel images by digest. Build zstd devel from the
+  zstd OpenAI digest, and verify all relevant child manifests before final
+  tags are created.
+- Convert nydus images through unique staging tags, validate them, and publish
+  the final tags from the verified immutable digests.
+- Fold the apt-mirror experiments into the final Volces mirror state.
 
 ### 5.2 DSV4 Correctness and IndexCache
 
@@ -252,8 +282,8 @@ Recommended sub-stacks:
    `df0273759e`.
 4. DeepEP LL/HT: `b283f4b26a`, `2bbc5b51a9`, `6226ac4e52`,
    `0f233eeec3`.
-5. Humming W4A8: `031fc9a691`, with `2bee42cda6` supplying the image
-   dependency.
+5. Humming W4A8: `031fc9a691`; drop `2bee42cda6` because `v0.27.0` already
+   pins Humming 0.1.10 in `requirements/cuda.txt`.
 
 For `8b291ae6f3`, drop the already-upstream top-k layout changes and separately
 decide whether to retain the removal of `fp8_e5m2` from the advertised indexer
@@ -272,21 +302,21 @@ cache dtypes.
 
 ### 6.1 Build and Release
 
-| Old commit | Disposition | Migration note |
+| Old commit | Disposition | Result |
 | --- | --- | --- |
-| `a9f1617cc7` | SPLIT | Port private workflows/scripts; manually adapt Docker and DeepGEMM pieces |
-| `4edbfab0a9` | SQUASH | Keep actionlint metadata with the migrated workflows |
-| `23dfea6fca` | SQUASH | Fold rustup and HPC image checks into the build stack |
-| `ec58aaf9f3` | SQUASH | Add HPC-Ops only after MiniMax HPC runtime lands |
-| `30cf9d9bad` | SQUASH | Keep wheel API validation with HPC-Ops installation |
-| `9493f04276` | PORT | Retain zstd/nydus publishing on target workflow syntax |
-| `aa4fd55c54` | SQUASH | Keep child-manifest checks with image-format support |
-| `348c70ca0b` | SQUASH | Do not replay intermediate apt mirror state |
-| `0b37e9134c` | SQUASH | Do not replay intermediate DNS workaround |
-| `09aa3c1bde` | SQUASH | Do not replay intermediate host-mapping workaround |
-| `18f1129660` | SQUASH | Do not replay intermediate mirror workaround |
-| `eb454b2d43` | PORT | Use this final Volces mirror state in one Docker commit |
-| `2bee42cda6` | SQUASH | Install Humming with the Humming W4A8 backend |
+| `a9f1617cc7` | SPLIT | Helpers/workflows/Docker rebuilt as `f8040e5a16`, `7899a9fa28`, and `dfd6f57723` |
+| `4edbfab0a9` | SQUASH | Runner metadata folded into `dfd6f57723` |
+| `23dfea6fca` | SPLIT | HPC checks in `7899a9fa28`; rustup retry in `2fd47e7683` |
+| `ec58aaf9f3` | SQUASH | Final HPC source ref folded into `7899a9fa28` |
+| `30cf9d9bad` | SQUASH | Final HPC API validation folded into `7899a9fa28` |
+| `9493f04276` | SPLIT | Tag helpers in `f8040e5a16`; publishing in `9d72a701d3` |
+| `aa4fd55c54` | SQUASH | Reworked in `f8040e5a16`, `16d786bc7b`, and `9d72a701d3` |
+| `348c70ca0b` | DROP | Intermediate mirror state omitted |
+| `0b37e9134c` | DROP | Intermediate DNS workaround omitted |
+| `09aa3c1bde` | DROP | Intermediate host-mapping workaround omitted |
+| `18f1129660` | DROP | Intermediate mirror workaround omitted |
+| `eb454b2d43` | PORT | Final Volces mirror state in `7899a9fa28` |
+| `2bee42cda6` | DROP | Humming 0.1.10 is already pinned by upstream `v0.27.0` |
 
 ### 6.2 DSV4
 
@@ -377,31 +407,55 @@ ad70d89158  Merge apt mirror fixes
 de55af9138  Merge Humming W4A8
 ```
 
-## 7. Proposed New Commit Series
+## 7. Implemented Source-to-Target Mapping
 
-The new branch should have a linear, reviewable history rather than preserve
-the old merge topology:
+The migration uses a linear target-native history. Multiple source commits are
+intentionally folded where later source commits only harden or test the same
+behavior.
 
-1. `ci(byteiaas): port v0.27 wheel and image workflows`
-2. `fix(dsv4): port residual v0.27 correctness fixes`
-3. `feat(dsv4): port index cache onto packed KV layouts`
-4. `feat(dsv4): add SM90 MegaMoE runtime support`
-5. `build(deepgemm): add validated SM90 MegaMoE source override`
-6. `fix(spec-decode): port DFlash and DSpark correctness guards`
-7. `feat(spec-decode): add runtime-K dynamic scheduling`
-8. `feat(spec-decode): add opt-in DP-global dynamic scheduling`
-9. `fix(spec-decode): align graph capture and full-K warmup`
-10. `feat(mooncake): add shared-region identity`
-11. `fix(mooncake): handle replicated heterogeneous TP and stale completions`
-12. `feat(mooncake): add long-request admission gate`
-13. `feat(moe): add MiniMax HPC MXFP8 backend`
-14. `feat(moe): add MiniMax CUTLASS W4A8 support`
-15. `feat(moe): support W4A8 with DeepEP LL and HT`
-16. `feat(moe): add Humming W4A8 backend`
-17. `fix(dsv4): close MRV2 PCP integration gaps`
-18. `ci(byteiaas): publish zstd/nydus images with runtime dependencies`
+| Source commit(s) | Target commit(s) | State |
+| --- | --- | --- |
+| `55bfba2920` | `aa5a75d799` | Ported |
+| `9c8a93450d` | `cca9a49550` | Ported |
+| `f37b865341` | `6120c51141` | Ported |
+| `027887b86b` | `f24fd3012b` | Ported |
+| `f56547192d` | `5a20fd1389` | Ported |
+| `3c7ed3742c`, `657132e0aa`, `3bc91bb763`, `d62244f050`, `6ca83dd045` | `549942052e` | Ported/squashed |
+| `39d86ed8c7` | `effe7093cf` | Ported |
+| `3e60ad63d3` | `78dea35eb9`, `b84298dbe1` | Split into runtime/build |
+| `d623aef9c0` | `86ec283e47` | Ported without upstream-covered hunks |
+| `83c16e1cb6` | `9e006972e2` | Ported |
+| `bb946a7ce7` | `33176a5408` | Ported |
+| `67a597c869`, `aa8e0a91b8`, `9016ee5bb6` | `aecdda1e0d`, `b5c95a75f7` | Ported and hardened |
+| `7a6f9efb6f` | `d709a41c46` | Ported |
+| `09cede6391`, `77ed1eece5` | `d00896ae74` | Squashed |
+| `23b6150467` | `0c142e5b8e` | Ported |
+| `da0e8131f2`, `1f00d2a3bf`, `9dd89bf957` | `66bf65058d` | Squashed |
+| `129e53cf71` | None | Dropped as formatting-only |
+| `0d6fd1c83c` | None | Hold pending reduced-K GPU evidence |
+| `cfcba9469a`, `95188da984` | `5b701d086f` | Squashed |
+| `88e2f20ed2` | `f00de7548e` | Partial port |
+| `07fbbb0bdb` | `4324aa0125` | Ported |
+| `f20c7435de` | `d5115b2da8` | Ported |
+| `57fed50368`, `25e140853f`, `4799bb3106`, `55b2e207d1`, `4b730aef58` | `deb0b32e0d` | Squashed |
+| `8b291ae6f3` | Upstream `d1a8ba63d9`; no target commit | Top-k covered; E5M2 removal held |
+| `8bef682e2d`, `5188517c82`, `df0273759e` | `099caa830f` | Squashed |
+| `b283f4b26a` | `29a60ddd0a` | Ported |
+| `2bbc5b51a9` | `4779c1117c` | Ported |
+| `6226ac4e52` | `d39f8de0c0` | Ported |
+| `0f233eeec3` | `7d07b7b5b3` | Ported |
+| `176c597e1e` | None | Dropped as formatting-only |
+| `031fc9a691` | `19d96bcbfa` | Ported and hardened |
+| `87ec6ecd11` | None | Legacy PCP core dropped; direct Mooncake PCP held |
+| `f4a2217461`, `20bce687d4` | None | Hold pending MRV2 adapter and parity work |
+| `a9f1617cc7`, `4edbfab0a9`, `23dfea6fca`, `ec58aaf9f3`, `30cf9d9bad`, `9493f04276`, `aa4fd55c54`, `eb454b2d43` | `f8040e5a16` through `f798a87ca3`, plus `2fd47e7683` | Rebuilt on v0.27.0 |
+| `348c70ca0b`, `0b37e9134c`, `09aa3c1bde`, `18f1129660` | None | Intermediate mirror workarounds dropped |
+| `2bee42cda6` | Upstream `requirements/cuda.txt` | Already covered |
 
-Each new commit should record the old commit IDs it replaces in its body.
+Target-only hardening commits such as `e3f14d2e48`, `90b13c90e1`,
+`16d786bc7b`, `7bac341c97`, `ac36a3ee3b`, `f798a87ca3`, and `90aecd5ad3`
+close review findings discovered during the migration rather than correspond
+to one source commit.
 
 ## 8. Validation Matrix
 
@@ -427,11 +481,24 @@ python -m pytest -q \
   tests/kernels/moe/test_hpc_fp8_backend.py \
   tests/kernels/moe/test_hpc_moe.py \
   tests/kernels/moe/test_cutlass_moe.py \
+  tests/kernels/moe/test_w4a8_humming.py \
   tests/kernels/quantization/test_cutlass_w4a8_moe.py
+
+python3 -m unittest \
+  scripts.ci.test_get_byteiaas_image_tag \
+  scripts.ci.test_verify_byteiaas_image_format
+
+actionlint \
+  .github/workflows/_byteiaas-build-wheel.yml \
+  .github/workflows/_byteiaas-build-and-publish-image.yml \
+  .github/workflows/byteiaas-release-dev.yml \
+  .github/workflows/byteiaas-release.yml
+
+python tools/generate_versions_json.py --check
+bash -n build_rust.sh
 ```
 
-Run `ruff`, `mypy` for touched modules, `actionlint`, the image-tag tests, and
-the image-format manifest tests before GPU validation.
+Run `ruff` and `mypy` for touched runtime modules before GPU validation.
 
 ### GPU and distributed validation
 
@@ -456,6 +523,21 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 - Dynamic SD acceptance rate and selected K per step.
 - NVTX stage overlap and step latency for communication-heavy topologies.
 
+### Validation Completed During Migration
+
+- Focused CPU tests passed for DSV4, Dynamic SD, Mooncake, HPC, CUTLASS W4A8,
+  DeepEP LL/HT, and Humming selection/shape contracts.
+- The final Humming W4A8 review approved `19d96bcbfa`.
+- The final CUTLASS W4A8/DeepEP review approved
+  `099caa830f^..90b13c90e1`.
+- ByteIAAS helper tests pass with 18 cases, including mixed child/layer,
+  attestation, shared-DAG, cycle, tag-length, and ASCII validation.
+- Actionlint 1.7.7 passes all ByteIAAS workflows.
+- Both Dockerfiles parse and `docker/versions.json` matches
+  `docker/Dockerfile`.
+- A real Docker build was not run locally because the available Docker client
+  has no Buildx plugin.
+
 ## 9. High-Risk Decisions Before Execution
 
 1. **DSpark K below block size**: default recommendation is not to migrate
@@ -472,13 +554,20 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 
 ## 10. Completion Criteria
 
-The migration is complete only when:
+| Criterion | Status |
+| --- | --- |
+| Every one of the 63 non-merge IAAS commits has a disposition | Complete |
+| No upstream-equivalent or merge-only commit is replayed | Complete |
+| Retained code is rebased onto `v0.27.0` APIs | Complete |
+| Focused CPU/static tests pass | Complete for implemented stacks |
+| Final source-to-target review has no unexplained behavior loss | Pending |
+| GPU/distributed validation covers affected topology | Pending |
+| Built images prove DeepGEMM, HPC-Ops, Humming, zstd, and nydus contracts | Pending |
 
-- Every one of the 63 non-merge IAAS commits has an old-to-new disposition.
-- No upstream-equivalent or merge-only commit is replayed.
-- All retained tests are rebased onto `v0.27.0` APIs and pass.
-- GPU/distributed validation covers the topology affected by each feature.
-- `git range-diff` and a final tree review show no unexplained IAAS behavior
-  loss.
-- Build artifacts prove the pinned DeepGEMM, HPC-Ops, and Humming APIs are
-  present.
+The branch is code-complete for the accepted migration scope, but it is not
+production-validated until the pending GPU, multi-rank, RDMA, and image
+publication checks pass. The three held behaviors remain intentionally absent:
+
+- DSpark speculative K below its block size.
+- Direct Mooncake P/D with MRV2 PCP fan-in.
+- MiniMax indexer `fp8_e5m2` capability removal.
