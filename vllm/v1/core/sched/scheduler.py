@@ -255,19 +255,10 @@ class Scheduler(SchedulerInterface):
                 )
             if speculative_config.use_eagle():
                 self.use_eagle = True
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.uses_draft_model():
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.use_dflash():
-                # DFlash requires an extra lookahead slot since it uses in-fill-style
-                # decoding instead of standard next-token sampling, so it has a query
-                # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = self.num_spec_tokens + 1
-            if speculative_config.use_dspark():
-                # DSpark drafts a block of num_spec_tokens query tokens in which the
-                # anchor itself is the first prediction position (no separate bonus
-                # query), so it needs exactly num_spec_tokens lookahead slots.
-                self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_eagle() or speculative_config.uses_draft_model():
+                self.num_lookahead_tokens = (
+                    speculative_config.num_drafter_query_tokens
+                )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -513,46 +504,76 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
+            is_async_spec_decode = (
+                self.scheduler_config.async_scheduling
+                and self.num_sampled_tokens_per_step > 0
+                and request.spec_token_ids
+                and not request.is_prefill_chunk
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            while True:
+                num_new_tokens = (
+                    request.num_tokens_with_spec
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if (
+                    0
+                    < self.scheduler_config.long_prefill_token_threshold
+                    < num_new_tokens
+                ):
+                    num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens,
-                self.max_model_len
-                - request.num_computed_tokens
-                - self.num_sampled_tokens_per_step,
-            )
+                num_new_tokens = min(num_new_tokens, token_budget)
 
-            # Schedule encoder inputs.
-            encoder_inputs_to_schedule = None
-            external_load_encoder_input: list[int] = []
-            new_encoder_compute_budget = encoder_compute_budget
-            if request.has_encoder_inputs:
-                (
-                    encoder_inputs_to_schedule,
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
                     num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = self._try_schedule_encoder_inputs(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    self.max_model_len
+                    - request.num_computed_tokens
+                    - self.num_sampled_tokens_per_step,
                 )
 
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
-                )
+                # Schedule encoder inputs.
+                encoder_inputs_to_schedule = None
+                external_load_encoder_input: list[int] = []
+                new_encoder_compute_budget = encoder_compute_budget
+                if request.has_encoder_inputs:
+                    (
+                        encoder_inputs_to_schedule,
+                        num_new_tokens,
+                        new_encoder_compute_budget,
+                        external_load_encoder_input,
+                    ) = self._try_schedule_encoder_inputs(
+                        request,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        encoder_compute_budget,
+                        shift_computed_tokens=1 if self.use_eagle else 0,
+                    )
+
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request, num_new_tokens
+                    )
+
+                if is_async_spec_decode:
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if num_scheduled_spec_tokens >= num_new_tokens or (
+                        0 < num_scheduled_spec_tokens < len(request.spec_token_ids)
+                    ):
+                        # The sampled token and its drafts are atomic. Recompute
+                        # without drafts after every downstream scheduling clamp
+                        # instead of leaving the request permanently unschedulable.
+                        request.spec_token_ids = []
+                        is_async_spec_decode = False
+                        continue
+                break
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -2143,6 +2164,13 @@ class Scheduler(SchedulerInterface):
                 # rejection or drafter gather can reference it.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    @staticmethod
+    def _trim_invalid_spec_token_ids(spec_token_ids: list[int]) -> list[int]:
+        for i, token_id in enumerate(spec_token_ids):
+            if token_id < 0:
+                return spec_token_ids[:i]
+        return spec_token_ids
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
@@ -2159,6 +2187,7 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            spec_token_ids = self._trim_invalid_spec_token_ids(spec_token_ids)
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
@@ -2188,6 +2217,7 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
+            spec_token_ids = self._trim_invalid_spec_token_ids(spec_token_ids)
             # Filter out spec tokens which do not adhere to the grammar.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request

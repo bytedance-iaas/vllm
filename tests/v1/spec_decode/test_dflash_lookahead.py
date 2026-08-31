@@ -48,8 +48,23 @@ def _dflash_speculative_config(num_speculative_tokens: int) -> SpeculativeConfig
     )
 
 
-def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
+def _dspark_speculative_config(
+    num_speculative_tokens: int,
+    *,
+    sample_from_anchor: bool | None = None,
+) -> SpeculativeConfig:
     speculative_config = _dflash_speculative_config(num_speculative_tokens)
+    speculative_config.method = "dspark"
+    if sample_from_anchor is not None:
+        speculative_config.draft_model_config.hf_config.sample_from_anchor = (
+            sample_from_anchor
+        )
+    return speculative_config
+
+
+def _create_parallel_drafter_scheduler(
+    speculative_config: SpeculativeConfig,
+) -> Scheduler:
     model_config = speculative_config.target_model_config
     scheduler_config = SchedulerConfig(
         max_num_seqs=16,
@@ -95,6 +110,12 @@ def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
     )
 
 
+def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
+    return _create_parallel_drafter_scheduler(
+        _dflash_speculative_config(num_speculative_tokens)
+    )
+
+
 def test_dflash_prefill_reserves_lookahead_blocks():
     scheduler = _create_dflash_scheduler(NUM_SPECULATIVE_TOKENS)
 
@@ -131,6 +152,45 @@ def test_dflash_first_prefill_query_window_fits_allocated_blocks():
     assert all(pos // BLOCK_SIZE < len(block_ids) for pos in query_positions)
 
 
+def test_bonus_anchor_dspark_reserves_full_query_window(monkeypatch):
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    speculative_config = _dspark_speculative_config(
+        NUM_SPECULATIVE_TOKENS, sample_from_anchor=False
+    )
+    scheduler = _create_parallel_drafter_scheduler(speculative_config)
+
+    assert scheduler.num_lookahead_tokens == NUM_SPECULATIVE_TOKENS + 1
+
+    num_tokens = BLOCK_SIZE - NUM_SPECULATIVE_TOKENS
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=num_tokens,
+        block_size=BLOCK_SIZE,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    block_ids = output.scheduled_new_reqs[0].block_ids[0]
+    query_positions = range(num_tokens, num_tokens + NUM_SPECULATIVE_TOKENS + 1)
+
+    assert len(block_ids) == 2
+    assert all(pos // BLOCK_SIZE < len(block_ids) for pos in query_positions)
+
+
+def test_dspark_query_width_follows_anchor_layout():
+    default_anchor_as_first = _dspark_speculative_config(NUM_SPECULATIVE_TOKENS)
+    configured_anchor_as_first = _dspark_speculative_config(
+        NUM_SPECULATIVE_TOKENS, sample_from_anchor=True
+    )
+    bonus_anchor = _dspark_speculative_config(
+        NUM_SPECULATIVE_TOKENS, sample_from_anchor=False
+    )
+
+    assert default_anchor_as_first.num_drafter_query_tokens == NUM_SPECULATIVE_TOKENS
+    assert configured_anchor_as_first.num_drafter_query_tokens == NUM_SPECULATIVE_TOKENS
+    assert bonus_anchor.num_drafter_query_tokens == NUM_SPECULATIVE_TOKENS + 1
+
+
 def test_dflash_drafter_window_reserves_bonus_token():
     # DFlash's drafter window is num_spec + 1 (the extra slot is the bonus token),
     # so max_seq_len + num_spec + 1 must stay within the draft model's max len.
@@ -145,10 +205,24 @@ def test_dflash_drafter_window_reserves_bonus_token():
     assert not input_fits_in_drafter(dflash_runner, SimpleNamespace(max_seq_len=97))
     assert not input_fits_in_drafter(dflash_runner, None)  # no metadata
 
-    # Other drafters don't reserve the bonus token, so 97 fits (97 + 3 == 100).
-    plain_runner = SimpleNamespace(
-        num_spec_tokens=NUM_SPECULATIVE_TOKENS,
+    # Anchor-sampling DSpark has no separate bonus slot, so 97 still fits.
+    dspark_runner = SimpleNamespace(
         effective_drafter_max_model_len=100,
-        speculative_config=SimpleNamespace(use_dflash=lambda: False),
+        speculative_config=_dspark_speculative_config(
+            NUM_SPECULATIVE_TOKENS, sample_from_anchor=True
+        ),
     )
-    assert input_fits_in_drafter(plain_runner, SimpleNamespace(max_seq_len=97))
+    assert input_fits_in_drafter(dspark_runner, SimpleNamespace(max_seq_len=97))
+
+
+def test_bonus_anchor_dspark_drafter_window_reserves_bonus_token():
+    input_fits_in_drafter = GPUModelRunner._input_fits_in_drafter
+    dspark_runner = SimpleNamespace(
+        effective_drafter_max_model_len=100,
+        speculative_config=_dspark_speculative_config(
+            NUM_SPECULATIVE_TOKENS, sample_from_anchor=False
+        ),
+    )
+
+    assert input_fits_in_drafter(dspark_runner, SimpleNamespace(max_seq_len=96))
+    assert not input_fits_in_drafter(dspark_runner, SimpleNamespace(max_seq_len=97))
