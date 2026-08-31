@@ -9,6 +9,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -57,7 +58,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheTemporalLayout
 from vllm.v1.worker.cp_utils import (
     run_split_fa2_dcp_context_attention,
     should_skip_dcp_context_attention,
@@ -385,6 +386,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        if kv_cache_spec.temporal_layout == KVCacheTemporalLayout.FULL_TEMPORAL:
             self.dcp_world_size = 1
             self.dcp_rank = 0
 
@@ -731,6 +735,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
 
     def __init__(
         self,
@@ -918,10 +923,19 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale = layer._v_scale.expand(descale_shape)
 
             if self.dcp_world_size > 1:
+                dcp_query = query[:num_actual_tokens]
+                dcp_key = key[:num_actual_tokens]
+                dcp_value = value[:num_actual_tokens]
+                if (
+                    self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    and dcp_query.dtype == current_platform.fp8_dtype()
+                ):
+                    dcp_key = self._quantize_dcp_live_kv(dcp_key, layer._k_scale)
+                    dcp_value = self._quantize_dcp_live_kv(dcp_value, layer._v_scale)
                 self._forward_with_dcp(
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
+                    dcp_query,
+                    dcp_key,
+                    dcp_value,
                     key_cache,
                     value_cache,
                     output[:num_actual_tokens],
@@ -1067,6 +1081,25 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def _quantize_dcp_live_kv(
+        self,
+        tensor: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match live K/V to the FP8 query dtype used by FA3 DCP."""
+        if tensor.dtype == current_platform.fp8_dtype():
+            return tensor
+        assert tensor.ndim == 3
+        original_shape = tensor.shape
+        flat = tensor.view(original_shape[0], -1)
+        group_shape = (-1, original_shape[-1]) if scale.numel() > 1 else None
+        quantized, _ = ops.scaled_fp8_quant(
+            flat,
+            scale,
+            group_shape=group_shape,
+        )
+        return quantized.view(original_shape)
 
     def do_kv_cache_update(
         self,

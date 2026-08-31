@@ -829,6 +829,40 @@ def test_correct_attn_out_zeroes_empty_nan_partial(is_lse_base_on_e: bool):
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_correct_attn_out_writes_fp32_workspace():
+    out = torch.tensor([[[1.0, -2.0, 3.0, -4.0]]], dtype=torch.bfloat16, device="cuda")
+    inplace_out = out.clone()
+    corrected_out = torch.empty_like(out, dtype=torch.float32)
+    lses = torch.tensor(
+        [[[0.0]], [[float("-inf")]]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    ctx = CPTritonContext()
+
+    inplace, _ = correct_attn_out(
+        inplace_out,
+        lses,
+        cp_rank=0,
+        ctx=ctx,
+    )
+    corrected, final_lse = correct_attn_out(
+        out,
+        lses,
+        cp_rank=0,
+        ctx=ctx,
+        corrected_out=corrected_out,
+    )
+    torch.accelerator.synchronize()
+
+    assert inplace is inplace_out
+    torch.testing.assert_close(inplace, out)
+    assert corrected is corrected_out
+    torch.testing.assert_close(corrected, out.float())
+    torch.testing.assert_close(final_lse, torch.zeros_like(final_lse))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 def test_decode_topk_pads_surplus_with_negative_one():
     """When a row's valid length < topk the top-k kernel must pad the surplus
     slots with -1: the DCP merge (`topk_indices >= 0`) and
