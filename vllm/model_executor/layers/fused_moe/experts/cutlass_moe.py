@@ -50,6 +50,38 @@ from vllm.scalar_type import scalar_types
 logger = init_logger(__name__)
 
 
+def _apply_w4a8_moe_activation(
+    activation: MoEActivation,
+    output: torch.Tensor,
+    input: torch.Tensor,
+    gemm1_alpha: float | None,
+    gemm1_beta: float | None,
+    gemm1_clamp_limit: float | None,
+) -> None:
+    if activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE and (
+        gemm1_alpha is None or gemm1_beta is None or gemm1_clamp_limit is None
+    ):
+        missing = [
+            name
+            for name, value in (
+                ("gemm1_alpha", gemm1_alpha),
+                ("gemm1_beta", gemm1_beta),
+                ("gemm1_clamp_limit", gemm1_clamp_limit),
+            )
+            if value is None
+        ]
+        raise ValueError("SWIGLUOAI_UNINTERLEAVE requires " + ", ".join(missing))
+
+    apply_moe_activation(
+        activation,
+        output,
+        input,
+        clamp_limit=gemm1_clamp_limit,
+        alpha=1.0 if gemm1_alpha is None else gemm1_alpha,
+        beta=0.0 if gemm1_beta is None else gemm1_beta,
+    )
+
+
 def run_cutlass_moe_fp8(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -1109,6 +1141,9 @@ def run_cutlass_moe_w4a8_fp8(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: MoEActivation,
+    gemm1_alpha: float | None,
+    gemm1_beta: float | None,
+    gemm1_clamp_limit: float | None,
     global_num_experts: int,
     expert_map: torch.Tensor | None,
     w1_scale: torch.Tensor | None,
@@ -1214,7 +1249,14 @@ def run_cutlass_moe_w4a8_fp8(
         s_strides1,
     )
 
-    apply_moe_activation(activation, act_out, mm1_out)
+    _apply_w4a8_moe_activation(
+        activation,
+        act_out,
+        mm1_out,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+    )
 
     a2q, a2q_scale = ops.scaled_fp8_quant(
         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
@@ -1301,13 +1343,36 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
                 f"kernel does not support {moe_config.in_dtype} input/output dtype",
             )
 
-        return mk.FusedMoEExperts.is_supported_config(
+        supported, reason = mk.FusedMoEExperts.is_supported_config(
             cls,
             moe_config,
             weight_key,
             activation_key,
             activation_format,
         )
+        if not supported:
+            return supported, reason
+
+        if moe_config.hidden_dim % 256 != 0:
+            return False, "kernel requires hidden_dim to be divisible by 256"
+        if moe_config.intermediate_size_per_partition % 256 != 0:
+            reason = (
+                "kernel requires intermediate_size_per_partition to be "
+                "divisible by 256"
+            )
+            return False, reason
+
+        if moe_config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            params = {
+                "swiglu_alpha": moe_config.swiglu_alpha,
+                "swiglu_beta": moe_config.swiglu_beta,
+                "swiglu_limit": moe_config.swiglu_limit,
+            }
+            missing = [name for name, value in params.items() if value is None]
+            if missing:
+                return False, "kernel requires " + ", ".join(missing)
+
+        return True, None
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -1330,6 +1395,7 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
             MoEActivation.SILU,
             MoEActivation.GELU,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         )
 
     @staticmethod
@@ -1345,8 +1411,17 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
+            max_num_tokens = self.moe_config.max_num_tokens
+            if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
-                max_num_tokens=self.moe_config.max_num_tokens,
+                max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
@@ -1408,6 +1483,9 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
             w2,
             topk_ids,
             activation,
+            self.quant_config.gemm1_alpha,
+            self.quant_config.gemm1_beta,
+            self.quant_config.gemm1_clamp_limit,
             global_num_experts,
             expert_map,
             self.w1_scale,

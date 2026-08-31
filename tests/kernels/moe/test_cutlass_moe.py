@@ -3,10 +3,14 @@
 import copy
 import dataclasses
 from math import prod
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 import torch
 
+import vllm.model_executor.layers.fused_moe.experts.cutlass_moe as cutlass_moe
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm import _custom_ops as ops
@@ -24,9 +28,22 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
     CutlassExpertsFp4,
     CutlassExpertsFp8,
+    CutlassExpertsW4A8Fp8,
     run_cutlass_moe_fp8,
 )
+from vllm.model_executor.layers.fused_moe.oracle.w4a8 import (
+    W4A8MoeBackend,
+    make_w4a8_moe_quant_config,
+    select_w4a8_moe_backend,
+)
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_w4a8_fp8,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8DynamicTokenSym,
+    kInt4Static,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -57,6 +74,222 @@ def test_cutlass_moe_supports_gelu_tanh_activation_metadata():
     assert CutlassExpertsFp8._supports_activation(MoEActivation.GELU_TANH)
     assert CutlassExpertsFp4._supports_activation(MoEActivation.GELU_TANH)
     assert CutlassExpertsFp4._supports_activation(MoEActivation.GELU_TANH_NO_MUL)
+
+
+def make_minimax_w4a8_config(intermediate_size: int = 3072):
+    config = make_dummy_moe_config(
+        num_experts=128,
+        num_local_experts=16,
+        experts_per_token=4,
+        hidden_dim=6144,
+        intermediate_size=intermediate_size,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    )
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        ep_size=8,
+        use_ep=True,
+    )
+    config.swiglu_alpha = 1.702
+    config.swiglu_beta = 1.0
+    config.swiglu_limit = 7.0
+    return config
+
+
+def get_w4a8_support(config):
+    with patch.object(
+        CutlassExpertsW4A8Fp8,
+        "_supports_current_device",
+        return_value=True,
+    ):
+        return CutlassExpertsW4A8Fp8.is_supported_config(
+            CutlassExpertsW4A8Fp8,
+            config,
+            kInt4Static,
+            kFp8DynamicTokenSym,
+            mk.FusedMoEActivationFormat.Standard,
+        )
+
+
+def test_cutlass_w4a8_supports_minimax_uninterleaved_swiglu_with_ep():
+    config = make_minimax_w4a8_config()
+    supported, reason = get_w4a8_support(config)
+
+    assert supported
+    assert reason is None
+    with patch.object(
+        CutlassExpertsW4A8Fp8,
+        "_supports_current_device",
+        return_value=True,
+    ):
+        backend, experts_cls = select_w4a8_moe_backend(config)
+    assert backend is W4A8MoeBackend.CUTLASS
+    assert experts_cls is CutlassExpertsW4A8Fp8
+
+
+@pytest.mark.parametrize(
+    ("parallel_overrides", "expected_dispatchers"),
+    [
+        ({"dp_size": 8, "ep_size": 1, "use_ep": False}, 8),
+        (
+            {
+                "dp_size": 2,
+                "ep_size": 8,
+                "use_ep": True,
+                "all2all_backend": "deepep_high_throughput",
+            },
+            8,
+        ),
+    ],
+)
+def test_cutlass_w4a8_permute_scratch_covers_standard_dispatch_group(
+    parallel_overrides,
+    expected_dispatchers,
+):
+    config = make_minimax_w4a8_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        **parallel_overrides,
+    )
+    experts = object.__new__(CutlassExpertsW4A8Fp8)
+    object.__setattr__(experts, "moe_config", config)
+    object.__setattr__(experts, "_permute_scratch", None)
+
+    with (
+        patch.object(
+            cutlass_moe,
+            "moe_permute_unpermute_supported",
+            return_value=True,
+        ),
+        patch.object(cutlass_moe, "MoEPermuteScratch") as scratch_cls,
+    ):
+        experts._get_permute_scratch()
+
+    assert scratch_cls.call_args.kwargs["max_num_tokens"] == (
+        config.max_num_tokens * expected_dispatchers
+    )
+
+
+@pytest.mark.parametrize("missing", ["swiglu_alpha", "swiglu_beta", "swiglu_limit"])
+def test_cutlass_w4a8_rejects_missing_minimax_swiglu_params(missing):
+    config = make_minimax_w4a8_config()
+    setattr(config, missing, None)
+
+    supported, reason = get_w4a8_support(config)
+
+    assert not supported
+    assert reason is not None
+    assert missing in reason
+
+
+def test_cutlass_w4a8_rejects_unaligned_intermediate_partition():
+    supported, reason = get_w4a8_support(
+        make_minimax_w4a8_config(intermediate_size=384)
+    )
+
+    assert not supported
+    assert reason is not None
+    assert "intermediate_size_per_partition" in reason
+
+
+def test_w4a8_quant_config_preserves_minimax_swiglu_params():
+    quant_config = make_w4a8_moe_quant_config(
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+        g1_alphas=torch.empty(1),
+        g2_alphas=torch.empty(1),
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+
+    assert quant_config.gemm1_alpha == 1.702
+    assert quant_config.gemm1_beta == 1.0
+    assert quant_config.gemm1_clamp_limit == 7.0
+
+
+def test_compressed_tensors_w4a8_propagates_minimax_swiglu_params():
+    method = object.__new__(
+        compressed_tensors_moe_w4a8_fp8.CompressedTensorsW4A8Fp8MoEMethod
+    )
+    object.__setattr__(
+        method,
+        "moe",
+        SimpleNamespace(
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
+            swiglu_limit=7.0,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight_scale=torch.empty(1),
+        w2_weight_scale=torch.empty(1),
+        w13_weight_chan_scale=torch.empty(1),
+        w2_weight_chan_scale=torch.empty(1),
+    )
+
+    quant_config = method.get_fused_moe_quant_config(layer)
+
+    assert quant_config.gemm1_alpha == 1.702
+    assert quant_config.gemm1_beta == 1.0
+    assert quant_config.gemm1_clamp_limit == 7.0
+
+
+def test_cutlass_w4a8_activation_forwards_minimax_swiglu_params(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_apply_moe_activation(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        cutlass_moe,
+        "apply_moe_activation",
+        fake_apply_moe_activation,
+    )
+    output = torch.empty((1, 1))
+    input = torch.empty((1, 2))
+
+    cutlass_moe._apply_w4a8_moe_activation(
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        output,
+        input,
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+
+    assert captured["args"] == (
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        output,
+        input,
+    )
+    assert captured["kwargs"] == {
+        "clamp_limit": 7.0,
+        "alpha": 1.702,
+        "beta": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"],
+)
+def test_cutlass_w4a8_activation_rejects_missing_minimax_swiglu_param(missing):
+    params: dict[str, float | None] = {
+        "gemm1_alpha": 1.702,
+        "gemm1_beta": 1.0,
+        "gemm1_clamp_limit": 7.0,
+    }
+    params[missing] = None
+
+    with pytest.raises(ValueError, match=missing):
+        cutlass_moe._apply_w4a8_moe_activation(
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            torch.empty((1, 1)),
+            torch.empty((1, 2)),
+            **params,
+        )
 
 
 @dataclasses.dataclass

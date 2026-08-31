@@ -151,6 +151,9 @@ def make_w4a8_moe_quant_config(
     w2_scale: torch.Tensor,
     g1_alphas: torch.Tensor,
     g2_alphas: torch.Tensor,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     return int4_w4afp8_moe_quant_config(
         w1_scale=w1_scale,
@@ -159,6 +162,9 @@ def make_w4a8_moe_quant_config(
         g2_alphas=g2_alphas,
         per_act_token_quant=True,
         per_out_ch_quant=True,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
