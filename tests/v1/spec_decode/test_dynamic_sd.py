@@ -253,9 +253,6 @@ def test_dflash_runtime_k_maps_to_bonus_query_width():
     assert speculator._get_num_speculative_tokens_for_query_len(4) == 3
     assert speculator._get_num_query_per_req_for_k(0) == 1
     assert speculator._get_num_speculative_tokens_for_query_len(1) == 0
-    assert not speculator._requires_eager_query(8, is_profile=False)
-    assert speculator._requires_eager_query(4, is_profile=False)
-    assert speculator._requires_eager_query(8, is_profile=True)
 
     with pytest.raises(ValueError, match="runtime_num_speculative_tokens"):
         speculator._get_runtime_num_speculative_tokens(8)
@@ -302,9 +299,6 @@ def test_dspark_runtime_k_maps_to_anchor_query_width():
     assert speculator._get_num_speculative_tokens_for_query_len(3) == 3
     assert speculator._get_num_query_per_req_for_k(0) == 0
     assert speculator._get_num_speculative_tokens_for_query_len(0) == 0
-    assert not speculator._requires_eager_query(7, is_profile=False)
-    assert speculator._requires_eager_query(3, is_profile=False)
-    assert speculator._requires_eager_query(0, is_profile=False)
 
 
 @pytest.mark.parametrize(

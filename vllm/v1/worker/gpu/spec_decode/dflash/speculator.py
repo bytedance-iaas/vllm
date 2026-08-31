@@ -132,9 +132,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             return num_query_per_req
         return max(num_query_per_req - 1, 0)
 
-    def _requires_eager_query(self, num_query_per_req: int, is_profile: bool) -> bool:
-        return is_profile or num_query_per_req != self.num_query_per_req
-
     def _get_sample_col_for_k(
         self, num_reqs: int, num_speculative_tokens: int
     ) -> torch.Tensor:
@@ -529,9 +526,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             uniform_token_count=num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            # Runtime-width graph families are added separately. Until then,
-            # only the statically captured maximum width can replay safely.
-            need_eager=self._requires_eager_query(num_query_per_req, is_profile),
+            need_eager=is_profile,
         )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
