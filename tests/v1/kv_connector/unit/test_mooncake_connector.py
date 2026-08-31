@@ -3431,6 +3431,19 @@ def test_scheduler_request_finished():
     assert "id-1" in scheduler_connector._reqs_not_processed
 
 
+@pytest.mark.asyncio
+async def test_worker_ignores_unknown_not_processed_transfer():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.reqs_need_send = {}
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_not_processed.add("aborted-before-first-schedule")
+
+    await worker.record_send_reqs(metadata)
+
+    assert worker.reqs_need_send == {}
+
+
 @contextlib.contextmanager
 def patch_worker_dependencies():
     """Helper to mock all distributed and network dependencies for Worker tests."""

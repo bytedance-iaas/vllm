@@ -2634,6 +2634,7 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        self.validate_prefix_cache_reset(reset_running_requests)
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -2673,6 +2674,17 @@ class Scheduler(SchedulerInterface):
             reset_successful = self.reset_connector_cache() and reset_successful
 
         return reset_successful
+
+    def validate_prefix_cache_reset(self, reset_running_requests: bool = False) -> None:
+        if (
+            reset_running_requests
+            and self._decode_only_dcp_no_preemption
+            and self.running
+        ):
+            raise RuntimeError(
+                "Cannot force-reset the prefix cache while strict DCP decode "
+                "requests are running. Abort or drain them first."
+            )
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:

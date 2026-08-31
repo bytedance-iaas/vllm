@@ -596,8 +596,6 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
             selected_global_ids // self.dcp_world_size,
             selected_global_ids.new_full((), -1),
         )
-        self._dcp_canonical_global_topk = selected_global_ids
-        self._dcp_aligned_local_topk = localized
         out.copy_(localized)
         return out
 

@@ -43,6 +43,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
+from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1354,6 +1355,38 @@ def test_scheduler_reset_prefix_cache():
 
     for i, request in enumerate(requests):
         assert scheduler.waiting[i] == request
+
+
+def test_decode_only_dcp_rejects_forced_prefix_cache_reset():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._decode_only_dcp_no_preemption = True
+    scheduler.running = [Mock(status=RequestStatus.RUNNING)]
+    scheduler.kv_cache_manager = Mock()
+    scheduler._preempt_request = Mock()
+
+    with pytest.raises(RuntimeError, match="strict DCP decode"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    assert len(scheduler.running) == 1
+    scheduler._preempt_request.assert_not_called()
+    scheduler.kv_cache_manager.reset_prefix_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("core_cls", [EngineCore, EngineCoreProc])
+def test_keep_pause_rejects_unsafe_strict_dcp_cache_reset(core_cls):
+    core = core_cls.__new__(core_cls)
+    core.scheduler = Mock()
+    core.scheduler.validate_prefix_cache_reset.side_effect = RuntimeError(
+        "strict DCP decode"
+    )
+
+    with pytest.raises(RuntimeError, match="strict DCP decode"):
+        core.pause_scheduler(mode="keep", clear_cache=True)
+
+    core.scheduler.validate_prefix_cache_reset.assert_called_once_with(
+        reset_running_requests=True
+    )
+    core.scheduler.set_pause_state.assert_not_called()
 
 
 def test_reset_connector_cache_no_connector_is_no_op_success():
