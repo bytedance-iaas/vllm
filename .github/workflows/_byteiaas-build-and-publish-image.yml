@@ -66,6 +66,13 @@ jobs:
       BYTEIAAS_VLLM_VERSION: ${{ inputs.vllm_version }}
       BYTEIAAS_IMAGE_FORMATS: ${{ inputs.image_formats }}
     steps:
+      - name: Configure isolated Docker credentials
+        run: |
+          set -euo pipefail
+          docker_config="${RUNNER_TEMP}/byteiaas-docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${docker_config}"
+          echo "DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"
+
       - name: Validate immutable checkout ref
         env:
           CHECKOUT_REF: ${{ inputs.checkout_ref }}
@@ -107,13 +114,6 @@ jobs:
             echo "::error::tag_value is required in release mode"
             exit 1
           fi
-
-      - name: Configure isolated Docker credentials
-        run: |
-          set -euo pipefail
-          docker_config="${RUNNER_TEMP}/byteiaas-docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -p "${docker_config}"
-          echo "DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"
 
       - name: Resolve Volcengine publish target
         run: |
@@ -582,6 +582,8 @@ jobs:
       - name: Logout from Volcengine CR
         if: ${{ always() }}
         run: |
-          if [ -n "${VOLCENGINE_CR_REGISTRY}" ]; then
+          if [ -n "${DOCKER_CONFIG:-}" ] && \
+              [[ "${DOCKER_CONFIG}" == "${RUNNER_TEMP}/byteiaas-docker-"* ]] && \
+              [ -n "${VOLCENGINE_CR_REGISTRY}" ]; then
             docker logout "${VOLCENGINE_CR_REGISTRY}" || true
           fi

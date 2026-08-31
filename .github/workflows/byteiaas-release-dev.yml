@@ -55,8 +55,11 @@ jobs:
             source_ref="refs/remotes/origin/iaas_main"
           elif [[ "${REQUESTED_REF}" =~ ^refs/tags/[0-9A-Za-z][0-9A-Za-z_.-]*$ ]]; then
             source_ref="${REQUESTED_REF}"
+          elif [[ "${REQUESTED_REF}" =~ ^[0-9A-Za-z][0-9A-Za-z_.-]*$ ]] && \
+              git show-ref --verify --quiet "refs/tags/${REQUESTED_REF}"; then
+            source_ref="refs/tags/${REQUESTED_REF}"
           else
-            echo "::error::checkout_ref must be a full SHA, iaas_main, or a tag ref"
+            echo "::error::checkout_ref must be a full SHA, iaas_main, or a tag"
             exit 1
           fi
 
