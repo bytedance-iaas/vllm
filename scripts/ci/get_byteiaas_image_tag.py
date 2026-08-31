@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 TAG_SAFE_CHARS = frozenset(
     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_.-"
 )
+MAX_DOCKER_TAG_LENGTH = 128
 
 
 def is_tag_safe_suffix(value: str) -> bool:
@@ -26,7 +27,13 @@ def is_tag_safe_suffix(value: str) -> bool:
 
 def is_vllm_version(value: str) -> bool:
     parts = value.split(".", 2)
-    if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+    if (
+        len(parts) != 3
+        or not parts[0].isascii()
+        or not parts[0].isdigit()
+        or not parts[1].isascii()
+        or not parts[1].isdigit()
+    ):
         return False
 
     patch = parts[2]
@@ -95,6 +102,12 @@ def get_vllm_version(version_arg: str) -> str:
     return get_git_described_version(repo_root())
 
 
+def get_vllm_version_for_mode(mode: str, version_arg: str) -> str:
+    if mode == "release":
+        return ""
+    return get_vllm_version(version_arg)
+
+
 def current_timestamp(timestamp_arg: str) -> str:
     if timestamp_arg:
         if len(timestamp_arg) != 12 or not timestamp_arg.isdigit():
@@ -137,6 +150,11 @@ def build_tag(
         if not is_tag_safe_suffix(format_suffix):
             raise SystemExit("--format-suffix must be a Docker tag-safe suffix")
         tag = f"{tag}-{format_suffix}"
+    if len(tag) > MAX_DOCKER_TAG_LENGTH or not is_tag_safe_suffix(tag):
+        raise SystemExit(
+            f"generated image tag is not Docker-compatible: {tag!r}; "
+            f"maximum length is {MAX_DOCKER_TAG_LENGTH}"
+        )
     return tag
 
 
@@ -182,7 +200,7 @@ def main() -> None:
     tag = build_tag(
         mode=args.mode,
         image_flavor=args.image_flavor,
-        vllm_version=get_vllm_version(args.vllm_version),
+        vllm_version=get_vllm_version_for_mode(args.mode, args.vllm_version),
         timestamp=current_timestamp(args.timestamp),
         tag_value=args.tag_value,
         cuda_suffix=args.cuda_suffix,

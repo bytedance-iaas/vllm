@@ -12,6 +12,12 @@ from typing import Any
 
 Manifest = dict[str, Any]
 InspectManifest = Callable[[str], Manifest]
+ZSTD_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+zstd"
+NYDUS_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.nydus.blob.v1"
+NYDUS_LAYER_ANNOTATIONS = {
+    "containerd.io/snapshot/nydus-blob",
+    "containerd.io/snapshot/nydus-bootstrap",
+}
 
 
 def image_repository(reference: str) -> str:
@@ -31,31 +37,99 @@ def inspect_manifest(reference: str) -> Manifest:
     return json.loads(raw)
 
 
-def collect_layers(
+def is_runnable_descriptor(descriptor: Manifest) -> bool:
+    if descriptor.get("artifactType"):
+        return False
+
+    annotations = descriptor.get("annotations")
+    if isinstance(annotations, dict):
+        reference_type = annotations.get("vnd.docker.reference.type", "")
+        if "attestation" in str(reference_type).lower():
+            return False
+
+    platform = descriptor.get("platform")
+    if isinstance(platform, dict):
+        if platform.get("os") == "unknown" or platform.get("architecture") == "unknown":
+            return False
+
+    return True
+
+
+def collect_layer_sets(
     reference: str,
     inspect: InspectManifest = inspect_manifest,
-    seen: set[str] | None = None,
-) -> list[Manifest]:
-    if seen is None:
-        seen = set()
-    if reference in seen:
+    ancestors: frozenset[str] = frozenset(),
+) -> list[list[Manifest]]:
+    if reference in ancestors:
         raise ValueError(f"manifest cycle detected at {reference}")
-    seen.add(reference)
 
     manifest = inspect(reference)
     layers = manifest.get("layers")
     if isinstance(layers, list):
-        return layers
+        return [layers]
 
     repository = image_repository(reference)
-    collected: list[Manifest] = []
-    for descriptor in manifest.get("manifests", []):
+    descriptors = manifest.get("manifests")
+    if not isinstance(descriptors, list) or not descriptors:
+        raise ValueError(f"manifest {reference} has no layers or child manifests")
+
+    collected: list[list[Manifest]] = []
+    child_ancestors = ancestors | {reference}
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict) or not is_runnable_descriptor(descriptor):
+            continue
         digest = descriptor.get("digest", "")
-        if digest:
-            collected.extend(
-                collect_layers(f"{repository}@{digest}", inspect=inspect, seen=seen)
+        if not digest:
+            raise ValueError(f"runnable child manifest in {reference} has no digest")
+        collected.extend(
+            collect_layer_sets(
+                f"{repository}@{digest}",
+                inspect=inspect,
+                ancestors=child_ancestors,
             )
+        )
+
+    if not collected:
+        raise ValueError(f"manifest {reference} has no runnable child manifests")
     return collected
+
+
+def collect_layers(
+    reference: str,
+    inspect: InspectManifest = inspect_manifest,
+) -> list[Manifest]:
+    return [
+        layer
+        for layer_set in collect_layer_sets(reference, inspect=inspect)
+        for layer in layer_set
+    ]
+
+
+def layer_markers(layers: list[Manifest]) -> tuple[set[str], dict[str, set[str]]]:
+    media_types = {
+        str(layer.get("mediaType", "")) for layer in layers if layer.get("mediaType")
+    }
+    annotations_by_key: dict[str, set[str]] = {}
+    for layer in layers:
+        annotations = layer.get("annotations")
+        if isinstance(annotations, dict):
+            for key, value in annotations.items():
+                annotations_by_key.setdefault(str(key), set()).add(str(value))
+    return media_types, annotations_by_key
+
+
+def has_requested_format(layers: list[Manifest], image_format: str) -> bool:
+    media_types, annotations_by_key = layer_markers(layers)
+    if image_format == "zstd":
+        return ZSTD_LAYER_MEDIA_TYPE in media_types
+
+    if NYDUS_LAYER_MEDIA_TYPE in media_types:
+        return True
+    return any(
+        annotations_by_key.get(key, set()) == {"true"}
+        or "true" in annotations_by_key.get(key, set())
+        for key in NYDUS_LAYER_ANNOTATIONS
+    )
 
 
 def verify_image_format(
@@ -63,36 +137,25 @@ def verify_image_format(
     image_format: str,
     inspect: InspectManifest = inspect_manifest,
 ) -> list[str]:
-    layers = collect_layers(reference, inspect=inspect)
-    media_types = sorted(
-        {layer.get("mediaType", "") for layer in layers if layer.get("mediaType")}
-    )
+    if image_format not in {"zstd", "nydus"}:
+        raise ValueError(f"unsupported image format: {image_format}")
 
-    if image_format == "zstd":
-        if not any("zstd" in media_type.lower() for media_type in media_types):
+    all_markers: set[str] = set()
+    for child_index, layers in enumerate(
+        collect_layer_sets(reference, inspect=inspect),
+        start=1,
+    ):
+        media_types, annotations_by_key = layer_markers(layers)
+        if not has_requested_format(layers, image_format):
             raise ValueError(
-                f"expected zstd layer media types for {reference}, got {media_types}"
+                f"expected {image_format} markers for every runnable manifest "
+                f"in {reference}; child {child_index} has media types "
+                f"{sorted(media_types)} and annotations {annotations_by_key}"
             )
-        return media_types
+        all_markers.update(media_types)
+        all_markers.update(annotations_by_key)
 
-    if image_format == "nydus":
-        annotation_markers = {
-            str(marker)
-            for layer in layers
-            for marker in (
-                *(layer.get("annotations", {}) or {}).keys(),
-                *(layer.get("annotations", {}) or {}).values(),
-            )
-        }
-        markers = media_types + sorted(annotation_markers)
-        if not any("nydus" in marker.lower() for marker in markers):
-            raise ValueError(
-                f"expected nydus markers for {reference}; "
-                f"layers={media_types}, annotations={sorted(annotation_markers)}"
-            )
-        return markers
-
-    raise ValueError(f"unsupported image format: {image_format}")
+    return sorted(all_markers)
 
 
 def main() -> None:

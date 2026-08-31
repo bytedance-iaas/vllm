@@ -7,10 +7,15 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from get_byteiaas_image_tag import build_tag
+from get_byteiaas_image_tag import (
+    build_tag,
+    get_vllm_version_for_mode,
+    normalize_version,
+)
 
 
 class GetByteiaasImageTagTest(unittest.TestCase):
@@ -70,6 +75,30 @@ class GetByteiaasImageTagTest(unittest.TestCase):
                     cuda_suffix="cu130",
                     format_suffix=value,
                 )
+
+    def test_generated_tag_must_fit_docker_tag_limit(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "maximum length is 128"):
+            build_tag(
+                mode="release",
+                image_flavor="openai-devel",
+                vllm_version="",
+                timestamp="202608141200",
+                tag_value="a" * 110,
+                cuda_suffix="cu130",
+                format_suffix="nydus",
+            )
+
+    def test_version_requires_ascii_digits(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "invalid vLLM version"):
+            normalize_version("１２.27.0")
+
+    def test_release_mode_does_not_resolve_unused_vllm_version(self) -> None:
+        with patch(
+            "get_byteiaas_image_tag.get_vllm_version",
+            side_effect=AssertionError("must not resolve"),
+        ) as get_version:
+            self.assertEqual(get_vllm_version_for_mode("release", ""), "")
+        get_version.assert_not_called()
 
 
 if __name__ == "__main__":
