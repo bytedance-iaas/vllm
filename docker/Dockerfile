@@ -327,7 +327,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         git -C /tmp/hpc-ops-src checkout --detach FETCH_HEAD && \
         test "$(git -C /tmp/hpc-ops-src rev-parse HEAD)" = "${HPC_OPS_REF}" && \
         cd /tmp/hpc-ops-src && \
-        CUDA_VISIBLE_DEVICES="" python3 -m build --wheel --no-isolation && \
+        CMAKE_GENERATOR=Ninja CUDA_VISIBLE_DEVICES="" \
+            python3 -m build --wheel --no-isolation && \
         test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1 && \
         cp dist/*.whl /tmp/hpc-ops-dist/ && \
         sha256sum /tmp/hpc-ops-dist/*.whl \
