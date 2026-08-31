@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       checkout_ref:
-        description: "Optional full SHA or tag in iaas_main history"
+        description: "Optional full SHA or tag; defaults to the workflow commit"
         required: false
         default: ""
       vllm_version:
@@ -47,7 +47,9 @@ jobs:
       - name: Resolve trusted immutable source
         id: source
         env:
-          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || github.event_name == 'push' && github.sha || 'refs/heads/iaas_main' }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUESTED_REF: ${{ inputs.checkout_ref || github.sha }}
         run: |
           set -euo pipefail
           trusted_head="$(git rev-parse HEAD)"
@@ -67,8 +69,14 @@ jobs:
           fi
 
           checkout_sha="$(git rev-parse --verify "${source_ref}^{commit}")"
-          if ! git merge-base --is-ancestor \
-              "${checkout_sha}" "${trusted_head}"; then
+          is_workflow_sha=false
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && \
+              [ "${checkout_sha}" = "${EVENT_SHA}" ]; then
+            is_workflow_sha=true
+          fi
+          if [ "${is_workflow_sha}" != "true" ] && \
+              ! git merge-base --is-ancestor \
+                "${checkout_sha}" "${trusted_head}"; then
             echo "::error::Requested source is not in iaas_main history"
             exit 1
           fi
