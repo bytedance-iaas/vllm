@@ -896,6 +896,11 @@ class VllmConfig:
                 "dynamic_sd_dp_batch_policy='global_max'. Rank-local Dynamic SD "
                 "remains disabled under DP > 1."
             )
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                "DP-global Dynamic SD requires the V2 model runner because "
+                "MRV1 dummy batches cannot preserve the synchronized runtime K."
+            )
         if (
             speculative_config.method == "dspark"
             and not self.scheduler_config.async_scheduling

@@ -10,11 +10,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import vllm.envs as envs
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.config import SpeculativeConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.utils import replace
 from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.worker.gpu import model_runner as gpu_model_runner
@@ -144,6 +146,37 @@ def test_dynamic_sd_rejects_negative_k():
 def test_dynamic_sd_rejects_empty_schedule():
     with pytest.raises(ValueError, match="must not be empty"):
         _make_lookup([])
+
+
+def test_speculative_config_rejects_empty_dynamic_sd_schedule_before_post_init(
+    monkeypatch,
+):
+    post_init = MagicMock(side_effect=AssertionError("post-init must not run"))
+    monkeypatch.setattr(SpeculativeConfig, "__post_init__", post_init)
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        SpeculativeConfig(
+            model="ngram",
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[],
+        )
+    post_init.assert_not_called()
+
+
+def test_speculative_config_normalizes_dynamic_sd_schedule():
+    config = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=(  # type: ignore[arg-type]
+            (5, 16, 1),
+            (1, 4, 3),
+        ),
+    )
+
+    assert config.num_speculative_tokens_per_batch_size == [
+        (1, 4, 3),
+        (5, 16, 1),
+    ]
 
 
 def test_dynamic_sd_requires_schedule_config():
@@ -676,17 +709,54 @@ def test_dynamic_sd_dp_requires_explicit_global_policy():
         )
 
 
+def _make_dynamic_sd_dp_validation_config(
+    *, data_parallel_size: int, use_v2_model_runner: bool
+):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle",
+            uses_dynamic_speculative_decoding=lambda: True,
+            uses_dynamic_sd_dp_global_max_policy=lambda: True,
+        ),
+        parallel_config=SimpleNamespace(data_parallel_size=data_parallel_size),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        use_v2_model_runner=use_v2_model_runner,
+    )
+
+
 def test_dynamic_sd_dp_global_policy_allows_data_parallel():
+    config = _make_dynamic_sd_dp_validation_config(
+        data_parallel_size=2,
+        use_v2_model_runner=True,
+    )
+
+    VllmConfig._verify_dynamic_sd_dp_config(config)
+
+
+def test_dynamic_sd_dp_global_policy_rejects_mrv1(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+
+    with pytest.raises(ValueError, match="requires the V2 model runner"):
+        create_scheduler(
+            max_num_seqs=16,
+            max_num_batched_tokens=160,
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            data_parallel_size=2,
+        )
+
+
+def test_dynamic_sd_rank_local_policy_allows_mrv1(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
     scheduler = create_scheduler(
         max_num_seqs=16,
         max_num_batched_tokens=160,
         num_speculative_tokens=3,
         num_speculative_tokens_per_batch_size=[(1, 16, 3)],
-        dynamic_sd_dp_batch_policy="global_max",
-        data_parallel_size=2,
     )
 
-    assert scheduler.vllm_config.speculative_config is not None
+    assert not scheduler.vllm_config.use_v2_model_runner
     assert scheduler._dynamic_sd is not None
 
 
@@ -717,6 +787,40 @@ def test_dynamic_sd_dp_global_policy_requires_non_increasing_schedule():
             dynamic_sd_dp_batch_policy="global_max",
             data_parallel_size=2,
         )
+
+
+def test_dynamic_sd_pressure_includes_fresh_waiting_wave():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 3)],
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+    )
+    for request in create_requests(num_requests=3, num_tokens=10):
+        scheduler.add_request(request)
+
+    assert scheduler.get_dynamic_sd_local_batch_pressure() == 3
+
+
+def test_dynamic_sd_pressure_counts_streaming_resident_once():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 8, 3)],
+        max_num_seqs=8,
+        max_num_batched_tokens=80,
+    )
+    requests = create_requests(num_requests=7, num_tokens=10)
+    for request in requests[:2]:
+        request.status = RequestStatus.RUNNING
+        scheduler.running.append(request)
+    for request in requests[2:5]:
+        scheduler.waiting.add_request(request)
+
+    requests[5].status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.skipped_waiting.add_request(requests[5])
+    requests[6].status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    scheduler.skipped_waiting.add_request(requests[6])
+    scheduler.num_waiting_for_streaming_input = 1
+
+    assert scheduler.get_dynamic_sd_local_batch_pressure() == 7
 
 
 def test_scheduler_uses_static_k_when_no_requests_are_scheduled():

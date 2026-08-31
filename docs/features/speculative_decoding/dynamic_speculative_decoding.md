@@ -34,6 +34,7 @@ implies that:
 
 For data-parallel serving, Dynamic SD must use
 `dynamic_sd_dp_batch_policy="global_max"` so every DP rank uses the same K.
+This DP-global policy requires Model Runner V2.
 The DP-global batch pressure is synchronized every
 `dynamic_sd_dp_sync_interval` engine steps, defaulting to 8. Set
 `dynamic_sd_dp_sync_interval=1` to restore per-step synchronization. A larger
@@ -81,4 +82,4 @@ VLLM_USE_V2_MODEL_RUNNER=0 vllm serve meta-llama/Llama-3.1-8B-Instruct \
 
 * Tested with Eagle, Eagle-3, and DFlash. Other SD methods may or may not work out of the box
 * Full Cudagraph only works with Model Runner V2. MRv1 only supports piece-wise cuda graph with this feature
-* Data parallelism requires explicit `dynamic_sd_dp_batch_policy="global_max"` opt-in. The schedule's K values must be non-increasing as batch size grows, and DSpark also requires asynchronous scheduling.
+* Data parallelism requires Model Runner V2 and explicit `dynamic_sd_dp_batch_policy="global_max"` opt-in. The schedule's K values must be non-increasing as batch size grows, and DSpark also requires asynchronous scheduling.

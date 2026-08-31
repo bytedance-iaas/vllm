@@ -2266,10 +2266,23 @@ class Scheduler(SchedulerInterface):
     def get_dynamic_sd_local_batch_pressure(self) -> int:
         if self._dynamic_sd is None:
             return 0
-        num_decode_reqs = sum(
-            1 for request in self.running if not request.is_prefill_chunk
+        # Admission has side effects, so use a slot-bounded upper estimate
+        # that cannot miss a waiting-request surge before schedule().
+        resident_reqs = len(self.running) + self.num_waiting_for_streaming_input
+        waiting_reqs = max(
+            len(self.waiting)
+            + len(self.skipped_waiting)
+            - self.num_waiting_for_streaming_input,
+            0,
         )
-        return min(num_decode_reqs, self.scheduler_config.max_num_seqs)
+        available_slots = max(
+            self.max_num_running_reqs - resident_reqs,
+            0,
+        )
+        return min(
+            resident_reqs + min(waiting_reqs, available_slots),
+            self.max_num_running_reqs,
+        )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:

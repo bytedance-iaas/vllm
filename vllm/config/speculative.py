@@ -20,6 +20,9 @@ from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.spec_decode.dynamic.utils import (
+    validate_and_normalize_dynamic_sd_schedule,
+)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -1282,6 +1285,13 @@ class SpeculativeConfig:
                 return None
             return AttentionBackendEnum[value.upper()]
         return value
+
+    @field_validator("num_speculative_tokens_per_batch_size", mode="after")
+    @classmethod
+    def _validate_dynamic_sd_schedule(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return validate_and_normalize_dynamic_sd_schedule(value)
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
