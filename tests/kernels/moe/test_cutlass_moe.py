@@ -340,6 +340,34 @@ def test_cutlass_w4a8_supports_minimax_uninterleaved_swiglu_with_ep():
 
 
 @pytest.mark.parametrize(
+    ("all2all_backend", "expected"),
+    [
+        ("allgather_reducescatter", True),
+        ("deepep_high_throughput", True),
+        ("deepep_v2", False),
+        ("flashinfer_nvlink_one_sided", False),
+    ],
+)
+def test_cutlass_w4a8_rejects_incompatible_standard_transport(
+    all2all_backend,
+    expected,
+):
+    config = make_minimax_w4a8_config()
+    config.moe_parallel_config = dataclasses.replace(
+        config.moe_parallel_config,
+        dp_size=2,
+        ep_size=8,
+        use_ep=True,
+        all2all_backend=all2all_backend,
+    )
+
+    supported, reason = get_w4a8_support(config)
+
+    assert supported is expected
+    assert (reason is None) is expected
+
+
+@pytest.mark.parametrize(
     ("parallel_overrides", "expected_dispatchers"),
     [
         ({"dp_size": 8, "ep_size": 1, "use_ep": False}, 8),

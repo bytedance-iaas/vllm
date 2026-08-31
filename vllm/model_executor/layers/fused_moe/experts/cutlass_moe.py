@@ -1872,7 +1872,10 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return True
+        return not (
+            moe_parallel_config.use_deepep_v2_kernels
+            or moe_parallel_config.use_fi_nvl_one_sided_kernels
+        )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         # topk weights and reduction are fused in moe_unpermute cuda kernel
