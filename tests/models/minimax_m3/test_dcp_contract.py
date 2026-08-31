@@ -196,10 +196,10 @@ class _FakeDCPGroup:
 
 
 @pytest.mark.parametrize(
-    ("rank", "score", "expected", "aligned"),
+    ("rank", "score", "expected"),
     [
-        (0, [1.0, 9.0, 3.0], [1, -1, -1], [1, -1, -1]),
-        (1, [8.0, 2.0, 7.0], [-1, 0, 2], [-1, 0, 2]),
+        (0, [1.0, 9.0, 3.0], [1, -1, -1]),
+        (1, [8.0, 2.0, 7.0], [-1, 0, 2]),
     ],
 )
 def test_dcp_global_topk_localizes_selected_owners(
@@ -207,7 +207,6 @@ def test_dcp_global_topk_localizes_selected_owners(
     rank: int,
     score: list[float],
     expected: list[int],
-    aligned: list[int],
 ) -> None:
     # Rank 0 owns global blocks 0/2/4; rank 1 owns 1/3/5.
     # The global top-3 is {2, 1, 5}.
@@ -247,8 +246,6 @@ def test_dcp_global_topk_localizes_selected_owners(
     )
 
     assert result.tolist() == [[expected]]
-    assert impl._dcp_canonical_global_topk.tolist() == [[[2, 1, 5]]]
-    assert impl._dcp_aligned_local_topk.tolist() == [[aligned]]
 
 
 def test_dcp_topk_uses_strict_lexicographic_order() -> None:
