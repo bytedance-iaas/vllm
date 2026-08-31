@@ -1,0 +1,152 @@
+name: ByteIAAS Build vLLM Wheel
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      cuda_version:
+        description: "CUDA_VERSION build arg"
+        required: false
+        type: string
+        default: "13.0.3"
+      artifact_name:
+        description: "Uploaded wheel artifact name"
+        required: false
+        type: string
+        default: "vllm-cu130-wheel"
+
+jobs:
+  build-wheel:
+    if: github.repository == 'bytedance-iaas/vllm'
+    runs-on:
+      - self-hosted
+      - x64-vllm-wheel-build-node
+      - vllm-byteiaas-build-01
+    timeout-minutes: 1440
+    env:
+      HTTP_PROXY: http://100.68.162.211:3128
+      HTTPS_PROXY: http://100.68.162.211:3128
+      ALL_PROXY: http://100.68.162.211:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+      BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-wheel-cache
+      BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
+      BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
+      BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
+    steps:
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate CUDA version
+        run: |
+          set -euo pipefail
+          if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
+            echo "::error::ByteIAAS builds require CUDA 13.0.3"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+          cleanup: false
+
+      - name: Build wheel stage image
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -euo pipefail
+          build_cpus="$(nproc)"
+          build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
+          default_nvcc_threads=4
+          if [ "${build_cpus}" -lt "${default_nvcc_threads}" ]; then
+            default_nvcc_threads="${build_cpus}"
+          fi
+          build_nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-${default_nvcc_threads}}"
+          cache_root="${BYTEIAAS_BUILDX_CACHE_ROOT}"
+
+          echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}"
+          echo "DeepGEMM source: ${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}@${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
+          echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
+          df -h /data /data/docker /data/buildkit || true
+          mkdir -p "${cache_root}"
+
+          cache_dir="${cache_root}/build"
+          cache_new="${cache_dir}.new"
+          cache_old="${cache_dir}.old"
+          cache_args=(--cache-to "type=local,dest=${cache_new},mode=max")
+          if [ -d "${cache_dir}" ]; then
+            cache_args=(
+              --cache-from "type=local,src=${cache_dir}"
+              "${cache_args[@]}"
+            )
+          fi
+
+          rm -rf "${cache_new}"
+          docker buildx build \
+            --builder "${BUILDX_BUILDER}" \
+            "${cache_args[@]}" \
+            --load \
+            --target build \
+            --network=host \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}" \
+            --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${BYTEIAAS_CUDA_VERSION}-devel-ubuntu22.04" \
+            --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
+            --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
+            --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON \
+            --build-arg max_jobs="${build_max_jobs}" \
+            --build-arg nvcc_threads="${build_nvcc_threads}" \
+            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+            --build-arg ALL_PROXY="${ALL_PROXY}" \
+            --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg http_proxy="${HTTP_PROXY}" \
+            --build-arg https_proxy="${HTTPS_PROXY}" \
+            --build-arg all_proxy="${ALL_PROXY}" \
+            --build-arg no_proxy="${NO_PROXY}" \
+            -t "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}" \
+            .
+
+          if [ -d "${cache_new}" ]; then
+            rm -rf "${cache_old}"
+            if [ -d "${cache_dir}" ]; then
+              mv "${cache_dir}" "${cache_old}"
+            fi
+            mv "${cache_new}" "${cache_dir}"
+            rm -rf "${cache_old}"
+          fi
+
+      - name: Copy wheels from build stage
+        run: |
+          set -euo pipefail
+          rm -rf byteiaas-wheel-dist
+          mkdir -p byteiaas-wheel-dist
+          container="$(docker create "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}")"
+          trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container}:/workspace/dist/." byteiaas-wheel-dist/
+          ls -lh byteiaas-wheel-dist
+          test -n "$(find byteiaas-wheel-dist -maxdepth 1 -name '*.whl' -print -quit)"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: byteiaas-wheel-dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
