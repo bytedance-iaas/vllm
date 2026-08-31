@@ -48,6 +48,10 @@ Now you can send requests to the proxy server through port 8000.
     - Default: 480
     - If a request is aborted and the decoder has not yet notified the prefiller, the prefill instance will release its KV-cache blocks after this timeout to avoid holding them indefinitely.
 
+- `VLLM_MOONCAKE_PD_TRACE`: Emit direct P/D transfer timing, descriptor, and byte-count diagnostics at INFO level. (Optional)
+    - Default: false
+    - Enable only while diagnosing transfers because per-request logging can perturb latency measurements.
+
 ## KV Transfer Config
 
 ### KV Role Options
@@ -61,6 +65,18 @@ Now you can send requests to the proxy server through port 8000.
 - **num_workers**: Size of thread pool for one prefiller worker to transfer KV caches by mooncake. (default 10)
 - **mooncake_protocol**: Mooncake connector protocol. (default "rdma")
 - **device_name**: RDMA device list for the Mooncake transfer engine, for example `"mlx5_1,mlx5_2"`. If unset, Mooncake uses its default device selection.
+- **max_concurrent_large_requests**: Maximum concurrent producer send batches that contain at least one long request. (default 0, disabled)
+- **large_request_threshold_tokens**: Treat a request as long when its largest KV cache group reaches this token count. (default 0, disabled)
+- **node_large_request_slots**: Optional node-wide limit on long-request send batches, shared by producer workers through advisory file locks. This requires both long-request settings above to be positive. (default 0, disabled)
+- **node_large_request_slot_dir**: Host-local directory shared by producer processes for advisory slot files. The directory must already exist and be writable. (default `/dev/shm`)
+- **node_large_request_slot_namespace**: Namespace for node slot files. It defaults to the engine ID; set the same value on producer workers that should share a limit.
+
+The long-request gate is opt-in. Both `max_concurrent_large_requests` and
+`large_request_threshold_tokens` must be positive before any request is gated.
+`node_large_request_slots` adds a cross-process node limit; without it, only
+the per-worker limit applies. The admission unit is one
+`MooncakeXferMetadata` send batch: a batch containing one or more long requests
+uses one permit and one node slot.
 
 Deploy producer and consumer workers together when their KV cache contains
 shared physical regions. Ordinary non-aliased regions retain the legacy wire

@@ -1899,6 +1899,106 @@ def test_receive_kv_rejects_consumer_pp_fanout(
     assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
+def test_large_request_gate_detects_any_long_request_by_largest_kv_group():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._large_request_semaphore = object()
+    worker.large_request_threshold_tokens = 32768
+    worker.logical_block_size = 256
+    worker.block_size = 32
+
+    long_meta = SimpleNamespace(
+        req_blocks={
+            "short-request": ("short-transfer", [[0] * 2]),
+            "long-request": ("long-transfer", [[0] * 128, [0] * 2]),
+        }
+    )
+    short_meta = SimpleNamespace(
+        req_blocks={
+            "request-a": ("transfer-a", [[0] * 64, [0] * 64]),
+            "request-b": ("transfer-b", [[0] * 2]),
+        }
+    )
+
+    assert worker._contains_large_request(long_meta)
+    assert not worker._contains_large_request(short_meta)
+
+
+@pytest.mark.asyncio
+async def test_node_large_request_slots_are_namespaced_and_exclusive(tmp_path):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._node_large_request_slot_paths = (
+        MooncakeConnectorWorker._get_node_large_request_slot_paths(
+            str(tmp_path), "engine-a", 1
+        )
+    )
+    assert worker._node_large_request_slot_paths != (
+        MooncakeConnectorWorker._get_node_large_request_slot_paths(
+            str(tmp_path), "engine-b", 1
+        )
+    )
+
+    first_slot = await worker._acquire_node_large_request_slot()
+    waiting = asyncio.create_task(worker._acquire_node_large_request_slot())
+    await asyncio.sleep(0.01)
+    assert not waiting.done()
+
+    worker._release_node_large_request_slot(first_slot)
+    second_slot = await asyncio.wait_for(waiting, timeout=1)
+    worker._release_node_large_request_slot(second_slot)
+
+
+@pytest.mark.asyncio
+async def test_large_request_admission_releases_slot_on_failure():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._large_request_semaphore = asyncio.Semaphore(1)
+    worker.large_request_threshold_tokens = 1
+    worker.logical_block_size = 1
+    worker.block_size = 1
+    worker._node_large_request_slot_paths = []
+    worker.send_kv_to_decode = AsyncMock(side_effect=RuntimeError("failed"))
+    worker._release_node_large_request_slot = MagicMock()
+    metadata = SimpleNamespace(req_blocks={"request": ("transfer", [[0]])})
+
+    with pytest.raises(RuntimeError, match="failed"):
+        await worker._send_with_admission(b"id", AsyncMock(), metadata)
+
+    worker._release_node_large_request_slot.assert_called_once_with(None)
+    assert not worker._large_request_semaphore.locked()
+
+
+def test_pd_trace_lifecycle_is_transfer_generation_scoped(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MOONCAKE_PD_TRACE", True)
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.dp_rank = worker.pp_rank = worker.tp_rank = 0
+    old_meta = PullReqMeta(
+        d_req_id="req",
+        transfer_id="old-transfer",
+        local_block_ids=[[1]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap",
+    )
+    new_meta = PullReqMeta(
+        d_req_id="req",
+        transfer_id="new-transfer",
+        local_block_ids=[[2]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap",
+    )
+    worker._pd_trace_pull_started = {
+        (old_meta.d_req_id, old_meta.transfer_id): time.perf_counter(),
+        (new_meta.d_req_id, new_meta.transfer_id): time.perf_counter(),
+    }
+
+    worker._finish_pull_trace(old_meta, "failed")
+
+    assert (old_meta.d_req_id, old_meta.transfer_id) not in (
+        worker._pd_trace_pull_started
+    )
+    assert (new_meta.d_req_id, new_meta.transfer_id) in (
+        worker._pd_trace_pull_started
+    )
+
+
 def test_resolve_need_send_accounts_for_remote_tp_fanout():
     """Producer-side completion waits for every paired consumer TP pull."""
 
