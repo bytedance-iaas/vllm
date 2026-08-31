@@ -3,11 +3,14 @@
 """Regression tests for the Dynamic SD batch-size schedule helpers."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.config.utils import replace
+from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -58,6 +61,21 @@ def _add_requests_and_schedule(
     for request in requests:
         scheduler.add_request(request)
     return scheduler.schedule()
+
+
+def _model_output(scheduler: Scheduler, output, sampled: list[list[int]]) -> None:
+    req_ids = list(output.num_scheduled_tokens.keys())
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={request_id: i for i, request_id in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
 
 
 def test_dynamic_sd_uses_batch_size_schedule():
@@ -140,7 +158,7 @@ def test_scheduler_initializes_dynamic_sd_lookup_from_speculative_config():
         runtime_num_speculative_tokens=3,
     )
 
-    assert scheduler.dynamic_sd_lookup is not None
+    assert scheduler._dynamic_sd is not None
     assert scheduler.num_spec_tokens == 3
 
 
@@ -177,6 +195,263 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
     assert output.num_spec_tokens_to_schedule == 3
 
 
+def test_scheduler_uses_dsd_batch_size_override():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 4, 3), (5, 16, 1)],
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        runtime_num_speculative_tokens=3,
+    )
+    scheduler.set_dynamic_sd_batch_size_override(8)
+    output = _add_requests_and_schedule(scheduler, 2)
+
+    assert len(output.num_scheduled_tokens) == 2
+    assert output.num_spec_tokens_to_schedule == 1
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_dynamic_sd_pads_first_decode_with_verification_k(async_scheduling):
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        speculative_method="ngram_gpu" if async_scheduling else None,
+        async_scheduling=async_scheduling,
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[r1.request_id] == 33
+    _model_output(scheduler, output, [[100]])
+
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
+    )
+    scheduler.add_request(r2)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r2.request_id] == [-1] * 5
+    # Proposal K is selected independently from the current verification K.
+    assert output.num_spec_tokens_to_schedule == 7
+
+
+@pytest.mark.parametrize(
+    ("draft_widths", "prefill_scheduled", "expected_k"),
+    [
+        ([5, 5], False, 5),
+        ([5, 3], False, None),
+        ([0, 0], False, None),
+        ([5, 5], True, None),
+    ],
+)
+def test_dynamic_sd_padding_requires_uniform_running_decode(
+    draft_widths,
+    prefill_scheduled,
+    expected_k,
+):
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5)],
+        runtime_num_speculative_tokens=7,
+    )
+    running = [
+        SimpleNamespace(request_id=f"req-{i}", is_prefill_chunk=False)
+        for i in range(len(draft_widths))
+    ]
+    scheduled_tokens = {
+        request.request_id: draft_width + 1
+        for request, draft_width in zip(running, draft_widths)
+    }
+    scheduled_drafts = {
+        request.request_id: list(range(draft_width))
+        for request, draft_width in zip(running, draft_widths)
+        if draft_width
+    }
+
+    running_k = scheduler._get_uniform_running_decode_k(
+        running,
+        scheduled_tokens,
+        scheduled_drafts,
+        prefill_scheduled,
+    )
+
+    assert running_k == expected_k
+    assert scheduler._get_waiting_decode_padding(
+        1, running_k, running, prefill_scheduled
+    ) == ((1 + expected_k, expected_k) if expected_k else (1, 0))
+
+
+def test_static_spec_decode_does_not_pad_diffusion_batches():
+    scheduler = create_scheduler(
+        num_speculative_tokens=3,
+    )
+    scheduler.num_sampled_tokens_per_step = 0
+    running = [SimpleNamespace(request_id="req-0", is_prefill_chunk=False)]
+
+    assert scheduler._get_waiting_decode_padding(
+        1,
+        running_decode_k=None,
+        scheduled_running_reqs=running,
+        prefill_scheduled=False,
+    ) == (1, 0)
+
+
+def test_dynamic_sd_clears_padding_when_later_constraint_changes_width():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=7,
+        num_speculative_tokens_per_batch_size=[(1, 16, 7), (17, 60, 5)],
+        enable_prefix_caching=True,
+        block_size=16,
+    )
+    r1, r2 = create_requests(
+        num_requests=2,
+        num_tokens=33,
+        same_prompt=True,
+        max_tokens=16,
+    )
+
+    scheduler.add_request(r1)
+    output = scheduler.schedule()
+    _model_output(scheduler, output, [[100]])
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([r1.request_id], [[1, 2, 3, 4, 5]])
+    )
+
+    original_split = scheduler._mamba_block_aligned_split
+
+    def fake_split(request, num_new_tokens, *args):
+        if request.request_id == r2.request_id and num_new_tokens == 6:
+            return 4
+        return original_split(request, num_new_tokens, *args)
+
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler._mamba_block_aligned_split = fake_split  # type: ignore[method-assign]
+
+    scheduler.add_request(r2)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[r1.request_id] == 6
+    assert output.scheduled_spec_decode_tokens[r1.request_id] == [1, 2, 3, 4, 5]
+    assert output.num_scheduled_tokens[r2.request_id] == 1
+    assert r2.request_id not in output.scheduled_spec_decode_tokens
+
+
+def _set_parallel_drafting_budget_reclaim(
+    scheduler: Scheduler,
+    *,
+    auto_derived: bool,
+    reclaim_parallel_drafting_slots: bool = True,
+) -> None:
+    scheduler.max_num_scheduled_tokens = 2048 - 6 * 96
+    scheduler.scheduler_config.max_num_scheduled_tokens_auto_derived = auto_derived
+    assert scheduler._dynamic_sd is not None
+    can_reclaim_token_budget = (
+        auto_derived
+        and reclaim_parallel_drafting_slots
+        and scheduler.max_num_scheduled_tokens == 2048 - 6 * 96
+    )
+    scheduler._dynamic_sd.budget_policy = (
+        _DynamicSDBudgetPolicy(max_num_batched_tokens=2048, max_num_seqs=96)
+        if can_reclaim_token_budget
+        else None
+    )
+
+
+def test_scheduler_reclaims_dynamic_sd_auto_token_budget_with_override():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _set_parallel_drafting_budget_reclaim(scheduler, auto_derived=True)
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == 2048 - 2 * 96
+
+
+@pytest.mark.parametrize(
+    ("explicit_budget", "expected_scheduled"),
+    [(2048 - 6 * 96, 2048 - 6 * 96), (1024, 1024)],
+)
+def test_scheduler_does_not_reclaim_explicit_token_budget(
+    explicit_budget,
+    expected_scheduled,
+):
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _set_parallel_drafting_budget_reclaim(scheduler, auto_derived=False)
+    scheduler.max_num_scheduled_tokens = explicit_budget
+
+    scheduler.set_dynamic_sd_batch_size_override(61)
+    output = _add_requests_and_schedule(scheduler, 1, num_tokens=4000)
+
+    assert output.num_spec_tokens_to_schedule == 3
+    assert output.total_num_scheduled_tokens == expected_scheduled
+
+
+def test_scheduler_dynamic_sd_budget_reclaim_handles_kmax_and_kzero():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 0)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    _set_parallel_drafting_budget_reclaim(scheduler, auto_derived=True)
+
+    assert scheduler._get_effective_max_num_scheduled_tokens(7) == 2048 - 6 * 96
+    assert scheduler._get_effective_max_num_scheduled_tokens(0) == 2048
+
+
+def test_dynamic_sd_token_budget_provenance_survives_config_replace():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 7), (17, 60, 5), (61, 96, 3)],
+        max_num_seqs=96,
+        max_num_batched_tokens=2048,
+        runtime_num_speculative_tokens=7,
+    )
+    vllm_config = scheduler.vllm_config
+    assert vllm_config.speculative_config is not None
+    vllm_config.speculative_config.parallel_drafting = True
+    auto_derived_budget = 2048 - 6 * 96
+    vllm_config.scheduler_config.max_num_scheduled_tokens = auto_derived_budget
+
+    vllm_config.scheduler_config.max_num_scheduled_tokens_auto_derived = True
+    replaced_config = replace(vllm_config, cache_config=vllm_config.cache_config)
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens == (
+        auto_derived_budget
+    )
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens_auto_derived
+
+    vllm_config.scheduler_config.max_num_scheduled_tokens_auto_derived = False
+    replaced_config = replace(vllm_config, cache_config=vllm_config.cache_config)
+    assert replaced_config.scheduler_config.max_num_scheduled_tokens == (
+        auto_derived_budget
+    )
+    assert not replaced_config.scheduler_config.max_num_scheduled_tokens_auto_derived
+
+
 def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     scheduler = create_scheduler(
         max_num_seqs=4,
@@ -185,7 +460,7 @@ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     )
     output = _add_requests_and_schedule(scheduler, 4)
 
-    assert scheduler.dynamic_sd_lookup is None
+    assert scheduler._dynamic_sd is None
     assert output.num_spec_tokens_to_schedule == 3
 
 
@@ -206,7 +481,7 @@ def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):
     speculative_config = scheduler.vllm_config.speculative_config
     assert speculative_config is not None
     assert speculative_config.num_speculative_tokens_per_batch_size is None
-    assert scheduler.dynamic_sd_lookup is None
+    assert scheduler._dynamic_sd is None
     assert "Dynamic speculative decoding is not supported with data parallelism" in (
         caplog_vllm.text
     )
@@ -241,7 +516,7 @@ def test_scheduler_passes_max_num_seqs_as_dsd_runtime_batch_limit():
     )
     output = _add_requests_and_schedule(scheduler, 16)
 
-    assert scheduler.dynamic_sd_lookup is not None
-    assert len(scheduler.dynamic_sd_lookup) == 17
+    assert scheduler._dynamic_sd is not None
+    assert len(scheduler._dynamic_sd.lookup) == 17
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3

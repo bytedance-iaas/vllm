@@ -1752,6 +1752,14 @@ class VllmConfig:
                 self.scheduler_config.max_num_scheduled_tokens = (
                     max_num_batched_tokens - scheduled_token_delta
                 )
+                self.scheduler_config.max_num_scheduled_tokens_auto_derived = True
+            else:
+                auto_derived_tokens = max_num_batched_tokens - scheduled_token_delta
+                self.scheduler_config.max_num_scheduled_tokens_auto_derived = (
+                    self.scheduler_config.max_num_scheduled_tokens_auto_derived
+                    and self.scheduler_config.max_num_scheduled_tokens
+                    == auto_derived_tokens
+                )
 
             if self.scheduler_config.max_num_scheduled_tokens <= 0:
                 raise ValueError(
