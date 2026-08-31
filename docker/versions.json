@@ -46,6 +46,24 @@
     "INSTALL_KV_CONNECTORS": {
       "default": "false"
     },
+    "INSTALL_VLLM_ROUTER": {
+      "default": "false"
+    },
+    "VLLM_ROUTER_VERSION": {
+      "default": "0.1.15"
+    },
+    "INSTALL_HPC_OPS": {
+      "default": "false"
+    },
+    "HPC_OPS_REPO": {
+      "default": "https://github.com/wangyicong52/hpc-ops.git"
+    },
+    "HPC_OPS_REF": {
+      "default": "915755b437257e1118a80f5cbb07509037faad05"
+    },
+    "VLLM_IMAGE_SOURCE": {
+      "default": "https://github.com/vllm-project/vllm"
+    },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
     },

@@ -105,6 +105,14 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+# ByteIAAS OpenAI image options.
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_VERSION=0.1.15
+ARG INSTALL_HPC_OPS=false
+ARG HPC_OPS_REPO=https://github.com/wangyicong52/hpc-ops.git
+ARG HPC_OPS_REF=915755b437257e1118a80f5cbb07509037faad05
+ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -297,6 +305,38 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
+
+#################### HPC-OPS BUILD IMAGE ####################
+FROM base AS hpc-ops-build
+ARG TARGETPLATFORM
+ARG INSTALL_HPC_OPS
+ARG HPC_OPS_REPO
+ARG HPC_OPS_REF
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    mkdir -p /tmp/hpc-ops-dist && \
+    if [ "${INSTALL_HPC_OPS}" = "true" ]; then \
+        test "${TARGETPLATFORM}" = "linux/amd64" && \
+        printf '%s\n' "${HPC_OPS_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
+        uv pip install --python /opt/venv/bin/python3 \
+            "build" "cmake>=3.26.1" && \
+        git init /tmp/hpc-ops-src && \
+        git -C /tmp/hpc-ops-src remote add origin "${HPC_OPS_REPO}" && \
+        git -C /tmp/hpc-ops-src fetch --no-tags --depth 1 origin \
+            "${HPC_OPS_REF}" && \
+        git -C /tmp/hpc-ops-src checkout --detach FETCH_HEAD && \
+        test "$(git -C /tmp/hpc-ops-src rev-parse HEAD)" = "${HPC_OPS_REF}" && \
+        cd /tmp/hpc-ops-src && \
+        CUDA_VISIBLE_DEVICES="" python3 -m build --wheel --no-isolation && \
+        test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1 && \
+        cp dist/*.whl /tmp/hpc-ops-dist/ && \
+        sha256sum /tmp/hpc-ops-dist/*.whl \
+            > /tmp/hpc-ops-dist/wheels.sha256 && \
+        rm -rf /tmp/hpc-ops-src; \
+    else \
+        printf 'disabled\n' > /tmp/hpc-ops-dist/wheels.sha256; \
+    fi
+#################### HPC-OPS BUILD IMAGE ####################
 
 #################### RUST BUILD IMAGE ####################
 # Build the Rust frontend (`vllm-rs`) in a dedicated stage so the main wheel
@@ -1008,11 +1048,16 @@ RUN mv vllm src/vllm
 FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
+ARG INSTALL_VLLM_ROUTER
+ARG VLLM_ROUTER_VERSION
+ARG INSTALL_HPC_OPS
+ARG HPC_OPS_REF
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG VLLM_IMAGE_SOURCE
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1070,12 +1115,32 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
+# Install the optional source-built HPC-Ops wheel. Docker builds do not have an
+# NVIDIA driver, so inspect the installed package without importing it.
+COPY --from=hpc-ops-build /tmp/hpc-ops-dist/wheels.sha256 \
+    /tmp/hpc-ops-wheels.sha256
+RUN --mount=type=bind,from=hpc-ops-build,src=/tmp/hpc-ops-dist,target=/tmp/hpc-ops-dist \
+    --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_HPC_OPS}" = "true" ]; then \
+        uv pip install --system --no-deps /tmp/hpc-ops-dist/*.whl && \
+        HPC_OPS_EXPECTED_REF="${HPC_OPS_REF}" python3 -c 'import ast, os; from importlib.metadata import distribution; dist = distribution("hpc-ops"); files = {str(path) for path in dist.files or ()}; required_files = {"hpc/_C.abi3.so", "hpc/fuse_moe.py", "hpc/group_gemm.py", "hpc/act.py"}; missing_files = required_files - files; assert not missing_files, f"HPC-Ops wheel missing required files: {sorted(missing_files)}"; expected_hash = os.environ["HPC_OPS_EXPECTED_REF"][:7]; assert dist.version.endswith(f"+g{expected_hash}"), f"HPC-Ops version {dist.version} does not match {expected_hash}"; functions = lambda path: {node.name: node for node in ast.parse(dist.locate_file(path).read_text()).body if isinstance(node, ast.FunctionDef)}; fuse_moe_functions = functions("hpc/fuse_moe.py"); group_gemm_functions = functions("hpc/group_gemm.py"); act_functions = functions("hpc/act.py"); required_functions = {"hpc/fuse_moe.py": (fuse_moe_functions, {"fuse_moe", "fuse_moe_blockwise", "fuse_moe_blockwise_fp8"}), "hpc/group_gemm.py": (group_gemm_functions, {"build_mxfp8_k32_moe_routing_cache", "fuse_moe_mxfp8_k32_candidate", "fuse_moe_mxfp8_k32_bf16_candidate", "fuse_moe_mxfp8_k32_bf16_candidate_out"}), "hpc/act.py": (act_functions, {"swigluoai_mxfp8_k32_quant"})}; missing_functions = {path: sorted(names - funcs.keys()) for path, (funcs, names) in required_functions.items() if names - funcs.keys()}; assert not missing_functions, f"HPC-Ops wheel missing required functions: {missing_functions}"; parameters = {arg.arg for arg in fuse_moe_functions["fuse_moe_blockwise"].args.args}; assert "activation_clamp" in parameters; print(f"HPC-Ops {dist.version} package verified for vLLM")'; \
+    fi
+
+# Install vllm-router in ByteIAAS P/D images so router pods do not require
+# runtime network access before their liveness probes start.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
+        uv pip install --system "vllm-router==${VLLM_ROUTER_VERSION}" && \
+        command -v vllm-router && \
+        python3 -m pip show vllm-router >/dev/null; \
+    fi
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-openai:dev}
-LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       org.opencontainers.image.url="${VLLM_BUILD_URL}" \
