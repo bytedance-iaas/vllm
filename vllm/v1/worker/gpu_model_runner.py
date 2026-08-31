@@ -5839,6 +5839,7 @@ class GPUModelRunner(
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
+        use_cudagraph_capture_metadata: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         randomize_inputs: bool = False,
@@ -5864,6 +5865,9 @@ class GPUModelRunner(
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
+            use_cudagraph_capture_metadata: If True, build attention metadata
+                using cudagraph capture builders without treating the run as an
+                active graph capture.
             num_active_loras: Number of distinct active LoRAs to capture for.
                 LoRA is activated when num_active_loras > 0.
             profile_seq_lens: If provided, use this value for seq_lens instead
@@ -6077,6 +6081,7 @@ class GPUModelRunner(
                     for_cudagraph_capture=(
                         is_graph_capturing
                         or cudagraph_runtime_mode == CUDAGraphMode.FULL
+                        or use_cudagraph_capture_metadata
                     ),
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
@@ -6941,6 +6946,9 @@ class GPUModelRunner(
                 skip_eplb=True,
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
+                use_cudagraph_capture_metadata=(
+                    force_attention and profile_seq_lens is None
+                ),
                 profile_seq_lens=profile_seq_lens,
             )
         if num_warmups > 0:

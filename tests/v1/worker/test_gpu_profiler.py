@@ -298,3 +298,35 @@ def test_profiler_entered_during_capture():
 
     mock_profiler.__enter__.assert_called_once()
     mock_profiler.__exit__.assert_called_once()
+
+
+def test_full_warmup_uses_capture_metadata_without_graph_capture():
+    runner = MagicMock()
+    runner.compilation_config.cudagraph_num_of_warmups = 1
+
+    GPUModelRunner._warmup_and_capture(
+        runner,
+        desc=MagicMock(num_tokens=4, uniform=True, num_active_loras=0),
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+    )
+
+    warmup_call, capture_call = runner._dummy_run.call_args_list
+    assert warmup_call.kwargs["use_cudagraph_capture_metadata"] is True
+    assert warmup_call.kwargs.get("is_graph_capturing", False) is False
+    assert capture_call.kwargs["is_graph_capturing"] is True
+
+
+def test_profile_seq_lens_disables_capture_metadata_during_warmup():
+    runner = MagicMock()
+    runner.compilation_config.cudagraph_num_of_warmups = 1
+
+    GPUModelRunner._warmup_and_capture(
+        runner,
+        desc=MagicMock(num_tokens=4, uniform=True, num_active_loras=0),
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        profile_seq_lens=128,
+    )
+
+    warmup_call, _ = runner._dummy_run.call_args_list
+    assert warmup_call.kwargs["use_cudagraph_capture_metadata"] is False
+    assert warmup_call.kwargs.get("is_graph_capturing", False) is False
