@@ -19,6 +19,9 @@ concurrency:
   group: byteiaas-vllm-release-${{ github.event.inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   resolve-release:
     if: github.repository == 'bytedance-iaas/vllm'
@@ -33,6 +36,7 @@ jobs:
           ref: refs/heads/iaas_main
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Resolve existing release tag
         id: release
@@ -41,8 +45,7 @@ jobs:
           REQUESTED_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
         run: |
           set -euo pipefail
-          git fetch --force --tags origin \
-            refs/heads/iaas_main:refs/remotes/origin/iaas_main
+          trusted_head="$(git rev-parse HEAD)"
           raw_tag="${GITHUB_REF_NAME}"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             raw_tag="${REQUESTED_RELEASE_TAG}"
@@ -64,7 +67,7 @@ jobs:
             exit 1
           fi
           if ! git merge-base --is-ancestor \
-              "${checkout_sha}" refs/remotes/origin/iaas_main; then
+              "${checkout_sha}" "${trusted_head}"; then
             echo "::error::Release tag is not in iaas_main history"
             exit 1
           fi

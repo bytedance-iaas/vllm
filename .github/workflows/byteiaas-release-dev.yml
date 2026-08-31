@@ -26,6 +26,9 @@ concurrency:
   group: byteiaas-vllm-dev-${{ github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   resolve-source:
     if: github.repository == 'bytedance-iaas/vllm'
@@ -39,6 +42,7 @@ jobs:
           ref: refs/heads/iaas_main
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Resolve trusted immutable source
         id: source
@@ -46,13 +50,12 @@ jobs:
           REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || github.event_name == 'push' && github.sha || 'refs/heads/iaas_main' }}
         run: |
           set -euo pipefail
-          git fetch --force --tags origin \
-            refs/heads/iaas_main:refs/remotes/origin/iaas_main
+          trusted_head="$(git rev-parse HEAD)"
 
           if [[ "${REQUESTED_REF}" =~ ^[0-9a-f]{40}$ ]]; then
             source_ref="${REQUESTED_REF}"
           elif [ "${REQUESTED_REF}" = "refs/heads/iaas_main" ]; then
-            source_ref="refs/remotes/origin/iaas_main"
+            source_ref="${trusted_head}"
           elif [[ "${REQUESTED_REF}" =~ ^refs/tags/[0-9A-Za-z][0-9A-Za-z_.-]*$ ]]; then
             source_ref="${REQUESTED_REF}"
           elif [[ "${REQUESTED_REF}" =~ ^[0-9A-Za-z][0-9A-Za-z_.-]*$ ]] && \
@@ -65,7 +68,7 @@ jobs:
 
           checkout_sha="$(git rev-parse --verify "${source_ref}^{commit}")"
           if ! git merge-base --is-ancestor \
-              "${checkout_sha}" refs/remotes/origin/iaas_main; then
+              "${checkout_sha}" "${trusted_head}"; then
             echo "::error::Requested source is not in iaas_main history"
             exit 1
           fi

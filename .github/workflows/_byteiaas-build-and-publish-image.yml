@@ -37,6 +37,9 @@ on:
       VOLCENGINE_CR_PASSWORD:
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   build-and-publish-image:
     if: github.repository == 'bytedance-iaas/vllm'
@@ -94,6 +97,7 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Validate build inputs
         env:

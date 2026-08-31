@@ -18,6 +18,9 @@ on:
         type: string
         default: "vllm-cu130-wheel"
 
+permissions:
+  contents: read
+
 jobs:
   build-wheel:
     if: github.repository == 'bytedance-iaas/vllm'
@@ -57,6 +60,7 @@ jobs:
           ref: ${{ inputs.checkout_ref }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Validate build contract
         env:
