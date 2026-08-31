@@ -48,6 +48,7 @@ jobs:
         id: source
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
           EVENT_SHA: ${{ github.sha }}
           REQUESTED_REF: ${{ inputs.checkout_ref || github.sha }}
         run: |
@@ -71,6 +72,7 @@ jobs:
           checkout_sha="$(git rev-parse --verify "${source_ref}^{commit}")"
           is_workflow_sha=false
           if [ "${EVENT_NAME}" = "workflow_dispatch" ] && \
+              [[ "${EVENT_REF}" == refs/heads/* ]] && \
               [ "${checkout_sha}" = "${EVENT_SHA}" ]; then
             is_workflow_sha=true
           fi
