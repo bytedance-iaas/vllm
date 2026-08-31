@@ -96,4 +96,6 @@ jobs:
       tag_mode: release
       tag_value: ${{ needs.resolve-release.outputs.internal_tag }}
       image_formats: ${{ github.event_name == 'workflow_dispatch' && inputs.image_formats || 'oci,zstd,nydus' }}
-    secrets: inherit
+    secrets:
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}

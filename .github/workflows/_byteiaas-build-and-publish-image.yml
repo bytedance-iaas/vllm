@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: "oci,zstd,nydus"
+    secrets:
+      VOLCENGINE_CR_USERNAME:
+        required: true
+      VOLCENGINE_CR_PASSWORD:
+        required: true
 
 jobs:
   build-and-publish-image:

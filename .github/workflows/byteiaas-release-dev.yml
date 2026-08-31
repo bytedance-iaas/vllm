@@ -92,4 +92,6 @@ jobs:
       tag_mode: dev
       vllm_version: ${{ github.event_name == 'workflow_dispatch' && inputs.vllm_version || '' }}
       image_formats: ${{ github.event_name == 'workflow_dispatch' && inputs.image_formats || 'oci,zstd,nydus' }}
-    secrets: inherit
+    secrets:
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
