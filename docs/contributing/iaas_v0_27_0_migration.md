@@ -536,8 +536,16 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 - Actionlint 1.7.7 passes all ByteIAAS workflows.
 - Both Dockerfiles parse and `docker/versions.json` matches
   `docker/Dockerfile`.
-- A real Docker build was not run locally because the available Docker client
-  has no Buildx plugin.
+- Buildx 0.36.1 frontend validation reports zero warnings for the ByteIAAS
+  devel Dockerfile. The main Dockerfile reports only the same two
+  `SCCACHE_S3_NO_CREDENTIALS` false positives and legacy `ENV` warning present
+  before the ByteIAAS changes.
+- The existing v0.26 MiniMax-M3 Humming P/D control deployment is healthy on
+  two 8xH20 nodes and passes a minimal completion request with zero pod
+  restarts. This establishes the environment baseline but does not validate
+  the v0.27 branch.
+- A complete v0.27 wheel/image build and registry publication have not yet
+  been triggered.
 
 ## 9. High-Risk Decisions Before Execution
 
