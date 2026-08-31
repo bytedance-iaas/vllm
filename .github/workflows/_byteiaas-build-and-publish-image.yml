@@ -82,7 +82,7 @@ jobs:
             -exec rm -rf -- {} +
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.checkout_ref }}
           fetch-depth: 0
@@ -195,7 +195,7 @@ jobs:
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
         with:
           driver-opts: |
             network=host
@@ -409,6 +409,9 @@ jobs:
               "${{ steps.image-tags.outputs.openai_devel_zstd_image_tag }}"
             devel_zstd_digest="$(read_digest "${devel_zstd_metadata}")"
             validate_digest "${devel_zstd_digest}"
+            python3 scripts/ci/verify_byteiaas_image_format.py --format zstd \
+              "${IMAGE_REPO}@${openai_zstd_digest}" \
+              "${IMAGE_REPO}@${devel_zstd_digest}"
 
             echo "openai_zstd_digest=${openai_zstd_digest}" >> "${GITHUB_OUTPUT}"
             echo "openai_devel_zstd_digest=${devel_zstd_digest}" >> "${GITHUB_OUTPUT}"

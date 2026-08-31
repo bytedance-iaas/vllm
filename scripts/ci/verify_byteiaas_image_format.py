@@ -153,7 +153,9 @@ def layer_markers(layers: list[Manifest]) -> tuple[set[str], dict[str, set[str]]
 def has_requested_format(layers: list[Manifest], image_format: str) -> bool:
     media_types, annotations_by_key = layer_markers(layers)
     if image_format == "zstd":
-        return ZSTD_LAYER_MEDIA_TYPE in media_types
+        return bool(layers) and all(
+            layer.get("mediaType") == ZSTD_LAYER_MEDIA_TYPE for layer in layers
+        )
 
     if NYDUS_LAYER_MEDIA_TYPE in media_types:
         return True

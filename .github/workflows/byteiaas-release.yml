@@ -28,7 +28,7 @@ jobs:
       checkout_sha: ${{ steps.release.outputs.checkout_sha }}
     steps:
       - name: Checkout trusted branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/heads/iaas_main
           fetch-depth: 0
@@ -37,6 +37,7 @@ jobs:
       - name: Resolve existing release tag
         id: release
         env:
+          EVENT_SHA: ${{ github.sha }}
           REQUESTED_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
         run: |
           set -euo pipefail
@@ -57,6 +58,11 @@ jobs:
             exit 1
           fi
           checkout_sha="$(git rev-parse --verify "refs/tags/${raw_tag}^{commit}")"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && \
+              [ "${checkout_sha}" != "${EVENT_SHA}" ]; then
+            echo "::error::Release tag moved after the workflow event"
+            exit 1
+          fi
           if ! git merge-base --is-ancestor \
               "${checkout_sha}" refs/remotes/origin/iaas_main; then
             echo "::error::Release tag is not in iaas_main history"

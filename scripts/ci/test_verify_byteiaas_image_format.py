@@ -146,6 +146,23 @@ class VerifyByteiaasImageFormatTest(unittest.TestCase):
                 inspect=manifests.__getitem__,
             )
 
+    def test_every_zstd_layer_must_match(self) -> None:
+        manifest = {
+            "registry.example.com/serving/vllm:zstd": {
+                "layers": [
+                    {"mediaType": "application/vnd.oci.image.layer.v1.tar+zstd"},
+                    {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"},
+                ]
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "expected zstd markers"):
+            verify_image_format(
+                "registry.example.com/serving/vllm:zstd",
+                "zstd",
+                inspect=manifest.__getitem__,
+            )
+
     def test_attestation_manifest_is_ignored(self) -> None:
         manifests: dict[str, dict[str, Any]] = {
             "registry.example.com/serving/vllm:zstd": {
