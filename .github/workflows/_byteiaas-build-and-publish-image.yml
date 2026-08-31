@@ -108,6 +108,13 @@ jobs:
             exit 1
           fi
 
+      - name: Configure isolated Docker credentials
+        run: |
+          set -euo pipefail
+          docker_config="${RUNNER_TEMP}/byteiaas-docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${docker_config}"
+          echo "DOCKER_CONFIG=${docker_config}" >> "${GITHUB_ENV}"
+
       - name: Resolve Volcengine publish target
         run: |
           set -euo pipefail
@@ -210,6 +217,7 @@ jobs:
           VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
         run: |
           set -euo pipefail
+          mkdir -p "${DOCKER_CONFIG}"
           if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
             echo "::error::VOLCENGINE_CR_USERNAME and VOLCENGINE_CR_PASSWORD secrets are required"
             exit 1
@@ -229,6 +237,8 @@ jobs:
           devel_metadata="/tmp/byteiaas-vllm-openai-devel-image.json"
           openai_zstd_metadata="/tmp/byteiaas-vllm-openai-zstd-image.json"
           devel_zstd_metadata="/tmp/byteiaas-vllm-openai-devel-zstd-image.json"
+          openai_nydus_source_metadata="/tmp/byteiaas-vllm-openai-nydus-source.json"
+          devel_nydus_source_metadata="/tmp/byteiaas-vllm-openai-devel-nydus-source.json"
           build_cpus="$(nproc)"
           build_max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-${build_cpus}}"
           default_nvcc_threads=4
@@ -417,6 +427,28 @@ jobs:
             echo "openai_devel_zstd_digest=${devel_zstd_digest}" >> "${GITHUB_OUTPUT}"
           fi
 
+          if [ "${{ steps.image-formats.outputs.nydus }}" = "true" ]; then
+            build_openai read "" "${openai_nydus_source_metadata}" \
+              "${{ steps.image-tags.outputs.openai_nydus_image_tag }}"
+            openai_nydus_source_digest="$(
+              read_digest "${openai_nydus_source_metadata}"
+            )"
+            validate_digest "${openai_nydus_source_digest}"
+
+            build_devel read "" "${openai_nydus_source_digest}" \
+              "${devel_nydus_source_metadata}" \
+              "${{ steps.image-tags.outputs.openai_devel_nydus_image_tag }}"
+            devel_nydus_source_digest="$(
+              read_digest "${devel_nydus_source_metadata}"
+            )"
+            validate_digest "${devel_nydus_source_digest}"
+
+            echo "openai_nydus_source_digest=${openai_nydus_source_digest}" \
+              >> "${GITHUB_OUTPUT}"
+            echo "openai_devel_nydus_source_digest=${devel_nydus_source_digest}" \
+              >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Create Volcengine OCI image tags
         if: ${{ steps.image-formats.outputs.oci == 'true' }}
         run: |
@@ -521,12 +553,12 @@ jobs:
           staging_prefix="staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           openai_nydus_digest="$(
             convert_image \
-              "${{ steps.build.outputs.openai_digest }}" \
+              "${{ steps.build.outputs.openai_nydus_source_digest }}" \
               "${staging_prefix}-openai-nydus"
           )"
           devel_nydus_digest="$(
             convert_image \
-              "${{ steps.build.outputs.openai_devel_digest }}" \
+              "${{ steps.build.outputs.openai_devel_nydus_source_digest }}" \
               "${staging_prefix}-openai-devel-nydus"
           )"
           echo "openai_nydus_digest=${openai_nydus_digest}" >> "${GITHUB_OUTPUT}"
@@ -546,3 +578,10 @@ jobs:
             "${IMAGE_REPO}@${{ steps.nydus.outputs.openai_devel_nydus_digest }}"
           python3 scripts/ci/verify_byteiaas_image_format.py \
             --format nydus "${openai_ref}" "${devel_ref}"
+
+      - name: Logout from Volcengine CR
+        if: ${{ always() }}
+        run: |
+          if [ -n "${VOLCENGINE_CR_REGISTRY}" ]; then
+            docker logout "${VOLCENGINE_CR_REGISTRY}" || true
+          fi
