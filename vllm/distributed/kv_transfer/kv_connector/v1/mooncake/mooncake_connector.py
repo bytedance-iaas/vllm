@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -79,6 +80,7 @@ except ImportError:
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 ReqId = str  # Internal scheduler request ID
@@ -291,6 +293,58 @@ def _region_group_indices(
     )
 
 
+def _spec_transfers_unique_kv_heads(spec: KVCacheSpec) -> bool:
+    return isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)) and not isinstance(
+        spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+    )
+
+
+def _spec_transfers_fully_replicated(spec: KVCacheSpec) -> bool:
+    return isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+
+
+def _infer_total_num_kv_heads(
+    local_tp_size: int,
+    remote_tp_size: int,
+    local_kv_block_len: int,
+    remote_kv_block_len: int,
+    total_num_kv_heads_hint: int | None,
+) -> int | None:
+    candidates: list[int] = []
+    max_candidate = max(
+        256,
+        local_tp_size * remote_tp_size,
+        total_num_kv_heads_hint or 0,
+    )
+    for total_num_kv_heads in range(1, max_candidate + 1):
+        if total_num_kv_heads >= local_tp_size:
+            if total_num_kv_heads % local_tp_size:
+                continue
+            local_heads = total_num_kv_heads // local_tp_size
+        else:
+            if local_tp_size % total_num_kv_heads:
+                continue
+            local_heads = 1
+        if total_num_kv_heads >= remote_tp_size:
+            if total_num_kv_heads % remote_tp_size:
+                continue
+            remote_heads = total_num_kv_heads // remote_tp_size
+        else:
+            if remote_tp_size % total_num_kv_heads:
+                continue
+            remote_heads = 1
+        if (
+            local_kv_block_len % local_heads == 0
+            and remote_kv_block_len % remote_heads == 0
+            and local_kv_block_len // local_heads
+            == remote_kv_block_len // remote_heads
+        ):
+            candidates.append(total_num_kv_heads)
+    if total_num_kv_heads_hint in candidates:
+        return total_num_kv_heads_hint
+    return min(candidates) if candidates else None
+
+
 def _compute_sender_transfer_plan(
     local_tp_rank: int,
     local_tp_size: int,
@@ -299,12 +353,67 @@ def _compute_sender_transfer_plan(
     local_kv_block_len: int,
     remote_kv_block_len: int,
     producer_cache_replicated: bool,
+    transfer_unique_kv_heads: bool = False,
+    total_num_kv_heads: int | None = None,
 ) -> tuple[bool, int, int, int]:
     """Plan one producer-rank to one consumer-rank copy for heterogeneous TP."""
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
 
     if tp_ratio == 1:
         return True, 0, 0, local_kv_block_len
+
+    if transfer_unique_kv_heads:
+        num_kv_heads = _infer_total_num_kv_heads(
+            local_tp_size,
+            remote_tp_size,
+            local_kv_block_len,
+            remote_kv_block_len,
+            total_num_kv_heads,
+        )
+        if num_kv_heads is not None:
+
+            def partition(rank: int, size: int) -> tuple[int, int, int, int]:
+                if size >= num_kv_heads:
+                    assert size % num_kv_heads == 0
+                    replicas = size // num_kv_heads
+                    return rank // replicas, 1, rank % replicas, replicas
+                assert num_kv_heads % size == 0
+                heads = num_kv_heads // size
+                return rank * heads, heads, 0, 1
+
+            local_start, local_count, local_replica, local_replicas = partition(
+                local_tp_rank, local_tp_size
+            )
+            remote_start, remote_count, remote_replica, remote_replicas = partition(
+                remote_tp_rank, remote_tp_size
+            )
+            canonical = True
+            if local_replicas >= remote_replicas:
+                assert local_replicas % remote_replicas == 0
+                canonical = local_replica == (
+                    remote_replica * (local_replicas // remote_replicas)
+                )
+            elif remote_replicas > 1:
+                assert remote_replicas % local_replicas == 0
+                canonical = (
+                    remote_replica // (remote_replicas // local_replicas)
+                    == local_replica
+                )
+            overlap_start = max(local_start, remote_start)
+            overlap_end = min(
+                local_start + local_count, remote_start + remote_count
+            )
+            if not canonical or overlap_start >= overlap_end:
+                return False, 0, 0, 0
+            local_head_len = local_kv_block_len // local_count
+            remote_head_len = remote_kv_block_len // remote_count
+            assert local_head_len == remote_head_len
+            return (
+                True,
+                (overlap_start - local_start) * local_head_len,
+                (overlap_start - remote_start) * remote_head_len,
+                (overlap_end - overlap_start) * local_head_len,
+            )
 
     if tp_ratio > 0:
         if producer_cache_replicated:
@@ -350,6 +459,10 @@ def _validate_asymmetric_region_lengths(
     local_tp_size: int,
     remote_tp_size: int,
     producer_cache_replicated: bool,
+    unique_kv_head_layers: set[str] | None = None,
+    fully_replicated_layers: set[str] | None = None,
+    total_num_kv_heads_hint: int | None = None,
+    total_num_kv_heads_by_layer: dict[str, int] | None = None,
 ) -> str | None:
     """Validate transfer-region metadata for a fixed producer/consumer pair.
 
@@ -363,13 +476,60 @@ def _validate_asymmetric_region_lengths(
             "producer and consumer."
         )
 
-    if producer_cache_replicated:
-        return None
-
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
     for idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
     ):
+        names = set(local_region.match_layer_names)
+        is_unique = bool(names & (unique_kv_head_layers or set()))
+        is_fully_replicated = bool(names & (fully_replicated_layers or set()))
+        if is_unique and is_fully_replicated:
+            return (
+                "Mooncake shared region aliases have conflicting transfer "
+                f"policies at region {idx}: {sorted(names)}."
+            )
+        if is_fully_replicated:
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Mooncake fully replicated KV region length mismatch at "
+                    f"region {idx}: local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
+            continue
+        if is_unique:
+            layer_head_counts = {
+                total_num_kv_heads_by_layer[name]
+                for name in names
+                if total_num_kv_heads_by_layer
+                and name in total_num_kv_heads_by_layer
+            }
+            if len(layer_head_counts) > 1:
+                return (
+                    "Mooncake shared region aliases have conflicting KV-head "
+                    f"counts at region {idx}: {sorted(layer_head_counts)}."
+                )
+            region_num_heads = (
+                next(iter(layer_head_counts))
+                if layer_head_counts
+                else total_num_kv_heads_hint
+            )
+            if (
+                _infer_total_num_kv_heads(
+                    local_tp_size,
+                    remote_tp_size,
+                    local_region.kv_block_len,
+                    remote_region.kv_block_len,
+                    region_num_heads,
+                )
+                is None
+            ):
+                return (
+                    "Mooncake cannot infer a consistent heterogeneous TP "
+                    f"KV-head mapping at region {idx}."
+                )
+            continue
+        if producer_cache_replicated:
+            continue
         if tp_ratio == 1:
             if local_region.kv_block_len != remote_region.kv_block_len:
                 return (
@@ -909,6 +1069,59 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
 
 
+@dataclass
+class MooncakeCompletionMetadata(KVConnectorWorkerMetadata):
+    finished_sending: dict[tuple[ReqId, TransferId], int] = field(
+        default_factory=dict
+    )
+    finished_recving: dict[tuple[ReqId, TransferId], int] = field(
+        default_factory=dict
+    )
+
+    def aggregate(
+        self, other: KVConnectorWorkerMetadata
+    ) -> "MooncakeCompletionMetadata":
+        assert isinstance(other, MooncakeCompletionMetadata)
+        for current, incoming in (
+            (self.finished_sending, other.finished_sending),
+            (self.finished_recving, other.finished_recving),
+        ):
+            for transfer_key, count in incoming.items():
+                current[transfer_key] = current.get(transfer_key, 0) + count
+        return self
+
+    def split_finished_sending(
+        self, completed_req_ids: set[str]
+    ) -> tuple[
+        "MooncakeCompletionMetadata | None",
+        "MooncakeCompletionMetadata | None",
+    ]:
+        released_sending = {
+            key: count
+            for key, count in self.finished_sending.items()
+            if key[0] in completed_req_ids
+        }
+        pending_sending = {
+            key: count
+            for key, count in self.finished_sending.items()
+            if key[0] not in completed_req_ids
+        }
+        released = (
+            MooncakeCompletionMetadata(
+                finished_sending=released_sending,
+                finished_recving=dict(self.finished_recving),
+            )
+            if released_sending or self.finished_recving
+            else None
+        )
+        pending = (
+            MooncakeCompletionMetadata(finished_sending=pending_sending)
+            if pending_sending
+            else None
+        )
+        return released, pending
+
+
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -981,6 +1194,14 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
+    def on_new_request(self, request: "Request") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_new_request(request)
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_connector_output(connector_output)
+
     def request_finished(
         self,
         request: "Request",
@@ -1010,6 +1231,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
+        assert self.connector_worker is not None
+        return self.connector_worker.build_completion_metadata()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1089,6 +1314,8 @@ class MooncakeConnectorScheduler:
         # GDN is represented as a MambaSpec in vLLM. This Mooncake MambaSpec
         # path is currently tested with GDN; Mamba2 is not validated yet.
         self._has_mamba = kv_cache_config.has_mamba_layers
+        self._request_transfer_ids: dict[ReqId, TransferId] = {}
+        self._completion_counts: dict[tuple[str, ReqId, TransferId], int] = {}
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -1112,6 +1339,72 @@ class MooncakeConnectorScheduler:
             cdiv(n_tokens, block_size) + 1 if n_tokens else 0
             for n_tokens, block_size in sw_sizes_tokens
         ]
+
+    def _clear_request_transfer_tracking(self, req_id: ReqId) -> None:
+        self._request_transfer_ids.pop(req_id, None)
+        self._completion_counts = {
+            key: count
+            for key, count in self._completion_counts.items()
+            if key[1] != req_id
+        }
+
+    def on_new_request(self, request: "Request") -> None:
+        self._clear_request_transfer_tracking(request.request_id)
+        params = request.kv_transfer_params
+        if params and (transfer_id := params.get("transfer_id")):
+            self._request_transfer_ids[request.request_id] = transfer_id
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        metadata = connector_output.kv_connector_worker_meta
+        if not isinstance(metadata, MooncakeCompletionMetadata):
+            return
+
+        expected_count = connector_output.expected_finished_count or 1
+        matched_req_ids: set[ReqId] = set()
+        for field_name, transfer_counts, kind in (
+            (
+                "finished_sending",
+                metadata.finished_sending,
+                "send",
+            ),
+            (
+                "finished_recving",
+                metadata.finished_recving,
+                "recv",
+            ),
+        ):
+            req_ids = getattr(connector_output, field_name)
+            if req_ids:
+                for req_id, _ in transfer_counts:
+                    req_ids.discard(req_id)
+                if not req_ids:
+                    setattr(connector_output, field_name, None)
+            for (req_id, transfer_id), count in transfer_counts.items():
+                completion_key = (kind, req_id, transfer_id)
+                completed = self._completion_counts.get(completion_key, 0) + count
+                if completed < expected_count:
+                    self._completion_counts[completion_key] = completed
+                    continue
+                self._completion_counts.pop(completion_key, None)
+                expected = self._request_transfer_ids.get(req_id)
+                if expected is None or transfer_id != expected:
+                    logger.debug(
+                        "Ignoring stale Mooncake %s completion for request %s: "
+                        "expected transfer_id=%s, reported=%s",
+                        kind,
+                        req_id,
+                        expected,
+                        transfer_id,
+                    )
+                else:
+                    req_ids = getattr(connector_output, field_name)
+                    if req_ids is None:
+                        req_ids = set()
+                        setattr(connector_output, field_name, req_ids)
+                    req_ids.add(req_id)
+                    matched_req_ids.add(req_id)
+        for req_id in matched_req_ids:
+            self._clear_request_transfer_tracking(req_id)
 
     def get_sw_clipped_blocks(
         self,
@@ -1317,6 +1610,7 @@ class MooncakeConnectorScheduler:
             return False, None
 
         if not params.get("do_remote_decode"):
+            self._clear_request_transfer_tracking(request.request_id)
             return False, None
 
         assert not self.is_kv_consumer
@@ -1325,6 +1619,7 @@ class MooncakeConnectorScheduler:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
+            self._clear_request_transfer_tracking(request.request_id)
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -1336,6 +1631,8 @@ class MooncakeConnectorScheduler:
                 request,
                 self.get_sw_clipped_blocks(block_ids),
             )
+        else:
+            self._clear_request_transfer_tracking(request.request_id)
 
         return delay_free_blocks, None
 
@@ -1463,6 +1760,14 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self.finished_sending_transfer_counts: dict[
+            tuple[ReqId, TransferId], int
+        ] = {}
+        self.finished_recving_transfer_counts: dict[
+            tuple[ReqId, TransferId], int
+        ] = {}
+        self._staged_finished_sending: dict[tuple[ReqId, TransferId], int] = {}
+        self._staged_finished_recving: dict[tuple[ReqId, TransferId], int] = {}
         self._invalid_block_ids_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
         self._requires_alias_protocol = False
@@ -1708,6 +2013,21 @@ class MooncakeConnectorWorker:
             local_tp_size=self.tp_size,
             remote_tp_size=meta.remote_tp_size,
             producer_cache_replicated=self._producer_cache_is_replicated(),
+            unique_kv_head_layers={
+                name
+                for name, spec in self._layer_specs.items()
+                if _spec_transfers_unique_kv_heads(spec)
+            },
+            fully_replicated_layers={
+                name
+                for name, spec in self._layer_specs.items()
+                if _spec_transfers_fully_replicated(spec)
+            },
+            total_num_kv_heads_hint=self.transfer_topo.total_num_kv_heads,
+            total_num_kv_heads_by_layer={
+                name: self._get_layer_total_num_kv_heads(name)
+                for name in self._layer_specs
+            },
         )
         if validation_err is not None:
             response = MooncakeXferResponse(
@@ -1841,6 +2161,8 @@ class MooncakeConnectorWorker:
                     and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
+                    key = (send_meta.p_req_id, send_meta.transfer_id)
+                    self.finished_sending_transfer_counts[key] = 1
 
             response = MooncakeXferResponse(
                 status=response_status,
@@ -2083,6 +2405,11 @@ class MooncakeConnectorWorker:
                 remote_block_ids,
                 active_group_indices,
             ) in selected_region_blocks:
+                (
+                    transfer_unique_kv_heads,
+                    region_fully_replicated,
+                    region_num_kv_heads,
+                ) = self._get_region_transfer_policy(local_region)
                 num_region_descriptors_before = len(src_ptrs)
                 # Group by indices within this region's KV-cache group only.
                 group_local_block_ids, group_remote_block_ids = (
@@ -2098,6 +2425,11 @@ class MooncakeConnectorWorker:
                     remote_kv_block_len=remote_region.kv_block_len,
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
+                    transfer_unique_kv_heads=transfer_unique_kv_heads,
+                    producer_cache_replicated=(
+                        True if region_fully_replicated else None
+                    ),
+                    total_num_kv_heads=region_num_kv_heads,
                 )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
@@ -2390,6 +2722,9 @@ class MooncakeConnectorWorker:
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
         self.finished_recving_reqs = set()
+        transfer_counts = self.finished_recving_transfer_counts
+        self.finished_recving_transfer_counts = {}
+        self._staged_finished_recving.update(transfer_counts)
         return finished_recving_reqs
 
     async def fetch_finished_sending_reqs(self) -> set[ReqId]:
@@ -2414,11 +2749,16 @@ class MooncakeConnectorWorker:
                 )
                 self.xfer_stats.record_kv_expired_req()
                 finished_sending_reqs.add(send_meta.p_req_id)
+                key = (send_meta.p_req_id, transfer_id)
+                self.finished_sending_transfer_counts[key] = 1
                 expired_transfer_id.append(transfer_id)
 
         for transfer_id in expired_transfer_id:
             del self.reqs_need_send[transfer_id]
 
+        transfer_counts = self.finished_sending_transfer_counts
+        self.finished_sending_transfer_counts = {}
+        self._staged_finished_sending.update(transfer_counts)
         return finished_sending_reqs
 
     def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
@@ -2453,6 +2793,17 @@ class MooncakeConnectorWorker:
 
         return finished_sending_reqs or None, finished_recving_reqs or None
 
+    def build_completion_metadata(self) -> MooncakeCompletionMetadata | None:
+        if not self._staged_finished_sending and not self._staged_finished_recving:
+            return None
+        metadata = MooncakeCompletionMetadata(
+            finished_sending=self._staged_finished_sending,
+            finished_recving=self._staged_finished_recving,
+        )
+        self._staged_finished_sending = {}
+        self._staged_finished_recving = {}
+        return metadata
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return transfer stats collected since the last call, or None
         if nothing has been recorded in this interval."""
@@ -2471,6 +2822,8 @@ class MooncakeConnectorWorker:
             with self._invalid_block_ids_lock:
                 self._invalid_block_ids.update(invalid_blocks)
         self.finished_recving_reqs.add(pull_meta.d_req_id)
+        key = (pull_meta.d_req_id, pull_meta.transfer_id)
+        self.finished_recving_transfer_counts[key] = 1
 
     def _account_failed_pull_tasks(
         self,
@@ -2621,6 +2974,8 @@ class MooncakeConnectorWorker:
                     self._mark_pull_failed(pull_meta)
                 else:
                     self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    key = (pull_meta.d_req_id, pull_meta.transfer_id)
+                    self.finished_recving_transfer_counts[key] = 1
             accounted_req_ids.add(req_id)
 
         if ok_reqs:
@@ -2883,6 +3238,52 @@ class MooncakeConnectorWorker:
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
 
+    def _get_layer_total_num_kv_heads(self, layer_name: str) -> int:
+        layer = self.vllm_config.compilation_config.static_forward_context.get(
+            layer_name
+        )
+        return int(
+            getattr(
+                layer,
+                "total_num_kv_heads",
+                self.transfer_topo.total_num_kv_heads,
+            )
+        )
+
+    def _get_region_transfer_policy(
+        self, region: TransferRegion
+    ) -> tuple[bool, bool, int]:
+        model_num_kv_heads = getattr(self.transfer_topo, "total_num_kv_heads", 1)
+        layer_specs = getattr(self, "_layer_specs", {})
+        unique_layers: list[str] = []
+        fully_replicated_layers: list[str] = []
+        for layer_name in region.match_layer_names:
+            spec = layer_specs.get(layer_name)
+            if spec is None:
+                continue
+            if _spec_transfers_unique_kv_heads(spec):
+                unique_layers.append(layer_name)
+            elif _spec_transfers_fully_replicated(spec):
+                fully_replicated_layers.append(layer_name)
+        if unique_layers and fully_replicated_layers:
+            raise ValueError(
+                "Mooncake shared region aliases have conflicting transfer "
+                f"policies: {sorted(region.match_layer_names)}."
+            )
+        head_counts = {
+            self._get_layer_total_num_kv_heads(layer_name)
+            for layer_name in unique_layers
+        }
+        if len(head_counts) > 1:
+            raise ValueError(
+                "Mooncake shared region aliases have conflicting KV-head "
+                f"counts: {sorted(head_counts)}."
+            )
+        num_kv_heads = (
+            next(iter(head_counts)) if head_counts else model_num_kv_heads
+        )
+        return bool(unique_layers), bool(fully_replicated_layers), num_kv_heads
+
     def _get_transfer_regions(
         self,
         base_addrs: list[int],
@@ -2931,6 +3332,9 @@ class MooncakeConnectorWorker:
         remote_kv_block_len: int,
         remote_tp_rank: int,
         remote_tp_size: int,
+        transfer_unique_kv_heads: bool = False,
+        producer_cache_replicated: bool | None = None,
+        total_num_kv_heads: int | None = None,
     ) -> tuple[bool, int, int, int]:
         return _compute_sender_transfer_plan(
             local_tp_rank=self.tp_rank,
@@ -2939,7 +3343,15 @@ class MooncakeConnectorWorker:
             remote_tp_size=remote_tp_size,
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
-            producer_cache_replicated=self._producer_cache_is_replicated(),
+            producer_cache_replicated=(
+                self._producer_cache_is_replicated()
+                if producer_cache_replicated is None
+                else producer_cache_replicated
+            ),
+            transfer_unique_kv_heads=transfer_unique_kv_heads,
+            total_num_kv_heads=(
+                total_num_kv_heads or self.transfer_topo.total_num_kv_heads
+            ),
         )
 
     def _log_debug_cache_registration(

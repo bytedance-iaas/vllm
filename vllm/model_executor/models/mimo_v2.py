@@ -337,6 +337,7 @@ class MiMoV2Attention(nn.Module):
             attn_backend=attn_backend,
             head_size_v=self.v_head_dim,
         )
+        self.attn.total_num_kv_heads = self.total_num_kv_heads
 
     def forward(
         self,

@@ -17,6 +17,7 @@ from vllm import envs
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
+    MooncakeCompletionMetadata,
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeConnectorWorker,
@@ -28,7 +29,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     TransferRegion,
     _align_transfer_regions,
     _common_group_indices_for_regions,
+    _compute_sender_transfer_plan,
     _expand_transfer_regions,
+    _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -44,9 +47,335 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from .utils import create_request, create_scheduler, create_vllm_config
+
+
+@pytest.mark.parametrize(
+    ("local_tp_rank", "expected"),
+    [
+        (0, (True, 0, 0, 32768)),
+        (1, (False, 0, 0, 0)),
+        (2, (True, 0, 32768, 32768)),
+        (3, (False, 0, 0, 0)),
+        (4, (True, 0, 65536, 32768)),
+        (5, (False, 0, 0, 0)),
+        (6, (True, 0, 98304, 32768)),
+        (7, (False, 0, 0, 0)),
+    ],
+)
+def test_sender_plan_gqa_replicas_tp8_to_tp1(local_tp_rank, expected):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=8,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        local_kv_block_len=32768,
+        remote_kv_block_len=131072,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=4,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("remote_tp_rank", "expected_src_offset"),
+    [
+        (0, 0),
+        (1, 0),
+        (2, 32768),
+        (3, 32768),
+        (4, 65536),
+        (5, 65536),
+        (6, 98304),
+        (7, 98304),
+    ],
+)
+def test_sender_plan_gqa_replicas_tp1_to_tp8(
+    remote_tp_rank, expected_src_offset
+):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=0,
+        local_tp_size=1,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=8,
+        local_kv_block_len=131072,
+        remote_kv_block_len=32768,
+        producer_cache_replicated=False,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=4,
+    ) == (True, expected_src_offset, 0, 32768)
+
+
+def test_validate_asymmetric_regions_rejects_conflicting_alias_policies():
+    region = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=4096,
+        kv_block_len=4096,
+        layer_aliases=(
+            "model.layers.0.self_attn",
+            "model.layers.0.indexer",
+        ),
+        layer_indices=(0, 0),
+        logical_group_indices=(0, 1),
+        alias_group_indices=((0,), (1,)),
+    )
+
+    err = _validate_asymmetric_region_lengths(
+        local_regions=[region],
+        remote_regions=[region],
+        local_tp_size=8,
+        remote_tp_size=1,
+        producer_cache_replicated=True,
+        unique_kv_head_layers={"model.layers.0.self_attn"},
+        fully_replicated_layers={"model.layers.0.indexer"},
+    )
+
+    assert err is not None
+    assert "conflicting transfer policies" in err
+
+
+def test_validate_asymmetric_regions_allows_fully_replicated_region():
+    local_region = TransferRegion("indexer", 0, 0x1000, 4096, 4096)
+    remote_region = TransferRegion("indexer", 0, 0x2000, 4096, 4096)
+
+    assert (
+        _validate_asymmetric_region_lengths(
+            local_regions=[local_region],
+            remote_regions=[remote_region],
+            local_tp_size=1,
+            remote_tp_size=8,
+            producer_cache_replicated=False,
+            fully_replicated_layers={"indexer"},
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("remote_tp_rank", range(8))
+def test_sender_plan_fully_replicated_tp1_to_tp8(remote_tp_rank):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=0,
+        local_tp_size=1,
+        remote_tp_rank=remote_tp_rank,
+        remote_tp_size=8,
+        local_kv_block_len=4096,
+        remote_kv_block_len=4096,
+        producer_cache_replicated=True,
+    ) == (True, 0, 0, 4096)
+
+
+@pytest.mark.parametrize("local_tp_rank", range(8))
+def test_sender_plan_infers_per_region_head_count(local_tp_rank):
+    assert _compute_sender_transfer_plan(
+        local_tp_rank=local_tp_rank,
+        local_tp_size=8,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        local_kv_block_len=32768,
+        remote_kv_block_len=8 * 32768,
+        producer_cache_replicated=True,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=4,
+    ) == (True, 0, local_tp_rank * 32768, 32768)
+
+
+def test_validate_asymmetric_regions_rejects_conflicting_alias_head_counts():
+    region = TransferRegion(
+        layer_name="layer.a",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=4096,
+        kv_block_len=4096,
+        layer_aliases=("layer.a", "layer.b"),
+        layer_indices=(0, 0),
+        logical_group_indices=(0, 1),
+        alias_group_indices=((0,), (1,)),
+    )
+
+    err = _validate_asymmetric_region_lengths(
+        local_regions=[region],
+        remote_regions=[region],
+        local_tp_size=8,
+        remote_tp_size=1,
+        producer_cache_replicated=True,
+        unique_kv_head_layers={"layer.a", "layer.b"},
+        total_num_kv_heads_by_layer={"layer.a": 4, "layer.b": 8},
+    )
+
+    assert err is not None
+    assert "conflicting KV-head counts" in err
+
+
+@pytest.mark.parametrize("completion_kind", ["finished_sending", "finished_recving"])
+def test_completion_transfer_id_filters_reused_request_id(completion_kind):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    connector = MooncakeConnector(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        _make_test_kv_cache_config(),
+    )
+    request = create_request(request_id=42)
+    request.kv_transfer_params = {"transfer_id": "new-transfer"}
+    connector.on_new_request(request)
+
+    other_connector_output = KVConnectorOutput(
+        **{completion_kind: {request.request_id}},
+        kv_connector_worker_meta=MooncakeCompletionMetadata(),
+    )
+    connector.update_connector_output(other_connector_output)
+    assert getattr(other_connector_output, completion_kind) == {request.request_id}
+
+    stale_output = KVConnectorOutput(
+        kv_connector_worker_meta=MooncakeCompletionMetadata(
+            **{completion_kind: {(request.request_id, "old-transfer"): 1}}
+        ),
+        expected_finished_count=1,
+    )
+    connector.update_connector_output(stale_output)
+    assert not getattr(stale_output, completion_kind)
+
+    current_output = KVConnectorOutput(
+        kv_connector_worker_meta=MooncakeCompletionMetadata(
+            **{completion_kind: {(request.request_id, "new-transfer"): 1}}
+        ),
+        expected_finished_count=1,
+    )
+    connector.update_connector_output(current_output)
+    assert getattr(current_output, completion_kind) == {request.request_id}
+
+
+def test_plain_request_reuse_clears_old_transfer_generation():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    connector = MooncakeConnector(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        _make_test_kv_cache_config(),
+    )
+    old_request = create_request(request_id=45)
+    old_request.kv_transfer_params = {"transfer_id": "old-transfer"}
+    connector.on_new_request(old_request)
+
+    new_request = create_request(request_id=45)
+    new_request.kv_transfer_params = None
+    connector.on_new_request(new_request)
+    output = KVConnectorOutput(
+        kv_connector_worker_meta=MooncakeCompletionMetadata(
+            finished_recving={(new_request.request_id, "old-transfer"): 1}
+        ),
+        expected_finished_count=1,
+    )
+    connector.update_connector_output(output)
+
+    assert output.finished_recving is None
+
+
+@pytest.mark.parametrize("completion_kind", ["finished_sending", "finished_recving"])
+def test_completion_counts_do_not_mix_transfer_generations(completion_kind):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    connector = MooncakeConnector(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        _make_test_kv_cache_config(),
+    )
+    request = create_request(request_id=43)
+    request.kv_transfer_params = {"transfer_id": "new-transfer"}
+    connector.on_new_request(request)
+
+    def update(transfer_id: str) -> KVConnectorOutput:
+        output = KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeCompletionMetadata(
+                **{completion_kind: {(request.request_id, transfer_id): 1}}
+            ),
+            expected_finished_count=2,
+        )
+        connector.update_connector_output(output)
+        return output
+
+    assert not getattr(update("old-transfer"), completion_kind)
+    assert not getattr(update("new-transfer"), completion_kind)
+    assert not getattr(update("old-transfer"), completion_kind)
+    assert getattr(update("new-transfer"), completion_kind) == {request.request_id}
+
+
+def test_completion_metadata_keeps_distinct_transfer_generations():
+    metadata = MooncakeCompletionMetadata(
+        finished_recving={("req", "old-transfer"): 1}
+    )
+
+    metadata.aggregate(
+        MooncakeCompletionMetadata(
+            finished_recving={
+                ("req", "old-transfer"): 1,
+                ("req", "new-transfer"): 1,
+            }
+        )
+    )
+
+    assert metadata.finished_recving == {
+        ("req", "old-transfer"): 2,
+        ("req", "new-transfer"): 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_stages_distinct_generations_for_reused_request_id():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = lambda: None
+    worker.finished_recving_reqs = {"req"}
+    worker.finished_recving_transfer_counts = {
+        ("req", "old-transfer"): 1,
+        ("req", "new-transfer"): 1,
+    }
+    worker._staged_finished_recving = {}
+
+    assert await worker.fetch_finished_recving_reqs() == {"req"}
+    worker._staged_finished_sending = {}
+    metadata = worker.build_completion_metadata()
+
+    assert metadata is not None
+    assert metadata.finished_recving == {
+        ("req", "old-transfer"): 1,
+        ("req", "new-transfer"): 1,
+    }
+
+
+def test_request_finish_without_async_transfer_clears_generation():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    connector = MooncakeConnector(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        _make_test_kv_cache_config(),
+    )
+    request = create_request(request_id=44)
+    request.kv_transfer_params = {
+        "transfer_id": "unused-transfer",
+        "do_remote_prefill": False,
+        "do_remote_decode": False,
+    }
+    connector.on_new_request(request)
+    assert connector.connector_scheduler is not None
+    connector.connector_scheduler._completion_counts[
+        ("recv", request.request_id, "unused-transfer")
+    ] = 1
+
+    assert connector.request_finished(request, []) == (False, None)
+    assert request.request_id not in (
+        connector.connector_scheduler._request_transfer_ids
+    )
+    assert not connector.connector_scheduler._completion_counts
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -561,6 +890,7 @@ def _make_pull_result_worker(*, requires_alias_protocol: bool = False):
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.shutdown = lambda: None
     worker.finished_recving_reqs = set()
+    worker.finished_recving_transfer_counts = {}
     worker._invalid_block_ids_lock = threading.Lock()
     worker._invalid_block_ids = set()
     worker._requires_alias_protocol = requires_alias_protocol
@@ -1836,6 +2166,12 @@ async def test_worker_get_finished_timeout(monkeypatch):
         assert "p-req-active" not in finished_reqs
         assert "tx-expired" not in prefill_worker.reqs_need_send
         assert "tx-active" in prefill_worker.reqs_need_send
+        completion_meta = prefill_worker.build_completion_metadata()
+        assert completion_meta is not None
+        assert completion_meta.finished_sending == {
+            ("p-req-expired", "tx-expired"): 1
+        }
+        assert prefill_worker.build_completion_metadata() is None
 
 
 def test_register_kv_caches():
@@ -2205,7 +2541,8 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
     P_TP_SIZE = 2
     P_TP_RANK = 0
-    LOCAL_BLOCK_LEN = 4096
+    # The fixture model has 12 KV heads, so TP2 owns 6 heads per rank.
+    LOCAL_BLOCK_LEN = 6 * 1024
 
     local_block_len = LOCAL_BLOCK_LEN
     remote_block_len = LOCAL_BLOCK_LEN * P_TP_SIZE // d_tp_size
