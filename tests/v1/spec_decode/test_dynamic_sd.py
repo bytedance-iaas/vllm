@@ -3,7 +3,6 @@
 """Regression tests for the Dynamic SD batch-size schedule helpers."""
 
 import inspect
-import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -12,6 +11,7 @@ import pytest
 import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.config import SpeculativeConfig
 from vllm.config.utils import replace
 from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -661,9 +661,9 @@ def test_scheduler_falls_back_to_static_k_when_dsd_not_configured():
     assert output.num_spec_tokens_to_schedule == 3
 
 
-def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):
-    with caplog_vllm.at_level(logging.WARNING, logger="vllm"):
-        scheduler = create_scheduler(
+def test_dynamic_sd_dp_requires_explicit_global_policy():
+    with pytest.raises(ValueError, match="dynamic_sd_dp_batch_policy='global_max'"):
+        create_scheduler(
             max_num_seqs=256,
             max_num_batched_tokens=2560,
             num_speculative_tokens=3,
@@ -675,17 +675,48 @@ def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):
             data_parallel_size=2,
         )
 
-    speculative_config = scheduler.vllm_config.speculative_config
-    assert speculative_config is not None
-    assert speculative_config.num_speculative_tokens_per_batch_size is None
-    assert scheduler._dynamic_sd is None
-    assert "Dynamic speculative decoding is not supported with data parallelism" in (
-        caplog_vllm.text
+
+def test_dynamic_sd_dp_global_policy_allows_data_parallel():
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=160,
+        num_speculative_tokens=3,
+        num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+        dynamic_sd_dp_batch_policy="global_max",
+        data_parallel_size=2,
     )
 
-    output = _add_requests_and_schedule(scheduler, 256)
-    assert len(output.num_scheduled_tokens) == 256
-    assert output.num_spec_tokens_to_schedule == 3
+    assert scheduler.vllm_config.speculative_config is not None
+    assert scheduler._dynamic_sd is not None
+
+
+def test_dynamic_sd_dp_policy_requires_schedule_and_valid_interval():
+    with pytest.raises(ValueError, match="requires num_speculative_tokens"):
+        SpeculativeConfig(
+            model="ngram",
+            num_speculative_tokens=3,
+            dynamic_sd_dp_batch_policy="global_max",
+        )
+    with pytest.raises(ValueError):
+        SpeculativeConfig(
+            model="ngram",
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            dynamic_sd_dp_sync_interval=0,
+        )
+
+
+def test_dynamic_sd_dp_global_policy_requires_non_increasing_schedule():
+    with pytest.raises(ValueError, match="non-increasing"):
+        create_scheduler(
+            max_num_seqs=16,
+            max_num_batched_tokens=160,
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=[(1, 4, 1), (5, 16, 3)],
+            dynamic_sd_dp_batch_policy="global_max",
+            data_parallel_size=2,
+        )
 
 
 def test_scheduler_uses_static_k_when_no_requests_are_scheduled():

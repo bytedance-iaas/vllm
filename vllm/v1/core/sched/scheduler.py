@@ -82,6 +82,10 @@ class _DynamicSDSchedulerState:
     max_runtime_k: int
     budget_policy: _DynamicSDBudgetPolicy | None
     batch_size_override: int | None = None
+    last_selected_k: int = 0
+
+    def __post_init__(self) -> None:
+        self.last_selected_k = self.max_runtime_k
 
     def k_for_batch_size(self, batch_size: int) -> int:
         batch_size = min(batch_size, len(self.lookup) - 1)
@@ -89,6 +93,8 @@ class _DynamicSDSchedulerState:
 
     def set_batch_size_override(self, batch_size: int | None) -> None:
         self.batch_size_override = batch_size
+        if batch_size is not None:
+            self.last_selected_k = self.k_for_batch_size(batch_size)
 
     def early_k(self) -> int | None:
         if self.batch_size_override is None:
@@ -102,6 +108,7 @@ class _DynamicSDSchedulerState:
             selected_k = self.k_for_batch_size(actual_batch_size)
         else:
             selected_k = self.max_runtime_k
+        self.last_selected_k = selected_k
         self.batch_size_override = None
         return selected_k
 
@@ -2250,6 +2257,19 @@ class Scheduler(SchedulerInterface):
     def set_dynamic_sd_batch_size_override(self, batch_size: int | None) -> None:
         if self._dynamic_sd is not None:
             self._dynamic_sd.set_batch_size_override(batch_size)
+
+    def get_num_spec_tokens_to_schedule_for_dummy_batch(self) -> int:
+        if self._dynamic_sd is None:
+            return self.num_spec_tokens
+        return self._dynamic_sd.last_selected_k
+
+    def get_dynamic_sd_local_batch_pressure(self) -> int:
+        if self._dynamic_sd is None:
+            return 0
+        num_decode_reqs = sum(
+            1 for request in self.running if not request.is_prefill_chunk
+        )
+        return min(num_decode_reqs, self.scheduler_config.max_num_seqs)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:

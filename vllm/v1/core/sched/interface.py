@@ -82,6 +82,15 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def set_dynamic_sd_batch_size_override(self, batch_size: int | None) -> None:
+        raise NotImplementedError
+
+    def get_num_spec_tokens_to_schedule_for_dummy_batch(self) -> int:
+        raise NotImplementedError
+
+    def get_dynamic_sd_local_batch_pressure(self) -> int:
+        raise NotImplementedError
+
     @abstractmethod
     def get_grammar_bitmask(
         self, scheduler_output: "SchedulerOutput"
