@@ -65,7 +65,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -765,6 +764,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return self.block_sparse_moe.experts.moe_config.skip_final_all_reduce
         return not self.mlp.down_proj.reduce_results
 
+    def set_ffn_all_reduce_deferred(self, defer: bool) -> None:
+        if self.is_moe_layer:
+            self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = defer
+        else:
+            self.mlp.down_proj.reduce_results = not defer
+
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
@@ -824,18 +829,73 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+        local_layers = self.layers[self.start_layer : self.end_layer]
+        self._original_ffn_all_reduce_deferred = tuple(
+            layer.ffn_all_reduce_deferred for layer in local_layers
         )
+        self._configure_deferred_allreduce(())
 
-        # Configure cross-layer all-reduce/RMSNorm fusion: a layer whose FFN output
-        # is left un-reduced has that all-reduce fused into the next layer's
-        # input_layernorm (or the final norm).
+    def _configure_deferred_allreduce(
+        self,
+        materialized_boundaries: tuple[int, ...],
+    ) -> None:
+        local_layers = self.layers[self.start_layer : self.end_layer]
+        assert len(local_layers) == len(self._original_ffn_all_reduce_deferred)
+        materialized = set(materialized_boundaries)
+
         prev_defers = False
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for idx, (layer, originally_deferred) in enumerate(
+            zip(local_layers, self._original_ffn_all_reduce_deferred)
+        ):
+            layer.set_ffn_all_reduce_deferred(
+                originally_deferred and idx + 1 not in materialized
+            )
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        num_hidden_layers = len(self.layers)
+        invalid = [idx for idx in layers if idx < 0 or idx > num_hidden_layers]
+        if invalid:
+            raise ValueError(
+                f"Invalid MiniMax-M3 EAGLE3 auxiliary boundaries: {invalid}."
+            )
+        if tuple(sorted(set(layers))) != layers:
+            raise ValueError(
+                "MiniMax-M3 EAGLE3 auxiliary boundaries must be unique and "
+                "strictly increasing."
+            )
+
+        EagleModelMixin._set_aux_hidden_state_layers(self, layers)
+        local_boundaries = tuple(
+            idx - self.start_layer
+            for idx in layers
+            if self.start_layer < idx <= self.end_layer
+        )
+        self._configure_deferred_allreduce(local_boundaries)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        incoming_aux_keys = [
+            f"aux_hidden_state_{idx}"
+            for idx in self.aux_hidden_state_layers
+            if idx <= self.start_layer
+        ]
+        return IntermediateTensors(
+            {
+                key: torch.zeros(
+                    (batch_size, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                )
+                for key in ["hidden_states", "residual", *incoming_aux_keys]
+            }
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -858,18 +918,45 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # EAGLE3 is not yet compatible with pipeline parallel
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        if get_pp_group().is_first_rank:
+            aux_hidden_states = self._maybe_add_hidden_state(
+                [], 0, hidden_states, residual
+            )
+            if aux_hidden_states:
+                # The first layer aliases its input as the residual and may mutate it.
+                aux_hidden_states[-1] = aux_hidden_states[-1].clone()
+        else:
+            assert intermediate_tensors is not None
+            aux_hidden_states = [
+                intermediate_tensors[f"aux_hidden_state_{idx}"]
+                for idx in self.aux_hidden_state_layers
+                if idx <= self.start_layer
+            ]
         for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                aux_hidden_states,
+                self.start_layer + idx + 1,
+                hidden_states,
+                residual,
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            carried_layers = tuple(
+                idx for idx in self.aux_hidden_state_layers if idx <= self.end_layer
             )
+            if len(carried_layers) != len(aux_hidden_states):
+                raise RuntimeError(
+                    "MiniMax-M3 pipeline auxiliary hidden states are incomplete."
+                )
+            tensors.update(
+                {
+                    f"aux_hidden_state_{idx}": value
+                    for idx, value in zip(carried_layers, aux_hidden_states)
+                }
+            )
+            return IntermediateTensors(tensors)
 
         if self.fuse_final_norm_allreduce:
             hidden_states, _ = fused_allreduce_gemma_rms_norm(
@@ -879,6 +966,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
+            if len(aux_hidden_states) != len(self.aux_hidden_state_layers):
+                raise RuntimeError(
+                    "MiniMax-M3 pipeline auxiliary hidden states are incomplete."
+                )
             return hidden_states, aux_hidden_states
         return hidden_states
 

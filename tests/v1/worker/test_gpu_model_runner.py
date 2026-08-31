@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +13,7 @@ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CUDAGraphMode,
     KVTransferConfig,
     ModelConfig,
     ParallelConfig,
@@ -42,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTemporalLayout,
     KVCacheTensor,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -85,6 +88,489 @@ def test_v1_kv_producer_only_requires_active_pure_producer(
     runner.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
 
     assert runner._is_kv_producer_only_instance() is expected
+
+
+@pytest.mark.parametrize(
+    ("enforce_eager", "resolved_mode"),
+    [
+        (True, CUDAGraphMode.NONE),
+        (False, CUDAGraphMode.FULL_DECODE_ONLY),
+    ],
+)
+def test_replicated_draft_accepts_resolved_cudagraph_mode(
+    enforce_eager: bool,
+    resolved_mode: CUDAGraphMode,
+) -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(enable_eagle3_replicated_draft_kv=True)
+    runner.model_config = SimpleNamespace(enforce_eager=enforce_eager)
+
+    runner._validate_replicated_draft_cudagraph_mode(resolved_mode)
+
+
+@pytest.mark.parametrize(
+    "resolved_mode",
+    [
+        CUDAGraphMode.NONE,
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ],
+)
+def test_replicated_draft_rejects_backend_cudagraph_downgrade(
+    resolved_mode: CUDAGraphMode,
+) -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(enable_eagle3_replicated_draft_kv=True)
+    runner.model_config = SimpleNamespace(enforce_eager=False)
+
+    with pytest.raises(ValueError, match="resolved an unsupported CUDA Graph mode"):
+        runner._validate_replicated_draft_cudagraph_mode(resolved_mode)
+
+
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
+def test_extract_hidden_states_producer_only_creates_drafter_on_last_pp_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    is_last_pp_rank: bool,
+) -> None:
+    spec_config = SimpleNamespace(
+        method="extract_hidden_states",
+        num_speculative_tokens=1,
+        uses_extract_hidden_states=lambda: True,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=(2, 30, 57))
+        ),
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = spec_config
+    runner.vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+        )
+    )
+    runner.use_aux_hidden_state_outputs = False
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=is_last_pp_rank, world_size=2),
+    )
+
+    runner._configure_kv_producer_speculation()
+
+    if is_last_pp_rank:
+        assert runner.speculative_config is spec_config
+        assert runner._target_speculative_config is spec_config
+        assert runner.num_spec_tokens == 1
+        assert runner._producer_aux_hidden_state_layers == ()
+        assert not runner.use_aux_hidden_state_outputs
+    else:
+        assert runner.speculative_config is None
+        assert runner._target_speculative_config is spec_config
+        assert runner.num_spec_tokens == 1
+        assert runner._producer_aux_hidden_state_layers == (2, 30, 57)
+        assert runner.use_aux_hidden_state_outputs
+        assert not hasattr(runner, "drafter")
+
+
+def test_non_last_extract_hidden_states_producer_clamps_spec_placeholders() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._target_speculative_config = SimpleNamespace()
+    runner.input_ids = SimpleNamespace(
+        gpu=torch.tensor([41, -1, 17, -1], dtype=torch.int32)
+    )
+
+    runner._clamp_speculative_input_ids(3)
+
+    assert runner.input_ids.gpu.tolist() == [41, 0, 17, -1]
+
+
+def test_eagle_producer_only_keeps_existing_non_speculative_runner_state() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        method="eagle3",
+        num_speculative_tokens=3,
+    )
+    runner.vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+        )
+    )
+    runner.use_aux_hidden_state_outputs = False
+
+    runner._configure_kv_producer_speculation()
+
+    assert runner.speculative_config is None
+    assert runner._target_speculative_config is None
+    assert runner.num_spec_tokens == 0
+    assert runner.prev_num_spec_tokens == 0
+    assert runner._producer_aux_hidden_state_layers == ()
+    assert not runner.use_aux_hidden_state_outputs
+
+
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
+def test_eagle3_prefill_draft_kv_stage_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    is_last_pp_rank: bool,
+) -> None:
+    spec_config = SimpleNamespace(
+        method="eagle3",
+        num_speculative_tokens=1,
+        enable_eagle3_prefill_draft_kv=True,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = spec_config
+    runner.vllm_config = SimpleNamespace(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_producer",
+            kv_load_failure_policy="fail",
+        )
+    )
+    runner.model_config = SimpleNamespace(
+        architectures=["MiniMaxM3SparseForConditionalGeneration"],
+        get_total_num_hidden_layers=lambda: 60,
+    )
+    runner.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=4,
+        decode_context_parallel_size=1,
+    )
+    runner.use_aux_hidden_state_outputs = False
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=is_last_pp_rank, world_size=2),
+    )
+
+    runner._configure_kv_producer_speculation()
+
+    assert runner._target_speculative_config is spec_config
+    assert runner.num_spec_tokens == 1
+    if is_last_pp_rank:
+        assert runner.speculative_config is spec_config
+        assert runner._producer_aux_hidden_state_layers == ()
+        assert not runner.use_aux_hidden_state_outputs
+    else:
+        assert runner.speculative_config is None
+        assert runner._producer_aux_hidden_state_layers == (2, 30, 57)
+        assert runner.use_aux_hidden_state_outputs
+        assert not hasattr(runner, "drafter")
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        None,
+        KVTransferConfig(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_consumer",
+            kv_load_failure_policy="fail",
+        ),
+        KVTransferConfig(
+            kv_connector="MooncakeConnector",
+            kv_role="kv_both",
+            kv_load_failure_policy="fail",
+        ),
+        KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+            kv_load_failure_policy="fail",
+        ),
+    ],
+    ids=["no-connector", "consumer", "both", "non-mooncake"],
+)
+def test_eagle3_prefill_draft_kv_rejects_non_pure_mooncake_producer(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_transfer_config: KVTransferConfig | None,
+) -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        method="eagle3",
+        num_speculative_tokens=1,
+        enable_eagle3_prefill_draft_kv=True,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(eagle_aux_hidden_state_layer_ids=(2, 30, 57))
+        ),
+    )
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    runner.model_config = SimpleNamespace(
+        architectures=["MiniMaxM3SparseForConditionalGeneration"],
+        get_total_num_hidden_layers=lambda: 60,
+    )
+    runner.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=4,
+        decode_context_parallel_size=1,
+    )
+    runner.use_aux_hidden_state_outputs = False
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+
+    with pytest.raises(ValueError, match="Mooncake pure producer"):
+        runner._configure_kv_producer_speculation()
+
+
+@pytest.mark.parametrize(
+    "feature_flag",
+    [
+        "enable_eagle3_prefill_draft_kv",
+        "enable_eagle3_replicated_draft_kv",
+    ],
+)
+def test_full_temporal_draft_kv_marks_only_global_draft_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    feature_flag: str,
+) -> None:
+    class FakeAttention:
+        def __init__(self, spec: FullAttentionSpec) -> None:
+            self._spec = spec
+            self.kv_sharing_target_layer_name = None
+
+        def get_kv_cache_spec(self, _vllm_config):
+            return self._spec
+
+        def get_attn_backend(self):
+            return SimpleNamespace(indexes_kv_by_block_stride=lambda: False)
+
+    target_layer = "model.layers.0.self_attn.attn"
+    draft_layer = "model.layers.60.self_attn.attn"
+    base_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    layers = {
+        target_layer: FakeAttention(base_spec),
+        draft_layer: FakeAttention(base_spec),
+    }
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        enable_eagle3_prefill_draft_kv=False,
+        enable_eagle3_replicated_draft_kv=False,
+    )
+    setattr(runner.speculative_config, feature_flag, True)
+    runner.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 60)
+    runner.vllm_config = SimpleNamespace()
+    runner.shared_kv_cache_layers = {}
+    monkeypatch.setattr(gpu_model_runner_module, "Attention", FakeAttention)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: layers,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _config: nullcontext(),
+    )
+
+    specs = runner.get_kv_cache_spec()
+
+    assert specs[target_layer].temporal_layout == (KVCacheTemporalLayout.SHARDED_DCP)
+    assert specs[draft_layer].temporal_layout == (KVCacheTemporalLayout.FULL_TEMPORAL)
+
+
+@pytest.mark.parametrize("layer_prefix", ["language_model.model", "model"])
+def test_prefill_marks_minimax_target_dense_layers_full_temporal(
+    monkeypatch: pytest.MonkeyPatch,
+    layer_prefix: str,
+) -> None:
+    class FakeAttention:
+        def __init__(self, spec: FullAttentionSpec) -> None:
+            self._spec = spec
+            self.kv_sharing_target_layer_name = None
+
+        def get_kv_cache_spec(self, _vllm_config):
+            return self._spec
+
+        def get_attn_backend(self):
+            return SimpleNamespace(indexes_kv_by_block_stride=lambda: False)
+
+    layer_names = [
+        f"{layer_prefix}.layers.{layer}.self_attn.attn" for layer in range(4)
+    ]
+    base_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    layers = {layer_name: FakeAttention(base_spec) for layer_name in layer_names}
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = None
+    runner._target_speculative_config = SimpleNamespace(
+        enable_eagle3_prefill_draft_kv=True,
+        enable_eagle3_replicated_draft_kv=False,
+        enable_eagle3_target_dense_full_temporal_kv=True,
+    )
+    runner.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 60)
+    runner.vllm_config = SimpleNamespace()
+    runner.shared_kv_cache_layers = {}
+    runner.dcp_world_size = 1
+    monkeypatch.setattr(gpu_model_runner_module, "Attention", FakeAttention)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: layers,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _config: nullcontext(),
+    )
+
+    specs = runner.get_kv_cache_spec()
+
+    for layer_name in layer_names[:3]:
+        assert specs[layer_name].temporal_layout == (
+            KVCacheTemporalLayout.FULL_TEMPORAL
+        )
+    assert specs[layer_names[3]].temporal_layout == (KVCacheTemporalLayout.SHARDED_DCP)
+
+
+@pytest.mark.parametrize("layer_prefix", ["language_model.model", "model"])
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_decode_target_dense_layers_use_effective_dcp1(
+    monkeypatch: pytest.MonkeyPatch,
+    layer_prefix: str,
+    dcp_size: int,
+) -> None:
+    class FakeAttention:
+        def __init__(self, spec: FullAttentionSpec) -> None:
+            self._spec = spec
+            self.kv_sharing_target_layer_name = None
+            self.impl = SimpleNamespace(
+                dcp_world_size=dcp_size,
+                dcp_rank=0 if dcp_size == 1 else 1,
+                pcp_world_size=1,
+                pcp_rank=0,
+                total_cp_world_size=dcp_size,
+                total_cp_rank=0 if dcp_size == 1 else 1,
+                need_to_return_lse_for_decode=dcp_size > 1,
+            )
+
+        def get_kv_cache_spec(self, _vllm_config):
+            return self._spec
+
+        def get_attn_backend(self):
+            return SimpleNamespace(
+                get_name=lambda: "FLASH_ATTN",
+                indexes_kv_by_block_stride=lambda: False,
+            )
+
+    dense_layers = [
+        f"{layer_prefix}.layers.{layer}.self_attn.attn" for layer in range(3)
+    ]
+    sparse_layer = f"{layer_prefix}.layers.3.self_attn.attn"
+    draft_layer = "model.layers.60.self_attn.attn"
+    base_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    layers = {
+        layer_name: FakeAttention(base_spec)
+        for layer_name in (*dense_layers, sparse_layer, draft_layer)
+    }
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(
+        enable_eagle3_prefill_draft_kv=False,
+        enable_eagle3_replicated_draft_kv=True,
+        enable_eagle3_target_dense_full_temporal_kv=True,
+    )
+    runner._target_speculative_config = runner.speculative_config
+    runner.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 60)
+    runner.vllm_config = SimpleNamespace()
+    runner.shared_kv_cache_layers = {}
+    runner.dcp_world_size = dcp_size
+    monkeypatch.setattr(gpu_model_runner_module, "Attention", FakeAttention)
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: layers,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _config: nullcontext(),
+    )
+
+    specs = runner.get_kv_cache_spec()
+
+    for layer_name in dense_layers:
+        impl = layers[layer_name].impl
+        assert specs[layer_name].temporal_layout == (
+            KVCacheTemporalLayout.FULL_TEMPORAL
+        )
+        assert impl.dcp_world_size == 1
+        assert impl.dcp_rank == 0
+        assert impl.total_cp_world_size == 1
+        assert impl.total_cp_rank == 0
+        assert impl.need_to_return_lse_for_decode is False
+    assert layers[sparse_layer].impl.dcp_world_size == dcp_size
+    assert layers[draft_layer].impl.dcp_world_size == dcp_size
+
+
+def test_full_temporal_target_mapping_expands_pages_and_masks_padding() -> None:
+    parent_table = torch.tensor(
+        [[3, 5], [7, 9], [0, 0]],
+        dtype=torch.int32,
+    )
+    block_table = SimpleNamespace(
+        block_size=128,
+        block_table=SimpleNamespace(gpu=parent_table),
+        get_device_tensor=lambda num_reqs: parent_table[:num_reqs],
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(block_table=[block_table])
+    runner.query_start_loc = SimpleNamespace(
+        gpu=torch.tensor([0, 3, 5, 5], dtype=torch.int32)
+    )
+    runner.positions = torch.tensor([0, 127, 128, 255, 256, 0])
+    runner.dcp_world_size = 2
+    runner.max_model_len = 512
+    runner.max_num_tokens = 6
+    runner.device = torch.device("cpu")
+    runner._full_temporal_block_tables = {}
+    runner._full_temporal_slot_mappings = {}
+
+    expanded, slots = runner._get_full_temporal_target_mapping(
+        kv_cache_gid=0,
+        num_tokens_padded=6,
+        num_reqs_padded=3,
+        num_tokens_unpadded=5,
+    )
+
+    assert expanded.tolist() == [
+        [6, 7, 10, 11],
+        [14, 15, 18, 19],
+        [0, 0, 0, 0],
+    ]
+    assert slots.tolist() == [768, 895, 896, 2047, 2304, -1]
+
+
+def test_clear_full_temporal_target_mappings_releases_buffers() -> None:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._full_temporal_block_tables = {0: torch.empty(1)}
+    runner._full_temporal_slot_mappings = {0: torch.empty(1)}
+
+    runner._clear_full_temporal_target_mappings()
+
+    assert runner._full_temporal_block_tables == {}
+    assert runner._full_temporal_slot_mappings == {}
 
 
 def test_calc_spec_decode_metadata_rejects_all_draft_schedule():
