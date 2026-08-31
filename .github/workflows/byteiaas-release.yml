@@ -25,11 +25,12 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       internal_tag: ${{ steps.release.outputs.internal_tag }}
-      checkout_ref: ${{ steps.release.outputs.checkout_ref }}
+      checkout_sha: ${{ steps.release.outputs.checkout_sha }}
     steps:
-      - name: Checkout repository
+      - name: Checkout trusted branch
         uses: actions/checkout@v4
         with:
+          ref: refs/heads/iaas_main
           fetch-depth: 0
           fetch-tags: true
 
@@ -39,7 +40,8 @@ jobs:
           REQUESTED_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
         run: |
           set -euo pipefail
-          git fetch --force --tags origin
+          git fetch --force --tags origin \
+            refs/heads/iaas_main:refs/remotes/origin/iaas_main
           raw_tag="${GITHUB_REF_NAME}"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             raw_tag="${REQUESTED_RELEASE_TAG}"
@@ -54,15 +56,33 @@ jobs:
             echo "::error::Invalid internal tag value: ${internal_tag}"
             exit 1
           fi
+          checkout_sha="$(git rev-parse --verify "refs/tags/${raw_tag}^{commit}")"
+          if ! git merge-base --is-ancestor \
+              "${checkout_sha}" refs/remotes/origin/iaas_main; then
+            echo "::error::Release tag is not in iaas_main history"
+            exit 1
+          fi
+          contract="$(git show "${checkout_sha}:.github/byteiaas-build-contract")"
+          if [ "${contract}" != "1" ]; then
+            echo "::error::Release tag lacks ByteIAAS build contract 1"
+            exit 1
+          fi
+          python3 scripts/ci/get_byteiaas_image_tag.py \
+            --mode release \
+            --image-flavor openai-devel \
+            --tag-value "${internal_tag}" \
+            --cuda-suffix cu130 \
+            --format-suffix nydus \
+            --timestamp 200001010000 >/dev/null
           echo "internal_tag=${internal_tag}" >> "${GITHUB_OUTPUT}"
-          echo "checkout_ref=refs/tags/${raw_tag}" >> "${GITHUB_OUTPUT}"
+          echo "checkout_sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"
 
   build-wheel:
     if: github.repository == 'bytedance-iaas/vllm'
     needs: resolve-release
     uses: ./.github/workflows/_byteiaas-build-wheel.yml
     with:
-      checkout_ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+      checkout_ref: ${{ needs.resolve-release.outputs.checkout_sha }}
       cuda_version: "13.0.3"
       artifact_name: vllm-cu130-wheel-release-${{ needs.resolve-release.outputs.internal_tag }}
 
@@ -71,7 +91,7 @@ jobs:
     needs: resolve-release
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
-      checkout_ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+      checkout_ref: ${{ needs.resolve-release.outputs.checkout_sha }}
       cuda_version: "13.0.3"
       tag_mode: release
       tag_value: ${{ needs.resolve-release.outputs.internal_tag }}

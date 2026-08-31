@@ -4,10 +4,9 @@ on:
   workflow_call:
     inputs:
       checkout_ref:
-        description: "Git ref to checkout"
-        required: false
+        description: "Validated immutable commit SHA to checkout"
+        required: true
         type: string
-        default: ""
       cuda_version:
         description: "CUDA_VERSION build arg"
         required: false
@@ -50,8 +49,6 @@ jobs:
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
-      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
-      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
@@ -64,19 +61,35 @@ jobs:
       BYTEIAAS_VLLM_VERSION: ${{ inputs.vllm_version }}
       BYTEIAAS_IMAGE_FORMATS: ${{ inputs.image_formats }}
     steps:
+      - name: Validate immutable checkout ref
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${CHECKOUT_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::checkout_ref must be a full commit SHA"
+            exit 1
+          fi
+
       - name: Cleanup workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+        run: |
+          sudo find "${GITHUB_WORKSPACE}" -mindepth 1 -maxdepth 1 \
+            -exec rm -rf -- {} +
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
+          ref: ${{ inputs.checkout_ref }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Validate build inputs
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
+          test "$(cat .github/byteiaas-build-contract)" = "1"
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
@@ -95,10 +108,6 @@ jobs:
           set -euo pipefail
           if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
             echo "::error::VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE variables are required"
-            exit 1
-          fi
-          if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
-            echo "::error::VOLCENGINE_CR_USERNAME and VOLCENGINE_CR_PASSWORD secrets are required"
             exit 1
           fi
           IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
@@ -188,11 +197,18 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
-          cleanup: false
+          cleanup: true
 
       - name: Login to Volcengine CR
+        env:
+          VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+          VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "::error::VOLCENGINE_CR_USERNAME and VOLCENGINE_CR_PASSWORD secrets are required"
+            exit 1
+          fi
           echo "${VOLCENGINE_CR_PASSWORD}" | docker login \
             "${VOLCENGINE_CR_REGISTRY}" \
             --username "${VOLCENGINE_CR_USERNAME}" \

@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       checkout_ref:
-        description: "Optional ref to checkout; defaults to iaas_main"
+        description: "Optional full SHA or tag in iaas_main history"
         required: false
         default: ""
       vllm_version:
@@ -27,19 +27,67 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-source:
+    if: github.repository == 'bytedance-iaas/vllm'
+    runs-on: ubuntu-22.04
+    outputs:
+      checkout_sha: ${{ steps.source.outputs.checkout_sha }}
+    steps:
+      - name: Checkout trusted branch
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/iaas_main
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve trusted immutable source
+        id: source
+        env:
+          REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || github.event_name == 'push' && github.sha || 'refs/heads/iaas_main' }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin \
+            refs/heads/iaas_main:refs/remotes/origin/iaas_main
+
+          if [[ "${REQUESTED_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            source_ref="${REQUESTED_REF}"
+          elif [ "${REQUESTED_REF}" = "refs/heads/iaas_main" ]; then
+            source_ref="refs/remotes/origin/iaas_main"
+          elif [[ "${REQUESTED_REF}" =~ ^refs/tags/[0-9A-Za-z][0-9A-Za-z_.-]*$ ]]; then
+            source_ref="${REQUESTED_REF}"
+          else
+            echo "::error::checkout_ref must be a full SHA, iaas_main, or a tag ref"
+            exit 1
+          fi
+
+          checkout_sha="$(git rev-parse --verify "${source_ref}^{commit}")"
+          if ! git merge-base --is-ancestor \
+              "${checkout_sha}" refs/remotes/origin/iaas_main; then
+            echo "::error::Requested source is not in iaas_main history"
+            exit 1
+          fi
+          contract="$(git show "${checkout_sha}:.github/byteiaas-build-contract")"
+          if [ "${contract}" != "1" ]; then
+            echo "::error::Requested source lacks ByteIAAS build contract 1"
+            exit 1
+          fi
+          echo "checkout_sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"
+
   build-wheel:
     if: github.repository == 'bytedance-iaas/vllm'
+    needs: resolve-source
     uses: ./.github/workflows/_byteiaas-build-wheel.yml
     with:
-      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || 'refs/heads/iaas_main' }}
+      checkout_ref: ${{ needs.resolve-source.outputs.checkout_sha }}
       cuda_version: "13.0.3"
       artifact_name: vllm-cu130-wheel-dev
 
   build-image:
     if: github.repository == 'bytedance-iaas/vllm'
+    needs: resolve-source
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
-      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || 'refs/heads/iaas_main' }}
+      checkout_ref: ${{ needs.resolve-source.outputs.checkout_sha }}
       cuda_version: "13.0.3"
       tag_mode: dev
       vllm_version: ${{ github.event_name == 'workflow_dispatch' && inputs.vllm_version || '' }}

@@ -4,10 +4,9 @@ on:
   workflow_call:
     inputs:
       checkout_ref:
-        description: "Git ref to checkout"
-        required: false
+        description: "Validated immutable commit SHA to checkout"
+        required: true
         type: string
-        default: ""
       cuda_version:
         description: "CUDA_VERSION build arg"
         required: false
@@ -37,19 +36,35 @@ jobs:
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
     steps:
+      - name: Validate immutable checkout ref
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${CHECKOUT_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::checkout_ref must be a full commit SHA"
+            exit 1
+          fi
+
       - name: Cleanup workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+        run: |
+          sudo find "${GITHUB_WORKSPACE}" -mindepth 1 -maxdepth 1 \
+            -exec rm -rf -- {} +
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
+          ref: ${{ inputs.checkout_ref }}
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Validate CUDA version
+      - name: Validate build contract
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
+          test "$(cat .github/byteiaas-build-contract)" = "1"
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
@@ -64,7 +79,7 @@ jobs:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
-          cleanup: false
+          cleanup: true
 
       - name: Build wheel stage image
         env:
