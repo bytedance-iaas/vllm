@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch.nn as nn
 
-from vllm.config import CacheConfig, VllmConfig, replace
+from vllm.config import CacheConfig, KernelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
@@ -31,6 +31,18 @@ def get_draft_cache_config(vllm_config: VllmConfig) -> CacheConfig:
     return vllm_config.cache_config
 
 
+def get_draft_kernel_config(vllm_config: VllmConfig) -> KernelConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+
+    if speculative_config.moe_backend is not None:
+        return replace(
+            vllm_config.kernel_config,
+            moe_backend=speculative_config.moe_backend,
+        )
+    return vllm_config.kernel_config
+
+
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
@@ -48,6 +60,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             backend=speculative_config.attention_backend,
         ),
         cache_config=get_draft_cache_config(vllm_config),
+        kernel_config=get_draft_kernel_config(vllm_config),
     )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
