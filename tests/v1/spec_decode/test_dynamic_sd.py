@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for the Dynamic SD batch-size schedule helpers."""
 
+import inspect
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.config.utils import replace
@@ -13,6 +17,15 @@ from vllm.v1.core.sched.scheduler import Scheduler, _DynamicSDBudgetPolicy
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu import model_runner as gpu_model_runner
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
+    MultiModuleMTPSpeculator,
+)
 
 
 def _make_lookup(
@@ -193,6 +206,190 @@ def test_scheduler_clamps_dsd_k_to_runtime_num_speculative_tokens():
 
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_dflash_runtime_k_maps_to_bonus_query_width():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = False
+    speculator.num_query_per_req = 8
+
+    assert speculator._get_runtime_num_speculative_tokens(None) == 7
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 4
+    assert speculator._get_num_speculative_tokens_for_query_len(4) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 1
+    assert speculator._get_num_speculative_tokens_for_query_len(1) == 0
+    assert not speculator._requires_eager_query(8, is_profile=False)
+    assert speculator._requires_eager_query(4, is_profile=False)
+    assert speculator._requires_eager_query(8, is_profile=True)
+
+    with pytest.raises(ValueError, match="runtime_num_speculative_tokens"):
+        speculator._get_runtime_num_speculative_tokens(8)
+
+
+def test_dflash_runtime_sample_col_uses_runtime_k_stride():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.device = torch.device("cpu")
+    speculator.sample_col = torch.arange(7, dtype=torch.int32).repeat(4)
+    speculator._sample_col_steps = torch.arange(7, dtype=torch.int32)
+    speculator._runtime_sample_col = torch.empty(4 * 7, dtype=torch.int32)
+
+    sample_col = speculator._get_sample_col_for_k(num_reqs=3, num_speculative_tokens=3)
+
+    assert sample_col.tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    assert speculator._get_sample_col_for_k(2, 0).numel() == 0
+    assert speculator._get_sample_col_for_k(2, 7).tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    ]
+
+
+def test_dspark_runtime_k_maps_to_anchor_query_width():
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.num_speculative_steps = 7
+    speculator.sample_from_anchor = True
+    speculator.num_query_per_req = 7
+
+    assert speculator._get_runtime_num_speculative_tokens(3) == 3
+    assert speculator._get_num_query_per_req_for_k(3) == 3
+    assert speculator._get_num_speculative_tokens_for_query_len(3) == 3
+    assert speculator._get_num_query_per_req_for_k(0) == 0
+    assert speculator._get_num_speculative_tokens_for_query_len(0) == 0
+    assert not speculator._requires_eager_query(7, is_profile=False)
+    assert speculator._requires_eager_query(3, is_profile=False)
+    assert speculator._requires_eager_query(0, is_profile=False)
+
+
+@pytest.mark.parametrize(
+    "speculator_cls",
+    [
+        AutoRegressiveSpeculator,
+        DFlashSpeculator,
+        DSparkSpeculator,
+        MultiModuleMTPSpeculator,
+    ],
+)
+def test_mrv2_speculators_accept_runtime_k(speculator_cls):
+    parameter = inspect.signature(speculator_cls.propose).parameters[
+        "runtime_num_speculative_tokens"
+    ]
+    assert parameter.default is None
+
+
+def _make_dynamic_sd_dummy_runner() -> tuple[object, dict[str, int]]:
+    runner = object.__new__(gpu_model_runner.GPUModelRunner)
+    runner.max_num_reqs = 8
+    runner.num_speculative_steps = 7
+    runner.decode_query_len = 8
+    runner.last_completed_num_spec_tokens_to_schedule = 0
+    runner.speculative_config = MagicMock()
+    runner.speculative_config.uses_dynamic_speculative_decoding.return_value = True
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    runner.kv_connector = SimpleNamespace(set_disabled=lambda *_: None)
+    runner.is_first_pp_rank = True
+    runner.is_last_pp_rank = True
+    runner.intermediate_tensors = None
+    runner.lora_config = None
+    runner.execute_model_state = None
+    runner.device = torch.device("cpu")
+    runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
+    runner.req_states = SimpleNamespace(
+        last_sampled_tokens=torch.zeros(runner.max_num_reqs, dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(runner.max_num_reqs, dtype=torch.int64),
+    )
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(
+                gpu=torch.zeros(runner.max_num_reqs, dtype=torch.float32)
+            ),
+            seeds=SimpleNamespace(
+                gpu=torch.zeros(runner.max_num_reqs, dtype=torch.int64)
+            ),
+        )
+    )
+    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: nullcontext()
+    recorded: dict[str, int] = {}
+
+    def fake_execute_model(self, scheduler_output, **kwargs):
+        scheduled_tokens = list(scheduler_output.num_scheduled_tokens.values())
+        recorded["target_query_len"] = scheduled_tokens[0]
+        recorded["target_total_tokens"] = scheduler_output.total_num_scheduled_tokens
+        recorded["target_runtime_k"] = scheduler_output.num_spec_tokens_to_schedule
+        self.execute_model_state = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                num_reqs=len(scheduled_tokens),
+                num_tokens=scheduler_output.total_num_scheduled_tokens,
+                logits_indices=torch.tensor([0], dtype=torch.int64),
+            ),
+            attn_metadata=None,
+            slot_mappings_by_layer=None,
+            hidden_states=torch.zeros(
+                scheduler_output.total_num_scheduled_tokens, 4, dtype=torch.float32
+            ),
+            aux_hidden_states=None,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            finished_req_ids=set(),
+        )
+
+    class FakeSpeculator:
+        supports_mm_inputs = False
+
+        def propose(self, *args, runtime_num_speculative_tokens, **kwargs):
+            recorded["proposer_runtime_k"] = int(runtime_num_speculative_tokens)
+            input_batch = kwargs["input_batch"] if "input_batch" in kwargs else args[0]
+            return torch.zeros(
+                input_batch.num_reqs,
+                runtime_num_speculative_tokens,
+                dtype=torch.int64,
+            )
+
+    runner.execute_model = fake_execute_model.__get__(runner, type(runner))
+    runner.speculator = FakeSpeculator()
+    runner.model = SimpleNamespace()
+    return runner, recorded
+
+
+@pytest.mark.parametrize(
+    ("previous_k", "current_k", "expected_target_qlen"),
+    [(5, 7, 6), (7, 5, 8), (0, 5, 1)],
+)
+def test_dynamic_sd_dummy_uses_previous_target_k_and_current_proposer_k(
+    previous_k,
+    current_k,
+    expected_target_qlen,
+):
+    runner, recorded = _make_dynamic_sd_dummy_runner()
+    runner.last_completed_num_spec_tokens_to_schedule = previous_k
+
+    gpu_model_runner.GPUModelRunner._dummy_run(
+        runner,
+        1,
+        uniform_decode=True,
+        num_spec_tokens_to_schedule=current_k,
+        skip_eplb=True,
+    )
+
+    assert recorded == {
+        "target_query_len": expected_target_qlen,
+        "target_total_tokens": expected_target_qlen,
+        "target_runtime_k": current_k,
+        "proposer_runtime_k": current_k,
+    }
+    assert runner.last_completed_num_spec_tokens_to_schedule == current_k
 
 
 def test_scheduler_uses_dsd_batch_size_override():

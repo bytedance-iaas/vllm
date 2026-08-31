@@ -5,6 +5,7 @@ import asyncio
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -42,6 +43,35 @@ def test_supports_async_scheduling_executor_with_external_launcher():
 
 def test_supports_async_scheduling_multiproc_executor():
     assert MultiprocExecutor.supports_async_scheduling() is True
+
+
+@pytest.mark.parametrize("runtime_k", [None, 0, 5])
+def test_executor_dummy_batch_preserves_optional_rpc_argument(runtime_k):
+    calls = []
+    executor = SimpleNamespace(
+        collective_rpc=lambda method, **kwargs: calls.append((method, kwargs))
+    )
+
+    Executor.execute_dummy_batch(executor, runtime_k)
+
+    expected_kwargs = {} if runtime_k is None else {"args": (runtime_k,)}
+    assert calls == [("execute_dummy_batch", expected_kwargs)]
+
+
+@pytest.mark.parametrize("runtime_k", [None, 0, 5])
+def test_multiproc_dummy_batch_preserves_optional_rpc_argument(runtime_k):
+    calls = []
+    executor = SimpleNamespace(
+        output_rank=3,
+        collective_rpc=lambda method, **kwargs: calls.append((method, kwargs)),
+    )
+
+    MultiprocExecutor.execute_dummy_batch(executor, runtime_k)
+
+    expected_kwargs = {"unique_reply_rank": 3}
+    if runtime_k is not None:
+        expected_kwargs["args"] = (runtime_k,)
+    assert calls == [("execute_dummy_batch", expected_kwargs)]
 
 
 class _FakeClock:

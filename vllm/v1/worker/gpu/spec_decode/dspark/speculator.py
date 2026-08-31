@@ -64,11 +64,6 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_speculative_steps, dtype=torch.int32, device=device
         )
 
-        self._anchor_idx = (
-            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
-            * self.num_query_per_req
-        )
-
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
@@ -97,9 +92,20 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return model
 
-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+    def _sample_sequential(
+        self,
+        num_reqs: int,
+        head_hidden: torch.Tensor,
+        num_speculative_tokens: int | None = None,
+    ) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
-        n_spec = self.num_speculative_steps
+        n_spec = (
+            self.num_speculative_steps
+            if num_speculative_tokens is None
+            else num_speculative_tokens
+        )
+        if n_spec == 0:
+            return
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
@@ -111,9 +117,15 @@ class DSparkSpeculator(DFlashSpeculator):
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
 
-        # Anchor (bonus) token per request = the input id at query offset 0,
-        # read via the precomputed persistent index (fixed buffer for capture).
-        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        # Anchor (bonus) token per request = the input id at query offset 0.
+        # Derive it from sample_indices so Dynamic SD can shrink query width.
+        first_sample_indices = self.sample_indices[:num_sample:n_spec]
+        prev_indices = (
+            first_sample_indices
+            if self.sample_from_anchor
+            else first_sample_indices - 1
+        )
+        prev = self.input_buffers.input_ids[prev_indices]
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
@@ -156,9 +168,15 @@ class DSparkSpeculator(DFlashSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_query_per_req: int | None = None,
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
+        num_speculative_tokens = (
+            self.num_speculative_steps
+            if num_query_per_req is None
+            else self._get_num_speculative_tokens_for_query_len(num_query_per_req)
+        )
         head_hidden = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -166,4 +184,4 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden)
+        self._sample_sequential(num_reqs, head_hidden, num_speculative_tokens)
