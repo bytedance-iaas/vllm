@@ -383,10 +383,14 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         num_kv_heads: int | None = None,
         kv_cache_dtype: str = "auto",
         *,
+        num_query_heads: int | None = None,
         topk_blocks: int,
         sparse_block_size: int,
     ) -> None:
         self.num_heads = num_heads
+        self.num_query_heads = (
+            num_query_heads if num_query_heads is not None else num_heads
+        )
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
@@ -486,7 +490,7 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         )
         assert topk is not None
         hd = self.head_size
-        q = query[:num_tokens].view(-1, self.num_heads, hd)
+        q = query[:num_tokens].view(-1, self.num_query_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
         kv_cache = (
             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
@@ -500,7 +504,11 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
             assert d is not None
             if self.dcp_world_size > 1:
                 assert d.local_kv_lens is not None
-                decode_q = get_dcp_group().all_gather(q[:nd].contiguous(), dim=1)
+                decode_q = (
+                    get_dcp_group().all_gather(q[:nd].contiguous(), dim=1)
+                    if self.num_query_heads == self.num_heads
+                    else q[:nd].contiguous()
+                )
                 local_out = torch.empty(
                     decode_q.shape,
                     dtype=(

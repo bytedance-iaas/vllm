@@ -82,6 +82,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
@@ -108,6 +109,32 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _use_dcp_replicated_q_proj(
+    vllm_config: VllmConfig,
+    *,
+    is_mtp_block: bool,
+) -> bool:
+    parallel_config = vllm_config.parallel_config
+    dcp_size = parallel_config.decode_context_parallel_size
+    if is_mtp_block or dcp_size == 1:
+        return False
+    if not current_platform.is_cuda():
+        raise NotImplementedError(
+            "MiniMax-M3 DCP replicated Q projection currently supports CUDA only."
+        )
+    if (
+        parallel_config.tensor_parallel_size != 8
+        or dcp_size != 2
+        or parallel_config.prefill_context_parallel_size != 1
+        or parallel_config.dcp_comm_backend != "a2a"
+    ):
+        raise NotImplementedError(
+            "MiniMax-M3 DCP replicated Q projection is currently restricted to "
+            "TP8/DCP2/PCP1 with dcp_comm_backend='a2a'."
+        )
+    return True
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -409,14 +436,23 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         cache_config: CacheConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        dcp_q_replicate: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
         tp_size = get_tensor_model_parallel_world_size()
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
+        self.dcp_q_replicate = dcp_q_replicate
+        self.num_query_heads = (
+            self.num_heads * parallel_config.decode_context_parallel_size
+            if self.dcp_q_replicate
+            else self.num_heads
+        )
         self.total_num_kv_heads = config.num_key_value_heads
         if self.total_num_kv_heads >= tp_size:
             assert self.total_num_kv_heads % tp_size == 0
@@ -424,7 +460,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = config.head_dim
-        self.q_size = self.num_heads * self.head_dim
+        self.q_size = self.num_query_heads * self.head_dim
+        self.out_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
@@ -448,6 +485,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            dcp_q_replicate=self.dcp_q_replicate,
+            dcp_world_size=parallel_config.decode_context_parallel_size,
         )
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
@@ -484,7 +523,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.index_rotary_emb = self.rotary_emb
 
         # Attention-backend wiring.
-        vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
@@ -519,6 +557,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.scaling,
             self.num_kv_heads,
             kv_cache_dtype=self.kv_cache_dtype,
+            num_query_heads=self.num_query_heads,
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
             sparse_block_size=sparse_cfg["sparse_block_size"],
         )
@@ -606,7 +645,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.k_norm.weight,
             cos_sin_cache,
             positions,
-            self.num_heads,
+            self.num_query_heads,
             self.num_kv_heads,
             rotary_dim,
             eps,
@@ -623,7 +662,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype,
         )
 
-        output = torch.empty_like(q)
+        output = qkv.new_empty((num_tokens, self.out_size))
         attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
@@ -675,6 +714,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
         )
+        dcp_q_replicate = is_sparse_attention_layer and _use_dcp_replicated_q_proj(
+            vllm_config,
+            is_mtp_block=is_mtp_block,
+        )
 
         if is_sparse_attention_layer:
             self.self_attn = MiniMaxM3SparseAttention(
@@ -684,6 +727,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 cache_config=cache_config,
                 topk_indices_buffer=topk_indices_buffer,
+                dcp_q_replicate=dcp_q_replicate,
             )
         else:
             self.self_attn = MiniMaxM3Attention(

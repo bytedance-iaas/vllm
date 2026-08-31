@@ -95,6 +95,96 @@ def test_target_parity_flag_enables_sparse_bf16_partials(
     assert impl.dcp_bf16_partials is expected
 
 
+@pytest.mark.parametrize(
+    ("dcp_size", "is_mtp_block", "expected"),
+    [
+        (1, False, False),
+        (2, True, False),
+        (2, False, True),
+    ],
+)
+def test_dcp_q_replication_follows_production_topology(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_size: int,
+    is_mtp_block: bool,
+    expected: bool,
+) -> None:
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=dcp_size,
+            prefill_context_parallel_size=1,
+            dcp_comm_backend="a2a",
+        )
+    )
+    monkeypatch.setattr(minimax_model, "current_platform", _SM100Platform())
+
+    assert (
+        minimax_model._use_dcp_replicated_q_proj(
+            config,
+            is_mtp_block=is_mtp_block,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tensor_parallel_size", 4),
+        ("decode_context_parallel_size", 4),
+        ("prefill_context_parallel_size", 2),
+        ("dcp_comm_backend", "ag_rs"),
+    ],
+)
+def test_dcp_q_replication_rejects_unvalidated_topologies(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    topology = {
+        "tensor_parallel_size": 8,
+        "decode_context_parallel_size": 2,
+        "prefill_context_parallel_size": 1,
+        "dcp_comm_backend": "a2a",
+    }
+    topology[field] = value
+    config = SimpleNamespace(parallel_config=SimpleNamespace(**topology))
+    monkeypatch.setattr(minimax_model, "current_platform", _SM100Platform())
+
+    with pytest.raises(NotImplementedError, match="TP8/DCP2/PCP1"):
+        minimax_model._use_dcp_replicated_q_proj(
+            config,
+            is_mtp_block=False,
+        )
+
+
+def test_dcp_q_replication_passes_q_shard_rank_to_v2_loader() -> None:
+    linear = object.__new__(minimax_model.MinimaxM3QKVParallelLinearWithIndexer)
+    linear.head_size = 4
+    linear.num_heads = 8
+    linear.num_kv_heads = 1
+    linear.num_index_heads = 1
+    linear.index_head_size = 4
+    linear.tp_size = 8
+    linear.num_kv_head_replicas = 2
+    linear.q_shard_rank = 3
+    calls: dict[str, object] = {}
+    param = SimpleNamespace(
+        load_qkv_weight=lambda **kwargs: calls.update(kwargs),
+    )
+
+    linear.weight_loader_v2(
+        param,
+        torch.empty((256, 4)),
+        loaded_shard_id="q",
+    )
+
+    assert calls["shard_rank"] == 3
+    assert calls["shard_size"] == 32
+    assert calls["shard_offset"] == 0
+
+
 class _FakeDCPGroup:
     def __init__(self, gathered: torch.Tensor) -> None:
         self.gathered = gathered
