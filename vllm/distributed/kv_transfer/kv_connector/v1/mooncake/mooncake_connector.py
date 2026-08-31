@@ -3119,6 +3119,25 @@ class MooncakeConnectorWorker:
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
+        remote_pp_sizes = {
+            remote_tp_rank: len(self._remote_agents[remote_engine_id][remote_tp_rank])
+            for remote_tp_rank in remote_tp_ranks
+        }
+        if any(
+            remote_pp_size < self.pp_size
+            for remote_pp_size in remote_pp_sizes.values()
+        ):
+            logger.error(
+                "Unsupported Mooncake PP topology for engine %s: "
+                "producer PP sizes=%s, consumer PP size=%d",
+                remote_engine_id,
+                remote_pp_sizes,
+                self.pp_size,
+            )
+            for pull_meta in pull_metas.values():
+                pull_meta.pull_failed = True
+                self._mark_pull_failed(pull_meta)
+            return
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
         for remote_tp_rank in remote_tp_ranks:
