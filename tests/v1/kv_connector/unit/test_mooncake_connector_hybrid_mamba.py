@@ -306,12 +306,25 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
             ),
         ]
 
-        src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = asyncio.run(
-            build_transfer_params()
-        )
+        (
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+            err_reqs,
+            err_msg,
+            transferred_reqs,
+            transferred_region_ranges,
+        ) = asyncio.run(build_transfer_params())
 
         assert err_reqs == []
         assert err_msg is None
+        assert transferred_reqs == {"d-hybrid-gdn"}
+        assert transferred_region_ranges == {
+            "d-hybrid-gdn": {
+                (0x6000, 1, 0, block_len),
+                (0x2000, 0, 0, block_len),
+            }
+        }
         assert src_ptrs == [
             0x5000 + 4 * block_len,
             0x1000 + 10 * block_len,
