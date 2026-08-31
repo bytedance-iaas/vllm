@@ -3648,6 +3648,44 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
 
 
+def test_full_sequence_admission_includes_reserved_blocks():
+    block_size = 16
+    num_blocks = 10  # 9 usable after reserving the null block.
+    config = make_kv_cache_config(block_size, num_blocks)
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=16 * block_size,
+        enable_caching=False,
+        hash_block_size=block_size,
+    )
+    req = make_request("reserved", list(range(block_size)), block_size, sha256)
+
+    # The request needs six blocks through completion. Four blocks reserved for
+    # active requests leave only five available, so admission must wait.
+    assert (
+        manager.allocate_slots(
+            req,
+            block_size,
+            full_sequence_must_fit=True,
+            full_sequence_num_tokens=6 * block_size,
+            reserved_blocks=4,
+        )
+        is None
+    )
+
+    # Reducing the reservation by one makes the same full sequence fit exactly.
+    assert (
+        manager.allocate_slots(
+            req,
+            block_size,
+            full_sequence_must_fit=True,
+            full_sequence_num_tokens=6 * block_size,
+            reserved_blocks=3,
+        )
+        is not None
+    )
+
+
 def test_cache_hit_local_and_external():
     # Regression test for #33775: when a request hits the local prefix cache
     # in one KV cache group and needs external (connector) blocks in another,
