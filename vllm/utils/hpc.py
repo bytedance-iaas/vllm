@@ -31,6 +31,27 @@ def has_hpc() -> bool:
     return True
 
 
+@functools.cache
+def has_hpc_mxfp8_k32_moe() -> bool:
+    """Return whether hpc-ops exposes the MiniMax-M3 MXFP8 K32 kernel."""
+    if not has_hpc():
+        return False
+    try:
+        import hpc  # noqa: F401
+    except Exception as err:
+        logger.warning_once("Failed to import hpc package: %s", err)
+        return False
+
+    op_name = "fuse_moe_mxfp8_k32_bf16_candidate_out"
+    if not hasattr(torch.ops.hpc, op_name):
+        logger.warning_once(
+            "Installed hpc package is missing MiniMax-M3 MXFP8 K32 MoE op: %s",
+            op_name,
+        )
+        return False
+    return True
+
+
 # Remove 'torch._library.custom_ops':
 # The output of this custom operator (1) must not also be an input to
 # this custom operator and (2) may not alias any inputs to this custom
@@ -264,8 +285,61 @@ def hpc_fuse_moe_blockwise(
     )
 
 
+def hpc_fuse_moe_mxfp8_k32_bf16_candidate_out(
+    hidden: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    row_indices: torch.Tensor,
+    topk_pos: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    grouped_hidden: torch.Tensor,
+    grouped_hidden_scale: torch.Tensor,
+    gate_output: torch.Tensor,
+    activated_output: torch.Tensor,
+    activated_scale: torch.Tensor,
+    down_output: torch.Tensor,
+    activation_clamp: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    import hpc  # noqa: F401
+
+    torch.ops.hpc.fuse_moe_mxfp8_k32_bf16_candidate_out(
+        hidden,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_weights,
+        output,
+        row_indices,
+        topk_pos,
+        seqlens,
+        cu_seqlens,
+        grouped_hidden,
+        grouped_hidden_scale,
+        gate_output,
+        activated_output,
+        activated_scale,
+        down_output,
+        activation_clamp,
+        alpha,
+        beta,
+    )
+    return output
+
+
 __all__ = [
     "has_hpc",
+    "has_hpc_mxfp8_k32_moe",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",
+    "hpc_fuse_moe_mxfp8_k32_bf16_candidate_out",
 ]
