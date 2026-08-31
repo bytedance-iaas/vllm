@@ -65,8 +65,8 @@ Disposition terms:
 
 ### 3.1 Current Execution Status
 
-The CPU/static migration is implemented through `f911556cb6`. The branch has
-46 target-native commits after `v0.27.0`, including this document's initial
+The CPU/static migration is implemented through `3b27f22d7c`. The branch has
+50 target-native commits after `v0.27.0`, including this document's initial
 planning commit.
 
 | Area | Status | Target commits |
@@ -79,7 +79,7 @@ planning commit.
 | MiniMax HPC | Complete, image/GPU pending | `6120c51141`, `deb0b32e0d` |
 | CUTLASS W4A8 and DeepEP | Complete, GPU/multi-rank pending | `099caa830f` through `90b13c90e1` |
 | Humming W4A8 | Complete, GPU pending | `19d96bcbfa` |
-| ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `f911556cb6` |
+| ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `3b27f22d7c` |
 | MRV2 direct-Mooncake PCP | Hold | No safe target-native implementation yet |
 | DSpark K below block size | Hold | `0d6fd1c83c` intentionally not migrated |
 | MiniMax indexer E5M2 removal | Hold | Existing top-k layout is upstream; dtype removal lacks evidence |
@@ -149,8 +149,11 @@ Migration rules:
 - Reuse the `humming-kernels[cu13]==0.1.10` target dependency; do not reinstall
   Humming in the devel image.
 - Resolve requested refs to one immutable SHA in `iaas_main` history before
-  launching wheel and image jobs. Require the versioned ByteIAAS build
-  contract and limit registry credentials to the login step.
+  launching wheel and image jobs. For pre-merge validation, permit only a
+  branch-based manual dispatch to build the exact `github.sha` carrying that
+  workflow; tag dispatches remain subject to the ancestry check. Require the
+  versioned ByteIAAS build contract and limit registry credentials to the
+  login step.
 - Build CUDA 13.0.3 OpenAI/devel images by digest. Build zstd devel from the
   zstd OpenAI digest, and verify all relevant child manifests before final
   tags are created.
@@ -531,9 +534,14 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 - The final CUTLASS W4A8/DeepEP review approved
   `099caa830f^..90b13c90e1`.
 - The final ByteIAAS source review approved `f8040e5a16^..f911556cb6`.
+- The branch self-dispatch hardening through `3b27f22d7c` passed independent
+  review with no P0-P2 findings.
 - ByteIAAS helper tests pass with 18 cases, including mixed child/layer,
   attestation, shared-DAG, cycle, tag-length, and ASCII validation.
 - Actionlint 1.7.7 passes all ByteIAAS workflows.
+- The source-selection matrix accepts an exact branch self-dispatch and rejects
+  tag self-dispatch, a different feature-branch SHA, non-dispatch feature
+  sources, and sources without build contract `1`.
 - Both Dockerfiles parse and `docker/versions.json` matches
   `docker/Dockerfile`.
 - Buildx 0.36.1 frontend validation reports zero warnings for the ByteIAAS
