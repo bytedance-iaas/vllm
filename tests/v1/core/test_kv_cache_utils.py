@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,6 +33,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_capacity,
     get_kv_cache_configs,
+    get_kv_cache_groups,
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     group_and_unify_kv_cache_specs,
@@ -48,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    KVCacheTemporalLayout,
     KVCacheTensor,
     KVQuantMode,
     MambaSpec,
@@ -1653,6 +1656,390 @@ def test_get_max_concurrency_packed_kv_cache_config():
     assert get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config_packed
     ) == num_blocks / (1024 + 73)
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_replicated_eagle_draft_kv_accounting(dcp_size: int):
+    target_spec = new_kv_cache_spec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+    )
+    draft_spec = replace(
+        new_kv_cache_spec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.float8_e4m3fn,
+        ),
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=128,
+        kv_cache_specs=specs,
+    )
+    groups = [KVCacheGroupSpec(list(specs), uniform_spec)]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            enable_eagle3_replicated_draft_kv=True,
+        ),
+        model_config=SimpleNamespace(
+            max_model_len=512,
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+
+    bytes_per_parent = (
+        target_spec.page_size_bytes + dcp_size * draft_spec.page_size_bytes
+    )
+    assert kv_cache_utils._pool_bytes_per_block(vllm_config, groups) == bytes_per_parent
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+        == (4 // dcp_size) * bytes_per_parent
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=10 * bytes_per_parent,
+    )
+    assert config.num_blocks == 10
+    tensor_sizes = {
+        tensor.shared_by[0]: tensor.size for tensor in config.kv_cache_tensors
+    }
+    assert tensor_sizes["model.layers.0.self_attn.attn"] == (
+        10 * target_spec.page_size_bytes
+    )
+    assert tensor_sizes["model.layers.60.self_attn.attn"] == (
+        10 * dcp_size * draft_spec.page_size_bytes
+    )
+
+
+def test_prefill_eagle_draft_kv_keeps_identity_page_allocation():
+    target_spec = new_kv_cache_spec(block_size=128)
+    draft_spec = replace(
+        new_kv_cache_spec(
+            block_size=128,
+            num_kv_heads=16,
+            head_size=128,
+        ),
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    specs = {
+        "model.layers.30.self_attn.attn": target_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=specs,
+            ),
+        )
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            enable_eagle3_prefill_draft_kv=True,
+            enable_eagle3_replicated_draft_kv=False,
+        ),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+    bytes_per_parent = target_spec.page_size_bytes + draft_spec.page_size_bytes
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=10 * bytes_per_parent,
+    )
+    tensor_sizes = {
+        tensor.shared_by[0]: tensor.size for tensor in config.kv_cache_tensors
+    }
+
+    assert config.num_blocks == 10
+    assert tensor_sizes["model.layers.30.self_attn.attn"] == (
+        10 * target_spec.page_size_bytes
+    )
+    assert tensor_sizes["model.layers.60.self_attn.attn"] == (
+        10 * draft_spec.page_size_bytes
+    )
+
+
+@pytest.mark.parametrize("layer_prefix", ["language_model.model", "model"])
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_target_dense_and_draft_full_temporal_accounting(
+    layer_prefix: str,
+    dcp_size: int,
+):
+    target_specs = {
+        f"{layer_prefix}.layers.{layer}.self_attn.attn": replace(
+            new_kv_cache_spec(block_size=128),
+            temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+        )
+        for layer in range(3)
+    }
+    sparse_spec = new_kv_cache_spec(block_size=128)
+    draft_spec = replace(
+        new_kv_cache_spec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+        ),
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    specs = {
+        **target_specs,
+        f"{layer_prefix}.layers.3.self_attn.attn": sparse_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=specs,
+            ),
+        )
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            enable_eagle3_prefill_draft_kv=False,
+            enable_eagle3_replicated_draft_kv=True,
+            enable_eagle3_target_dense_full_temporal_kv=True,
+        ),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+    bytes_per_parent = sum(spec.page_size_bytes for spec in specs.values()) + (
+        dcp_size - 1
+    ) * sum(spec.page_size_bytes for spec in (*target_specs.values(), draft_spec))
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=10 * bytes_per_parent,
+    )
+    tensor_sizes = {
+        tensor.shared_by[0]: tensor.size for tensor in config.kv_cache_tensors
+    }
+
+    assert config.num_blocks == 10
+    for layer_name, spec in target_specs.items():
+        assert tensor_sizes[layer_name] == (10 * dcp_size * spec.page_size_bytes)
+    assert tensor_sizes[f"{layer_prefix}.layers.3.self_attn.attn"] == (
+        10 * sparse_spec.page_size_bytes
+    )
+    assert tensor_sizes["model.layers.60.self_attn.attn"] == (
+        10 * dcp_size * draft_spec.page_size_bytes
+    )
+
+
+def test_prefill_eagle_draft_kv_allows_non_draft_pp_stage():
+    target_spec = new_kv_cache_spec(block_size=128)
+    groups = [
+        KVCacheGroupSpec(
+            ["model.layers.0.self_attn.attn"],
+            target_spec,
+        )
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            enable_eagle3_prefill_draft_kv=True,
+            enable_eagle3_replicated_draft_kv=False,
+        ),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+    )
+
+    assert (
+        kv_cache_utils._get_eagle_full_temporal_layers(
+            vllm_config,
+            groups,
+        )
+        == []
+    )
+
+
+def test_full_temporal_draft_keeps_shared_parent_allocator_group():
+    target_spec = new_kv_cache_spec(block_size=128)
+    draft_spec = replace(
+        new_kv_cache_spec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+        ),
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    groups = get_kv_cache_groups(
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+        ),
+        specs,
+    )
+
+    assert len(groups) == 1
+    assert isinstance(groups[0].kv_cache_spec, UniformTypeKVCacheSpecs)
+    assert groups[0].layer_names == list(specs)
+    assert groups[0].kv_cache_spec.kv_cache_specs == specs
+
+
+def test_replicated_eagle_draft_kv_requires_explicit_full_temporal_spec():
+    target_spec = new_kv_cache_spec(block_size=128)
+    draft_spec = new_kv_cache_spec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=specs,
+            ),
+        )
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            enable_eagle3_replicated_draft_kv=True,
+        ),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+    )
+
+    with pytest.raises(ValueError, match="Unexpected FULL_TEMPORAL"):
+        kv_cache_utils._get_eagle_full_temporal_layers(
+            vllm_config,
+            groups,
+        )
+
+
+def test_replicated_eagle_draft_kv_override_counts_parent_blocks():
+    target_spec = new_kv_cache_spec(block_size=128)
+    draft_spec = replace(
+        new_kv_cache_spec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+        ),
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=specs,
+            ),
+        )
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            enable_eagle3_replicated_draft_kv=True,
+        ),
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=7),
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=1,
+    )
+    tensor_sizes = {
+        tensor.shared_by[0]: tensor.size for tensor in config.kv_cache_tensors
+    }
+    assert config.num_blocks == 7
+    assert tensor_sizes["model.layers.0.self_attn.attn"] == (
+        7 * target_spec.page_size_bytes
+    )
+    assert tensor_sizes["model.layers.60.self_attn.attn"] == (
+        14 * draft_spec.page_size_bytes
+    )
+
+
+def test_replicated_eagle_draft_kv_feature_off_preserves_allocation():
+    target_spec = new_kv_cache_spec(block_size=128)
+    draft_spec = new_kv_cache_spec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+    )
+    specs = {
+        "model.layers.0.self_attn.attn": target_spec,
+        "model.layers.60.self_attn.attn": draft_spec,
+    }
+    groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=specs,
+            ),
+        )
+    ]
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            enable_eagle3_replicated_draft_kv=False,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+    bytes_per_parent = target_spec.page_size_bytes + draft_spec.page_size_bytes
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=10 * bytes_per_parent,
+    )
+    tensor_sizes = {
+        tensor.shared_by[0]: tensor.size for tensor in config.kv_cache_tensors
+    }
+    assert config.num_blocks == 10
+    assert tensor_sizes["model.layers.0.self_attn.attn"] == (
+        10 * target_spec.page_size_bytes
+    )
+    assert tensor_sizes["model.layers.60.self_attn.attn"] == (
+        10 * draft_spec.page_size_bytes
+    )
 
 
 def test_allocate_with_lookahead():

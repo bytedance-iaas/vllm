@@ -1,10 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.v1.worker.cp_utils as cp_utils
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
+from vllm.v1.worker.cp_utils import (
+    check_attention_cp_compatibility,
+    should_skip_dcp_context_attention,
+)
+
+
+def test_cp_compatibility_allows_effective_dcp1_layer(monkeypatch) -> None:
+    full_temporal = SimpleNamespace(
+        dcp_world_size=1,
+        need_to_return_lse_for_decode=False,
+        supports_mtp_with_cp_non_trivial_interleave_size=True,
+    )
+    sharded = SimpleNamespace(
+        dcp_world_size=2,
+        need_to_return_lse_for_decode=True,
+        supports_mtp_with_cp_non_trivial_interleave_size=True,
+    )
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {
+            "dense": SimpleNamespace(impl=full_temporal),
+            "sparse": SimpleNamespace(impl=sharded),
+        },
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=128,
+        ),
+    )
+
+    check_attention_cp_compatibility(config)
+
+    sharded.need_to_return_lse_for_decode = False
+    with pytest.raises(AssertionError, match="requires attention"):
+        check_attention_cp_compatibility(config)
 
 
 def test_skip_gate_only_for_zero_context():

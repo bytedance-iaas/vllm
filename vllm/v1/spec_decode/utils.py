@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Collection
+from dataclasses import dataclass
+
 import torch
 
+from vllm.distributed.cp_mapping import map_cp_positions
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import (
@@ -9,6 +13,142 @@ from vllm.v1.attention.backends.utils import (
 )
 
 PADDING_SLOT_ID = -1
+MINIMAX_M3_TARGET_LAYER_COUNT = 60
+MINIMAX_M3_DENSE_TARGET_LAYER_IDS = (0, 1, 2)
+MINIMAX_M3_TARGET_LAYER_PREFIXES = ("language_model.model", "model")
+
+
+def get_minimax_m3_target_attention_layer_name(layer_index: int) -> str:
+    """Return the global attention-layer identity for a MiniMax-M3 layer."""
+    if not 0 <= layer_index < MINIMAX_M3_TARGET_LAYER_COUNT:
+        raise ValueError(
+            "MiniMax-M3 target layer index must be in "
+            f"[0, {MINIMAX_M3_TARGET_LAYER_COUNT})"
+        )
+    return f"language_model.model.layers.{layer_index}.self_attn.attn"
+
+
+def get_minimax_m3_dense_target_attention_layer_names() -> tuple[str, ...]:
+    """Return target layers requiring DCP1-equivalent EAGLE-visible parity."""
+    return tuple(
+        get_minimax_m3_target_attention_layer_name(layer_index)
+        for layer_index in MINIMAX_M3_DENSE_TARGET_LAYER_IDS
+    )
+
+
+def resolve_minimax_m3_dense_target_attention_layer_names(
+    available_layer_names: Collection[str],
+) -> tuple[str, ...]:
+    """Resolve the complete dense target layer set for either model wrapper."""
+    resolved: list[tuple[str, ...]] = []
+    available = set(available_layer_names)
+    for prefix in MINIMAX_M3_TARGET_LAYER_PREFIXES:
+        candidates = tuple(
+            f"{prefix}.layers.{layer_index}.self_attn.attn"
+            for layer_index in MINIMAX_M3_DENSE_TARGET_LAYER_IDS
+        )
+        present = set(candidates) & available
+        if present and len(present) != len(candidates):
+            raise ValueError(
+                "MiniMax-M3 dense target attention layers are incomplete: "
+                f"expected {list(candidates)!r}, got {sorted(present)!r}"
+            )
+        if present:
+            resolved.append(candidates)
+    if len(resolved) > 1:
+        raise ValueError(
+            "Multiple MiniMax-M3 dense target attention layer prefixes found"
+        )
+    return resolved[0] if resolved else ()
+
+
+def get_eagle3_draft_attention_layer_name(
+    total_target_layers: int,
+    draft_layer_index: int = 0,
+) -> str:
+    """Return the global MiniMax-M3 layer identity for an EAGLE3 draft layer."""
+    if total_target_layers != MINIMAX_M3_TARGET_LAYER_COUNT:
+        raise ValueError("MiniMax-M3 EAGLE3 requires exactly 60 global target layers")
+    if draft_layer_index < 0:
+        raise ValueError("draft_layer_index must be non-negative")
+    layer_index = total_target_layers + draft_layer_index
+    return f"model.layers.{layer_index}.self_attn.attn"
+
+
+@dataclass(frozen=True)
+class PromptDraftKVCoverage:
+    """Logical prompt draft-KV handoff between Prefill and Decode."""
+
+    prompt_tokens: int
+    target_prefix_tokens: int
+    compatible_draft_prefix_tokens: int
+    transfer_start_token: int
+    transfer_end_token_exclusive: int
+    decode_recompute_position: int
+
+    @property
+    def transfer_token_count(self) -> int:
+        return self.transfer_end_token_exclusive - self.transfer_start_token
+
+
+def get_prompt_draft_kv_coverage(
+    prompt_tokens: int,
+    target_prefix_tokens: int,
+    compatible_draft_prefix_tokens: int,
+) -> PromptDraftKVCoverage:
+    """Freeze the half-open prompt draft-KV transfer and handoff contract."""
+    if prompt_tokens <= 0:
+        raise ValueError("prompt_tokens must be positive")
+    if not 0 <= target_prefix_tokens <= prompt_tokens:
+        raise ValueError("target_prefix_tokens must be within the prompt")
+    if not 0 <= compatible_draft_prefix_tokens <= target_prefix_tokens:
+        raise ValueError(
+            "compatible_draft_prefix_tokens must be within the target prefix"
+        )
+
+    decode_recompute_position = prompt_tokens - 1
+    transfer_start_token = min(
+        compatible_draft_prefix_tokens,
+        decode_recompute_position,
+    )
+    return PromptDraftKVCoverage(
+        prompt_tokens=prompt_tokens,
+        target_prefix_tokens=target_prefix_tokens,
+        compatible_draft_prefix_tokens=compatible_draft_prefix_tokens,
+        transfer_start_token=transfer_start_token,
+        transfer_end_token_exclusive=decode_recompute_position,
+        decode_recompute_position=decode_recompute_position,
+    )
+
+
+def expand_dcp_parent_block_table(
+    parent_block_table: torch.Tensor,
+    dcp_world_size: int,
+    max_model_len: int,
+    kernel_block_size: int,
+) -> torch.Tensor:
+    """Expand each DCP parent block into full-temporal physical child pages."""
+    if dcp_world_size <= 1:
+        return parent_block_table
+    if max_model_len <= 0 or kernel_block_size <= 0:
+        raise ValueError("max_model_len and kernel_block_size must be positive")
+
+    child_offsets = torch.arange(
+        dcp_world_size,
+        dtype=parent_block_table.dtype,
+        device=parent_block_table.device,
+    )
+    children = parent_block_table.unsqueeze(-1) * dcp_world_size + child_offsets
+    # Block zero is the null block. Keep all children of padding entries null.
+    children.masked_fill_(parent_block_table.unsqueeze(-1) == 0, 0)
+    max_child_blocks = (max_model_len + kernel_block_size - 1) // kernel_block_size
+    expanded = children.flatten(1)
+    if expanded.shape[1] < max_child_blocks:
+        raise ValueError(
+            "DCP parent block table is too short for full-temporal KV: "
+            f"{expanded.shape[1]} child blocks < {max_child_blocks}"
+        )
+    return expanded[:, :max_child_blocks].contiguous()
 
 
 def next_power_of_2(n: int) -> int:
@@ -25,6 +165,39 @@ def next_power_of_2(n: int) -> int:
     return n + 1
 
 
+def _advance_cpu_sequence_metadata(
+    metadata: CommonAttentionMetadata,
+    max_model_len: int,
+) -> None:
+    seq_lens = metadata._seq_lens_cpu
+    upper_bound = metadata.seq_lens_cpu_upper_bound
+    exceeds_max = None
+    if seq_lens is not None:
+        exceeds_max = seq_lens >= max_model_len
+        seq_lens.add_(1)
+        seq_lens.masked_fill_(exceeds_max, 1)
+    elif upper_bound is not None:
+        exceeds_max = upper_bound >= max_model_len
+
+    num_computed_tokens = metadata._num_computed_tokens_cpu
+    if num_computed_tokens is not None:
+        num_computed_tokens.add_(1)
+        if exceeds_max is not None:
+            num_computed_tokens.masked_fill_(exceeds_max, 0)
+
+    upper_bound_aliases_seq_lens = (
+        upper_bound is not None
+        and seq_lens is not None
+        and upper_bound.data_ptr() == seq_lens.data_ptr()
+        and upper_bound.shape == seq_lens.shape
+        and upper_bound.stride() == seq_lens.stride()
+    )
+    if upper_bound is not None and not upper_bound_aliases_seq_lens:
+        exceeds_upper_bound = upper_bound >= max_model_len
+        upper_bound.add_(1)
+        upper_bound.masked_fill_(exceeds_upper_bound, 1)
+
+
 @triton.jit
 def eagle_step_slot_mapping_metadata_kernel(
     positions_ptr,  # [batch_size] - current positions (1D view for M-RoPE)
@@ -33,6 +206,9 @@ def eagle_step_slot_mapping_metadata_kernel(
     seq_lens_ptr,  # [batch_size] - read and write
     out_clamped_positions_ptr,  # [batch_size] (output)
     out_slot_mapping_ptr,  # [input_batch_size] (output)
+    dcp_world_size,
+    dcp_rank,
+    cp_kv_cache_interleave_size,
     block_size: tl.constexpr,
     max_model_len: tl.constexpr,
     n_blocks_per_req: tl.constexpr,
@@ -65,14 +241,25 @@ def eagle_step_slot_mapping_metadata_kernel(
     exceeds_max = new_position >= max_model_len
     clamped_position = tl.where(exceeds_max, 0, new_position)
 
-    # Block table lookup: block_number = position // block_size
+    cp_cycle = dcp_world_size * cp_kv_cache_interleave_size
+    owner_rank = (clamped_position % cp_cycle) // cp_kv_cache_interleave_size
+    local_position = (
+        clamped_position // cp_cycle * cp_kv_cache_interleave_size
+        + clamped_position % cp_kv_cache_interleave_size
+    )
+
+    # The block table is compacted to this DCP rank's local token space.
     # Clamp block_number to avoid OOB when position is at max
-    block_number = clamped_position // block_size
+    block_number = local_position // block_size
     block_number = tl.minimum(block_number, n_blocks_per_req - 1)
 
     block_id = tl.load(block_table_ptr + req_idx * block_table_stride + block_number)
-    slot_id = block_id * block_size + (clamped_position % block_size)
-    slot_id = tl.where(exceeds_max, PAD_ID, slot_id)
+    slot_id = block_id * block_size + (local_position % block_size)
+    slot_id = tl.where(
+        exceeds_max | (owner_rank != dcp_rank),
+        PAD_ID,
+        slot_id,
+    )
 
     # Update seq_lens: +1 normally, or 1 if exceeded
     seq_len = tl.load(seq_lens_ptr + req_idx)
@@ -94,6 +281,9 @@ def eagle_step_update_slot_mapping_and_metadata(
     out_clamped_positions: torch.Tensor,
     out_slot_mapping: torch.Tensor,
     input_batch_size: int | None = None,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     """
     Fused update of slot mapping and metadata for one EAGLE autoregressive step.
@@ -125,6 +315,9 @@ def eagle_step_update_slot_mapping_and_metadata(
         seq_lens,
         out_clamped_positions,
         out_slot_mapping,
+        dcp_world_size,
+        dcp_rank,
+        cp_kv_cache_interleave_size,
         block_size=block_size,
         max_model_len=max_model_len,
         n_blocks_per_req=n_blocks_per_req,
@@ -239,6 +432,52 @@ def eagle_prepare_next_token_padded_kernel(
         tl.store(valid_sampled_tokens_count_ptr + req_idx, valid_count)
 
 
+def compute_slot_mapping_from_block_table(
+    query_start_loc: torch.Tensor,
+    block_table_tensor: torch.Tensor,
+    positions: torch.Tensor,
+    block_size: int,
+    max_model_len: int,
+    *,
+    num_new_tokens: int = 0,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
+    is_rejected_token_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map global token positions through an explicit block table."""
+    batch_size, n_blocks_per_req = block_table_tensor.shape
+    req_indices = torch.arange(batch_size, device=query_start_loc.device)
+    req_indices = torch.repeat_interleave(
+        req_indices,
+        query_start_loc[1:] - query_start_loc[:-1] + num_new_tokens,
+        output_size=len(positions),
+    )
+    # Clamp the positions to prevent an out-of-bounds error when indexing
+    # into block_table_tensor.
+    clamped_positions = torch.clamp(positions, max=max_model_len - 1)
+    owner_ranks, local_positions = map_cp_positions(
+        clamped_positions,
+        cp_world_size=dcp_world_size,
+        interleave_size=cp_kv_cache_interleave_size,
+    )
+    block_table_indices = req_indices * n_blocks_per_req + local_positions // block_size
+    block_nums = block_table_tensor.view(-1)[block_table_indices]
+    block_offsets = local_positions % block_size
+    new_slot_mapping = block_nums * block_size + block_offsets
+    # Mask out the position ids that exceed the max model length.
+    exceeds_max_model_len = positions >= max_model_len
+    new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+    new_slot_mapping.masked_fill_(owner_ranks != dcp_rank, PADDING_SLOT_ID)
+    # Mask out rejected tokens to prevent saves to the KV cache.
+    if is_rejected_token_mask is not None:
+        new_slot_mapping.masked_fill_(
+            is_rejected_token_mask,
+            PADDING_SLOT_ID,
+        )
+    return new_slot_mapping
+
+
 def compute_new_slot_mapping(
     cad: CommonAttentionMetadata,
     new_positions: torch.Tensor,
@@ -246,29 +485,22 @@ def compute_new_slot_mapping(
     block_size: int,
     num_new_tokens: int,
     max_model_len: int,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ):
-    batch_size, n_blocks_per_req = cad.block_table_tensor.shape
-    req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
-    req_indices = torch.repeat_interleave(
-        req_indices,
-        cad.naive_query_lens() + num_new_tokens,
-        output_size=len(new_positions),
+    return compute_slot_mapping_from_block_table(
+        query_start_loc=cad.query_start_loc,
+        block_table_tensor=cad.block_table_tensor,
+        positions=new_positions,
+        block_size=block_size,
+        max_model_len=max_model_len,
+        num_new_tokens=num_new_tokens,
+        dcp_world_size=dcp_world_size,
+        dcp_rank=dcp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        is_rejected_token_mask=is_rejected_token_mask,
     )
-    # Clamp the positions to prevent an out-of-bounds error when indexing
-    # into block_table_tensor.
-    clamped_positions = torch.clamp(new_positions, max=max_model_len - 1)
-    block_table_indices = (
-        req_indices * n_blocks_per_req + clamped_positions // block_size
-    )
-    block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
-    block_offsets = clamped_positions % block_size
-    new_slot_mapping = block_nums * block_size + block_offsets
-    # Mask out the position ids that exceed the max model length.
-    exceeds_max_model_len = new_positions >= max_model_len
-    new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
-    # Mask out rejected tokens to prevent saves to the KV cache.
-    new_slot_mapping.masked_fill_(is_rejected_token_mask, PADDING_SLOT_ID)
-    return new_slot_mapping
 
 
 def extend_all_queries_by_N(
@@ -290,6 +522,12 @@ def extend_all_queries_by_N(
     new_query_start_loc_cpu = cad.query_start_loc_cpu + N * torch.arange(
         len(cad.query_start_loc_cpu), dtype=torch.int32
     )
+    new_seq_lens_cpu = cad._seq_lens_cpu + N if cad._seq_lens_cpu is not None else None
+    new_seq_lens_cpu_upper_bound = (
+        cad.seq_lens_cpu_upper_bound + N
+        if cad.seq_lens_cpu_upper_bound is not None
+        else None
+    )
     new_cad = cad.replace(
         query_start_loc=new_query_start_loc,
         query_start_loc_cpu=new_query_start_loc_cpu,
@@ -300,6 +538,9 @@ def extend_all_queries_by_N(
         max_query_len=cad.max_query_len + N,
         max_seq_len=cad.max_seq_len + N,
         slot_mapping=new_slot_mapping,
+        _seq_lens_cpu=new_seq_lens_cpu,
+        seq_lens_cpu_upper_bound=new_seq_lens_cpu_upper_bound,
+        dcp_local_seq_lens_cpu=None,
     )
     return new_cad
 
