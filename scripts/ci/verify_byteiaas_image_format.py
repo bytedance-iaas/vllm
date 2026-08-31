@@ -14,6 +14,7 @@ Manifest = dict[str, Any]
 InspectManifest = Callable[[str], Manifest]
 ZSTD_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.v1.tar+zstd"
 NYDUS_LAYER_MEDIA_TYPE = "application/vnd.oci.image.layer.nydus.blob.v1"
+NYDUS_MANIFEST_ARTIFACT_TYPE = "application/vnd.nydus.image.manifest.v1+json"
 NYDUS_LAYER_ANNOTATIONS = {
     "containerd.io/snapshot/nydus-blob",
     "containerd.io/snapshot/nydus-bootstrap",
@@ -37,28 +38,56 @@ def inspect_manifest(reference: str) -> Manifest:
     return json.loads(raw)
 
 
-def is_runnable_descriptor(descriptor: Manifest) -> bool:
-    if descriptor.get("artifactType"):
-        return False
-
+def is_attestation_descriptor(descriptor: Manifest) -> bool:
+    artifact_type = str(descriptor.get("artifactType", "")).lower()
+    if "in-toto" in artifact_type or "attestation" in artifact_type:
+        return True
     annotations = descriptor.get("annotations")
     if isinstance(annotations, dict):
         reference_type = annotations.get("vnd.docker.reference.type", "")
         if "attestation" in str(reference_type).lower():
-            return False
+            return True
 
     platform = descriptor.get("platform")
     if isinstance(platform, dict):
-        if platform.get("os") == "unknown" or platform.get("architecture") == "unknown":
-            return False
+        return (
+            platform.get("os") == "unknown" or platform.get("architecture") == "unknown"
+        )
 
-    return True
+    return False
+
+
+def select_child_descriptors(
+    descriptors: list[Manifest],
+    image_format: str | None,
+) -> list[Manifest]:
+    candidates = [
+        descriptor
+        for descriptor in descriptors
+        if not is_attestation_descriptor(descriptor)
+    ]
+    if image_format == "nydus":
+        nydus_artifacts = [
+            descriptor
+            for descriptor in candidates
+            if descriptor.get("artifactType") == NYDUS_MANIFEST_ARTIFACT_TYPE
+        ]
+        if nydus_artifacts:
+            return nydus_artifacts
+    elif image_format == "zstd":
+        candidates = [
+            descriptor
+            for descriptor in candidates
+            if not descriptor.get("artifactType")
+        ]
+    return candidates
 
 
 def collect_layer_sets(
     reference: str,
     inspect: InspectManifest = inspect_manifest,
     ancestors: frozenset[str] = frozenset(),
+    image_format: str | None = None,
 ) -> list[list[Manifest]]:
     if reference in ancestors:
         raise ValueError(f"manifest cycle detected at {reference}")
@@ -69,15 +98,17 @@ def collect_layer_sets(
         return [layers]
 
     repository = image_repository(reference)
-    descriptors = manifest.get("manifests")
-    if not isinstance(descriptors, list) or not descriptors:
+    raw_descriptors = manifest.get("manifests")
+    if not isinstance(raw_descriptors, list) or not raw_descriptors:
         raise ValueError(f"manifest {reference} has no layers or child manifests")
 
+    descriptors = select_child_descriptors(
+        [descriptor for descriptor in raw_descriptors if isinstance(descriptor, dict)],
+        image_format,
+    )
     collected: list[list[Manifest]] = []
     child_ancestors = ancestors | {reference}
     for descriptor in descriptors:
-        if not isinstance(descriptor, dict) or not is_runnable_descriptor(descriptor):
-            continue
         digest = descriptor.get("digest", "")
         if not digest:
             raise ValueError(f"runnable child manifest in {reference} has no digest")
@@ -86,6 +117,7 @@ def collect_layer_sets(
                 f"{repository}@{digest}",
                 inspect=inspect,
                 ancestors=child_ancestors,
+                image_format=image_format,
             )
         )
 
@@ -142,7 +174,7 @@ def verify_image_format(
 
     all_markers: set[str] = set()
     for child_index, layers in enumerate(
-        collect_layer_sets(reference, inspect=inspect),
+        collect_layer_sets(reference, inspect=inspect, image_format=image_format),
         start=1,
     ):
         media_types, annotations_by_key = layer_markers(layers)

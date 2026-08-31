@@ -73,6 +73,52 @@ class VerifyByteiaasImageFormatTest(unittest.TestCase):
 
         self.assertIn("containerd.io/snapshot/nydus-blob", markers)
 
+    def test_nydus_referrer_index_selects_nydus_artifact(self) -> None:
+        manifests: dict[str, dict[str, Any]] = {
+            "registry.example.com/serving/vllm:nydus": {
+                "manifests": [
+                    {
+                        "digest": "sha256:source",
+                        "platform": {"os": "linux", "architecture": "amd64"},
+                    },
+                    {
+                        "digest": "sha256:nydus",
+                        "artifactType": (
+                            "application/vnd.nydus.image.manifest.v1+json"
+                        ),
+                        "platform": {"os": "linux", "architecture": "amd64"},
+                    },
+                ],
+            },
+            "registry.example.com/serving/vllm@sha256:source": {
+                "layers": [
+                    {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}
+                ],
+            },
+            "registry.example.com/serving/vllm@sha256:nydus": {
+                "layers": [
+                    {
+                        "mediaType": ("application/vnd.oci.image.layer.nydus.blob.v1"),
+                        "annotations": {"containerd.io/snapshot/nydus-blob": "true"},
+                    },
+                    {
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "annotations": {
+                            "containerd.io/snapshot/nydus-bootstrap": "true"
+                        },
+                    },
+                ],
+            },
+        }
+
+        markers = verify_image_format(
+            "registry.example.com/serving/vllm:nydus",
+            "nydus",
+            inspect=manifests.__getitem__,
+        )
+
+        self.assertIn("application/vnd.oci.image.layer.nydus.blob.v1", markers)
+
     def test_every_runnable_child_must_match(self) -> None:
         manifests: dict[str, dict[str, Any]] = {
             "registry.example.com/serving/vllm:zstd": {

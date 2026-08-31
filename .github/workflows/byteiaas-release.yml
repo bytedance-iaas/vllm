@@ -10,7 +10,10 @@ on:
       release_tag:
         description: "Existing git tag to release when dispatching from iaas_main"
         required: true
-        default: ""
+      image_formats:
+        description: "CSV of image formats to publish: oci,zstd,nydus"
+        required: false
+        default: "oci,zstd,nydus"
 
 concurrency:
   group: byteiaas-vllm-release-${{ github.event.inputs.release_tag || github.ref_name }}
@@ -72,4 +75,5 @@ jobs:
       cuda_version: "13.0.3"
       tag_mode: release
       tag_value: ${{ needs.resolve-release.outputs.internal_tag }}
+      image_formats: ${{ github.event_name == 'workflow_dispatch' && inputs.image_formats || 'oci,zstd,nydus' }}
     secrets: inherit
