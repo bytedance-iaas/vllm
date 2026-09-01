@@ -17,6 +17,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.scheduler import parse_prefill_token_bucket_schedule
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -214,6 +215,172 @@ def test_schedule_multimodal_requests():
     assert len(output.scheduled_encoder_inputs) == 10
     for req_id, encoder_input in output.scheduled_encoder_inputs.items():
         assert len(encoder_input) == 1
+
+
+@pytest.mark.parametrize(
+    ("num_prompt_tokens", "expected_first_chunk"),
+    [
+        (3500, 3500),
+        (8000, 4096),
+        (16383, 4096),
+        (16384, 8192),
+        (32000, 8192),
+    ],
+)
+def test_prefill_token_bucket_boundaries(
+    num_prompt_tokens: int,
+    expected_first_chunk: int,
+):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=num_prompt_tokens)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: expected_first_chunk}
+
+
+def test_prefill_token_bucket_disabled_by_default():
+    scheduler = create_scheduler(max_num_batched_tokens=8192, max_model_len=65536)
+    (request,) = create_requests(num_requests=1, num_tokens=8000)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {request.request_id: 8000}
+
+
+def test_prefill_token_bucket_limits_whole_step():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    req_a, req_b = create_requests(
+        num_requests=2,
+        num_tokens=8000,
+        req_ids=["a", "b"],
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"a": 4096}
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.skipped_waiting) == 1
+
+
+def test_prefill_token_bucket_batches_only_matching_buckets():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    short_a, short_b = create_requests(
+        num_requests=2,
+        num_tokens=3500,
+        req_ids=["short-a", "short-b"],
+    )
+    (medium,) = create_requests(
+        num_requests=1,
+        num_tokens=8000,
+        req_ids=["medium"],
+    )
+    for request in (short_a, short_b, medium):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"short-a": 3500, "short-b": 3500}
+    assert "medium" not in output.num_scheduled_tokens
+
+
+def test_prefill_token_bucket_allows_decode_in_prefill_step():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["decode"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    (prefill_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8000,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill_req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"decode": 1, "prefill": 4095}
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        "4095:0,-1:8192",
+        "0:8192,-1:8192",
+        "8192:4096,4095:8192,-1:8192",
+        "4095:8192,-1:8192,16383:4096",
+        "4095:8192,16383:4096",
+        "invalid",
+        ",",
+        "4095:8192,,-1:8192",
+    ],
+)
+def test_prefill_token_bucket_rejects_invalid_schedule(schedule: str):
+    with pytest.raises(ValueError, match="prefill token bucket"):
+        parse_prefill_token_bucket_schedule(schedule)
+
+
+def test_prefill_token_bucket_custom_schedule_and_global_cap():
+    custom = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+        prefill_token_bucket_schedule="4095:1024,-1:2048",
+    )
+    (custom_req,) = create_requests(num_requests=1, num_tokens=8000)
+    custom.add_request(custom_req)
+    assert custom.schedule().num_scheduled_tokens == {custom_req.request_id: 2048}
+
+    capped = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_num_scheduled_tokens=1024,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (capped_req,) = create_requests(num_requests=1, num_tokens=8000)
+    capped.add_request(capped_req)
+    assert capped.schedule().num_scheduled_tokens == {capped_req.request_id: 1024}
+
+
+def test_prefill_token_bucket_requires_chunked_prefill():
+    with pytest.raises(ValueError, match="requires chunked prefill"):
+        create_scheduler(
+            max_num_batched_tokens=8192,
+            max_model_len=8192,
+            enable_chunked_prefill=False,
+            enable_prefill_token_bucket_schedule=True,
+        )
 
 
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():

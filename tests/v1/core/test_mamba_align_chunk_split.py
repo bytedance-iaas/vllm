@@ -78,6 +78,7 @@ def _split(
     num_new_tokens: int,
     use_eagle: bool = True,
     partial_hit: bool = False,
+    max_prefill_tokens: int | None = None,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     stub = SimpleNamespace(
@@ -89,7 +90,12 @@ def _split(
         mamba_partial_cache_hit=partial_hit,
         hash_block_size=ATTN_BLOCK_SIZE,
     )
-    return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+    return Scheduler._mamba_block_aligned_split(
+        stub,
+        request,
+        num_new_tokens,
+        max_prefill_tokens=max_prefill_tokens,
+    )
 
 
 def _run_chunked_prefill(
@@ -166,6 +172,23 @@ def test_fragmented_first_chunk_does_not_poison_mamba_prefix_cache() -> None:
     next chunk crossed 1600 and published slot 0 as state@1600.
     """
     _prefill(PROMPT_LEN, budgets=[364, PROMPT_LEN])
+
+
+def test_sub_block_prefill_budget_still_makes_progress() -> None:
+    """A bucket budget smaller than one Mamba block must not stall prefill."""
+    (request,) = create_requests(
+        1,
+        num_tokens=PROMPT_LEN,
+        block_size=ATTN_BLOCK_SIZE,
+    )
+
+    first_chunk = _split(
+        request,
+        num_new_tokens=1024,
+        max_prefill_tokens=1024,
+    )
+
+    assert first_chunk == 1024
 
 
 def test_fragmented_tail_chunk_does_not_poison_mamba_prefix_cache() -> None:

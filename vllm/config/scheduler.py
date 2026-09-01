@@ -21,6 +21,56 @@ logger = init_logger(__name__)
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
 
+DEFAULT_PREFILL_TOKEN_BUCKET_SCHEDULE = (
+    (4095, 8192),
+    (16383, 4096),
+    (-1, 8192),
+)
+
+
+def parse_prefill_token_bucket_schedule(value: str) -> tuple[tuple[int, int], ...]:
+    """Parse and validate prompt-length to per-step token budget buckets."""
+    if not value:
+        return DEFAULT_PREFILL_TOKEN_BUCKET_SCHEDULE
+
+    buckets: list[tuple[int, int]] = []
+    previous_max = 0
+    items = [item.strip() for item in value.split(",")]
+    if any(not item for item in items):
+        raise ValueError("prefill token bucket schedule contains an empty entry")
+    for index, item in enumerate(items):
+        try:
+            max_prompt_tokens_str, step_tokens_str = item.split(":", 1)
+            max_prompt_tokens = int(max_prompt_tokens_str)
+            step_tokens = int(step_tokens_str)
+        except ValueError as exc:
+            raise ValueError(
+                "prefill token bucket schedule entries must use "
+                "'max_prompt_tokens:max_step_tokens' format"
+            ) from exc
+
+        if step_tokens <= 0:
+            raise ValueError("prefill token bucket step budget must be positive")
+        if max_prompt_tokens == -1:
+            if index != len(items) - 1:
+                raise ValueError("prefill token bucket catch-all must be last")
+        elif max_prompt_tokens <= 0:
+            raise ValueError(
+                "prefill token bucket max prompt tokens must be -1 or positive"
+            )
+        elif max_prompt_tokens <= previous_max:
+            raise ValueError(
+                "prefill token bucket max prompt tokens must be strictly increasing"
+            )
+
+        buckets.append((max_prompt_tokens, step_tokens))
+        if max_prompt_tokens != -1:
+            previous_max = max_prompt_tokens
+
+    if buckets[-1][0] != -1:
+        raise ValueError("prefill token bucket schedule must end with -1 catch-all")
+    return tuple(buckets)
+
 
 @config
 class SchedulerConfig:
@@ -61,6 +111,20 @@ class SchedulerConfig:
     Defaults to max_num_batched_tokens."""
     max_num_scheduled_tokens_auto_derived: bool = False
     """Whether max_num_scheduled_tokens was derived by vLLM rather than user-set."""
+
+    enable_prefill_token_bucket_schedule: bool = False
+    """Apply an experimental prompt-length bucket policy to local prefill steps.
+
+    The first local prefill scheduled in a step selects the bucket. The bucket
+    limits the total token budget for that step, including decode work, and
+    subsequent local prefills must belong to the same bucket."""
+
+    prefill_token_bucket_schedule: str = ""
+    """Comma-separated prompt-length to per-step token budget buckets.
+
+    Each entry is ``max_prompt_tokens:max_step_tokens``. Boundaries must be
+    strictly increasing and the final entry must use ``-1`` as a catch-all.
+    The default is ``4095:8192,16383:4096,-1:8192``."""
 
     max_num_seqs: int = Field(default=DEFAULT_MAX_NUM_SEQS, ge=1)
     """Maximum number of sequences to be processed in a single iteration.
@@ -236,6 +300,15 @@ class SchedulerConfig:
                 "Encoder-decoder models do not support chunked prefill nor"
                 " prefix caching; disabling both."
             )
+
+        if self.enable_prefill_token_bucket_schedule:
+            if not self.enable_chunked_prefill:
+                raise ValueError(
+                    "prefill token bucket scheduling requires chunked prefill"
+                )
+            parse_prefill_token_bucket_schedule(self.prefill_token_bucket_schedule)
+        elif self.prefill_token_bucket_schedule:
+            parse_prefill_token_bucket_schedule(self.prefill_token_bucket_schedule)
 
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
         self.encoder_cache_size = self.max_num_batched_tokens

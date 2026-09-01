@@ -9,6 +9,7 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
+from vllm.config.scheduler import parse_prefill_token_bucket_schedule
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -163,6 +164,12 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
+        )
+        self.enable_prefill_token_bucket_schedule = (
+            self.scheduler_config.enable_prefill_token_bucket_schedule
+        )
+        self.prefill_token_bucket_schedule = parse_prefill_token_bucket_schedule(
+            self.scheduler_config.prefill_token_bucket_schedule
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -336,9 +343,7 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
             if speculative_config.use_eagle() or speculative_config.uses_draft_model():
-                self.num_lookahead_tokens = (
-                    speculative_config.num_drafter_query_tokens
-                )
+                self.num_lookahead_tokens = speculative_config.num_drafter_query_tokens
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -436,6 +441,7 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        max_prefill_tokens: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -471,7 +477,8 @@ class Scheduler(SchedulerInterface):
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
+            if max_prefill_tokens is None:
+                max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
@@ -583,6 +590,42 @@ class Scheduler(SchedulerInterface):
             default_budget=self.max_num_scheduled_tokens,
         )
 
+    def _get_prefill_token_bucket(self, request: Request) -> tuple[int, int] | None:
+        if not self.enable_prefill_token_bucket_schedule:
+            return None
+
+        for index, (max_prompt_tokens, step_tokens) in enumerate(
+            self.prefill_token_bucket_schedule
+        ):
+            if max_prompt_tokens < 0 or request.num_prompt_tokens <= max_prompt_tokens:
+                return (
+                    index,
+                    min(step_tokens, self.scheduler_config.max_num_batched_tokens),
+                )
+        raise AssertionError("validated prefill token bucket schedule has no match")
+
+    def _get_prefill_request_budget(
+        self,
+        request: Request,
+        token_budget: int,
+        base_token_budget: int,
+        step_bucket: tuple[int, int] | None,
+    ) -> tuple[int, tuple[int, int] | None, bool]:
+        bucket = self._get_prefill_token_bucket(request)
+        if bucket is None:
+            return token_budget, step_bucket, True
+        if step_bucket is not None and bucket[0] != step_bucket[0]:
+            return token_budget, step_bucket, False
+
+        candidate_bucket = step_bucket or bucket
+        used_budget = base_token_budget - token_budget
+        remaining_budget = candidate_bucket[1] - used_budget
+        return (
+            min(token_budget, max(remaining_budget, 0)),
+            candidate_bucket,
+            remaining_budget > 0,
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -605,9 +648,14 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         dynamic_sd_early_k = self._get_dynamic_sd_early_k()
         token_budget = self._get_effective_max_num_scheduled_tokens(dynamic_sd_early_k)
+        base_token_budget = token_budget
+        prefill_token_bucket_step: tuple[int, int] | None = None
+        scheduled_prefill_buckets: dict[str, tuple[int, int]] = {}
+        prefill_bucket_backlog = False
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+            base_token_budget = 0
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -661,6 +709,24 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            is_local_prefill = request.is_prefill_chunk
+            request_token_budget = token_budget
+            request_prefill_token_bucket_step = prefill_token_bucket_step
+            if self.enable_prefill_token_bucket_schedule and is_local_prefill:
+                (
+                    request_token_budget,
+                    request_prefill_token_bucket_step,
+                    bucket_matches_step,
+                ) = self._get_prefill_request_budget(
+                    request,
+                    token_budget,
+                    base_token_budget,
+                    prefill_token_bucket_step,
+                )
+                if not bucket_matches_step or request_token_budget <= 0:
+                    req_index += 1
+                    continue
+
             is_async_spec_decode = (
                 self.scheduler_config.async_scheduling
                 and self.num_sampled_tokens_per_step > 0
@@ -680,7 +746,7 @@ class Scheduler(SchedulerInterface):
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 
-                num_new_tokens = min(num_new_tokens, token_budget)
+                num_new_tokens = min(num_new_tokens, request_token_budget)
 
                 # Make sure the input position does not exceed the max model len.
                 # This is necessary when using spec decoding.
@@ -711,7 +777,14 @@ class Scheduler(SchedulerInterface):
 
                 if self.need_mamba_block_aligned_split:
                     num_new_tokens = self._mamba_block_aligned_split(
-                        request, num_new_tokens
+                        request,
+                        num_new_tokens,
+                        max_prefill_tokens=(
+                            request_token_budget
+                            if self.enable_prefill_token_bucket_schedule
+                            and is_local_prefill
+                            else None
+                        ),
                     )
 
                 if is_async_spec_decode:
@@ -775,6 +848,13 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            scheduled_prefill_buckets.pop(preempted_req_id, None)
+                            prefill_token_bucket_step = next(
+                                iter(scheduled_prefill_buckets.values()), None
+                            )
+                            prefill_scheduled = any(
+                                req.is_prefill_chunk for req in scheduled_running_reqs
+                            )
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -807,8 +887,14 @@ class Scheduler(SchedulerInterface):
                 break
 
             # Schedule the request.
+            if self.enable_prefill_token_bucket_schedule and is_local_prefill:
+                assert request_prefill_token_bucket_step is not None
+                prefill_token_bucket_step = request_prefill_token_bucket_step
+                scheduled_prefill_buckets[request.request_id] = (
+                    request_prefill_token_bucket_step
+                )
             scheduled_running_reqs.append(request)
-            prefill_scheduled |= request.is_prefill_chunk
+            prefill_scheduled |= is_local_prefill
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -881,6 +967,9 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                request_token_budget = token_budget
+                request_prefill_token_bucket_step = prefill_token_bucket_step
+                is_local_prefill = False
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1043,6 +1132,30 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                is_local_prefill = (
+                    not load_kv_async and num_computed_tokens < request.num_tokens - 1
+                )
+                if (
+                    self.enable_prefill_token_bucket_schedule
+                    and is_local_prefill
+                    and not defer_prefills
+                ):
+                    (
+                        request_token_budget,
+                        request_prefill_token_bucket_step,
+                        bucket_matches_step,
+                    ) = self._get_prefill_request_budget(
+                        request,
+                        token_budget,
+                        base_token_budget,
+                        prefill_token_bucket_step,
+                    )
+                    if not bucket_matches_step or request_token_budget <= 0:
+                        prefill_bucket_backlog = True
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1077,7 +1190,7 @@ class Scheduler(SchedulerInterface):
                     if pad_spec_decode:
                         padded_num_new_tokens = num_new_tokens
                         if (
-                            num_new_tokens > token_budget
+                            num_new_tokens > request_token_budget
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
@@ -1091,13 +1204,13 @@ class Scheduler(SchedulerInterface):
                     # pooling requests to be chunked
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
+                        and num_new_tokens > request_token_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1125,6 +1238,12 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
+                        max_prefill_tokens=(
+                            request_token_budget
+                            if self.enable_prefill_token_bucket_schedule
+                            and is_local_prefill
+                            else None
+                        ),
                     )
                     if num_new_tokens == 0:
                         break
@@ -1243,6 +1362,13 @@ class Scheduler(SchedulerInterface):
                         )
                     continue
 
+                if self.enable_prefill_token_bucket_schedule and is_local_prefill:
+                    assert request_prefill_token_bucket_step is not None
+                    prefill_token_bucket_step = request_prefill_token_bucket_step
+                    scheduled_prefill_buckets[request_id] = (
+                        request_prefill_token_bucket_step
+                    )
+                    prefill_scheduled = True
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1292,14 +1418,21 @@ class Scheduler(SchedulerInterface):
             # DP prefill balancing: on a step that admitted prefills (release),
             # record whether it was capacity-bound.
             if not defer_prefills:
-                self.prefill_capacity_bound = bool(self.waiting)
+                self.prefill_capacity_bound = bool(
+                    self.waiting or prefill_bucket_backlog
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert (
-            total_num_scheduled_tokens
-            <= self._get_effective_max_num_scheduled_tokens(dynamic_sd_early_k)
+        max_scheduled_tokens = self._get_effective_max_num_scheduled_tokens(
+            dynamic_sd_early_k
         )
+        if prefill_token_bucket_step is not None:
+            max_scheduled_tokens = min(
+                max_scheduled_tokens,
+                prefill_token_bucket_step[1],
+            )
+        assert total_num_scheduled_tokens <= max_scheduled_tokens
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -3034,9 +3167,7 @@ class Scheduler(SchedulerInterface):
                 req_num_computed_blocks = (
                     req_num_computed_tokens + group_block_size - 1
                 ) // group_block_size
-                for idx, block_id in enumerate(
-                    req_block_ids[:req_num_computed_blocks]
-                ):
+                for idx, block_id in enumerate(req_block_ids[:req_num_computed_blocks]):
                     if block_id not in invalid_block_ids:
                         continue
 
