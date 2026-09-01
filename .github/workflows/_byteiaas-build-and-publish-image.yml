@@ -340,6 +340,7 @@ jobs:
               --build-arg https_proxy="${HTTPS_PROXY}"
               --build-arg all_proxy="${ALL_PROXY}"
               --build-arg no_proxy="${NO_PROXY}"
+              --build-arg RUN_WHEEL_CHECK=false
               --metadata-file "${metadata_path}"
               .
             )

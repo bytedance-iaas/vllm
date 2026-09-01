@@ -34,6 +34,9 @@
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
+    "UV_VERSION": {
+      "default": "0.11.25"
+    },
     "PYTORCH_CUDA_INDEX_BASE_URL": {
       "default": "https://download.pytorch.org/whl"
     },
@@ -72,6 +75,9 @@
     },
     "SCCACHE_S3_NO_CREDENTIALS": {
       "default": "0"
+    },
+    "DEEPGEMM_PYTHON_VERSIONS": {
+      "default": "3.10,3.11,3.12,3.13,3.14"
     },
     "TORCH_CUDA_ARCH_LIST": {
       "default": "7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0"
