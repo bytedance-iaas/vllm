@@ -271,8 +271,8 @@ def test_prefill_token_bucket_limits_whole_step():
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens == {"a": 4096}
-    assert len(scheduler.waiting) == 0
-    assert len(scheduler.skipped_waiting) == 1
+    assert len(scheduler.waiting) == 1
+    assert len(scheduler.skipped_waiting) == 0
 
 
 def test_prefill_token_bucket_batches_only_matching_buckets():
@@ -331,6 +331,55 @@ def test_prefill_token_bucket_allows_decode_in_prefill_step():
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens == {"decode": 1, "prefill": 4095}
+
+
+def test_prefill_token_bucket_caps_decode_after_prefill():
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        enable_prefill_token_bucket_schedule=True,
+        prefill_token_bucket_schedule="4:8,-1:4",
+    )
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["decode"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    (prefill_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill_req)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"decode": 1, "prefill": 3}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode", "prefill"],
+            req_id_to_index={"decode": 0, "prefill": 1},
+            sampled_token_ids=[[0], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.running[:] = [prefill_req, decode_req]
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"prefill": 4}
 
 
 @pytest.mark.parametrize(

@@ -626,6 +626,21 @@ class Scheduler(SchedulerInterface):
             remaining_budget > 0,
         )
 
+    @staticmethod
+    def _get_prefill_bucket_step_budget(
+        token_budget: int,
+        base_token_budget: int,
+        step_bucket: tuple[int, int] | None,
+    ) -> int:
+        if step_bucket is None:
+            return token_budget
+
+        used_budget = base_token_budget - token_budget
+        return min(
+            token_budget,
+            max(step_bucket[1] - used_budget, 0),
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -710,7 +725,13 @@ class Scheduler(SchedulerInterface):
                 continue
 
             is_local_prefill = request.is_prefill_chunk
-            request_token_budget = token_budget
+            request_token_budget = self._get_prefill_bucket_step_budget(
+                token_budget,
+                base_token_budget,
+                prefill_token_bucket_step,
+            )
+            if request_token_budget <= 0:
+                break
             request_prefill_token_bucket_step = prefill_token_bucket_step
             if self.enable_prefill_token_bucket_schedule and is_local_prefill:
                 (
@@ -967,7 +988,13 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                request_token_budget = token_budget
+                request_token_budget = self._get_prefill_bucket_step_budget(
+                    token_budget,
+                    base_token_budget,
+                    prefill_token_bucket_step,
+                )
+                if request_token_budget <= 0:
+                    break
                 request_prefill_token_bucket_step = prefill_token_bucket_step
                 is_local_prefill = False
 
