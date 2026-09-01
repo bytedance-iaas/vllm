@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheTemporalLayout,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
@@ -36,6 +37,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+from vllm.v1.spec_decode.utils import (
+    get_eagle3_draft_attention_layer_name,
+    resolve_minimax_m3_dense_target_attention_layer_names,
+)
 from vllm.v1.utils import tensor_data
 
 # BlockHash represents the hash of a single KV-cache block used for
@@ -985,6 +990,19 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
+    full_temporal_layers = _get_eagle_full_temporal_layers(vllm_config, kv_cache_groups)
+    if full_temporal_layers:
+        uniform_spec = cast(
+            UniformTypeKVCacheSpecs,
+            kv_cache_groups[0].kv_cache_spec,
+        )
+        extra_full_temporal_bytes = sum(
+            (_get_temporal_page_factor(vllm_config, layer_spec) - 1)
+            * layer_spec.page_size_bytes
+            for layer_name, layer_spec in uniform_spec.kv_cache_specs.items()
+            if layer_name in full_temporal_layers
+        )
+        return uniform_spec.page_size_bytes + extra_full_temporal_bytes
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1314,6 +1332,100 @@ def _use_packed_kv_cache_config(
     return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
 
 
+def _get_eagle_full_temporal_layers(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[str]:
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    decode_enabled = bool(
+        spec_config is not None
+        and getattr(
+            spec_config,
+            "enable_eagle3_replicated_draft_kv",
+            False,
+        )
+    )
+    prefill_enabled = bool(
+        spec_config is not None
+        and getattr(
+            spec_config,
+            "enable_eagle3_prefill_draft_kv",
+            False,
+        )
+    )
+    target_dense_enabled = bool(
+        spec_config is not None
+        and getattr(
+            spec_config,
+            "enable_eagle3_target_dense_full_temporal_kv",
+            False,
+        )
+    )
+    layer_specs = {
+        layer_name: (
+            group.kv_cache_spec.kv_cache_specs[layer_name]
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else group.kv_cache_spec
+        )
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    full_temporal_layers = [
+        layer_name
+        for layer_name, layer_spec in layer_specs.items()
+        if layer_spec.temporal_layout == KVCacheTemporalLayout.FULL_TEMPORAL
+    ]
+    expected_full_temporal_layers: set[str] = set()
+    if target_dense_enabled:
+        expected_full_temporal_layers.update(
+            resolve_minimax_m3_dense_target_attention_layer_names(layer_specs)
+        )
+    draft_layer: str | None = None
+    if decode_enabled or prefill_enabled:
+        draft_layer = get_eagle3_draft_attention_layer_name(
+            vllm_config.model_config.get_total_num_hidden_layers()
+        )
+        if decode_enabled or draft_layer in layer_specs:
+            expected_full_temporal_layers.add(draft_layer)
+
+    if set(full_temporal_layers) != expected_full_temporal_layers:
+        raise ValueError(
+            "Unexpected FULL_TEMPORAL KV cache layers: "
+            f"expected {sorted(expected_full_temporal_layers)!r}, "
+            f"got {sorted(full_temporal_layers)!r}"
+        )
+
+    if not decode_enabled:
+        return []
+
+    if spec_config is None or spec_config.method != "eagle3":
+        raise ValueError("Replicated draft KV requires EAGLE3 speculative decoding")
+    if vllm_config.parallel_config.decode_context_parallel_size not in (1, 2):
+        raise ValueError(
+            "Replicated draft KV requires decode_context_parallel_size 1 or 2"
+        )
+    if len(kv_cache_groups) != 1 or not isinstance(
+        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    ):
+        raise ValueError(
+            "Replicated draft KV requires one UniformTypeKVCacheSpecs group"
+        )
+    if draft_layer is None or draft_layer not in full_temporal_layers:
+        raise ValueError(
+            f"Replicated draft KV requires a FULL_TEMPORAL layer named {draft_layer!r}"
+        )
+    return full_temporal_layers
+
+
+def _get_temporal_page_factor(
+    vllm_config: VllmConfig,
+    kv_cache_spec: KVCacheSpec,
+) -> int:
+    if kv_cache_spec.temporal_layout == KVCacheTemporalLayout.FULL_TEMPORAL:
+        return vllm_config.parallel_config.decode_context_parallel_size
+    return 1
+
+
 def _get_kv_cache_config_packed(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1377,8 +1489,47 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    full_temporal_layers = _get_eagle_full_temporal_layers(vllm_config, kv_cache_groups)
+
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
+    if full_temporal_layers:
+        uniform_spec = cast(
+            UniformTypeKVCacheSpecs,
+            kv_cache_groups[0].kv_cache_spec,
+        )
+        per_layer_specs = uniform_spec.kv_cache_specs
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        extra_full_temporal_bytes = sum(
+            (_get_temporal_page_factor(vllm_config, layer_spec) - 1)
+            * layer_spec.page_size_bytes
+            for layer_name, layer_spec in per_layer_specs.items()
+            if layer_name in full_temporal_layers
+        )
+        bytes_per_parent_block = (
+            uniform_spec.page_size_bytes + extra_full_temporal_bytes
+        )
+        num_blocks = available_memory // bytes_per_parent_block
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=per_layer_specs[layer_name].page_size_bytes
+                * num_blocks
+                * _get_temporal_page_factor(
+                    vllm_config,
+                    per_layer_specs[layer_name],
+                ),
+                shared_by=[layer_name],
+            )
+            for layer_name in kv_cache_groups[0].layer_names
+        ]
+        logger.info_once(
+            "EAGLE full-temporal KV enabled for %s: %d parent blocks, "
+            "%dx physical pages",
+            tuple(full_temporal_layers),
+            num_blocks,
+            dcp_world_size,
+        )
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -1855,6 +2006,18 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    full_temporal_layers = _get_eagle_full_temporal_layers(vllm_config, kv_cache_groups)
+    if full_temporal_layers:
+        parent_block_size = (
+            kv_cache_groups[0].kv_cache_spec.block_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+        )
+        num_parent_blocks = cdiv(
+            vllm_config.model_config.max_model_len,
+            parent_block_size,
+        )
+        return num_parent_blocks * _pool_bytes_per_block(vllm_config, kv_cache_groups)
 
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs

@@ -164,6 +164,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    KVCacheTemporalLayout,
     KVQuantMode,
     MambaSpec,
     SlidingWindowSpec,
@@ -209,7 +210,13 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm.v1.spec_decode.utils import (
+    compute_slot_mapping_from_block_table,
+    expand_dcp_parent_block_table,
+    get_eagle3_draft_attention_layer_name,
+    resolve_minimax_m3_dense_target_attention_layer_names,
+    update_num_computed_tokens_for_batch_change,
+)
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -252,6 +259,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -471,15 +479,13 @@ class GPUModelRunner(
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        self._target_speculative_config = self.speculative_config
+        self.num_spec_tokens = 0
+        self.prev_num_spec_tokens = 0
+        self.use_aux_hidden_state_outputs = False
+        self._producer_aux_hidden_state_layers: tuple[int, ...] = ()
+        self._configure_kv_producer_speculation()
         self.observability_config = vllm_config.observability_config
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.method in ("eagle3", "dflash", "dspark")
-            and self._is_kv_producer_only_instance()
-        ):
-            # A pure prefill producer does not draft. Treat the runner as
-            # non-speculative while preserving the shared VllmConfig.
-            self.speculative_config = None
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -517,6 +523,9 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.pcp_rank = 0 if self.pcp_world_size <= 1 else get_pcp_group().rank_in_group
         self.cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        self._full_temporal_target_layers: set[str] = set()
+        self._full_temporal_block_tables: dict[int, torch.Tensor] = {}
+        self._full_temporal_slot_mappings: dict[int, torch.Tensor] = {}
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_buffer_num_tokens = get_pcp_max_buffer_num_tokens(vllm_config)
         self.max_num_reqs = scheduler_config.max_num_seqs
@@ -591,7 +600,6 @@ class GPUModelRunner(
         # Encoder CUDA graph manager (initialized after model load if enabled)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
-        self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -673,19 +681,22 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
-        self.num_spec_tokens = 0
-        self.prev_num_spec_tokens = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
-        if self.speculative_config:
-            self.num_spec_tokens = self.speculative_config.num_speculative_tokens
+        if self._target_speculative_config:
+            self.num_spec_tokens = (
+                self._target_speculative_config.num_speculative_tokens
+            )
             self.prev_num_spec_tokens = self.num_spec_tokens
+        if self.speculative_config:
             draft_config = self.speculative_config.draft_model_config
             if draft_config is not None and draft_config.max_model_len is not None:
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
         self.use_async_spec_decode = (
-            self.use_async_scheduling and self.num_spec_tokens > 0
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.num_spec_tokens > 0
         )
 
         # Request states.
@@ -998,6 +1009,129 @@ class GPUModelRunner(
             and kv_transfer_config.is_kv_producer
             and not kv_transfer_config.is_kv_consumer
         )
+
+    def _configure_kv_producer_speculation(self) -> None:
+        self._producer_aux_hidden_state_layers = ()
+        speculative_config = self.speculative_config
+        self._target_speculative_config = speculative_config
+        self.num_spec_tokens = (
+            0
+            if speculative_config is None
+            else speculative_config.num_speculative_tokens
+        )
+        self.prev_num_spec_tokens = self.num_spec_tokens
+        if speculative_config is None:
+            return
+
+        prefill_draft_kv = bool(
+            getattr(
+                speculative_config,
+                "enable_eagle3_prefill_draft_kv",
+                False,
+            )
+        )
+        if prefill_draft_kv:
+            self._configure_eagle3_prefill_draft_kv(speculative_config)
+            return
+
+        if not self._is_kv_producer_only_instance():
+            return
+
+        if speculative_config.method in ("eagle3", "dflash", "dspark"):
+            # A pure prefill producer does not draft. Treat the runner as
+            # non-speculative while preserving the shared VllmConfig.
+            self.speculative_config = None
+            self._target_speculative_config = None
+            self.num_spec_tokens = 0
+            self.prev_num_spec_tokens = 0
+            return
+
+        if not speculative_config.uses_extract_hidden_states():
+            return
+
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and pp_group.world_size != 2:
+            raise ValueError(
+                "extract_hidden_states producer pipeline transport currently "
+                "supports pipeline_parallel_size=2 only."
+            )
+        if pp_group.is_last_rank:
+            return
+
+        draft_model_config = speculative_config.draft_model_config
+        assert draft_model_config is not None
+        layer_ids = getattr(
+            draft_model_config.hf_config,
+            "eagle_aux_hidden_state_layer_ids",
+            None,
+        )
+        if not layer_ids:
+            raise ValueError(
+                "eagle_aux_hidden_state_layer_ids must be set for "
+                "extract_hidden_states producer pipeline transport."
+            )
+        self._producer_aux_hidden_state_layers = tuple(layer_ids)
+        self.use_aux_hidden_state_outputs = True
+        self.speculative_config = None
+
+    def _configure_eagle3_prefill_draft_kv(
+        self,
+        speculative_config: Any,
+    ) -> None:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        errors: list[str] = []
+        if speculative_config.method != "eagle3":
+            errors.append("method must be eagle3")
+        if speculative_config.num_speculative_tokens != 1:
+            errors.append("num_speculative_tokens must be 1")
+        if not current_platform.is_cuda():
+            errors.append("CUDA is required")
+        if not any(
+            "MiniMaxM3" in str(arch) for arch in (self.model_config.architectures or [])
+        ):
+            errors.append("target architecture must be MiniMaxM3")
+        if self.model_config.get_total_num_hidden_layers() != 60:
+            errors.append("target model must contain exactly 60 layers")
+        if self.parallel_config.pipeline_parallel_size != 2:
+            errors.append("pipeline_parallel_size must be 2")
+        if self.parallel_config.tensor_parallel_size != 4:
+            errors.append("tensor_parallel_size must be 4")
+        if self.parallel_config.decode_context_parallel_size != 1:
+            errors.append("decode_context_parallel_size must be 1")
+        if (
+            kv_transfer_config is None
+            or kv_transfer_config.kv_connector != "MooncakeConnector"
+            or kv_transfer_config.kv_role != "kv_producer"
+            or kv_transfer_config.kv_connector_module_path is not None
+            or kv_transfer_config.kv_load_failure_policy != "fail"
+        ):
+            errors.append("built-in Mooncake pure producer in fail mode is required")
+        draft_model_config = speculative_config.draft_model_config
+        layer_ids = (
+            None
+            if draft_model_config is None
+            else getattr(
+                draft_model_config.hf_config,
+                "eagle_aux_hidden_state_layer_ids",
+                None,
+            )
+        )
+        if layer_ids is None:
+            layer_ids = (2, 30, 57)
+        if tuple(layer_ids or ()) != (2, 30, 57):
+            errors.append("auxiliary hidden-state layers must be (2, 30, 57)")
+        if errors:
+            raise ValueError(
+                "EAGLE3 Prefill draft-KV runner requirements not met: "
+                + "; ".join(errors)
+            )
+
+        pp_group = get_pp_group()
+        if pp_group.is_last_rank:
+            return
+        self._producer_aux_hidden_state_layers = (2, 30, 57)
+        self.use_aux_hidden_state_outputs = True
+        self.speculative_config = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -2732,6 +2866,27 @@ class GPUModelRunner(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
+            group_attn_metadata = common_attn_metadata
+            if (
+                kv_cache_spec.temporal_layout == KVCacheTemporalLayout.FULL_TEMPORAL
+                and set(attn_group.layer_names) & self._full_temporal_target_layers
+                and self.dcp_world_size > 1
+            ):
+                if ubid is not None:
+                    raise ValueError(
+                        "EAGLE3 target dense full-temporal KV does not "
+                        "support ubatching"
+                    )
+                group_attn_metadata = common_attn_metadata.replace(
+                    block_table_tensor=self._full_temporal_block_tables[kv_cache_gid][
+                        : common_attn_metadata.num_reqs
+                    ],
+                    slot_mapping=self._full_temporal_slot_mappings[kv_cache_gid][
+                        : common_attn_metadata.num_actual_tokens
+                    ],
+                    dcp_local_seq_lens=None,
+                    dcp_local_seq_lens_cpu=None,
+                )
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -2767,7 +2922,7 @@ class GPUModelRunner(
 
             if for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
-                    common_attn_metadata
+                    group_attn_metadata
                 )
             elif (
                 cache_key in cached_attn_metadata
@@ -2775,13 +2930,13 @@ class GPUModelRunner(
             ):
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
-                    common_attn_metadata.block_table_tensor,
-                    common_attn_metadata.slot_mapping,
+                    group_attn_metadata.block_table_tensor,
+                    group_attn_metadata.slot_mapping,
                 )
             else:
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
-                    common_attn_metadata=common_attn_metadata,
+                    common_attn_metadata=group_attn_metadata,
                     **extra_attn_metadata_args,
                 )
                 if builder.supports_update_block_table:
@@ -3795,9 +3950,7 @@ class GPUModelRunner(
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
 
-        # Clamp speculative scheduler placeholders (-1) before embedding lookup.
-        if self.speculative_config is not None:
-            self.input_ids.gpu[:num_input_tokens].clamp_(min=0)
+        self._clamp_speculative_input_ids(num_input_tokens)
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
@@ -3928,6 +4081,17 @@ class GPUModelRunner(
             model_kwargs,
             ec_connector_output,
         )
+
+    def _clamp_speculative_input_ids(self, num_input_tokens: int) -> None:
+        target_speculative_config = getattr(
+            self,
+            "_target_speculative_config",
+            None,
+        )
+        if target_speculative_config is None:
+            target_speculative_config = getattr(self, "speculative_config", None)
+        if target_speculative_config is not None:
+            self.input_ids.gpu[:num_input_tokens].clamp_(min=0)
 
     def _sample(
         self,
@@ -4336,12 +4500,70 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
+    def _get_full_temporal_target_mapping(
+        self,
+        kv_cache_gid: int,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_tokens_unpadded: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        parent_table = self.input_batch.block_table[kv_cache_gid].get_device_tensor(
+            num_reqs_padded
+        )
+        kernel_block_size = self.input_batch.block_table[kv_cache_gid].block_size
+        expanded = expand_dcp_parent_block_table(
+            parent_table,
+            dcp_world_size=self.dcp_world_size,
+            max_model_len=self.max_model_len,
+            kernel_block_size=kernel_block_size,
+        )
+        block_buffer = self._full_temporal_block_tables.get(kv_cache_gid)
+        if block_buffer is None:
+            max_num_reqs = self.input_batch.block_table[
+                kv_cache_gid
+            ].block_table.gpu.shape[0]
+            block_buffer = torch.empty(
+                (max_num_reqs, expanded.shape[1]),
+                dtype=expanded.dtype,
+                device=self.device,
+            )
+            self._full_temporal_block_tables[kv_cache_gid] = block_buffer
+        block_table = block_buffer[:num_reqs_padded]
+        block_table.copy_(expanded)
+
+        slot_buffer = self._full_temporal_slot_mappings.get(kv_cache_gid)
+        if slot_buffer is None:
+            slot_buffer = torch.empty(
+                self.max_num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._full_temporal_slot_mappings[kv_cache_gid] = slot_buffer
+        slot_mapping = slot_buffer[:num_tokens_padded]
+        computed_slot_mapping = compute_slot_mapping_from_block_table(
+            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+            block_table_tensor=block_table,
+            positions=self.positions[:num_tokens_unpadded],
+            block_size=kernel_block_size,
+            max_model_len=self.max_model_len,
+        )
+        slot_mapping[:num_tokens_unpadded].copy_(computed_slot_mapping)
+        slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
+        return block_table, slot_mapping
+
+    def _clear_full_temporal_target_mappings(self) -> None:
+        if hasattr(self, "_full_temporal_block_tables"):
+            self._full_temporal_block_tables.clear()
+        if hasattr(self, "_full_temporal_slot_mappings"):
+            self._full_temporal_slot_mappings.clear()
+
     def _get_slot_mappings(
         self,
         num_tokens_padded: int,
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
+        skip_full_temporal_mapping: bool = False,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -4398,6 +4620,22 @@ class GPUModelRunner(
             slot_mapping = slot_mappings_by_gid[gid]
             for layer_name in kv_cache_group.layer_names:
                 slot_mappings_by_layer[layer_name] = slot_mapping
+            full_temporal_target_layers = self._full_temporal_target_layers & set(
+                kv_cache_group.layer_names
+            )
+            if (
+                full_temporal_target_layers
+                and self.dcp_world_size > 1
+                and not skip_full_temporal_mapping
+            ):
+                _, full_temporal_slot_mapping = self._get_full_temporal_target_mapping(
+                    gid,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    num_tokens_unpadded,
+                )
+                for layer_name in full_temporal_target_layers:
+                    slot_mappings_by_layer[layer_name] = full_temporal_slot_mapping
 
         if ubatch_slices is not None:
             result: list[dict[str, torch.Tensor]] = []
@@ -4731,7 +4969,7 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:
@@ -5779,7 +6017,10 @@ class GPUModelRunner(
             )
         # Try to get auxiliary layers from speculative config,
         # otherwise use model's default layers
-        aux_layers = self._get_eagle3_aux_layers_from_config()
+        aux_layers = (
+            self._producer_aux_hidden_state_layers
+            or self._get_eagle3_aux_layers_from_config()
+        )
         if aux_layers:
             logger.info(
                 "Using auxiliary layers from speculative config: %s", aux_layers
@@ -6278,19 +6519,11 @@ class GPUModelRunner(
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
-
-        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens_padded,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_unpadded=num_tokens_unpadded,
-            ubatch_slices=ubatch_slices_padded,
+        slot_mappings_by_group = None
+        slot_mappings = None
+        build_attention_metadata = (
+            force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
         )
-
-        # Dummy runs have no real slot assignments — fill with -1 so
-        # concat_and_cache kernels skip the KV write.
-        if slot_mappings_by_group is not None:
-            for sm in slot_mappings_by_group.values():
-                sm.fill_(-1)
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
         # etc.) with execute_model.  It must participate in the same event
@@ -6299,7 +6532,7 @@ class GPUModelRunner(
         with self.synchronize_input_prep():
             # If force_attention is True, we always capture attention.
             # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
-            if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            if build_attention_metadata:
                 if profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
@@ -6351,6 +6584,23 @@ class GPUModelRunner(
                 # requests can corrupt Mamba state.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+                skip_full_temporal_mapping=not build_attention_metadata,
+            )
+
+            # Dummy runs have no real slot assignments — fill with -1 so
+            # concat_and_cache kernels skip the KV write.
+            if slot_mappings_by_group is not None:
+                for sm in slot_mappings_by_group.values():
+                    sm.fill_(-1)
+                for sm in self._full_temporal_slot_mappings.values():
+                    sm.fill_(-1)
+
+            if build_attention_metadata:
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -6442,7 +6692,7 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and get_pp_group().is_last_rank:
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
@@ -6857,6 +7107,7 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        self._clear_full_temporal_target_mappings()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -7478,6 +7729,7 @@ class GPUModelRunner(
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
         )
+        self._validate_replicated_draft_cudagraph_mode(cudagraph_mode)
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
@@ -7499,6 +7751,28 @@ class GPUModelRunner(
                 | Gemma4Proposer,
             )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
+
+    def _validate_replicated_draft_cudagraph_mode(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+    ) -> None:
+        speculative_config = self.speculative_config
+        if speculative_config is None or not getattr(
+            speculative_config,
+            "enable_eagle3_replicated_draft_kv",
+            False,
+        ):
+            return
+        expected_mode = (
+            CUDAGraphMode.NONE
+            if self.model_config.enforce_eager
+            else CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        if cudagraph_mode != expected_mode:
+            raise ValueError(
+                "EAGLE3 replicated draft KV resolved an unsupported CUDA Graph "
+                f"mode: expected {expected_mode.name}, got {cudagraph_mode.name}"
+            )
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
@@ -7927,6 +8201,7 @@ class GPUModelRunner(
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        self._clear_full_temporal_target_mappings()
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
@@ -8084,6 +8359,37 @@ class GPUModelRunner(
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+        target_speculative_config = getattr(
+            self,
+            "_target_speculative_config",
+            self.speculative_config,
+        )
+        full_temporal_target_layers = (
+            set(resolve_minimax_m3_dense_target_attention_layer_names(set(attn_layers)))
+            if target_speculative_config is not None
+            and getattr(
+                target_speculative_config,
+                "enable_eagle3_target_dense_full_temporal_kv",
+                False,
+            )
+            else set()
+        )
+        full_temporal_draft_layer = None
+        if self.speculative_config is not None and (
+            getattr(
+                self.speculative_config,
+                "enable_eagle3_prefill_draft_kv",
+                False,
+            )
+            or getattr(
+                self.speculative_config,
+                "enable_eagle3_replicated_draft_kv",
+                False,
+            )
+        ):
+            full_temporal_draft_layer = get_eagle3_draft_attention_layer_name(
+                self.model_config.get_total_num_hidden_layers()
+            )
         for layer_name, attn_module in attn_layers.items():
             if isinstance(attn_module, Attention) and (
                 kv_tgt_layer := attn_module.kv_sharing_target_layer_name
@@ -8106,8 +8412,38 @@ class GPUModelRunner(
                     with set_current_vllm_config(self.vllm_config):
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
+                if (
+                    layer_name == full_temporal_draft_layer
+                    or layer_name in full_temporal_target_layers
+                ):
+                    spec = replace(
+                        spec,
+                        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+                    )
+                if (
+                    layer_name in full_temporal_target_layers
+                    and self.dcp_world_size > 1
+                ):
+                    if attn_module.get_attn_backend().get_name() != "FLASH_ATTN":
+                        raise ValueError(
+                            "EAGLE3 target dense full-temporal KV requires FLASH_ATTN"
+                        )
+                    impl = attn_module.impl
+                    impl.dcp_world_size = 1
+                    impl.dcp_rank = 0
+                    impl.total_cp_world_size = impl.pcp_world_size
+                    impl.total_cp_rank = impl.pcp_rank
+                    impl.need_to_return_lse_for_decode = False
                 kv_cache_spec[layer_name] = spec
 
+        self._full_temporal_target_layers = full_temporal_target_layers
+        if full_temporal_draft_layer is not None and full_temporal_draft_layer not in (
+            kv_cache_spec
+        ):
+            raise ValueError(
+                "EAGLE3 full-temporal draft-KV layer is missing from the KV cache "
+                f"spec: {full_temporal_draft_layer}"
+            )
         return kv_cache_spec
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:

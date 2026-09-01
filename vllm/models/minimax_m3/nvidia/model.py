@@ -65,7 +65,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -83,6 +82,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
@@ -109,6 +109,32 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _use_dcp_replicated_q_proj(
+    vllm_config: VllmConfig,
+    *,
+    is_mtp_block: bool,
+) -> bool:
+    parallel_config = vllm_config.parallel_config
+    dcp_size = parallel_config.decode_context_parallel_size
+    if is_mtp_block or dcp_size == 1:
+        return False
+    if not current_platform.is_cuda():
+        raise NotImplementedError(
+            "MiniMax-M3 DCP replicated Q projection currently supports CUDA only."
+        )
+    if (
+        parallel_config.tensor_parallel_size != 8
+        or dcp_size != 2
+        or parallel_config.prefill_context_parallel_size != 1
+        or parallel_config.dcp_comm_backend != "a2a"
+    ):
+        raise NotImplementedError(
+            "MiniMax-M3 DCP replicated Q projection is currently restricted to "
+            "TP8/DCP2/PCP1 with dcp_comm_backend='a2a'."
+        )
+    return True
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -410,14 +436,23 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         cache_config: CacheConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        dcp_q_replicate: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
         tp_size = get_tensor_model_parallel_world_size()
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
+        self.dcp_q_replicate = dcp_q_replicate
+        self.num_query_heads = (
+            self.num_heads * parallel_config.decode_context_parallel_size
+            if self.dcp_q_replicate
+            else self.num_heads
+        )
         self.total_num_kv_heads = config.num_key_value_heads
         if self.total_num_kv_heads >= tp_size:
             assert self.total_num_kv_heads % tp_size == 0
@@ -425,7 +460,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = config.head_dim
-        self.q_size = self.num_heads * self.head_dim
+        self.q_size = self.num_query_heads * self.head_dim
+        self.out_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
@@ -449,6 +485,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            dcp_q_replicate=self.dcp_q_replicate,
+            dcp_world_size=parallel_config.decode_context_parallel_size,
         )
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
@@ -485,7 +523,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.index_rotary_emb = self.rotary_emb
 
         # Attention-backend wiring.
-        vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
@@ -520,6 +557,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.scaling,
             self.num_kv_heads,
             kv_cache_dtype=self.kv_cache_dtype,
+            num_query_heads=self.num_query_heads,
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
             sparse_block_size=sparse_cfg["sparse_block_size"],
         )
@@ -607,7 +645,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.k_norm.weight,
             cos_sin_cache,
             positions,
-            self.num_heads,
+            self.num_query_heads,
             self.num_kv_heads,
             rotary_dim,
             eps,
@@ -624,7 +662,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype,
         )
 
-        output = torch.empty_like(q)
+        output = qkv.new_empty((num_tokens, self.out_size))
         attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
@@ -676,6 +714,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
         )
+        dcp_q_replicate = is_sparse_attention_layer and _use_dcp_replicated_q_proj(
+            vllm_config,
+            is_mtp_block=is_mtp_block,
+        )
 
         if is_sparse_attention_layer:
             self.self_attn = MiniMaxM3SparseAttention(
@@ -685,6 +727,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 cache_config=cache_config,
                 topk_indices_buffer=topk_indices_buffer,
+                dcp_q_replicate=dcp_q_replicate,
             )
         else:
             self.self_attn = MiniMaxM3Attention(
@@ -765,6 +808,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return self.block_sparse_moe.experts.moe_config.skip_final_all_reduce
         return not self.mlp.down_proj.reduce_results
 
+    def set_ffn_all_reduce_deferred(self, defer: bool) -> None:
+        if self.is_moe_layer:
+            self.block_sparse_moe.experts.moe_config.skip_final_all_reduce = defer
+        else:
+            self.mlp.down_proj.reduce_results = not defer
+
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
@@ -824,18 +873,73 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+        local_layers = self.layers[self.start_layer : self.end_layer]
+        self._original_ffn_all_reduce_deferred = tuple(
+            layer.ffn_all_reduce_deferred for layer in local_layers
         )
+        self._configure_deferred_allreduce(())
 
-        # Configure cross-layer all-reduce/RMSNorm fusion: a layer whose FFN output
-        # is left un-reduced has that all-reduce fused into the next layer's
-        # input_layernorm (or the final norm).
+    def _configure_deferred_allreduce(
+        self,
+        materialized_boundaries: tuple[int, ...],
+    ) -> None:
+        local_layers = self.layers[self.start_layer : self.end_layer]
+        assert len(local_layers) == len(self._original_ffn_all_reduce_deferred)
+        materialized = set(materialized_boundaries)
+
         prev_defers = False
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for idx, (layer, originally_deferred) in enumerate(
+            zip(local_layers, self._original_ffn_all_reduce_deferred)
+        ):
+            layer.set_ffn_all_reduce_deferred(
+                originally_deferred and idx + 1 not in materialized
+            )
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        num_hidden_layers = len(self.layers)
+        invalid = [idx for idx in layers if idx < 0 or idx > num_hidden_layers]
+        if invalid:
+            raise ValueError(
+                f"Invalid MiniMax-M3 EAGLE3 auxiliary boundaries: {invalid}."
+            )
+        if tuple(sorted(set(layers))) != layers:
+            raise ValueError(
+                "MiniMax-M3 EAGLE3 auxiliary boundaries must be unique and "
+                "strictly increasing."
+            )
+
+        EagleModelMixin._set_aux_hidden_state_layers(self, layers)
+        local_boundaries = tuple(
+            idx - self.start_layer
+            for idx in layers
+            if self.start_layer < idx <= self.end_layer
+        )
+        self._configure_deferred_allreduce(local_boundaries)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        incoming_aux_keys = [
+            f"aux_hidden_state_{idx}"
+            for idx in self.aux_hidden_state_layers
+            if idx <= self.start_layer
+        ]
+        return IntermediateTensors(
+            {
+                key: torch.zeros(
+                    (batch_size, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                )
+                for key in ["hidden_states", "residual", *incoming_aux_keys]
+            }
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -858,18 +962,45 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # EAGLE3 is not yet compatible with pipeline parallel
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        if get_pp_group().is_first_rank:
+            aux_hidden_states = self._maybe_add_hidden_state(
+                [], 0, hidden_states, residual
+            )
+            if aux_hidden_states:
+                # The first layer aliases its input as the residual and may mutate it.
+                aux_hidden_states[-1] = aux_hidden_states[-1].clone()
+        else:
+            assert intermediate_tensors is not None
+            aux_hidden_states = [
+                intermediate_tensors[f"aux_hidden_state_{idx}"]
+                for idx in self.aux_hidden_state_layers
+                if idx <= self.start_layer
+            ]
         for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                aux_hidden_states,
+                self.start_layer + idx + 1,
+                hidden_states,
+                residual,
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            carried_layers = tuple(
+                idx for idx in self.aux_hidden_state_layers if idx <= self.end_layer
             )
+            if len(carried_layers) != len(aux_hidden_states):
+                raise RuntimeError(
+                    "MiniMax-M3 pipeline auxiliary hidden states are incomplete."
+                )
+            tensors.update(
+                {
+                    f"aux_hidden_state_{idx}": value
+                    for idx, value in zip(carried_layers, aux_hidden_states)
+                }
+            )
+            return IntermediateTensors(tensors)
 
         if self.fuse_final_norm_allreduce:
             hidden_states, _ = fused_allreduce_gemma_rms_norm(
@@ -879,6 +1010,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) > 0:
+            if len(aux_hidden_states) != len(self.aux_hidden_state_layers):
+                raise RuntimeError(
+                    "MiniMax-M3 pipeline auxiliary hidden states are incomplete."
+                )
             return hidden_states, aux_hidden_states
         return hidden_states
 

@@ -19,7 +19,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
+    MooncakeRegionIdentity,
+    MooncakeRequestPageMap,
     MooncakeXferMetadata,
     MooncakeXferResponse,
     MooncakeXferResponseStatus,
@@ -28,20 +31,32 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     TransferRegion,
     _align_transfer_regions,
     _compute_sender_transfer_plan,
+    _get_full_temporal_suffix_blocks,
+    _get_owned_dcp_suffix_blocks,
+    _index_full_temporal_region_page_maps,
+    _pair_cp_block_ids,
+    _pair_dcp_blocks_by_global_page,
+    _pair_full_temporal_blocks_by_global_page,
     _pair_pcp_block_ids,
     _validate_asymmetric_region_lengths,
+    _validate_full_temporal_stage_coverage,
+    _validate_region_layouts,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+    MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+    MOONCAKE_KV_REGION_LAYOUT_VERSION,
     MooncakeBootstrapServer,
 )
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheChildPageMapping,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTemporalLayout,
     SlidingWindowSpec,
 )
 from vllm.v1.request import RequestStatus
@@ -154,8 +169,40 @@ def test_sender_plan_fully_replicated_tp4_to_tp2(
         remote_kv_block_len=4096,
         producer_cache_replicated=True,
     )
+    assert plan == ((True, 0, 0, 4096) if should_transfer else (False, 0, 0, 4096))
+
+
+@pytest.mark.parametrize(
+    ("producer_tp_rank", "consumer_tp_rank"),
+    [(producer, consumer) for producer in range(4) for consumer in range(8)],
+)
+def test_sender_plan_maps_tp4_draft_heads_to_tp8_consumers(
+    producer_tp_rank: int,
+    consumer_tp_rank: int,
+) -> None:
+    bytes_per_head_page = 128 * 128 * 2
+    plan = _compute_sender_transfer_plan(
+        local_tp_rank=producer_tp_rank,
+        local_tp_size=4,
+        remote_tp_rank=consumer_tp_rank,
+        remote_tp_size=8,
+        local_kv_block_len=16 * bytes_per_head_page,
+        remote_kv_block_len=8 * bytes_per_head_page,
+        producer_cache_replicated=False,
+        transfer_unique_kv_heads=True,
+        total_num_kv_heads=64,
+    )
+
+    if producer_tp_rank != consumer_tp_rank // 2:
+        assert plan == (False, 0, 0, 0)
+        return
+
+    expected_src_offset = (consumer_tp_rank % 2) * 8 * bytes_per_head_page
     assert plan == (
-        (True, 0, 0, 4096) if should_transfer else (False, 0, 0, 4096)
+        True,
+        expected_src_offset,
+        0,
+        8 * bytes_per_head_page,
     )
 
 
@@ -271,9 +318,7 @@ def test_sender_plan_replicated_heads_tp4_to_tp2(
         transfer_unique_kv_heads=True,
         total_num_kv_heads=1,
     )
-    assert plan == (
-        (True, 0, 0, 32768) if should_transfer else (False, 0, 0, 0)
-    )
+    assert plan == ((True, 0, 0, 32768) if should_transfer else (False, 0, 0, 0))
 
 
 @pytest.mark.parametrize(
@@ -310,11 +355,7 @@ def test_sender_plan_mimo_equal_region_tp16_to_tp8(local_tp_rank):
         producer_cache_replicated=True,
         transfer_unique_kv_heads=True,
         total_num_kv_heads=8,
-    ) == (
-        (True, 0, 0, 32768)
-        if local_tp_rank % 2 == 0
-        else (False, 0, 0, 0)
-    )
+    ) == ((True, 0, 0, 32768) if local_tp_rank % 2 == 0 else (False, 0, 0, 0))
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -512,6 +553,817 @@ def test_pair_pcp_blocks_fails_closed_for_unsupported_page_geometry():
     assert "interleave" in error
 
 
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_pair_cp_blocks_scatters_global_pages_to_consumer_dcp(dcp_rank: int):
+    local_blocks = list(range(28))
+    remote_blocks = list(range(100 + 100 * dcp_rank, 114 + 100 * dcp_rank))
+    remote_pages = list(range(dcp_rank, 28, 2))
+
+    paired_local, paired_remote, error = _pair_dcp_blocks_by_global_page(
+        local_blocks,
+        remote_blocks,
+        remote_pages,
+        total_tokens=3563,
+        num_external_tokens=3563,
+        external_start_token=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=dcp_rank,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert paired_local == list(range(dcp_rank, 28, 2))
+    assert paired_remote == remote_blocks
+
+
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+def test_pair_cp_blocks_maps_consumer_dcp_prefix_suffix(dcp_rank: int):
+    paired_local, paired_remote, error = _pair_dcp_blocks_by_global_page(
+        [4, 5, 6, 7],
+        [100, 101],
+        [4 + dcp_rank, 6 + dcp_rank],
+        total_tokens=1024,
+        num_external_tokens=512,
+        external_start_token=512,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=dcp_rank,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert paired_local == [4 + dcp_rank, 6 + dcp_rank]
+    assert paired_remote == [100, 101]
+
+
+def test_pair_cp_blocks_skips_consumer_dcp_rank_without_tokens():
+    result = _pair_dcp_blocks_by_global_page(
+        [0],
+        [],
+        [],
+        total_tokens=9,
+        num_external_tokens=9,
+        external_start_token=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=1,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert result == ([], [], None)
+
+
+@pytest.mark.parametrize(
+    ("dcp_rank", "expected_blocks", "expected_pages"),
+    [
+        (0, list(range(100, 114)), list(range(0, 28, 2))),
+        (1, list(range(200, 214)), list(range(1, 28, 2))),
+    ],
+)
+def test_describe_consumer_dcp_blocks_with_global_pages(
+    dcp_rank: int,
+    expected_blocks: list[int],
+    expected_pages: list[int],
+):
+    blocks, pages, error = _get_owned_dcp_suffix_blocks(
+        expected_blocks,
+        total_tokens=3563,
+        num_external_tokens=3563,
+        external_start_token=0,
+        dcp_size=2,
+        dcp_rank=dcp_rank,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert blocks == expected_blocks
+    assert pages == expected_pages
+
+
+@pytest.mark.parametrize(
+    ("total_tokens", "external_start_token", "expected_page"),
+    [(257, 0, 1), (257, 128, 1), (513, 256, 3)],
+)
+def test_describe_consumer_dcp_partial_tail_uses_valid_local_page(
+    total_tokens: int,
+    external_start_token: int,
+    expected_page: int,
+):
+    blocks, pages, error = _get_owned_dcp_suffix_blocks(
+        [100, 101],
+        total_tokens=total_tokens,
+        num_external_tokens=total_tokens - external_start_token,
+        external_start_token=external_start_token,
+        dcp_size=2,
+        dcp_rank=1,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert blocks == [100]
+    assert pages == [expected_page]
+
+
+def test_describe_consumer_dcp_blocks_maps_clipped_suffix_tail():
+    blocks, pages, error = _get_owned_dcp_suffix_blocks(
+        [100, 101],
+        total_tokens=1024,
+        num_external_tokens=1024,
+        external_start_token=0,
+        dcp_size=2,
+        dcp_rank=0,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert blocks == [100, 101]
+    assert pages == [4, 6]
+
+
+def test_describe_consumer_dcp_blocks_rejects_missing_owned_pages():
+    blocks, pages, error = _get_owned_dcp_suffix_blocks(
+        [],
+        total_tokens=1024,
+        num_external_tokens=1024,
+        external_start_token=0,
+        dcp_size=2,
+        dcp_rank=0,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert blocks == []
+    assert pages == []
+    assert error is not None
+    assert "missing owned global pages" in error
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "parent_blocks", "expected_blocks", "expected_pages"),
+    [
+        (1, [100], [], []),
+        (128, [100], [200], [0]),
+        (129, [100], [200], [0]),
+        (256, [100], [200, 201], [0, 1]),
+        (257, [100, 101], [200, 201], [0, 1]),
+    ],
+)
+def test_describe_full_temporal_draft_excludes_final_prompt_token(
+    prompt_tokens: int,
+    parent_blocks: list[int],
+    expected_blocks: list[int],
+    expected_pages: list[int],
+):
+    transferred_tokens = max(prompt_tokens - 1, 0)
+
+    blocks, pages, error = _get_full_temporal_suffix_blocks(
+        parent_blocks,
+        total_tokens=transferred_tokens,
+        num_external_tokens=transferred_tokens,
+        external_start_token=0,
+        child_page_factor=2,
+        page_size=128,
+    )
+
+    assert error is None
+    assert blocks == expected_blocks
+    assert pages == expected_pages
+
+
+def test_describe_full_temporal_factor1_preserves_absolute_suffix_pages():
+    blocks, pages, error = _get_full_temporal_suffix_blocks(
+        [10, 11, 12],
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        child_page_factor=1,
+        page_size=128,
+    )
+
+    assert error is None
+    assert blocks == [10, 11]
+    assert pages == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "expected_external_tokens"),
+    [(0, 0), (1, 0), (2, 1), (257, 256)],
+)
+def test_replicated_draft_remote_prefill_leaves_one_token_local(
+    prompt_tokens: int,
+    expected_external_tokens: int,
+):
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler._has_full_temporal_draft = True
+    scheduler._has_mamba = False
+
+    assert (
+        scheduler._get_remote_prefill_token_count(prompt_tokens)
+        == expected_external_tokens
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_external_tokens", "expected_start"),
+    [
+        (512, 0),
+        (256, 256),
+        (0, 512),
+    ],
+)
+def test_full_temporal_prefix_uses_atomic_target_draft_suffix(
+    num_external_tokens: int,
+    expected_start: int,
+):
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler._has_full_temporal_draft = True
+    scheduler._has_mamba = False
+
+    total_tokens, external_start_token = scheduler._get_remote_prefill_transfer_range(
+        num_prompt_tokens=513,
+        num_external_tokens=num_external_tokens,
+    )
+
+    assert total_tokens == 512
+    assert external_start_token == expected_start
+    assert total_tokens - external_start_token == num_external_tokens
+
+
+def test_pair_full_temporal_pages_uses_absolute_source_page_at_boundary():
+    paired_local, paired_remote, error = _pair_full_temporal_blocks_by_global_page(
+        [10, 11, 12],
+        [200, 201],
+        [0, 1],
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        page_size=128,
+    )
+
+    assert error is None
+    assert paired_local == [10, 11]
+    assert paired_remote == [200, 201]
+
+
+@pytest.mark.parametrize(
+    ("dcp_rank", "remote_pages", "expected_local"),
+    [
+        (0, [0], [10]),
+        (1, [1], [11]),
+    ],
+)
+def test_pair_dcp_pages_uses_absolute_source_page_at_recompute_boundary(
+    dcp_rank: int,
+    remote_pages: list[int],
+    expected_local: list[int],
+):
+    paired_local, paired_remote, error = _pair_dcp_blocks_by_global_page(
+        [10, 11, 12],
+        [200 + dcp_rank],
+        remote_pages,
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=dcp_rank,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert paired_local == expected_local
+    assert paired_remote == [200 + dcp_rank]
+
+
+def test_index_full_temporal_region_page_maps_fails_closed():
+    target = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=128,
+        kv_block_len=128,
+        group_index=0,
+        region_index=0,
+        identity=MooncakeRegionIdentity(
+            layer_name="model.layers.0.self_attn",
+            temporal_layout=KVCacheTemporalLayout.SHARDED_DCP.value,
+            protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+            child_page_factor=1,
+        ),
+    )
+    draft = TransferRegion(
+        layer_name="model.layers.60.self_attn.attn",
+        layer_index=60,
+        base_addr=0x2000,
+        block_len=128,
+        kv_block_len=128,
+        group_index=0,
+        region_index=1,
+        identity=MooncakeRegionIdentity(
+            layer_name="model.layers.60.self_attn.attn",
+            temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+            protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            child_page_mapping=(KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value),
+            child_page_factor=2,
+        ),
+    )
+    valid = MooncakeRequestPageMap(
+        region_index=1,
+        group_index=0,
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+        global_page_ids=[0, 1],
+        dst_physical_block_ids=[200, 201],
+    )
+
+    indexed, error = _index_full_temporal_region_page_maps(
+        [valid],
+        [target, draft],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+    assert error is None
+    assert indexed == {1: valid}
+
+    _, error = _index_full_temporal_region_page_maps(
+        [],
+        [target, draft],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+    assert error is not None
+    assert "missing" in error
+
+    _, error = _index_full_temporal_region_page_maps(
+        [valid, valid],
+        [target, draft],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+    assert error is not None
+    assert "duplicate" in error
+
+    invalid_child = msgspec.structs.replace(
+        valid,
+        dst_physical_block_ids=[201, 200],
+    )
+    _, error = _index_full_temporal_region_page_maps(
+        [invalid_child],
+        [target, draft],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+    assert error is not None
+    assert "parity" in error
+
+    duplicate_child = msgspec.structs.replace(
+        valid,
+        dst_physical_block_ids=[200, 200],
+    )
+    _, error = _index_full_temporal_region_page_maps(
+        [duplicate_child],
+        [target, draft],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+    assert error is not None
+    assert "unique" in error
+
+    duplicate_page = msgspec.structs.replace(
+        valid,
+        global_page_ids=[0, 0],
+    )
+    _, error = _index_full_temporal_region_page_maps(
+        [duplicate_page],
+        [target, draft],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+    assert error is not None
+    assert "unique" in error
+
+
+def test_index_full_temporal_factor1_page_map():
+    layer_name = "model.layers.60.self_attn.attn"
+    region = TransferRegion(
+        layer_name=layer_name,
+        layer_index=60,
+        base_addr=0x2000,
+        block_len=128,
+        kv_block_len=128,
+        group_index=0,
+        region_index=0,
+        identity=MooncakeRegionIdentity(
+            layer_name=layer_name,
+            temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+            protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+            child_page_factor=1,
+        ),
+    )
+    page_map = MooncakeRequestPageMap(
+        region_index=0,
+        group_index=0,
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+        global_page_ids=[0, 1],
+        dst_physical_block_ids=[100, 101],
+    )
+
+    indexed, error = _index_full_temporal_region_page_maps(
+        [page_map],
+        [region],
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+    )
+
+    assert error is None
+    assert indexed == {0: page_map}
+
+
+def test_full_temporal_region_layout_rejects_protocol_downgrade():
+    layer_name = "model.layers.60.self_attn.attn"
+    producer = TransferRegion(
+        layer_name=layer_name,
+        layer_index=60,
+        base_addr=0x1000,
+        block_len=256,
+        kv_block_len=128,
+        identity=MooncakeRegionIdentity(
+            layer_name=layer_name,
+            temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+            protocol_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+            child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+            child_page_factor=1,
+        ),
+    )
+    consumer = TransferRegion(
+        layer_name=layer_name,
+        layer_index=60,
+        base_addr=0x2000,
+        block_len=128,
+        kv_block_len=64,
+        identity=MooncakeRegionIdentity(
+            layer_name=layer_name,
+            temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+            protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            child_page_mapping=(KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value),
+            child_page_factor=2,
+        ),
+    )
+
+    error = _validate_region_layouts(
+        [producer],
+        [consumer],
+        producer_dcp_size=1,
+        consumer_dcp_size=2,
+    )
+
+    assert error is not None
+    assert "protocol" in error
+
+
+def test_full_temporal_region_layout_accepts_dcp1_identity():
+    layer_name = "model.layers.60.self_attn.attn"
+    identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+        child_page_factor=1,
+    )
+    producer = TransferRegion(
+        layer_name=layer_name,
+        layer_index=60,
+        base_addr=0x1000,
+        block_len=128,
+        kv_block_len=128,
+        identity=identity,
+    )
+    consumer = TransferRegion(
+        layer_name=layer_name,
+        layer_index=60,
+        base_addr=0x2000,
+        block_len=128,
+        kv_block_len=128,
+        identity=identity,
+    )
+
+    assert (
+        _validate_region_layouts(
+            [producer],
+            [consumer],
+            producer_dcp_size=1,
+            consumer_dcp_size=1,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("producer_layers", "pp_rank"),
+    [
+        (
+            [
+                "language_model.model.layers.0.self_attn.attn",
+                "language_model.model.layers.1.self_attn.attn",
+                "language_model.model.layers.2.self_attn.attn",
+            ],
+            0,
+        ),
+        (["model.layers.60.self_attn.attn"], 1),
+    ],
+    ids=["pp0-target-dense", "pp1-draft"],
+)
+def test_full_temporal_region_layout_allows_stage_local_subset(
+    producer_layers: list[str],
+    pp_rank: int,
+) -> None:
+    consumer_layers = [
+        "language_model.model.layers.0.self_attn.attn",
+        "language_model.model.layers.1.self_attn.attn",
+        "language_model.model.layers.2.self_attn.attn",
+        "model.layers.60.self_attn.attn",
+    ]
+
+    def make_region(layer_name: str, *, consumer: bool) -> TransferRegion:
+        layer_index = int(layer_name.split("layers.", 1)[1].split(".", 1)[0])
+        return TransferRegion(
+            layer_name=layer_name,
+            layer_index=layer_index,
+            base_addr=0x1000 + layer_index * 0x100,
+            block_len=128,
+            kv_block_len=64,
+            group_index=0,
+            identity=MooncakeRegionIdentity(
+                layer_name=layer_name,
+                temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+                protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+                child_page_mapping=(
+                    KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value
+                    if consumer
+                    else KVCacheChildPageMapping.IDENTITY.value
+                ),
+                child_page_factor=2 if consumer else 1,
+            ),
+        )
+
+    producer_regions = [
+        make_region(layer_name, consumer=False) for layer_name in producer_layers
+    ]
+    consumer_regions = [
+        make_region(layer_name, consumer=True) for layer_name in consumer_layers
+    ]
+
+    aligned_producer, aligned_consumer, align_error = _align_transfer_regions(
+        producer_regions, consumer_regions
+    )
+
+    assert align_error is None
+    assert [region.layer_name for region in aligned_producer] == producer_layers
+    assert [region.layer_name for region in aligned_consumer] == producer_layers
+    assert (
+        _validate_region_layouts(
+            aligned_producer,
+            aligned_consumer,
+            producer_dcp_size=1,
+            consumer_dcp_size=2,
+        )
+        is None
+    )
+    assert (
+        _validate_full_temporal_stage_coverage(
+            producer_regions,
+            consumer_regions,
+            speculative_config=SimpleNamespace(
+                enable_eagle3_target_dense_full_temporal_kv=True,
+                enable_eagle3_prefill_draft_kv=True,
+            ),
+            total_target_layers=60,
+            pp_rank=pp_rank,
+            pp_size=2,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("producer_layers", "pp_rank", "missing_layer"),
+    [
+        (
+            [
+                "language_model.model.layers.0.self_attn.attn",
+                "language_model.model.layers.1.self_attn.attn",
+            ],
+            0,
+            2,
+        ),
+        ([], 1, 60),
+    ],
+    ids=["pp0-missing-dense", "pp1-missing-draft"],
+)
+def test_full_temporal_stage_coverage_rejects_missing_layer(
+    producer_layers: list[str],
+    pp_rank: int,
+    missing_layer: int,
+) -> None:
+    def make_region(layer_name: str) -> TransferRegion:
+        layer_index = int(layer_name.split("layers.", 1)[1].split(".", 1)[0])
+        return TransferRegion(
+            layer_name=layer_name,
+            layer_index=layer_index,
+            base_addr=0x1000 + layer_index * 0x100,
+            block_len=128,
+            kv_block_len=64,
+            identity=MooncakeRegionIdentity(
+                layer_name=layer_name,
+                temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+                protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+                child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+                child_page_factor=1,
+            ),
+        )
+
+    producer_regions = [make_region(name) for name in producer_layers]
+    consumer_regions = [
+        make_region(
+            f"language_model.model.layers.{layer}.self_attn.attn"
+            if layer < 3
+            else "model.layers.60.self_attn.attn"
+        )
+        for layer in (0, 1, 2, 60)
+    ]
+
+    error = _validate_full_temporal_stage_coverage(
+        producer_regions,
+        consumer_regions,
+        speculative_config=SimpleNamespace(
+            enable_eagle3_target_dense_full_temporal_kv=True,
+            enable_eagle3_prefill_draft_kv=True,
+        ),
+        total_target_layers=60,
+        pp_rank=pp_rank,
+        pp_size=2,
+    )
+
+    assert error is not None
+    assert "incomplete full-temporal coverage" in error
+    assert str(missing_layer) in error
+
+
+def test_pair_dcp_global_pages_maps_clipped_sliding_window_tail():
+    paired_local, paired_remote, error = _pair_dcp_blocks_by_global_page(
+        [20, 21, 22, 23],
+        [100, 101],
+        [4, 6],
+        total_tokens=1024,
+        num_external_tokens=1024,
+        external_start_token=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=0,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is None
+    assert paired_local == [20, 22]
+    assert paired_remote == [100, 101]
+
+
+@pytest.mark.parametrize(
+    ("remote_pages", "match"),
+    [
+        ([0, 0], "unique"),
+        ([2, 0], "increasing"),
+        ([0, 3], "owner suffix"),
+        ([0], "counts differ"),
+    ],
+)
+def test_pair_dcp_global_pages_fails_closed(
+    remote_pages: list[int],
+    match: str,
+):
+    _, _, error = _pair_dcp_blocks_by_global_page(
+        [10, 11, 12, 13],
+        [100, 101],
+        remote_pages,
+        total_tokens=512,
+        num_external_tokens=512,
+        external_start_token=0,
+        consumer_dcp_size=2,
+        consumer_dcp_rank=0,
+        page_size=128,
+        interleave_size=128,
+    )
+
+    assert error is not None
+    assert match in error
+
+
+@pytest.mark.parametrize(
+    (
+        "producer_pcp_size",
+        "producer_dcp_size",
+        "consumer_pcp_size",
+        "consumer_dcp_size",
+        "consumer_interleave_size",
+        "match",
+    ),
+    [
+        (1, 2, 1, 1, 128, "producer DCP"),
+        (1, 1, 2, 2, 128, "consumer PCP and DCP"),
+        (2, 1, 1, 2, 128, "consumer DCP requires"),
+        (1, 1, 1, 2, 96, "interleave"),
+    ],
+)
+def test_pair_cp_blocks_rejects_unsupported_topologies(
+    producer_pcp_size: int,
+    producer_dcp_size: int,
+    consumer_pcp_size: int,
+    consumer_dcp_size: int,
+    consumer_interleave_size: int,
+    match: str,
+):
+    _, _, error = _pair_cp_block_ids(
+        [0, 1],
+        [100],
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        producer_pcp_size=producer_pcp_size,
+        producer_pcp_rank=0,
+        consumer_pcp_size=consumer_pcp_size,
+        consumer_pcp_rank=0,
+        producer_dcp_size=producer_dcp_size,
+        producer_dcp_rank=0,
+        consumer_dcp_size=consumer_dcp_size,
+        consumer_dcp_rank=0,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=consumer_interleave_size,
+        consumer_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+    )
+
+    assert error is not None
+    assert match in error
+
+
+def test_pair_cp_blocks_rejects_legacy_ambiguous_block_mismatch():
+    _, _, error = _pair_cp_block_ids(
+        list(range(28)),
+        list(range(100, 114)),
+        total_tokens=3563,
+        num_external_tokens=3563,
+        external_start_token=0,
+        producer_pcp_size=1,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        producer_dcp_size=1,
+        producer_dcp_rank=0,
+        consumer_dcp_size=1,
+        consumer_dcp_rank=0,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=1,
+        consumer_cp_block_pairing_version=0,
+    )
+
+    assert error is not None
+    assert "CP block pairing capability" in error
+
+
+def test_pair_cp_blocks_accepts_v1_non_dcp_pairing():
+    local, remote, error = _pair_cp_block_ids(
+        list(range(28)),
+        list(range(100, 114)),
+        total_tokens=3563,
+        num_external_tokens=3563,
+        external_start_token=0,
+        producer_pcp_size=1,
+        producer_pcp_rank=0,
+        consumer_pcp_size=1,
+        consumer_pcp_rank=0,
+        producer_dcp_size=1,
+        producer_dcp_rank=0,
+        consumer_dcp_size=1,
+        consumer_dcp_rank=0,
+        group_block_size=128,
+        producer_interleave_size=128,
+        consumer_interleave_size=1,
+        consumer_cp_block_pairing_version=1,
+    )
+
+    assert error is None
+    assert local == list(range(14, 28))
+    assert remote == list(range(100, 114))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("group_block_size", [256, 64, 8, 4])
 @pytest.mark.parametrize("pcp_rank", [0, 1])
@@ -622,6 +1474,449 @@ async def test_build_transfer_params_reassembles_pcp_pages(
         remote_base + (100 + (2 + pcp_rank) * local_pages_per_chunk) * region_block_len,
     ]
     assert lengths == [region_block_len * local_pages_per_chunk] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer_tp_rank", range(4))
+@pytest.mark.parametrize("dcp_rank", [0, 1])
+async def test_build_transfer_params_scatters_consumer_dcp_pages(
+    producer_tp_rank: int,
+    dcp_rank: int,
+):
+    layer_name = "model.layers.0.self_attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = False
+    worker.is_kv_producer = True
+    worker.tp_rank = producer_tp_rank
+    worker.tp_size = 4
+    worker.pcp_rank = 0
+    worker.pcp_size = 1
+    worker.dcp_rank = 0
+    worker.dcp_size = 1
+    worker.cp_kv_cache_interleave_size = 128
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=4,
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={layer_name: SimpleNamespace(total_num_kv_heads=4)}
+        )
+    )
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [layer_name],
+                layer_spec,
+            )
+        ],
+    )
+
+    block_len = 128
+    local_base = 0x1000
+    remote_base = 0xA000
+    local_regions = [
+        TransferRegion(
+            layer_name=layer_name,
+            layer_index=0,
+            base_addr=local_base,
+            block_len=block_len,
+            kv_block_len=block_len,
+            logical_group_indices=(0,),
+        )
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name=layer_name,
+            layer_index=0,
+            base_addr=remote_base,
+            block_len=block_len,
+            kv_block_len=block_len,
+            logical_group_indices=(0,),
+        )
+    ]
+    transfer_id = "xfer-dcp"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-dcp",
+        transfer_id=transfer_id,
+        local_block_ids=[list(range(28))],
+        ready=asyncio.Event(),
+    )
+    remote_blocks = list(range(100, 114))
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=producer_tp_rank * 2 + dcp_rank,
+        remote_pcp_size=1,
+        remote_pcp_rank=0,
+        remote_dcp_size=2,
+        remote_dcp_rank=dcp_rank,
+        remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        req_blocks={"d-req-dcp": (transfer_id, [remote_blocks])},
+        kv_caches_base_addr=[remote_base],
+        block_lens=[block_len],
+        kv_block_lens=[block_len],
+        req_total_tokens={"d-req-dcp": 3563},
+        req_num_external_tokens={"d-req-dcp": 3563},
+        req_external_start_tokens={"d-req-dcp": 0},
+        req_global_page_ids={"d-req-dcp": [list(range(dcp_rank, 28, 2))]},
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-req-dcp", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=local_regions,
+        remote_regions=remote_regions,
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src_ptrs == [
+        local_base + block_id * block_len for block_id in range(dcp_rank, 28, 2)
+    ]
+    assert dst_ptrs == [
+        remote_base + block_id * block_len for block_id in remote_blocks
+    ]
+    assert lengths == [block_len] * 14
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("consumer_dcp_size", "dcp_rank", "remote_tp_rank", "src_offset"),
+    [
+        (1, 0, 2, 0),
+        (1, 0, 3, 128),
+        (2, 0, 2, 0),
+        (2, 1, 3, 128),
+    ],
+)
+async def test_build_transfer_params_combines_full_temporal_pages_and_tp_slicing(
+    consumer_dcp_size: int,
+    dcp_rank: int,
+    remote_tp_rank: int,
+    src_offset: int,
+):
+    producer_tp_rank = 1
+    layer_name = "model.layers.60.self_attn.attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=16,
+        head_size=1,
+        dtype=torch.float16,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.tp_rank = producer_tp_rank
+    worker.tp_size = 4
+    worker.pcp_rank = 0
+    worker.pcp_size = 1
+    worker.dcp_rank = 0
+    worker.dcp_size = 1
+    worker.cp_kv_cache_interleave_size = 128
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=64,
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={layer_name: SimpleNamespace(total_num_kv_heads=64)}
+        )
+    )
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [layer_name],
+                layer_spec,
+            )
+        ],
+    )
+
+    producer_identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+        child_page_factor=1,
+    )
+    consumer_identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=(
+            KVCacheChildPageMapping.IDENTITY.value
+            if consumer_dcp_size == 1
+            else KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value
+        ),
+        child_page_factor=consumer_dcp_size,
+    )
+    local_block_len = 512
+    remote_block_len = 256
+    local_base = 0x1000
+    remote_base = 0xA000
+    local_regions = [
+        TransferRegion(
+            layer_name=layer_name,
+            layer_index=60,
+            base_addr=local_base,
+            block_len=local_block_len,
+            kv_block_len=256,
+            group_index=0,
+            logical_group_indices=(0,),
+            region_index=0,
+            identity=producer_identity,
+        )
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name=layer_name,
+            layer_index=60,
+            base_addr=remote_base,
+            block_len=remote_block_len,
+            kv_block_len=128,
+            group_index=0,
+            logical_group_indices=(0,),
+            region_index=0,
+            identity=consumer_identity,
+        )
+    ]
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-draft",
+        transfer_id="xfer-draft",
+        # Producer computed 257 prompt tokens, while Decode requests [0, 256).
+        local_block_ids=[[10, 11, 12]],
+        ready=asyncio.Event(),
+    )
+    metadata = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=remote_tp_rank,
+        remote_dcp_size=consumer_dcp_size,
+        remote_dcp_rank=dcp_rank,
+        remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        req_blocks={
+            "d-req-draft": (
+                "xfer-draft",
+                [[300 + dcp_rank]],
+            )
+        },
+        req_global_page_ids={"d-req-draft": [[dcp_rank]]},
+        req_region_page_maps={
+            "d-req-draft": [
+                MooncakeRequestPageMap(
+                    region_index=0,
+                    group_index=0,
+                    valid_start_token=0,
+                    valid_end_token_exclusive=256,
+                    global_page_ids=[0, 1],
+                    dst_physical_block_ids=[200, 201],
+                )
+            ]
+        },
+        kv_caches_base_addr=[remote_base],
+        block_lens=[remote_block_len],
+        kv_block_lens=[128],
+        req_total_tokens={"d-req-draft": 256},
+        req_num_external_tokens={"d-req-draft": 256},
+        req_external_start_tokens={"d-req-draft": 0},
+    )
+
+    src, dst, lengths, err_reqs, err_msg = await worker._build_transfer_params(
+        ready_reqs=[("d-req-draft", send_meta)],
+        agent_meta=metadata,
+        local_regions=local_regions,
+        remote_regions=remote_regions,
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src == [
+        local_base + 10 * local_block_len + src_offset,
+        local_base + 11 * local_block_len + src_offset,
+    ]
+    assert dst == [
+        remote_base + 200 * remote_block_len,
+        remote_base + 201 * remote_block_len,
+    ]
+    assert lengths == [128, 128]
+
+
+@pytest.mark.asyncio
+async def test_build_transfer_params_keeps_dcp_zero_transfer_handshake():
+    layer_name = "model.layers.0.self_attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = False
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 4
+    worker.pcp_rank = 0
+    worker.pcp_size = 1
+    worker.dcp_rank = 0
+    worker.dcp_size = 1
+    worker.cp_kv_cache_interleave_size = 128
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=4,
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={layer_name: SimpleNamespace(total_num_kv_heads=4)}
+        )
+    )
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([layer_name], layer_spec)],
+    )
+
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-dcp",
+        transfer_id="xfer-dcp",
+        local_block_ids=[[]],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=0,
+        remote_pcp_size=1,
+        remote_pcp_rank=0,
+        remote_dcp_size=2,
+        remote_dcp_rank=0,
+        remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        req_blocks={"d-req-dcp": ("xfer-dcp", [[]])},
+        req_global_page_ids={"d-req-dcp": [[]]},
+        kv_caches_base_addr=[0xA000],
+        block_lens=[128],
+        kv_block_lens=[128],
+        req_total_tokens={"d-req-dcp": 1024},
+        req_num_external_tokens={"d-req-dcp": 0},
+        req_external_start_tokens={"d-req-dcp": 1024},
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-req-dcp", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=[],
+        remote_regions=[],
+    )
+
+    assert src_ptrs == []
+    assert dst_ptrs == []
+    assert lengths == []
+    assert err_reqs == []
+    assert err_msg is None
+
+
+@pytest.mark.asyncio
+async def test_dcp_v2_missing_page_identities_fails_before_descriptors():
+    layer_name = "model.layers.0.self_attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=0,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([layer_name], layer_spec)],
+    )
+    send_meta = SendBlockMeta(
+        p_req_id="p-req",
+        transfer_id="xfer",
+        local_block_ids=[[0, 1]],
+        ready=asyncio.Event(),
+    )
+    metadata = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=2,
+        remote_tp_rank=0,
+        remote_dcp_size=2,
+        remote_dcp_rank=0,
+        remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        req_blocks={"d-req": ("xfer", [[100]])},
+        kv_caches_base_addr=[0xA000],
+        block_lens=[128],
+        kv_block_lens=[128],
+        req_total_tokens={"d-req": 256},
+        req_num_external_tokens={"d-req": 256},
+        req_external_start_tokens={"d-req": 0},
+    )
+
+    src, dst, lengths, err_reqs, err_msg = await worker._build_transfer_params(
+        ready_reqs=[("d-req", send_meta)],
+        agent_meta=metadata,
+        local_regions=[],
+        remote_regions=[],
+    )
+
+    assert src == dst == lengths == []
+    assert err_reqs == ["d-req"]
+    assert err_msg is not None
+    assert "global page identities" in err_msg
+
+    worker.pcp_size = 2
+    metadata.req_global_page_ids = {"d-req": [[0]]}
+    src, dst, lengths, err_reqs, err_msg = await worker._build_transfer_params(
+        ready_reqs=[("d-req", send_meta)],
+        agent_meta=metadata,
+        local_regions=[],
+        remote_regions=[],
+    )
+
+    assert src == dst == lengths == []
+    assert err_reqs == ["d-req"]
+    assert err_msg is not None
+    assert "PCP1" in err_msg
 
 
 class FakeMooncakeWrapper:
@@ -929,6 +2224,619 @@ def test_xfer_metadata_decodes_legacy_payload_with_alias_defaults():
     assert metadata.registered_layer_index_aliases == []
     assert metadata.registered_logical_group_indices == []
     assert metadata.registered_alias_group_indices == []
+    assert metadata.remote_dcp_size == 1
+    assert metadata.remote_dcp_rank == 0
+    assert metadata.remote_cp_kv_cache_interleave_size == 1
+    assert metadata.remote_cp_block_pairing_version == 0
+    assert metadata.req_region_page_maps == {}
+    assert metadata.registered_region_identities == []
+
+
+def test_xfer_metadata_round_trips_consumer_dcp_topology():
+    metadata = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=1,
+        req_blocks={"d-req": ("xfer", [[1]])},
+        kv_caches_base_addr=[0x1000],
+        block_lens=[4096],
+        kv_block_lens=[4096],
+        remote_dcp_size=2,
+        remote_dcp_rank=1,
+        remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        req_global_page_ids={"d-req": [[1, 3, 5]]},
+    )
+
+    payload = msgspec.msgpack.encode(metadata)
+    decoded = msgspec.msgpack.decode(payload, type=MooncakeXferMetadata)
+
+    assert decoded.remote_dcp_size == 2
+    assert decoded.remote_dcp_rank == 1
+    assert decoded.remote_cp_kv_cache_interleave_size == 128
+    assert decoded.remote_cp_block_pairing_version == MOONCAKE_CP_BLOCK_PAIRING_VERSION
+    assert decoded.req_global_page_ids == {"d-req": [[1, 3, 5]]}
+
+
+def test_xfer_metadata_round_trips_full_temporal_region_pages():
+    identity = MooncakeRegionIdentity(
+        layer_name="model.layers.60.self_attn.attn",
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=(KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value),
+        child_page_factor=2,
+    )
+    page_map = MooncakeRequestPageMap(
+        region_index=0,
+        group_index=0,
+        valid_start_token=0,
+        valid_end_token_exclusive=256,
+        global_page_ids=[0, 1],
+        dst_physical_block_ids=[200, 201],
+    )
+    metadata = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=8,
+        remote_tp_rank=1,
+        req_blocks={"d-req": ("xfer", [[100]])},
+        kv_caches_base_addr=[0x1000],
+        block_lens=[4096],
+        kv_block_lens=[2048],
+        remote_dcp_size=2,
+        remote_dcp_rank=1,
+        remote_cp_kv_cache_interleave_size=128,
+        remote_cp_block_pairing_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        req_global_page_ids={"d-req": [[1]]},
+        req_region_page_maps={"d-req": [page_map]},
+        registered_layer_names=[identity.layer_name],
+        registered_layer_indices=[60],
+        registered_region_identities=[identity],
+    )
+
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(metadata),
+        type=MooncakeXferMetadata,
+    )
+
+    assert decoded.registered_region_identities == [identity]
+    assert decoded.req_region_page_maps == {"d-req": [page_map]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dcp_rank", "expected_target_blocks", "expected_target_pages"),
+    [
+        (0, [100], [0]),
+        (1, [100], [1]),
+    ],
+)
+async def test_consumer_requests_owner_target_and_all_full_temporal_pages(
+    dcp_rank: int,
+    expected_target_blocks: list[int],
+    expected_target_pages: list[int],
+):
+    layer_name = "model.layers.60.self_attn.attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=(KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value),
+        child_page_factor=2,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.hostname = "consumer-host"
+    worker.rpc_port = 54321
+    worker.tp_size = 8
+    worker.tp_rank = dcp_rank
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.dcp_size = 2
+    worker.dcp_rank = dcp_rank
+    worker.cp_kv_cache_interleave_size = 128
+    worker.async_zmq_ctx = MagicMock()
+    worker._encoder = msgspec.msgpack.Encoder()
+    worker._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+    worker._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+    worker.transfer_topo = SimpleNamespace(virtually_split_kv_in_blocks=False)
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [layer_name],
+                layer_spec,
+            )
+        ],
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.kv_caches_base_addr = [0x1000]
+    worker.block_len_per_layer = [4096]
+    worker.kv_block_len_per_layer = [4096]
+    worker.registered_layer_names = [layer_name]
+    worker.registered_layer_indices = [60]
+    worker.registered_group_indices = [0]
+    worker.registered_layer_aliases = [[layer_name]]
+    worker.registered_layer_index_aliases = [[60]]
+    worker.registered_logical_group_indices = [[0]]
+    worker.registered_alias_group_indices = [[[0]]]
+    worker.registered_region_identities = [identity]
+    worker.process_pulling_result = MagicMock(return_value={"d-req"})
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req",
+        transfer_id="xfer",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=["d-req"],
+    )
+    socket = MagicMock(spec=zmq.asyncio.Socket)
+    socket.send = AsyncMock()
+    socket.recv = AsyncMock(return_value=worker._encoder.encode(response))
+    socket_context = MagicMock()
+    socket_context.__enter__.return_value = socket
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.make_zmq_socket",
+        return_value=socket_context,
+    ):
+        await worker.receive_kv_from_single_worker(
+            "tcp://producer:1234",
+            {"d-req": pull_meta},
+        )
+
+    sent_meta = worker._xfer_meta_decoder.decode(socket.send.await_args.args[0])
+    assert sent_meta.remote_cp_block_pairing_version == (
+        MOONCAKE_KV_REGION_LAYOUT_VERSION
+    )
+    assert sent_meta.req_blocks["d-req"] == (
+        "xfer",
+        [expected_target_blocks],
+    )
+    assert sent_meta.req_global_page_ids["d-req"] == [expected_target_pages]
+    assert sent_meta.req_region_page_maps["d-req"] == [
+        MooncakeRequestPageMap(
+            region_index=0,
+            group_index=0,
+            valid_start_token=0,
+            valid_end_token_exclusive=256,
+            global_page_ids=[0, 1],
+            dst_physical_block_ids=[200, 201],
+        )
+    ]
+    assert sent_meta.registered_region_identities == [identity]
+
+
+@pytest.mark.asyncio
+async def test_dcp1_consumer_requests_full_temporal_identity_pages():
+    layer_name = "model.layers.60.self_attn.attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+        child_page_factor=1,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.hostname = "consumer-host"
+    worker.rpc_port = 54321
+    worker.tp_size = 8
+    worker.tp_rank = 0
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.dcp_size = 1
+    worker.dcp_rank = 0
+    worker.cp_kv_cache_interleave_size = 1
+    worker.async_zmq_ctx = MagicMock()
+    worker._encoder = msgspec.msgpack.Encoder()
+    worker._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+    worker._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+    worker.transfer_topo = SimpleNamespace(virtually_split_kv_in_blocks=False)
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([layer_name], layer_spec)],
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.kv_caches_base_addr = [0x1000]
+    worker.block_len_per_layer = [4096]
+    worker.kv_block_len_per_layer = [4096]
+    worker.registered_layer_names = [layer_name]
+    worker.registered_layer_indices = [60]
+    worker.registered_group_indices = [0]
+    worker.registered_layer_aliases = [[layer_name]]
+    worker.registered_layer_index_aliases = [[60]]
+    worker.registered_logical_group_indices = [[0]]
+    worker.registered_alias_group_indices = [[[0]]]
+    worker.registered_region_identities = [identity]
+    worker.process_pulling_result = MagicMock(return_value={"d-req"})
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req",
+        transfer_id="xfer",
+        local_block_ids=[[100, 101, 102]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        total_tokens=256,
+        num_external_tokens=256,
+        external_start_token=0,
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=["d-req"],
+    )
+    socket = MagicMock(spec=zmq.asyncio.Socket)
+    socket.send = AsyncMock()
+    socket.recv = AsyncMock(return_value=worker._encoder.encode(response))
+    socket_context = MagicMock()
+    socket_context.__enter__.return_value = socket
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.make_zmq_socket",
+        return_value=socket_context,
+    ):
+        await worker.receive_kv_from_single_worker(
+            "tcp://producer:1234",
+            {"d-req": pull_meta},
+        )
+
+    sent_meta = worker._xfer_meta_decoder.decode(socket.send.await_args.args[0])
+    assert sent_meta.remote_cp_block_pairing_version == (
+        MOONCAKE_KV_REGION_LAYOUT_VERSION
+    )
+    assert sent_meta.req_blocks["d-req"] == (
+        "xfer",
+        [[100, 101, 102]],
+    )
+    assert sent_meta.req_region_page_maps["d-req"] == [
+        MooncakeRequestPageMap(
+            region_index=0,
+            group_index=0,
+            valid_start_token=0,
+            valid_end_token_exclusive=256,
+            global_page_ids=[0, 1],
+            dst_physical_block_ids=[100, 101],
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dcp_size", [1, 2])
+async def test_full_temporal_consumer_handles_abort_before_schedule(
+    dcp_size: int,
+):
+    layer_name = "model.layers.60.self_attn.attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=(
+            KVCacheChildPageMapping.IDENTITY.value
+            if dcp_size == 1
+            else KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value
+        ),
+        child_page_factor=dcp_size,
+    )
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.hostname = "consumer-host"
+    worker.rpc_port = 54321
+    worker.tp_size = 8
+    worker.tp_rank = 0
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.dcp_size = dcp_size
+    worker.dcp_rank = 0
+    worker.cp_kv_cache_interleave_size = 1 if dcp_size == 1 else 128
+    worker.async_zmq_ctx = MagicMock()
+    worker._encoder = msgspec.msgpack.Encoder()
+    worker._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+    worker._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+    worker.transfer_topo = SimpleNamespace(virtually_split_kv_in_blocks=False)
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([layer_name], layer_spec)],
+    )
+    worker._layer_specs = {layer_name: layer_spec}
+    worker.kv_caches_base_addr = [0x1000]
+    worker.block_len_per_layer = [4096]
+    worker.kv_block_len_per_layer = [4096]
+    worker.registered_layer_names = [layer_name]
+    worker.registered_layer_indices = [60]
+    worker.registered_group_indices = [0]
+    worker.registered_layer_aliases = [[layer_name]]
+    worker.registered_layer_index_aliases = [[60]]
+    worker.registered_logical_group_indices = [[0]]
+    worker.registered_alias_group_indices = [[[0]]]
+    worker.registered_region_identities = [identity]
+    worker.finished_recving_reqs = set()
+
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-aborted",
+        transfer_id="xfer-aborted",
+        local_block_ids=[],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+        total_tokens=0,
+        num_external_tokens=0,
+        external_start_token=0,
+        pull_tasks_count=1,
+    )
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        ok_reqs=[pull_meta.d_req_id],
+    )
+    socket = MagicMock(spec=zmq.asyncio.Socket)
+    socket.send = AsyncMock()
+    socket.recv = AsyncMock(return_value=worker._encoder.encode(response))
+    socket_context = MagicMock()
+    socket_context.__enter__.return_value = socket
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.make_zmq_socket",
+        return_value=socket_context,
+    ):
+        await worker.receive_kv_from_single_worker(
+            "tcp://producer:1234",
+            {pull_meta.d_req_id: pull_meta},
+        )
+
+    sent_meta = worker._xfer_meta_decoder.decode(socket.send.await_args.args[0])
+    assert sent_meta.req_blocks[pull_meta.d_req_id] == (
+        pull_meta.transfer_id,
+        [[]],
+    )
+    assert sent_meta.req_global_page_ids[pull_meta.d_req_id] == [[]]
+    assert sent_meta.req_region_page_maps[pull_meta.d_req_id] == [
+        MooncakeRequestPageMap(
+            region_index=0,
+            group_index=0,
+            valid_start_token=0,
+            valid_end_token_exclusive=0,
+            global_page_ids=[],
+            dst_physical_block_ids=[],
+        )
+    ]
+    assert pull_meta.pull_tasks_count == 0
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dcp_size", [1, 2])
+async def test_full_temporal_abort_completes_producer_consumer_lifecycle(
+    dcp_size: int,
+):
+    scheduler_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+    )
+    scheduler = create_scheduler(scheduler_config)
+    scheduler_connector = scheduler.get_kv_connector().connector_scheduler
+    request = create_request(request_id=91, do_remote_prefill=True)
+    assert request.kv_transfer_params is not None
+    request.kv_transfer_params.update(
+        {
+            "transfer_id": "xfer-aborted-lifecycle",
+            "remote_bootstrap_addr": "http://bootstrap:33333",
+        }
+    )
+    request.status = RequestStatus.FINISHED_ABORTED
+
+    delay_free, _ = scheduler_connector.request_finished(request, block_ids=([],))
+    connector_meta = scheduler_connector.build_connector_meta(MagicMock())
+    pull_metas = connector_meta.reqs_to_recv["my-engine-id"]
+    pull_meta = pull_metas[request.request_id]
+    assert delay_free is False
+    assert pull_meta.local_block_ids == []
+
+    layer_name = "model.layers.60.self_attn.attn"
+    layer_spec = FullAttentionSpec(
+        block_size=128,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.float16,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL,
+    )
+    producer_identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+        child_page_factor=1,
+    )
+    consumer_identity = MooncakeRegionIdentity(
+        layer_name=layer_name,
+        temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+        protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+        child_page_mapping=(
+            KVCacheChildPageMapping.IDENTITY.value
+            if dcp_size == 1
+            else KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value
+        ),
+        child_page_factor=dcp_size,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec([layer_name], layer_spec)],
+    )
+
+    producer = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    producer.shutdown = MagicMock()
+    producer.hostname = "producer-host"
+    producer.tp_size = 8
+    producer.tp_rank = 0
+    producer.pp_size = 1
+    producer.pp_rank = 0
+    producer.pcp_size = 1
+    producer.pcp_rank = 0
+    producer.dcp_size = 1
+    producer.dcp_rank = 0
+    producer.cp_kv_cache_interleave_size = 1
+    producer.transfer_topo = SimpleNamespace(
+        handshake_target_ranks=lambda _size: [0],
+        virtually_split_kv_in_blocks=False,
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=8,
+    )
+    producer.vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+    )
+    producer.kv_cache_config = kv_cache_config
+    producer._layer_specs = {layer_name: layer_spec}
+    producer.kv_caches_base_addr = [0x1000]
+    producer.block_len_per_layer = [4096]
+    producer.kv_block_len_per_layer = [4096]
+    producer.registered_layer_names = [layer_name]
+    producer.registered_layer_indices = [60]
+    producer.registered_group_indices = [0]
+    producer.registered_layer_aliases = [[layer_name]]
+    producer.registered_layer_index_aliases = [[60]]
+    producer.registered_logical_group_indices = [[0]]
+    producer.registered_alias_group_indices = [[[0]]]
+    producer.registered_region_identities = [producer_identity]
+    producer._physical_blocks_per_logical_kv_block = 1
+    producer._encoder = msgspec.msgpack.Encoder()
+    producer._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+    producer._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+    producer.reqs_need_send = {}
+    producer.finished_sending_reqs = set()
+    producer._send_blocks = MagicMock(return_value=0)
+
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-aborted-lifecycle",
+        transfer_id=pull_meta.transfer_id,
+        local_block_ids=[[10, 11]],
+        ready=asyncio.Event(),
+    )
+    send_meta.ready.set()
+    producer.reqs_need_send[send_meta.transfer_id] = send_meta
+
+    consumer = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    consumer.shutdown = MagicMock()
+    consumer.hostname = "consumer-host"
+    consumer.rpc_port = 54321
+    consumer.tp_size = 8
+    consumer.tp_rank = 0
+    consumer.pp_size = 1
+    consumer.pp_rank = 0
+    consumer.pcp_size = 1
+    consumer.pcp_rank = 0
+    consumer.dcp_size = dcp_size
+    consumer.dcp_rank = 0
+    consumer.cp_kv_cache_interleave_size = 1 if dcp_size == 1 else 128
+    consumer.transfer_topo = SimpleNamespace(
+        handshake_target_ranks=lambda _size: [0],
+        virtually_split_kv_in_blocks=False,
+    )
+    consumer.kv_cache_config = kv_cache_config
+    consumer._layer_specs = {layer_name: layer_spec}
+    consumer.kv_caches_base_addr = [0xA000]
+    consumer.block_len_per_layer = [4096]
+    consumer.kv_block_len_per_layer = [4096]
+    consumer.registered_layer_names = [layer_name]
+    consumer.registered_layer_indices = [60]
+    consumer.registered_group_indices = [0]
+    consumer.registered_layer_aliases = [[layer_name]]
+    consumer.registered_layer_index_aliases = [[60]]
+    consumer.registered_logical_group_indices = [[0]]
+    consumer.registered_alias_group_indices = [[[0]]]
+    consumer.registered_region_identities = [consumer_identity]
+    consumer._encoder = msgspec.msgpack.Encoder()
+    consumer._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+    consumer._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+    consumer.async_zmq_ctx = MagicMock()
+    consumer._remote_agents = {"my-engine-id": {0: {0: {0: "tcp://producer:1234"}}}}
+    consumer._tp_size = {"my-engine-id": 8}
+    consumer._pcp_size = {"my-engine-id": 1}
+    consumer._cp_block_pairing_version = {
+        "my-engine-id": MOONCAKE_KV_REGION_LAYOUT_VERSION
+    }
+    consumer.finished_recving_reqs = set()
+
+    producer_socket = AsyncMock(spec=zmq.asyncio.Socket)
+    producer_socket.send_multipart = AsyncMock()
+    consumer_socket = MagicMock(spec=zmq.asyncio.Socket)
+    consumer_socket.setsockopt = MagicMock()
+    consumer_socket.send = AsyncMock()
+    producer_responses: list[MooncakeXferResponse] = []
+
+    async def receive_producer_response():
+        sent_metadata = producer._xfer_meta_decoder.decode(
+            consumer_socket.send.await_args.args[0]
+        )
+        await producer.send_kv_to_decode(
+            b"consumer-id",
+            producer_socket,
+            sent_metadata,
+        )
+        _, response = producer_socket.send_multipart.await_args.args[0]
+        producer_responses.append(producer._xfer_resp_decoder.decode(response))
+        return response
+
+    consumer_socket.recv = AsyncMock(side_effect=receive_producer_response)
+    socket_context = MagicMock()
+    socket_context.__enter__.return_value = consumer_socket
+
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+        "mooncake_connector.make_zmq_socket",
+        return_value=socket_context,
+    ):
+        consumer.receive_kv("my-engine-id", pull_metas)
+        for _ in range(100):
+            if request.request_id in consumer.finished_recving_reqs:
+                break
+            await asyncio.sleep(0)
+
+    producer._send_blocks.assert_not_called()
+    assert len(producer_responses) == 1
+    assert producer_responses[0].status == MooncakeXferResponseStatus.FINISH
+    assert producer_responses[0].ok_reqs == [request.request_id]
+    assert not producer_responses[0].err_reqs
+    assert pull_meta.pull_failed is False
+    assert pull_meta.pull_tasks_count == 0
+    assert consumer.finished_recving_reqs == {request.request_id}
+    assert send_meta.transfer_id not in producer.reqs_need_send
+    assert producer.finished_sending_reqs == {send_meta.p_req_id}
 
 
 @pytest.mark.asyncio
@@ -1028,6 +2936,10 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
         registered_layer_names=[region.layer_name for region in remote_regions],
         registered_layer_indices=[region.layer_index for region in remote_regions],
     )
+    worker._layer_specs = {
+        region.layer_name: worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        for region in remote_regions
+    }
 
     for pp_rank, local_regions in producer_pp_regions.items():
         aligned_local, aligned_remote, err = _align_transfer_regions(
@@ -1048,7 +2960,6 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
             lengths,
             err_reqs,
             err_msg,
-            state_transfer_events,
         ) = await worker._build_transfer_params(
             ready_reqs=[("d-req-pp", send_meta)],
             agent_meta=xfer_meta,
@@ -1058,7 +2969,6 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
 
         assert err_reqs == []
         assert err_msg is None
-        assert state_transfer_events == []
         assert src_ptrs == expected_by_pp_rank[pp_rank]["src_ptrs"]
         assert dst_ptrs == expected_by_pp_rank[pp_rank]["dst_ptrs"]
         assert lengths == [2 * block_len, 2 * block_len]
@@ -1131,13 +3041,10 @@ async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
         ) as mock_send_blocks:
             await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
 
-        src_ptrs, dst_ptrs, lengths, state_transfer_events = mock_send_blocks.call_args[
-            0
-        ][1:]
+        src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0][1:]
         assert src_ptrs == [0x1000 + 10 * block_len]
         assert dst_ptrs == [0xB000 + 20 * block_len]
         assert lengths == [block_len]
-        assert state_transfer_events == []
 
         sent_identity, sent_payload = mock_socket.send_multipart.call_args[0][0]
         assert sent_identity == identity
@@ -1274,6 +3181,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pp_rank": 0,
         "pcp_rank": 0,
         "pcp_size": 2,
+        "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -1288,6 +3196,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pp_rank": 0,
         "pcp_rank": 1,
         "pcp_size": 2,
+        "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         "addr": "tcp://1.1.1.2:1112",
     }
     async with httpx.AsyncClient() as client:
@@ -1301,6 +3210,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pp_rank": 1,
         "pcp_rank": 0,
         "pcp_size": 2,
+        "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
@@ -1316,9 +3226,29 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert "0" in data
         assert data["0"]["engine_id"] == "eng-1"
         assert data["0"]["pcp_size"] == 2
+        assert (
+            data["0"]["cp_block_pairing_version"] == MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        )
         assert data["0"]["worker_addr"]["0"]["0"]["0"] == ("tcp://1.1.1.1:1111")
         assert data["0"]["worker_addr"]["0"]["0"]["1"] == ("tcp://1.1.1.2:1112")
         assert data["0"]["worker_addr"]["0"]["1"]["0"] == ("tcp://2.2.2.2:2222")
+
+    payload_version_mismatch = {
+        "engine_id": "eng-1",
+        "dp_rank": 0,
+        "tp_rank": 1,
+        "pp_rank": 0,
+        "pcp_rank": 0,
+        "pcp_size": 2,
+        "cp_block_pairing_version": 0,
+        "addr": "tcp://3.3.3.3:3333",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{base_url}/register", json=payload_version_mismatch
+        )
+        assert response.status_code == 400
+        assert "CP block pairing version mismatch" in response.text
 
     # Test failure: re-registering the same worker
     async with httpx.AsyncClient() as client:
@@ -1480,6 +3410,7 @@ def test_scheduler_request_finished():
     )
     scheduler = create_scheduler(vllm_config)
     scheduler_connector = scheduler.get_kv_connector().connector_scheduler
+    assert scheduler_connector.kv_cache_config.kv_cache_groups
 
     request = create_request(request_id=1, do_remote_decode=True)
     request.kv_transfer_params["transfer_id"] = request.request_id
@@ -1498,6 +3429,19 @@ def test_scheduler_request_finished():
     assert delay_free is False
     assert len(scheduler_connector._reqs_need_send) == 0
     assert "id-1" in scheduler_connector._reqs_not_processed
+
+
+@pytest.mark.asyncio
+async def test_worker_ignores_unknown_not_processed_transfer():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.reqs_need_send = {}
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_not_processed.add("aborted-before-first-schedule")
+
+    await worker.record_send_reqs(metadata)
+
+    assert worker.reqs_need_send == {}
 
 
 @contextlib.contextmanager
@@ -1666,6 +3610,117 @@ async def test_receive_kv_selects_remote_pp_workers(
 
     assert seen_addrs == expected_addrs
     assert pull_metas["d-req-1"].pull_tasks_count == 0
+
+
+def test_receive_kv_rejects_legacy_producer_for_consumer_dcp():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.dcp_size = 2
+    worker._cp_block_pairing_version = {"p-engine": 0}
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=MagicMock())
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    worker.receive_kv_from_single_worker = MagicMock()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-old-producer",
+        transfer_id="xfer-old-producer",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+
+    worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+
+    worker.transfer_topo.handshake_target_ranks.assert_not_called()
+    worker.receive_kv_from_single_worker.assert_not_called()
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_receive_kv_rejects_v2_producer_for_full_temporal_consumer(
+    dcp_size: int,
+):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.dcp_size = dcp_size
+    worker.registered_region_identities = [
+        MooncakeRegionIdentity(
+            layer_name="model.layers.60.self_attn.attn",
+            temporal_layout=KVCacheTemporalLayout.FULL_TEMPORAL.value,
+            protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            child_page_mapping=(
+                KVCacheChildPageMapping.IDENTITY.value
+                if dcp_size == 1
+                else KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value
+            ),
+            child_page_factor=dcp_size,
+        )
+    ]
+    worker._cp_block_pairing_version = {"p-engine": MOONCAKE_CP_BLOCK_PAIRING_VERSION}
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=MagicMock())
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    worker.receive_kv_from_single_worker = MagicMock()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-v2-producer",
+        transfer_id="xfer-v2-producer",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+
+    worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+
+    worker.transfer_topo.handshake_target_ranks.assert_not_called()
+    worker.receive_kv_from_single_worker.assert_not_called()
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
+
+
+def test_receive_kv_rejects_pcp_producer_for_consumer_dcp():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.dcp_size = 2
+    worker.pcp_size = 1
+    worker.pp_size = 1
+    worker.pp_rank = 0
+    worker._cp_block_pairing_version = {"p-engine": MOONCAKE_CP_BLOCK_PAIRING_VERSION}
+    worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda _size: [0])
+    worker._remote_agents = {
+        "p-engine": {
+            0: {
+                0: {
+                    0: "tcp://producer-pcp0:1234",
+                    1: "tcp://producer-pcp1:1234",
+                }
+            }
+        }
+    }
+    worker._tp_size = {"p-engine": 1}
+    worker._pcp_size = {"p-engine": 2}
+    worker._invalid_block_ids_lock = threading.Lock()
+    worker._invalid_block_ids = set()
+    worker.finished_recving_reqs = set()
+    worker.receive_kv_from_single_worker = MagicMock()
+    pull_meta = PullReqMeta(
+        d_req_id="d-req-pcp-producer",
+        transfer_id="xfer-pcp-producer",
+        local_block_ids=[[100, 101]],
+        remote_engine_id="p-engine",
+        remote_bootstrap_addr="http://bootstrap:33333",
+    )
+
+    worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+
+    worker.receive_kv_from_single_worker.assert_not_called()
+    assert pull_meta.pull_failed is True
+    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
+    assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
 def test_receive_kv_rejects_consumer_pp_fanout():
@@ -1869,6 +3924,36 @@ def test_resolve_need_send_accounts_for_remote_tp_fanout():
     assert send_meta.need_send == 2
 
 
+def test_finish_failed_send_attempts_release_after_all_targets():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.reqs_need_send = {}
+    worker.finished_sending_reqs = set()
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-failed",
+        transfer_id="xfer-failed",
+        local_block_ids=[[1]],
+        ready=asyncio.Event(),
+        need_send=2,
+        sending=2,
+    )
+    worker.reqs_need_send[send_meta.transfer_id] = send_meta
+
+    worker._finish_send_attempt(send_meta)
+
+    assert send_meta.sent == 1
+    assert send_meta.sending == 1
+    assert send_meta.transfer_id in worker.reqs_need_send
+    assert worker.finished_sending_reqs == set()
+
+    worker._finish_send_attempt(send_meta)
+
+    assert send_meta.sent == 2
+    assert send_meta.sending == 0
+    assert send_meta.transfer_id not in worker.reqs_need_send
+    assert worker.finished_sending_reqs == {"p-req-failed"}
+
+
 @pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.TransferEngine",
@@ -1922,6 +4007,7 @@ async def test_kv_producer(monkeypatch):
             remote_port=54321,
             remote_tp_size=1,
             remote_tp_rank=0,
+            remote_cp_block_pairing_version=MOONCAKE_CP_BLOCK_PAIRING_VERSION,
             req_blocks={"d-req-1": (transfer_id, [[20, 21]])},
             kv_caches_base_addr=[0x2000],
             block_lens=[block_len],
@@ -1954,7 +4040,6 @@ async def test_kv_producer(monkeypatch):
                 src,
                 dst,
                 lens,
-                [],
             )
             mock_socket.send_multipart.assert_called_once()
 
@@ -1987,7 +4072,6 @@ async def test_kv_producer(monkeypatch):
                 src,
                 dst,
                 lens,
-                [],
             )
             mock_socket.send_multipart.assert_called_once()
 
@@ -2378,7 +4462,7 @@ def test_pd_trace_lifecycle_clears_on_success_and_failure(monkeypatch):
     )
 
     assert worker._pd_trace_pull_started == {}
-    assert worker.finished_recving_reqs == {"d-req-ok"}
+    assert worker.finished_recving_reqs == {"d-req-ok", "d-req-failed"}
 
 
 def test_large_request_gate_uses_largest_kv_group_block_count():

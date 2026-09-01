@@ -13,6 +13,7 @@ class MiniMaxM3TextConfig(PretrainedConfig):
 
     model_type = "minimax_m3_text"
     architectures = ["MiniMaxM3SparseForCausalLM"]
+    supports_pp_aux_hidden_state_transport = True
 
     def __init__(
         self,

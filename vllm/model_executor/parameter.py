@@ -180,6 +180,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         shard_size: int = kwargs["shard_size"]
         shard_id: str = kwargs["shard_id"]
         num_heads: int = kwargs["num_heads"]
+        shard_rank: int | None = kwargs.get("shard_rank")
 
         # TODO: move these to PackedColumnParameter and PackedvLLMParameter
         if (
@@ -191,7 +192,11 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
 
         param_data = self.data
-        shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
+        shard_id_int = (
+            shard_rank
+            if shard_rank is not None
+            else (self.tp_rank if shard_id == "q" else self.tp_rank // num_heads)
+        )
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(
             self.output_dim, shard_id_int * shard_size, shard_size
@@ -504,6 +509,7 @@ class SharedWeightParameter(BasevLLMParameter):
         shard_offset = self.tp_rank * shard_size
         shard_id = "q"  # fake first partition
         num_heads = kwargs.get("num_heads")
+        shard_rank = kwargs.get("shard_rank")
 
         ModelWeightParameter.load_qkv_weight(
             partition,
@@ -512,6 +518,7 @@ class SharedWeightParameter(BasevLLMParameter):
             shard_size=shard_size,
             shard_id=shard_id,
             num_heads=num_heads,
+            shard_rank=shard_rank,
         )
 
     def process_weights_after_loading(self):

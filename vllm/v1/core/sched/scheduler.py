@@ -266,6 +266,7 @@ class Scheduler(SchedulerInterface):
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
+        self.capacity_error_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -297,6 +298,15 @@ class Scheduler(SchedulerInterface):
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self._decode_only_dcp_no_preemption = bool(
+            speculative_config is not None
+            and getattr(
+                speculative_config,
+                "enable_eagle3_replicated_draft_kv",
+                False,
+            )
+            and self.dcp_world_size > 1
+        )
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self._dynamic_sd: _DynamicSDSchedulerState | None = None
@@ -588,6 +598,15 @@ class Scheduler(SchedulerInterface):
 
         padded_num_new_tokens = self.num_sampled_tokens_per_step + candidate_padding_k
         return padded_num_new_tokens, candidate_padding_k
+
+    def _get_full_sequence_admission_tokens(self, request: Request) -> int | None:
+        if not self._decode_only_dcp_no_preemption:
+            return None
+        speculative_tail_slots = max(2 * self.num_lookahead_tokens - 1, 0)
+        return min(
+            request.num_prompt_tokens + request.max_tokens + speculative_tail_slots,
+            self.max_model_len,
+        )
 
     def _get_effective_max_num_scheduled_tokens(self, dynamic_sd_k: int | None) -> int:
         if dynamic_sd_k is None or self._dynamic_sd is None:
@@ -892,6 +911,17 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    if self._decode_only_dcp_no_preemption:
+                        logger.error(
+                            "DCP no-preemption admission invariant failed for "
+                            "running request %s; terminating the request instead "
+                            "of recomputing its history",
+                            request.request_id,
+                        )
+                        self.capacity_error_reqs.add(request.request_id)
+                        req_index += 1
+                        break
+
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -1022,6 +1052,15 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                if self._decode_only_dcp_request_exceeds_capacity(request):
+                    logger.error(
+                        "Request %s needs more KV blocks than the DCP "
+                        "no-preemption pool can provide",
+                        request_id,
+                    )
+                    self.capacity_error_reqs.add(request_id)
+                    break
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -1287,13 +1326,18 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
-                if load_kv_async:
+                if self._decode_only_dcp_no_preemption:
+                    reserved_blocks = self._active_full_sequence_reserved_blocks(
+                        exclude=request
+                    )
+                elif load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations), to
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
+                else:
+                    reserved_blocks = 0
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1304,7 +1348,13 @@ class Scheduler(SchedulerInterface):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl
+                        or self._decode_only_dcp_no_preemption
+                    ),
+                    full_sequence_num_tokens=self._get_full_sequence_admission_tokens(
+                        request
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
@@ -2272,6 +2322,10 @@ class Scheduler(SchedulerInterface):
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
+        capacity_error_reqs = getattr(self, "capacity_error_reqs", None)
+        if capacity_error_reqs:
+            error_req_ids.update(capacity_error_reqs)
+            capacity_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
 
@@ -2772,6 +2826,7 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        self.validate_prefix_cache_reset(reset_running_requests)
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -2811,6 +2866,17 @@ class Scheduler(SchedulerInterface):
             reset_successful = self.reset_connector_cache() and reset_successful
 
         return reset_successful
+
+    def validate_prefix_cache_reset(self, reset_running_requests: bool = False) -> None:
+        if (
+            reset_running_requests
+            and self._decode_only_dcp_no_preemption
+            and self.running
+        ):
+            raise RuntimeError(
+                "Cannot force-reset the prefix cache while strict DCP decode "
+                "requests are running. Abort or drain them first."
+            )
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
@@ -2960,7 +3026,9 @@ class Scheduler(SchedulerInterface):
 
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to allocate to hold its full sequence."""
-        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        full_num_tokens = self._get_full_sequence_admission_tokens(request)
+        if full_num_tokens is None:
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
         return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=full_num_tokens,
@@ -2978,6 +3046,28 @@ class Scheduler(SchedulerInterface):
         return sum(
             self._request_remaining_blocks(req) for req in self._inflight_prefills
         )
+
+    def _active_full_sequence_reserved_blocks(
+        self,
+        exclude: Request | None = None,
+    ) -> int:
+        """Blocks active requests still need through their output budget."""
+        active = set(self.running)
+        active.update(self._inflight_prefills)
+        if exclude is not None:
+            active.discard(exclude)
+        return sum(self._request_remaining_blocks(req) for req in active)
+
+    def _decode_only_dcp_request_exceeds_capacity(self, request: Request) -> bool:
+        if not self._decode_only_dcp_no_preemption:
+            return False
+        full_sequence_tokens = self._get_full_sequence_admission_tokens(request)
+        assert full_sequence_tokens is not None
+        required_parent_blocks = (
+            full_sequence_tokens + self.block_size - 1
+        ) // self.block_size
+        usable_parent_blocks = self.kv_cache_manager.block_pool.num_gpu_blocks - 1
+        return required_parent_blocks > usable_parent_blocks
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """

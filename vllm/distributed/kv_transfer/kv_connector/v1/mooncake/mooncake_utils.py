@@ -13,6 +13,9 @@ from vllm.distributed.kv_transfer.kv_connector.utils import EngineId
 from vllm.logger import init_logger
 
 WorkerAddr = str
+MOONCAKE_LEGACY_CP_BLOCK_PAIRING_VERSION = 1
+MOONCAKE_CP_BLOCK_PAIRING_VERSION = 2
+MOONCAKE_KV_REGION_LAYOUT_VERSION = 3
 
 logger = init_logger(__name__)
 
@@ -33,6 +36,7 @@ class RegisterWorkerPayload(BaseModel):
     pp_rank: int
     pcp_rank: int = 0
     pcp_size: int = 1
+    cp_block_pairing_version: int = 0
     addr: WorkerAddr
 
 
@@ -40,6 +44,7 @@ class RegisterWorkerPayload(BaseModel):
 class EngineEntry:
     engine_id: EngineId
     pcp_size: int
+    cp_block_pairing_version: int
     # {tp_rank: {pp_rank: {pcp_rank: worker_addr}}}
     worker_addr: dict[int, dict[int, dict[int, WorkerAddr]]]
 
@@ -96,6 +101,7 @@ class MooncakeBootstrapServer:
             self.workers[payload.dp_rank] = EngineEntry(
                 engine_id=payload.engine_id,
                 pcp_size=payload.pcp_size,
+                cp_block_pairing_version=payload.cp_block_pairing_version,
                 worker_addr={},
             )
 
@@ -122,6 +128,15 @@ class MooncakeBootstrapServer:
                 detail=(
                     f"PCP size mismatch for dp_rank={payload.dp_rank}: "
                     f"expected {dp_entry.pcp_size}, got {payload.pcp_size}"
+                ),
+            )
+        if dp_entry.cp_block_pairing_version != payload.cp_block_pairing_version:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"CP block pairing version mismatch for dp_rank={payload.dp_rank}: "
+                    f"expected {dp_entry.cp_block_pairing_version}, "
+                    f"got {payload.cp_block_pairing_version}"
                 ),
             )
         if payload.tp_rank not in dp_entry.worker_addr:
