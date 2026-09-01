@@ -271,8 +271,8 @@ def test_prefill_token_bucket_limits_whole_step():
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens == {"a": 4096}
-    assert len(scheduler.waiting) == 1
-    assert len(scheduler.skipped_waiting) == 0
+    assert len(scheduler.waiting) == 0
+    assert len(scheduler.skipped_waiting) == 1
 
 
 def test_prefill_token_bucket_batches_only_matching_buckets():
@@ -410,17 +410,26 @@ def test_prefill_token_bucket_allows_async_kv_load_after_cap():
     )
 
     scheduler.connector = Mock()
-    scheduler.connector.get_num_new_matched_tokens.return_value = (4, True)
+    scheduler.connector.get_num_new_matched_tokens.side_effect = lambda request, _: (
+        (4, True) if request.request_id == "remote" else (0, False)
+    )
+    (blocked_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["blocked"],
+    )
     (remote_req,) = create_requests(
         num_requests=1,
         num_tokens=8,
         req_ids=["remote"],
     )
+    scheduler.add_request(blocked_req)
     scheduler.add_request(remote_req)
 
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens == {"prefill": 4}
+    assert blocked_req in scheduler.skipped_waiting
     assert remote_req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     scheduler.connector.update_state_after_alloc.assert_called_once()
 

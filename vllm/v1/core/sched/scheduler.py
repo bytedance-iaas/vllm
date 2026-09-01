@@ -1168,7 +1168,11 @@ class Scheduler(SchedulerInterface):
                         prefill_token_bucket_step,
                     )
                     if request_token_budget <= 0:
-                        break
+                        if is_local_prefill:
+                            prefill_bucket_backlog = True
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 if (
                     self.enable_prefill_token_bucket_schedule
