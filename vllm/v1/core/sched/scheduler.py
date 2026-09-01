@@ -617,7 +617,10 @@ class Scheduler(SchedulerInterface):
         if step_bucket is not None and bucket[0] != step_bucket[0]:
             return token_budget, step_bucket, False
 
-        candidate_bucket = step_bucket or bucket
+        candidate_bucket = step_bucket or (
+            bucket[0],
+            min(bucket[1], base_token_budget),
+        )
         used_budget = base_token_budget - token_budget
         remaining_budget = candidate_bucket[1] - used_budget
         return (
@@ -802,9 +805,10 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         max_prefill_tokens=(
-                            request_token_budget
+                            request_prefill_token_bucket_step[1]
                             if self.enable_prefill_token_bucket_schedule
                             and is_local_prefill
+                            and request_prefill_token_bucket_step is not None
                             else None
                         ),
                     )
@@ -989,13 +993,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                request_token_budget = self._get_prefill_bucket_step_budget(
-                    token_budget,
-                    base_token_budget,
-                    prefill_token_bucket_step,
-                )
-                if request_token_budget <= 0:
-                    break
+                request_token_budget = token_budget
                 request_prefill_token_bucket_step = prefill_token_bucket_step
                 is_local_prefill = False
 
@@ -1163,6 +1161,15 @@ class Scheduler(SchedulerInterface):
                 is_local_prefill = (
                     not load_kv_async and num_computed_tokens < request.num_tokens - 1
                 )
+                if not load_kv_async:
+                    request_token_budget = self._get_prefill_bucket_step_budget(
+                        token_budget,
+                        base_token_budget,
+                        prefill_token_bucket_step,
+                    )
+                    if request_token_budget <= 0:
+                        break
+
                 if (
                     self.enable_prefill_token_bucket_schedule
                     and is_local_prefill
@@ -1267,9 +1274,10 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                         max_prefill_tokens=(
-                            request_token_budget
+                            request_prefill_token_bucket_step[1]
                             if self.enable_prefill_token_bucket_schedule
                             and is_local_prefill
+                            and request_prefill_token_bucket_step is not None
                             else None
                         ),
                     )

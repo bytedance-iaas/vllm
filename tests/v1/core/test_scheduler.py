@@ -382,6 +382,49 @@ def test_prefill_token_bucket_caps_decode_after_prefill():
     assert output.num_scheduled_tokens == {"prefill": 4}
 
 
+def test_prefill_token_bucket_allows_async_kv_load_after_cap():
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        enable_prefill_token_bucket_schedule=True,
+        prefill_token_bucket_schedule="-1:4",
+    )
+    (prefill_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["prefill"],
+            req_id_to_index={"prefill": 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (4, True)
+    (remote_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["remote"],
+    )
+    scheduler.add_request(remote_req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"prefill": 4}
+    assert remote_req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.connector.update_state_after_alloc.assert_called_once()
+
+
 @pytest.mark.parametrize(
     "schedule",
     [

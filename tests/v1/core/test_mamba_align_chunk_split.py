@@ -191,6 +191,23 @@ def test_sub_block_prefill_budget_still_makes_progress() -> None:
     assert first_chunk == 1024
 
 
+def test_residual_budget_waits_for_next_aligned_step() -> None:
+    """A full-block bucket must not become sub-block due to decode usage."""
+    (request,) = create_requests(
+        1,
+        num_tokens=PROMPT_LEN,
+        block_size=ATTN_BLOCK_SIZE,
+    )
+
+    first_chunk = _split(
+        request,
+        num_new_tokens=MAMBA_BLOCK_SIZE - 1,
+        max_prefill_tokens=MAMBA_BLOCK_SIZE,
+    )
+
+    assert first_chunk == 0
+
+
 def test_fragmented_tail_chunk_does_not_poison_mamba_prefix_cache() -> None:
     """Same poisoning one block in, where a hit is still cacheable.
 
