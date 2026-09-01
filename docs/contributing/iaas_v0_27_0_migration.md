@@ -8,23 +8,23 @@ upstream `v0.27.0`.
 | Item | Revision |
 | --- | --- |
 | Source branch | `iaas_main` |
-| Source head | `de55af913859da5dd6a420a5fc5d85be98f6b376` |
+| Source head | `8da5f70fca26827d8542722f6c8663f11bf2b32c` |
 | Target tag | `v0.27.0` |
 | Target commit | `4bdc8a788d2e2ce9165d552b3d4d8b72604626bf` |
 | Work branch | `wyc/iaas-v0.27.0` |
-| Implementation head before this update | `f911556cb6` |
+| Current implementation head | `f1d5ef2237` |
 | Merge base | `dcfebf93f4eccf30f71872283331eee757915daf` |
 
-The raw range `v0.27.0..iaas_main` contains 82 commits because the release
+The raw range `v0.27.0..iaas_main` contains 86 commits because the release
 branches diverged before `v0.26.0`. The meaningful IAAS stack starts after
 `v0.26.0` (`568afb3a13806beb53bb2e6bd518269357b237c0`) and contains:
 
-- 63 non-merge commits.
-- 7 merge commits.
+- 66 non-merge commits.
+- 8 merge commits.
 - 12 upstream `v0.26.0` release commits before the IAAS stack.
 
 The migration should therefore be a selective reconstruction on
-`wyc/iaas-v0.27.0`, not a blind `git rebase --onto` of all 82 commits.
+`wyc/iaas-v0.27.0`, not a blind `git rebase --onto` of all 86 commits.
 
 ## 2. Analysis Method
 
@@ -62,11 +62,12 @@ Disposition terms:
 | PCP | Upstream MRV2 virtual-batch PCP exists | Only DSV4 hybrid-backend and direct Mooncake gaps | Do not port legacy PCP implementation wholesale |
 | MiniMax HPC | Generic HPC backend exists | MiniMax-M3 MXFP8 K32 path, BF16 fused path, workspaces | Port as one backend stack |
 | MiniMax W4A8 | Basic CUTLASS W4A8 exists | SwiGLU parameters, DeepEP LL/HT, scheduling, Humming W4A8 | Port in dependency order |
+| Prefill token buckets | Absent | Opt-in prompt-length buckets with a whole-step token cap | Reimplement on the v0.27 scheduler; omit metrics and tracing |
 
 ### 3.1 Current Execution Status
 
-The CPU/static migration is implemented through `3b27f22d7c`. The branch has
-50 target-native commits after `v0.27.0`, including this document's initial
+The CPU/static migration is implemented through `f1d5ef2237`. That revision has
+56 target-native commits after `v0.27.0`, including this document's initial
 planning commit.
 
 | Area | Status | Target commits |
@@ -80,6 +81,7 @@ planning commit.
 | CUTLASS W4A8 and DeepEP | Complete, GPU/multi-rank pending | `099caa830f` through `90b13c90e1` |
 | Humming W4A8 | Complete, GPU pending | `19d96bcbfa` |
 | ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `3b27f22d7c` |
+| Step-level prefill token buckets | Complete, opt-in | `a8fd87c724` through `f1d5ef2237` |
 | MRV2 direct-Mooncake PCP | Hold | No safe target-native implementation yet |
 | DSpark K below block size | Hold | `0d6fd1c83c` intentionally not migrated |
 | MiniMax indexer E5M2 removal | Hold | Existing top-k layout is upstream; dtype removal lacks evidence |
@@ -396,7 +398,20 @@ cache dtypes.
 | --- | --- | --- |
 | `027887b86b` | PORT | Add the CuTe DSL LL BF16 kill switch and tests |
 
-### 6.7 Merge Commits
+### 6.7 Step-Level Prefill Token Buckets
+
+| Old commit | Disposition | Migration note |
+| --- | --- | --- |
+| `7f716ff4c5` | SPLIT | Port config, CLI, scheduler behavior, and focused tests only |
+| `efbe85cff4` | DROP | Metrics-only gauge fix; observability is outside the approved scope |
+| `494b0ecf05` | PORT | Reimplement final whole-step cap and same-bucket semantics |
+
+The target-native implementation also preserves dynamic-SD budgets, DP
+prefill cadence, priority-preemption rollback, async KV resume, and Mamba
+block-aligned progress. Prometheus metrics, PP queue telemetry, step latency,
+NVTX, trace, and debug helpers are intentionally not migrated.
+
+### 6.8 Merge Commits
 
 Drop these merge commits. Their non-merge children are classified above:
 
@@ -408,6 +423,7 @@ f292c28cb6  Merge DSV4 PCP refresh
 e947b67b83  Merge W4A8 optimization
 ad70d89158  Merge apt mirror fixes
 de55af9138  Merge Humming W4A8
+8da5f70fca  Merge step-level prefill token buckets
 ```
 
 ## 7. Implemented Source-to-Target Mapping
@@ -454,6 +470,9 @@ behavior.
 | `a9f1617cc7`, `4edbfab0a9`, `23dfea6fca`, `ec58aaf9f3`, `30cf9d9bad`, `9493f04276`, `aa4fd55c54`, `eb454b2d43` | `f8040e5a16` through `f798a87ca3`, plus `2fd47e7683` | Rebuilt on v0.27.0 |
 | `348c70ca0b`, `0b37e9134c`, `09aa3c1bde`, `18f1129660` | None | Intermediate mirror workarounds dropped |
 | `2bee42cda6` | Upstream `requirements/cuda.txt` | Already covered |
+| `7f716ff4c5`, `494b0ecf05` | `a8fd87c724` through `f1d5ef2237` | Core scheduler semantics ported and hardened |
+| `efbe85cff4` | None | Dropped as metrics-only by scope |
+| `8da5f70fca` | None | Dropped as merge-only |
 
 Target-only hardening commits such as `e3f14d2e48`, `90b13c90e1`,
 `16d786bc7b`, `7bac341c97`, `ac36a3ee3b`, `f798a87ca3`, `90aecd5ad3`, and
@@ -554,6 +573,9 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
   the v0.27 branch.
 - A complete v0.27 wheel/image build and registry publication have not yet
   been triggered.
+- Step-level prefill token buckets passed 21 focused scheduler cases, one CLI
+  parsing case, two Mamba budget/alignment regressions, two remote-KV cadence
+  cases, Ruff 0.15.12, `compileall`, and `git diff --check`.
 
 ## 9. High-Risk Decisions Before Execution
 
@@ -573,7 +595,7 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 
 | Criterion | Status |
 | --- | --- |
-| Every one of the 63 non-merge IAAS commits has a disposition | Complete |
+| Every one of the 66 non-merge IAAS commits has a disposition | Complete |
 | No upstream-equivalent or merge-only commit is replayed | Complete |
 | Retained code is rebased onto `v0.27.0` APIs | Complete |
 | Focused CPU/static tests pass | Complete for implemented stacks |
