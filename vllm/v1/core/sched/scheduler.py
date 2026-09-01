@@ -745,6 +745,7 @@ class Scheduler(SchedulerInterface):
                     prefill_token_bucket_step,
                 )
                 if not bucket_matches_step or request_token_budget <= 0:
+                    prefill_bucket_backlog = True
                     req_index += 1
                     continue
 
