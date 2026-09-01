@@ -580,6 +580,14 @@ def test_human_readable_other_args():
     args = parser.parse_args(["--max-num-scheduled-tokens", "10.5k"])
     assert args.max_num_scheduled_tokens == 10500
 
+    args = parser.parse_args(["--enable-prefill-token-bucket-schedule"])
+    assert args.enable_prefill_token_bucket_schedule
+
+    args = parser.parse_args(
+        ["--prefill-token-bucket-schedule", "4095:8192,16383:4096,-1:8192"]
+    )
+    assert args.prefill_token_bucket_schedule == "4095:8192,16383:4096,-1:8192"
+
     # Test kv_cache_memory_bytes (existing human-readable arg)
     args = parser.parse_args(["--kv-cache-memory-bytes", "100000"])
     assert args.kv_cache_memory_bytes == 100000

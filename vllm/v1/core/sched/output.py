@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -188,6 +188,16 @@ class ScheduledEncoderInputStats:
 
 
 @dataclass
+class PrefillChunkStats:
+    """Stats for prefill chunks scheduled in one iteration."""
+
+    num_chunks: int = 0
+    total_tokens: int = 0
+    max_tokens: int = 0
+    chunk_tokens: list[int] = field(default_factory=list)
+
+
+@dataclass
 class SchedulerOutput:
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
@@ -225,6 +235,7 @@ class SchedulerOutput:
     free_encoder_mm_hashes: list[str]
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+    prefill_chunk_stats: PrefillChunkStats | None = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
@@ -258,6 +269,10 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Engine-side PP batch queue occupancy sampled when this batch is enqueued.
+    pp_queue_len: int = 0
+    pp_queue_capacity: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

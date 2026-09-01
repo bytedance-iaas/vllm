@@ -518,6 +518,7 @@ class EngineCore:
             return
 
         iteration_index = getattr(self, "_iteration_index", 0)
+        pp_queue_capacity = getattr(self, "batch_queue_size", 0)
         # scheduler_output=None marks a DP dummy iteration.
         if scheduler_output is None:
             iteration_details = SchedulerIterationDetails(
@@ -527,6 +528,7 @@ class EngineCore:
                 num_generation_requests=0,
                 num_generation_tokens=0,
                 elapsed_ms=0.0,
+                pp_queue_capacity=pp_queue_capacity,
                 is_dummy=True,
             )
         else:
@@ -540,6 +542,12 @@ class EngineCore:
                 elapsed_ms=0.0,
                 num_encoder_inputs=details.num_encoder_inputs,
                 num_encoder_output_tokens=details.num_encoder_output_tokens,
+                prefill_chunks=details.prefill_chunks,
+                prefill_chunk_tokens=details.prefill_chunk_tokens,
+                max_prefill_chunk_tokens=details.max_prefill_chunk_tokens,
+                prefill_chunk_token_counts=details.prefill_chunk_token_counts or [],
+                pp_queue_len=scheduler_output.pp_queue_len,
+                pp_queue_capacity=pp_queue_capacity,
             )
 
         start_time = time.monotonic()
@@ -672,6 +680,8 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                scheduler_output.pp_queue_len = len(batch_queue)
+                scheduler_output.pp_queue_capacity = self.batch_queue_size
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -728,6 +738,8 @@ class EngineCore:
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            deferred_scheduler_output.pp_queue_len = len(batch_queue)
+            deferred_scheduler_output.pp_queue_capacity = self.batch_queue_size
 
         return engine_core_outputs, model_executed
 

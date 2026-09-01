@@ -228,6 +228,122 @@ def test_schedule_multimodal_requests():
         assert len(encoder_input) == 1
 
 
+@pytest.mark.parametrize(
+    ("num_prompt_tokens", "expected_first_chunk"),
+    [
+        (3500, 3500),
+        (8000, 4096),
+        (16383, 4096),
+        (16384, 8192),
+        (32000, 8192),
+    ],
+)
+def test_prefill_token_bucket_schedule(num_prompt_tokens, expected_first_chunk):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=num_prompt_tokens)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == expected_first_chunk
+    assert output.prefill_chunk_stats is not None
+    assert output.prefill_chunk_stats.num_chunks == 1
+    assert output.prefill_chunk_stats.chunk_tokens == [expected_first_chunk]
+
+
+def test_prefill_token_bucket_schedule_disabled_by_default():
+    scheduler = create_scheduler(max_num_batched_tokens=8192, max_model_len=65536)
+    (request,) = create_requests(num_requests=1, num_tokens=8000)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 8000
+
+
+def test_prefill_token_bucket_schedule_limits_step_budget():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    req_a, req_b = create_requests(
+        num_requests=2, num_tokens=8000, req_ids=["a", "b"]
+    )
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"a": 4096}
+    assert sum(output.num_scheduled_tokens.values()) <= 4096
+    assert len(scheduler.waiting) == 1
+
+
+def test_prefill_token_bucket_schedule_keeps_prefill_buckets_homogeneous():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (short_req,) = create_requests(
+        num_requests=1, num_tokens=3500, req_ids=["short"]
+    )
+    (medium_req,) = create_requests(
+        num_requests=1, num_tokens=8000, req_ids=["medium"]
+    )
+    scheduler.add_request(short_req)
+    scheduler.add_request(medium_req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"short": 3500}
+    assert "medium" not in output.num_scheduled_tokens
+
+    scheduler.finish_requests(short_req.request_id, RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"medium": 4096}
+
+
+def test_prefill_token_bucket_schedule_allows_decode_in_prefill_step():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        max_model_len=65536,
+        enable_prefill_token_bucket_schedule=True,
+    )
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["decode"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert decode_req in scheduler.running and not decode_req.is_prefill_chunk
+
+    (prefill_req,) = create_requests(
+        num_requests=1, num_tokens=8000, req_ids=["prefill"]
+    )
+    scheduler.add_request(prefill_req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["decode"] == 1
+    assert output.num_scheduled_tokens["prefill"] == 4095
+    assert sum(output.num_scheduled_tokens.values()) == 4096
+
+
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():
     """Async scheduling + PP: allow multi-step in-flight scheduling per request"""
     scheduler = create_scheduler(async_scheduling=True, pipeline_parallel_size=2)

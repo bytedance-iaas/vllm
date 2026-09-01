@@ -179,6 +179,12 @@ class SchedulerIterationDetails:
     elapsed_ms: float
     num_encoder_inputs: int = 0
     num_encoder_output_tokens: int = 0
+    prefill_chunks: int = 0
+    prefill_chunk_tokens: int = 0
+    max_prefill_chunk_tokens: int = 0
+    prefill_chunk_token_counts: list[int] = field(default_factory=list)
+    pp_queue_len: int = 0
+    pp_queue_capacity: int = 0
     is_dummy: bool = False
 
 

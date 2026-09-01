@@ -44,6 +44,7 @@ from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
     NewRequestData,
+    PrefillChunkStats,
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
@@ -164,6 +165,14 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
             else self.scheduler_config.max_num_batched_tokens
+        )
+        self.enable_prefill_token_bucket_schedule = (
+            self.scheduler_config.enable_prefill_token_bucket_schedule
+        )
+        self.prefill_token_bucket_schedule = (
+            self._parse_prefill_token_bucket_schedule(
+                self.scheduler_config.prefill_token_bucket_schedule
+            )
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
@@ -589,6 +598,94 @@ class Scheduler(SchedulerInterface):
             default_budget=self.max_num_scheduled_tokens,
         )
 
+    def _get_prefill_token_bucket(self, request: Request) -> tuple[int, int] | None:
+        if not self.enable_prefill_token_bucket_schedule:
+            return None
+
+        for index, (max_prompt_tokens, chunk_tokens) in enumerate(
+            self.prefill_token_bucket_schedule
+        ):
+            if max_prompt_tokens < 0 or request.num_prompt_tokens <= max_prompt_tokens:
+                return (
+                    index,
+                    min(chunk_tokens, self.scheduler_config.max_num_batched_tokens),
+                )
+        return None
+
+    def _get_prefill_token_bucket_budget(self, request: Request) -> int | None:
+        bucket = self._get_prefill_token_bucket(request)
+        return None if bucket is None else bucket[1]
+
+    @staticmethod
+    def _parse_prefill_token_bucket_schedule(
+        value: str,
+    ) -> tuple[tuple[int, int], ...]:
+        if not value:
+            return ((4095, 8192), (16383, 4096), (-1, 8192))
+
+        buckets: list[tuple[int, int]] = []
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                max_prompt_tokens_str, chunk_tokens_str = item.split(":", 1)
+                max_prompt_tokens = int(max_prompt_tokens_str)
+                chunk_tokens = int(chunk_tokens_str)
+            except ValueError as exc:
+                raise ValueError(
+                    "prefill_token_bucket_schedule entries must use "
+                    "'max_prompt_tokens:chunk_tokens' format"
+                ) from exc
+            if chunk_tokens <= 0:
+                raise ValueError("prefill token bucket chunk size must be positive")
+            if max_prompt_tokens < -1:
+                raise ValueError(
+                    "prefill token bucket max prompt tokens must be -1 or positive"
+                )
+            buckets.append((max_prompt_tokens, chunk_tokens))
+
+        if not buckets:
+            raise ValueError("prefill_token_bucket_schedule cannot be empty")
+        return tuple(buckets)
+
+    def _apply_prefill_token_bucket_budget(
+        self,
+        request: Request,
+        num_new_tokens: int,
+    ) -> int:
+        bucket_budget = self._get_prefill_token_bucket_budget(request)
+        if bucket_budget is None:
+            return num_new_tokens
+        return min(num_new_tokens, bucket_budget)
+
+    def _apply_prefill_token_bucket_step_budget(
+        self,
+        request: Request,
+        token_budget: int,
+        base_token_budget: int,
+        prefill_token_bucket_step: tuple[int, int] | None,
+    ) -> tuple[int, tuple[int, int] | None, bool]:
+        bucket = self._get_prefill_token_bucket(request)
+        if bucket is None:
+            return token_budget, prefill_token_bucket_step, True
+
+        bucket_index, bucket_budget = bucket
+        if prefill_token_bucket_step is not None:
+            return (
+                token_budget,
+                prefill_token_bucket_step,
+                bucket_index == prefill_token_bucket_step[0],
+            )
+
+        step_budget = min(bucket_budget, base_token_budget)
+        used_budget = base_token_budget - token_budget
+        remaining_budget = step_budget - used_budget
+        if remaining_budget <= 0:
+            return 0, prefill_token_bucket_step, False
+        token_budget = min(token_budget, remaining_budget)
+        return token_budget, (bucket_index, step_budget), True
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -611,9 +708,12 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         dynamic_sd_early_k = self._get_dynamic_sd_early_k()
         token_budget = self._get_effective_max_num_scheduled_tokens(dynamic_sd_early_k)
+        base_token_budget = token_budget
+        prefill_token_bucket_step: tuple[int, int] | None = None
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+            base_token_budget = 0
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -667,6 +767,23 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            request_token_budget = token_budget
+            request_prefill_token_bucket_step = prefill_token_bucket_step
+            if request.is_prefill_chunk:
+                (
+                    request_token_budget,
+                    request_prefill_token_bucket_step,
+                    bucket_matches_step,
+                ) = self._apply_prefill_token_bucket_step_budget(
+                    request,
+                    request_token_budget,
+                    base_token_budget,
+                    request_prefill_token_bucket_step,
+                )
+                if not bucket_matches_step or request_token_budget <= 0:
+                    req_index += 1
+                    continue
+
             is_async_spec_decode = (
                 self.scheduler_config.async_scheduling
                 and self.num_sampled_tokens_per_step > 0
@@ -686,7 +803,12 @@ class Scheduler(SchedulerInterface):
                 ):
                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 
-                num_new_tokens = min(num_new_tokens, token_budget)
+                if request.is_prefill_chunk:
+                    num_new_tokens = self._apply_prefill_token_bucket_budget(
+                        request, num_new_tokens
+                    )
+
+                num_new_tokens = min(num_new_tokens, request_token_budget)
 
                 # Make sure the input position does not exceed the max model len.
                 # This is necessary when using spec decoding.
@@ -809,6 +931,8 @@ class Scheduler(SchedulerInterface):
                 break
 
             # Schedule the request.
+            token_budget = request_token_budget
+            prefill_token_bucket_step = request_prefill_token_bucket_step
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
@@ -883,6 +1007,8 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                request_token_budget = token_budget
+                request_prefill_token_bucket_step = prefill_token_bucket_step
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1007,6 +1133,27 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                    is_local_prefill = num_computed_tokens < request.num_tokens - 1
+                    if (
+                        not load_kv_async
+                        and not defer_prefills
+                        and is_local_prefill
+                    ):
+                        (
+                            request_token_budget,
+                            request_prefill_token_bucket_step,
+                            bucket_matches_step,
+                        ) = self._apply_prefill_token_bucket_step_budget(
+                            request,
+                            request_token_budget,
+                            base_token_budget,
+                            request_prefill_token_bucket_step,
+                        )
+                        if not bucket_matches_step or request_token_budget <= 0:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if (
                         request.prefill_stats is not None
@@ -1059,7 +1206,7 @@ class Scheduler(SchedulerInterface):
                     if pad_spec_decode:
                         padded_num_new_tokens = num_new_tokens
                         if (
-                            num_new_tokens > token_budget
+                            num_new_tokens > request_token_budget
                             or num_computed_tokens + num_new_tokens > self.max_model_len
                         ):
                             # Prefer to not schedule than schedule un-padded here.
@@ -1069,17 +1216,22 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
+                    if num_computed_tokens < request.num_tokens - 1:
+                        num_new_tokens = self._apply_prefill_token_bucket_budget(
+                            request, num_new_tokens
+                        )
+
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
+                        and num_new_tokens > request_token_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1219,6 +1371,8 @@ class Scheduler(SchedulerInterface):
                         )
                     continue
 
+                token_budget = request_token_budget
+                prefill_token_bucket_step = request_prefill_token_bucket_step
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -1272,10 +1426,12 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert (
-            total_num_scheduled_tokens
-            <= self._get_effective_max_num_scheduled_tokens(dynamic_sd_early_k)
+        max_scheduled_tokens = self._get_effective_max_num_scheduled_tokens(
+            dynamic_sd_early_k
         )
+        if prefill_token_bucket_step is not None:
+            max_scheduled_tokens = min(max_scheduled_tokens, prefill_token_bucket_step[1])
+        assert total_num_scheduled_tokens <= max_scheduled_tokens
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -1360,6 +1516,13 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        prefill_chunk_stats = self._make_prefill_chunk_stats(
+            scheduled_new_reqs,
+            scheduled_running_reqs,
+            scheduled_resumed_reqs,
+            num_scheduled_tokens,
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1368,6 +1531,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             scheduled_encoder_input_stats=scheduled_encoder_input_stats,
+            prefill_chunk_stats=prefill_chunk_stats,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids=self.reset_preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
@@ -1776,6 +1940,34 @@ class Scheduler(SchedulerInterface):
                 stats.output_tokens += mm_feature.mm_position.get_num_embeds()
 
         return stats if stats.num_inputs else None
+
+    def _make_prefill_chunk_stats(
+        self,
+        scheduled_new_reqs: list[Request],
+        scheduled_running_reqs: list[Request],
+        scheduled_resumed_reqs: list[Request],
+        num_scheduled_tokens: dict[str, int],
+    ) -> PrefillChunkStats | None:
+        stats = PrefillChunkStats()
+        chunk_tokens: list[int] = []
+        reqs = itertools.chain(
+            scheduled_new_reqs,
+            scheduled_running_reqs,
+            scheduled_resumed_reqs,
+        )
+        for request in reqs:
+            num_tokens = num_scheduled_tokens.get(request.request_id, 0)
+            if num_tokens <= 0:
+                continue
+            if request.num_computed_tokens >= request.num_tokens:
+                continue
+            stats.num_chunks += 1
+            stats.total_tokens += num_tokens
+            stats.max_tokens = max(stats.max_tokens, num_tokens)
+            chunk_tokens.append(num_tokens)
+
+        stats.chunk_tokens = chunk_tokens
+        return stats if stats.num_chunks else None
 
     def get_grammar_bitmask(
         self, scheduler_output: SchedulerOutput

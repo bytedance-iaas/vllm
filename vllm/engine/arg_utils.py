@@ -527,6 +527,12 @@ class EngineArgs:
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
+    enable_prefill_token_bucket_schedule: bool = (
+        SchedulerConfig.enable_prefill_token_bucket_schedule
+    )
+    prefill_token_bucket_schedule: str = (
+        SchedulerConfig.prefill_token_bucket_schedule
+    )
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
@@ -1434,6 +1440,14 @@ class EngineArgs:
             },
         )
         scheduler_group.add_argument(
+            "--enable-prefill-token-bucket-schedule",
+            **scheduler_kwargs["enable_prefill_token_bucket_schedule"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-token-bucket-schedule",
+            **scheduler_kwargs["prefill_token_bucket_schedule"],
+        )
+        scheduler_group.add_argument(
             "--max-num-seqs",
             **{
                 **scheduler_kwargs["max_num_seqs"],
@@ -2182,6 +2196,10 @@ class EngineArgs:
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            enable_prefill_token_bucket_schedule=(
+                self.enable_prefill_token_bucket_schedule
+            ),
+            prefill_token_bucket_schedule=self.prefill_token_bucket_schedule,
             max_num_seqs=self.max_num_seqs,
             max_model_len=model_config.max_model_len,
             enable_chunked_prefill=self.enable_chunked_prefill,
