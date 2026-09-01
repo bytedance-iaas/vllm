@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       checkout_ref:
-        description: "Optional full SHA or tag; defaults to the workflow commit"
+        description: "Optional full SHA, branch, or tag; defaults to the workflow commit"
         required: false
         default: ""
       vllm_version:
@@ -54,18 +54,43 @@ jobs:
         run: |
           set -euo pipefail
           trusted_head="$(git rev-parse HEAD)"
+          source_is_branch=false
+
+          resolve_branch_ref() {
+            local branch_name="$1"
+            local branch_ref="refs/heads/${branch_name}"
+            local remote_ref="refs/remotes/origin/${branch_name}"
+            if ! git check-ref-format --branch "${branch_name}" >/dev/null 2>&1; then
+              return 1
+            fi
+            if [ "${EVENT_NAME}" = "workflow_dispatch" ] && \
+                [ "${EVENT_REF}" = "${branch_ref}" ]; then
+              source_ref="${EVENT_SHA}"
+            elif git show-ref --verify --quiet "${remote_ref}"; then
+              source_ref="${remote_ref}"
+            else
+              return 1
+            fi
+            source_is_branch=true
+          }
 
           if [[ "${REQUESTED_REF}" =~ ^[0-9a-f]{40}$ ]]; then
             source_ref="${REQUESTED_REF}"
-          elif [ "${REQUESTED_REF}" = "refs/heads/iaas_main" ]; then
+          elif [ "${REQUESTED_REF}" = "iaas_main" ] || \
+              [ "${REQUESTED_REF}" = "refs/heads/iaas_main" ]; then
             source_ref="${trusted_head}"
+          elif [[ "${REQUESTED_REF}" == refs/heads/* ]] && \
+              resolve_branch_ref "${REQUESTED_REF#refs/heads/}"; then
+            :
           elif [[ "${REQUESTED_REF}" =~ ^refs/tags/[0-9A-Za-z][0-9A-Za-z_.-]*$ ]]; then
             source_ref="${REQUESTED_REF}"
           elif [[ "${REQUESTED_REF}" =~ ^[0-9A-Za-z][0-9A-Za-z_.-]*$ ]] && \
               git show-ref --verify --quiet "refs/tags/${REQUESTED_REF}"; then
             source_ref="refs/tags/${REQUESTED_REF}"
+          elif resolve_branch_ref "${REQUESTED_REF}"; then
+            :
           else
-            echo "::error::checkout_ref must be a full SHA, iaas_main, or a tag"
+            echo "::error::checkout_ref must be a full SHA, branch, iaas_main, or a tag"
             exit 1
           fi
 
@@ -77,6 +102,7 @@ jobs:
             is_workflow_sha=true
           fi
           if [ "${is_workflow_sha}" != "true" ] && \
+              [ "${source_is_branch}" != "true" ] && \
               ! git merge-base --is-ancestor \
                 "${checkout_sha}" "${trusted_head}"; then
             echo "::error::Requested source is not in iaas_main history"
@@ -100,7 +126,9 @@ jobs:
 
   build-image:
     if: github.repository == 'bytedance-iaas/vllm'
-    needs: resolve-source
+    needs:
+      - resolve-source
+      - build-wheel
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
       checkout_ref: ${{ needs.resolve-source.outputs.checkout_sha }}

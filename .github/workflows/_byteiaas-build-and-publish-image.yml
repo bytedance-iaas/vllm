@@ -53,11 +53,12 @@ jobs:
       HTTP_PROXY: http://100.68.162.211:3128
       HTTPS_PROXY: http://100.68.162.211:3128
       ALL_PROXY: http://100.68.162.211:3128
-      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,mirrors.volces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
+      BYTEIAAS_UBUNTU_MIRROR: http://mirrors.volces.com/ubuntu
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
       BYTEIAAS_HPC_OPS_REPO: https://github.com/wangyicong52/hpc-ops.git
@@ -314,6 +315,7 @@ jobs:
               --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}"
               --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${BYTEIAAS_CUDA_VERSION}-devel-ubuntu22.04"
               --build-arg FINAL_BASE_IMAGE="nvidia/cuda:${BYTEIAAS_CUDA_VERSION}-base-ubuntu22.04"
+              --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}"
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
               --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
@@ -360,6 +362,7 @@ jobs:
               -f docker/byteiaas-openai-devel.Dockerfile
               --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${base_digest}"
               --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}"
+              --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}"
               --build-arg VLLM_BUILD_COMMIT="${build_commit}"
               --build-arg VLLM_BUILD_PIPELINE="${GITHUB_WORKFLOW}"
               --build-arg VLLM_BUILD_URL="${build_url}"

@@ -45,6 +45,10 @@ ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
+# Optional apt mirror for Ubuntu-based build stages. This is useful for
+# hermetic or region-local CI builds while preserving upstream defaults.
+ARG UBUNTU_MIRROR
+
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
 # as pytorch/manylinux2_28-builder:cuda13.0 to produce wheels with a glibc
@@ -121,6 +125,7 @@ ARG TARGETPLATFORM
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG BUILD_OS
+ARG UBUNTU_MIRROR
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
 ARG SCCACHE_ENDPOINT
@@ -167,7 +172,16 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && dnf clean all \
         && rm -rf /var/cache/dnf; \
     else \
-        apt-get update -y \
+        if [ -n "${UBUNTU_MIRROR}" ]; then \
+            if [ -f /etc/apt/sources.list ]; then \
+                sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
+            fi; \
+            if [ -d /etc/apt/sources.list.d ]; then \
+                find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) \
+                    -exec sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" {} +; \
+            fi; \
+        fi \
+        && apt-get -o Acquire::Retries=5 update -y \
         && apt-get install -y --no-install-recommends \
             ccache \
             software-properties-common \
@@ -708,6 +722,7 @@ FROM ${FINAL_BASE_IMAGE} AS vllm-base
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG NCCL_VERSION
+ARG UBUNTU_MIRROR
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
@@ -721,7 +736,16 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
 # Install Python and system dependencies
-RUN apt-get update -y \
+RUN if [ -n "${UBUNTU_MIRROR}" ]; then \
+        if [ -f /etc/apt/sources.list ]; then \
+            sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
+        fi; \
+        if [ -d /etc/apt/sources.list.d ]; then \
+            find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) \
+                -exec sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" {} +; \
+        fi; \
+    fi \
+    && apt-get -o Acquire::Retries=5 update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
         curl \
@@ -743,7 +767,7 @@ RUN apt-get update -y \
             { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
         done ; \
     fi \
-    && apt-get update -y \
+    && apt-get -o Acquire::Retries=5 update -y \
     && apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
