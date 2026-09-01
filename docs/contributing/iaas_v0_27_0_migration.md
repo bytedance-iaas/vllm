@@ -74,13 +74,13 @@ planning commit.
 | --- | --- | --- |
 | DFlash/DSpark foundation | Complete | `aa5a75d799`, `86ec283e47`, `0c142e5b8e`, `66bf65058d` |
 | DSV4 correctness and IndexCache | Complete | `549942052e`, `effe7093cf` |
-| SM90 MegaMoE | Complete, GPU pending | `78dea35eb9`, `b84298dbe1` |
-| Dynamic SD | Complete, GPU/DP pending | `9e006972e2` through `d00896ae74` |
+| SM90 MegaMoE | Core migrated; Kimi DeepGEMM ABI fix and GPU validation pending | `78dea35eb9`, `b84298dbe1` |
+| Dynamic SD | Core migrated; DSpark reduced-K and custom-scheduler fixes pending | `9e006972e2` through `d00896ae74` |
 | Mooncake | Complete except direct PCP | `cca9a49550`, `5b701d086f`, `f00de7548e`, `4324aa0125`, `d5115b2da8` |
 | MiniMax HPC | Complete, image/GPU pending | `6120c51141`, `deb0b32e0d` |
 | CUTLASS W4A8 and DeepEP | Complete, GPU/multi-rank pending | `099caa830f` through `90b13c90e1` |
 | Humming W4A8 | Complete, GPU pending | `19d96bcbfa` |
-| ByteIAAS build/release | Complete, CI execution pending | `f8040e5a16` through `3b27f22d7c` |
+| ByteIAAS build/release | Implemented; DeepGEMM pin fix and CI execution pending | `f8040e5a16` through `3b27f22d7c` |
 | Step-level prefill token buckets | Complete, opt-in | `a8fd87c724` through `f1d5ef2237` |
 | MRV2 direct-Mooncake PCP | Hold | No safe target-native implementation yet |
 | DSpark K below block size | Hold | `0d6fd1c83c` intentionally not migrated |
@@ -576,11 +576,18 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 - Step-level prefill token buckets passed 21 focused scheduler cases, one CLI
   parsing case, two Mamba budget/alignment regressions, two remote-KV cadence
   cases, Ruff 0.15.12, `compileall`, and `git diff --check`.
+- The complete source disposition is in
+  `docs/contributing/iaas_v0_27_0_source_commit_disposition.md`.
+- The post-migration audit is in
+  `docs/contributing/iaas_v0_27_0_target_commit_audit.md`. It found two P1
+  issues (DSpark Dynamic SD reduced-K and ByteIAAS DeepGEMM/Kimi ABI) plus one
+  P2 custom-scheduler compatibility issue.
 
 ## 9. High-Risk Decisions Before Execution
 
-1. **DSpark K below block size**: default recommendation is not to migrate
-   `0d6fd1c83c` until correctness is demonstrated for each deployed checkpoint.
+1. **DSpark K below block size**: `0d6fd1c83c` remains intentionally absent,
+   but Dynamic SD schedule values currently bypass the equivalent static guard.
+   Reject every non-zero scheduled K below `dspark_block_size`.
 2. **PCP implementation**: use upstream MRV2 PCP. Porting
    `vllm/models/deepseek_v4/pcp_metadata.py` wholesale would regress the target
    architecture.
@@ -599,14 +606,15 @@ For performance-sensitive paths, compare against matched `v0.27.0` controls:
 | No upstream-equivalent or merge-only commit is replayed | Complete |
 | Retained code is rebased onto `v0.27.0` APIs | Complete |
 | Focused CPU/static tests pass | Complete for implemented stacks |
-| Final source-to-target review has no unexplained behavior loss | Complete, with explicit holds |
+| Final source-to-target review has no unexplained behavior loss | Request changes: 2 P1, 1 P2 |
 | GPU/distributed validation covers affected topology | Pending |
 | Built images prove DeepGEMM, HPC-Ops, Humming, zstd, and nydus contracts | Pending |
 
-The branch is code-complete for the accepted migration scope, but it is not
-production-validated until the pending GPU, multi-rank, RDMA, and image
-publication checks pass. The three held behaviors remain intentionally absent:
+The branch is not yet code-complete after the post-migration audit. In
+addition to the pending GPU, multi-rank, RDMA, image publication checks, the
+two P1 and one P2 findings above must be resolved. The intentionally absent
+behaviors remain:
 
-- DSpark speculative K below its block size.
+- Direct support for DSpark speculative K below its block size.
 - Direct Mooncake P/D with MRV2 PCP fan-in.
 - MiniMax indexer `fp8_e5m2` capability removal.
