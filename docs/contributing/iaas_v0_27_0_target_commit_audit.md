@@ -3,7 +3,7 @@
 ## 1. Audit Scope
 
 This document audits every commit added on top of upstream `v0.27.0` through
-`37eb9535b5`.
+`944ecfdb054c7cd9d817c1901a2059775798018d`.
 
 The audit answers two questions:
 
@@ -12,22 +12,23 @@ The audit answers two questions:
 2. Is the implementation minimal, correctly placed, and suitable for an
    upstream/community contribution?
 
-The range contains 57 non-merge commits:
+The range contains 61 non-merge commits:
 
-- 51 implementation or hardening commits.
-- 6 migration/status documentation commits.
+- 53 implementation or hardening commits.
+- 8 migration/status documentation commits.
 
-The `bits-code-guard` pass inspected 90 production/config/build files covering
-9,636 changed lines after filtering generated, binary, and test-only files.
-Test changes were still reviewed per commit for behavioral coverage, together
-with the validation and independent-review records from migration rounds
-1-54. Cross-group checks covered build-to-runtime ABI, config-to-runtime
-constraints, connector metadata, and public interface changes.
+The target range changes 141 files and 21,697 lines. The `bits-code-guard` pass
+inspected 91 production/config/build files covering 9,879 changed lines after
+filtering generated, binary, and test-only files. Test changes were still
+reviewed per commit for behavioral coverage. The second pass enumerated all
+1,157 target hunks and cross-checked them against all 1,266 non-merge source
+hunks. Cross-group checks covered build-to-runtime ABI, config-to-runtime
+constraints, connector metadata, public interface changes, and final-tree
+interactions between independently migrated feature groups.
 
-This is a static and evidence audit. Existing focused CPU tests and prior
-independent reviews are considered, but this document does not treat missing
-GPU, multi-rank, CUDA Graph, RDMA, image-build, or registry-publication runs as
-completed evidence.
+This is a static and evidence audit. Focused CPU tests were run where available,
+but this document does not treat missing GPU, multi-rank, CUDA Graph, RDMA,
+image-build, or registry-publication runs as completed evidence.
 
 No implementation code was changed as part of this audit.
 
@@ -45,6 +46,9 @@ The complete source-commit disposition is recorded separately in
   commit is incomplete or unsafe without a later hardening commit.
 - **Intentional divergence**: differs from raw `iaas_main` by an explicit
   migration decision.
+- **Wrong**: conflicts with an accepted source invariant or introduces a
+  behavior that the migration explicitly held.
+- **Extra**: has no source, upstream-adaptation, or justified hardening basis.
 - **N/A**: documentation or target-only hardening with no direct source
   semantic.
 
@@ -61,12 +65,14 @@ The complete source-commit disposition is recorded separately in
 
 ### 3.1 Correctness
 
-The final tree is source-equivalent for the **accepted migration scope**, not
-for every raw behavior in `iaas_main`.
+The final tree is intended to preserve the **accepted migration scope**, not
+every raw behavior in `iaas_main`; the findings below prevent a full
+source-equivalence verdict.
 
 The following differences are deliberate:
 
-- DSpark `K < block_size` remains rejected.
+- Direct/static DSpark `K < block_size` remains rejected; Dynamic SD currently
+  violates this intended HOLD through a separate runtime-K path.
 - Legacy PCP and direct Mooncake PCP are not migrated.
 - DSV4 hybrid/sparse PCP declarations remain held.
 - MiniMax indexer `fp8_e5m2` removal remains held.
@@ -78,7 +84,7 @@ unsupported topologies, transports, graph modes, stale transfer generations,
 and incomplete schedules fail closed rather than silently selecting an unsafe
 path.
 
-The static audit found two open correctness gaps:
+The static audit found two open runtime/build correctness gaps:
 
 - Dynamic SD can select a non-zero DSpark K smaller than the checkpoint's
   `dspark_block_size`, bypassing the static guard and entering a layout known
@@ -88,6 +94,12 @@ The static audit found two open correctness gaps:
 
 The final tree therefore does not yet satisfy full source-equivalence for
 every accepted Dynamic SD configuration or the packaged Kimi-K3 MegaMoE path.
+
+The target test suite also has one deterministic integration failure:
+`b691276f62` added a `max_prefill_tokens=` keyword to the Mamba split helper
+call, but the Dynamic SD regression test's monkeypatch still accepts positional
+arguments only. The focused suite reports `1 failed, 96 passed`; this is a test
+integration defect rather than an additional runtime semantic mismatch.
 
 However, runtime equivalence is still conditional for GPU-sensitive areas:
 
@@ -104,10 +116,13 @@ The final implementation is substantially better aligned with v0.27 than a
 mechanical cherry-pick, but the history is not consistently suitable as an
 upstream commit series:
 
-- `78dea35eb9` depends on the build contract added by `b84298dbe1`.
+- `78dea35eb9` depends on the build contract added by
+  `b84298dbe158a454e91afbae6d2a25a3d63d2d20`.
 - `aecdda1e0d` is not safe without `b5c95a75f7`.
 - the initial W4A8 support requires later transport/device hardening.
 - `a8fd87c724` requires `14e2f52317`, `b691276f62`, and `f1d5ef2237`.
+- `b691276f62` leaves an earlier Dynamic SD regression test incompatible with
+  the updated helper call.
 - ByteIAAS workflow commits are intentionally iterative and should be
   squashed before external review.
 
@@ -142,17 +157,19 @@ The main upstream-fit concerns are:
 | Audit group | P0 | P1 | P2 | Result |
 | --- | ---: | ---: | ---: | --- |
 | ByteIAAS build/release | 0 | 1 | 0 | Request changes |
-| Dynamic SD/scheduler/draft | 0 | 1 | 1 | Request changes |
+| Dynamic SD/scheduler/draft | 0 | 2 | 1 | Request changes |
 | Mooncake/KV transfer | 0 | 0 | 0 | No P0-P2 |
-| DSV4/SM90/IndexCache | 0 | 0 | 0 | No P0-P2 |
+| DSV4/SM90/IndexCache | 0 | 1 | 0 | Same DeepGEMM/Kimi P1; deduplicated globally |
 | MoE/HPC/W4A8/Humming | 0 | 0 | 0 | No P0-P2; runtime gates remain |
 | Cross-module contracts | 0 | 0 | 0 | No additional P0-P2 |
+
+After cross-group deduplication, the final result is **P0 0 / P1 3 / P2 1**.
 
 #### P1: The pinned DeepGEMM source does not satisfy Kimi-K3 MegaMoE
 
 - Location:
-  `.github/workflows/_byteiaas-build-and-publish-image.yml:61-62` and
-  `.github/workflows/_byteiaas-build-wheel.yml:38-39`
+  `.github/workflows/_byteiaas-build-and-publish-image.yml:62-63` and
+  `.github/workflows/_byteiaas-build-wheel.yml:39-40`
 - Related checker: `tools/check_deepgemm_source.py:21-36`
 - Trigger: build the ByteIAAS image/wheel with its pinned
   `wangyicong52/DeepGEMM@babdbf01...`, then enable Kimi-K3 MegaMoE.
@@ -176,6 +193,19 @@ The main upstream-fit concerns are:
   produces incorrect output.
 - Required resolution: validate every DSpark schedule entry as
   `K == 0 or K >= dspark_block_size`, and retain a runtime defensive check.
+
+#### P1: Mamba helper change breaks a Dynamic SD regression test
+
+- Location: `tests/v1/spec_decode/test_dynamic_sd.py:560-566`
+- Introduced by interaction between: `9e006972e2` and `b691276f62`
+- Trigger: run the Dynamic SD/token-bucket focused CPU tests.
+- Impact: `_mamba_block_aligned_split()` is now called with
+  `max_prefill_tokens=`, while the test's `fake_split` accepts only `*args`.
+  The test fails with `TypeError` before checking that later width constraints
+  clear speculative padding.
+- Evidence: focused result `1 failed, 96 passed, 139 deselected`.
+- Required resolution: accept and forward `**kwargs` in the monkeypatch, then
+  keep Dynamic SD and token-bucket tests in one integration set.
 
 #### P2: Dynamic SD hooks break older custom schedulers
 
@@ -203,6 +233,8 @@ The main upstream-fit concerns are:
 | `df114553d9` | N/A; Buildx/H20 evidence only. | References internal validation environment. | Internal-only, correct. |
 | `338066b626` | N/A; secure-branch evidence only. | Specific to ByteIAAS workflow policy. | Internal-only, correct. |
 | `37eb9535b5` | N/A; token-bucket ledger update only. | Minimal. A community PR should carry feature documentation, not this migration ledger. | Internal-only, correct. |
+| `3c09241a7f` | N/A; creates the first source-disposition and target-audit documents. | Large internal audit artifact, not an upstream feature commit. | Internal-only; superseded by this second pass. |
+| `02cfe1607b` | N/A; records the first audit's findings in the migration status document. | Correctly scoped documentation, but its `2 P1 / 1 P2` count is now stale because this pass found the failing cross-feature test. | Internal-only; historical evidence. |
 
 ### 4.2 DFlash, DSV4, and SM90 Foundation
 
@@ -216,7 +248,7 @@ The main upstream-fit concerns are:
 | `549942052e` | Squashes `3c7ed3742c`, `657132e0aa`, `3bc91bb763`, `d62244f050`, and `6ca83dd045`, excluding upstream-covered concurrency logic. | Correct target-native split by behavior would be easier to review than this 12-file commit. Generic config/indexer changes are gated by DSV4 metadata. | Equivalent + hardened; **B**. |
 | `effe7093cf` | Reimplements `39d86ed8c7` on packed cache layouts. | Most model policy remains in DSV4 files; the core cache utility extension should stay metadata-driven. | Equivalent + hardened; **B**. |
 | `78dea35eb9` | Preserves the runtime half of `3e60ad63d3`, including sequence-parallel and Kimi compatibility adaptations. Its Kimi call contract is not met by the ByteIAAS-pinned dependency. | Model-owned runtime placement is mostly appropriate, but it is not independently buildable without a compatible fork API. | Series-only; packaged Kimi path has an open P1; **B/C**. |
-| `b84298dbe1` | Preserves the build/dependency half of `3e60ad63d3` with exact-source and symbol validation, but the checker omits Kimi's `activation` and beta keyword contract. | Generic source override logic is reusable; the SM90/Kimi private API contract is incomplete and not upstream-ready. | `REQUEST CHANGES`; **C** until dependency APIs are complete and public. |
+| `b84298dbe158a454e91afbae6d2a25a3d63d2d20` | Preserves the build/dependency half of `3e60ad63d3` with exact-source and symbol validation, but the checker omits Kimi's `activation` and beta keyword contract. | Generic source override logic is reusable; the SM90/Kimi private API contract is incomplete and not upstream-ready. | `REQUEST CHANGES`; **C** until dependency APIs are complete and public. |
 
 ### 4.3 Dynamic SD and Draft Execution
 
@@ -274,6 +306,8 @@ The main upstream-fit concerns are:
 | `f911556cb6` | Target-only checkout credential isolation. | Correct least-privilege hardening; fork-only workflow. | Correct hardening; **C**. |
 | `445cbf2b2c` | Allows exact self-dispatched branch validation. | Necessary internal pre-merge path, but unsafe without the following bypass fix. | Series-only; **C**. |
 | `3b27f22d7c` | Rejects tag/unrelated-SHA bypass in self-dispatch. | Correct hardening; should be squashed with `445cbf2b2c`. | Final fork behavior correct; **C**. |
+| `ec31fc96bc` | Restores source-compatible feature-branch dispatch and the final Volces apt mirror, while deliberately serializing image after wheel. | Correct fork repair after CI evidence; branch names resolve to immutable SHA before entering reusable workflows. Internal mirror and runner policy remain fork-only. | Equivalent + hardened; **C**. |
+| `944ecfdb05` | Restores the Python/uv and multi-ABI DeepGEMM bootstrap omitted from `a9f1617cc7`, including local interpreters, headers, bounded retries, and ByteIAAS wheel-check behavior. | Correct source-equivalence repair, but it should be squashed into the initial Docker/workflow port before external review. | Equivalent + hardened; **C**. |
 
 ### 4.7 Step-Level Prefill Token Buckets
 
@@ -282,7 +316,7 @@ The main upstream-fit concerns are:
 | `a8fd87c724` | Reimplements functional parts of `7f716ff4c5` and `494b0ecf05`; omits metrics/debug scope. Initial version did not correctly cap decode-after-prefill and mishandled Mamba/async-KV edges. | Generic feature, but not independently correct and default policy is workload-derived. | Series-only; requires later fixes; **B**. |
 | `14e2f52317` | Applies the active bucket cap to decode scheduled after prefill. | Necessary correctness fix; should be squashed into `a8fd87c724`. | Series hardening; **B**. |
 | `c38ceb7a3b` | Preserves cross-bucket running-prefill pressure for DP cadence. | One-line targeted correction; should be squashed. | Series hardening; **B**. |
-| `b691276f62` | Separates fixed effective Mamba cap from residual budget and allows pure async KV load after compute cap. | Correct cross-feature integration; should be part of the initial scheduler change. | Series hardening; **B**. |
+| `b691276f62` | Separates fixed effective Mamba cap from residual budget and allows pure async KV load after compute cap. Runtime behavior is correct, but it changes the helper call without updating the Dynamic SD monkeypatch. | The production fix should be folded into the initial scheduler change, with the cross-feature test updated in the same commit. | `REQUEST CHANGES` due deterministic test failure; **B**. |
 | `f1d5ef2237` | Scans past capped compute requests so later async KV loads can overlap. | Completes the accepted semantics. Before upstreaming, remove the workload-specific default or move the policy behind a scheduler extension. | Equivalent + hardened final state; **B**. |
 
 ## 5. Recommended Upstream Decomposition
@@ -313,6 +347,7 @@ private HPC-Ops defaults, and migration ledger commits should stay in the fork.
 
 Before claiming full production equivalence:
 
+- Repair and rerun the failing Dynamic SD/Mamba/token-bucket CPU regression.
 - Build the exact v0.27 image and verify packaged DeepGEMM/HPC-Ops/Humming ABIs.
 - Run SM90/H20 numeric tests for HPC MXFP8 and CUTLASS/Humming W4A8.
 - Run multi-rank DeepEP LL/HT and PCP2 graph replay.
@@ -324,8 +359,8 @@ Before claiming full production equivalence:
 Until those checks complete, the correct conclusion is:
 
 - **Static/source-level migration**: `REQUEST CHANGES` because of the two open
-  P1 findings (DeepGEMM/Kimi ABI and DSpark reduced-K) and the custom-scheduler
-  P2.
+  runtime/build P1 findings (DeepGEMM/Kimi ABI and DSpark reduced-K), one P1
+  test integration failure, and the custom-scheduler P2.
 - **Production runtime equivalence**: not fully proven.
 - **Community upstream readiness**: mixed; generic pieces are upstreamable
   after decomposition, while ByteIAAS/private-dependency pieces are fork-only.
