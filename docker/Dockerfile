@@ -220,10 +220,19 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
                     && echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list; \
                 fi; \
             else \
+                deadsnakes_added=0; \
                 for i in 1 2 3; do \
-                    add-apt-repository -y ppa:deadsnakes/ppa && break || \
-                    { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+                    if add-apt-repository -y ppa:deadsnakes/ppa; then \
+                        deadsnakes_added=1; \
+                        break; \
+                    fi; \
+                    echo "Attempt $i failed, retrying in 5s..."; \
+                    sleep 5; \
                 done; \
+                if [ "${deadsnakes_added}" != "1" ]; then \
+                    echo "Failed to add deadsnakes PPA after 3 attempts" >&2; \
+                    exit 1; \
+                fi; \
             fi \
             && apt-get -o Acquire::Retries=5 update -y; \
         fi \
@@ -816,10 +825,19 @@ RUN if [ -n "${UBUNTU_MIRROR}" ]; then \
             echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list ; \
         fi ; \
     else \
+        deadsnakes_added=0; \
         for i in 1 2 3; do \
-            add-apt-repository -y ppa:deadsnakes/ppa && break || \
-            { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+            if add-apt-repository -y ppa:deadsnakes/ppa; then \
+                deadsnakes_added=1; \
+                break; \
+            fi; \
+            echo "Attempt $i failed, retrying in 5s..."; \
+            sleep 5; \
         done ; \
+        if [ "${deadsnakes_added}" != "1" ]; then \
+            echo "Failed to add deadsnakes PPA after 3 attempts" >&2; \
+            exit 1; \
+        fi ; \
     fi \
     && apt-get -o Acquire::Retries=5 update -y \
     && apt-get install -y --no-install-recommends \
