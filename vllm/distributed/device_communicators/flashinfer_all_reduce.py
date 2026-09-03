@@ -14,7 +14,11 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm.config.compilation import PassConfig
-from vllm.distributed.parallel_state import get_node_count
+from vllm.distributed.parallel_state import (
+    get_node_count,
+    get_tp_group,
+    in_the_same_node_as,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -138,6 +142,45 @@ def _resolve_fi_ar_backend() -> tuple[str, bool]:
     return backend, allow_trtllm_fallback
 
 
+def _process_group_spans_multiple_nodes(group: ProcessGroup) -> bool:
+    """Return whether the current all-reduce group crosses node boundaries.
+
+    FlashInfer TRTLLM all-reduce is only unsafe when the actual all-reduce
+    group spans nodes. A PP2/TP8 deployment on two 8-GPU nodes has a multi-node
+    world, but each TP all-reduce group is still node-local.
+    """
+    node_count = get_node_count()
+    if node_count <= 1:
+        return False
+
+    try:
+        tp_group = get_tp_group()
+        if group is not tp_group.cpu_group and group is not tp_group.device_group:
+            logger.warning_once(
+                "Unable to match the FlashInfer allreduce process group to "
+                "the TP group; treating it as multi-node."
+            )
+            return True
+        same_node = in_the_same_node_as(tp_group.cpu_group)
+        ranks = dist.get_process_group_ranks(group)
+    except Exception:
+        logger.warning_once(
+            "Unable to determine FlashInfer allreduce process-group topology; "
+            "treating it as multi-node."
+        )
+        return True
+
+    spans_multiple_nodes = not all(same_node)
+    logger.info_once(
+        "FlashInfer allreduce group topology: ranks=%s, "
+        "same_node_as_group_rank_0=%s, spans_multiple_nodes=%s",
+        tuple(ranks),
+        tuple(same_node),
+        spans_multiple_nodes,
+    )
+    return spans_multiple_nodes
+
+
 def get_fi_ar_workspace(
     world_size: int,
     rank: int,
@@ -159,10 +202,11 @@ def get_fi_ar_workspace(
 
     backend, allow_trtllm_fallback = _resolve_fi_ar_backend()
 
-    if get_node_count() > 1 and backend == "trtllm":
+    if backend == "trtllm" and _process_group_spans_multiple_nodes(group):
         raise ValueError(
-            "Flashinfer allreduce is not supported for multi-node allreduce with "
-            "'trtllm' backend. Please use 'mnnvl' backend instead."
+            "Flashinfer allreduce is not supported for process groups that span "
+            "multiple nodes with 'trtllm' backend. Please use 'mnnvl' backend "
+            "instead."
         )
 
     def _get_or_create(be: str):
@@ -217,11 +261,11 @@ def get_fi_ar_quant_workspace(
 
     backend, allow_trtllm_fallback = _resolve_fi_ar_backend()
 
-    if get_node_count() > 1 and backend == "trtllm":
+    if backend == "trtllm" and _process_group_spans_multiple_nodes(group):
         raise ValueError(
             "Flashinfer allreduce quantization fusion is not supported for "
-            "multi-node allreduce with 'trtllm' backend. Please use 'mnnvl' "
-            "backend instead."
+            "process groups that span multiple nodes with 'trtllm' backend. "
+            "Please use 'mnnvl' backend instead."
         )
 
     # Reuse the non-quant workspace if it was already created with the same
