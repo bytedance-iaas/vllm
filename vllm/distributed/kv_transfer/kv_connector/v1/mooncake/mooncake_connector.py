@@ -2739,9 +2739,13 @@ class MooncakeConnectorWorker:
         speculative_method = getattr(
             self.vllm_config.speculative_config, "method", None
         )
-        is_decode_local_draft = speculative_method in ("mtp", "eagle3") or (
-            isinstance(speculative_method, str)
-            and speculative_method.endswith("_mtp")
+        is_decode_local_draft = speculative_method in (
+            "mtp",
+            "eagle3",
+            "dspark",
+            "dflash",
+        ) or (
+            isinstance(speculative_method, str) and speculative_method.endswith("_mtp")
         )
         total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
 
