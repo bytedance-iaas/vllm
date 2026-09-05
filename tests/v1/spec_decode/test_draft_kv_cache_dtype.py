@@ -210,8 +210,7 @@ def test_load_dspark_model_applies_explicit_draft_moe_backend(monkeypatch):
     monkeypatch.setattr(dspark_utils, "replace", _replace_namespace)
     monkeypatch.setattr(dspark_utils, "get_model", fake_get_model)
     monkeypatch.setattr(
-        dspark_utils,
-        "get_pp_group",
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils.get_pp_group",
         lambda: SimpleNamespace(world_size=1),
     )
     monkeypatch.setattr(dspark_utils, "_should_share", lambda *_args: False)
@@ -258,8 +257,7 @@ def test_load_dspark_model_inherits_target_moe_backend_when_unset(monkeypatch):
     monkeypatch.setattr(dspark_utils, "replace", _replace_namespace)
     monkeypatch.setattr(dspark_utils, "get_model", fake_get_model)
     monkeypatch.setattr(
-        dspark_utils,
-        "get_pp_group",
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils.get_pp_group",
         lambda: SimpleNamespace(world_size=1),
     )
     monkeypatch.setattr(dspark_utils, "_should_share", lambda *_args: False)
