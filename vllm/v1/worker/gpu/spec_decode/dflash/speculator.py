@@ -317,6 +317,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                     AttentionLayerBase,  # type: ignore[type-abstract]
                     layer_names,
                 )
+                local_prefix_alignment = (
+                    self.vllm_config.cache_config.prefix_match_unit
+                    or self.vllm_config.cache_config.block_size
+                )
                 for name in layer_names:
                     gid = name_to_gid[name]
                     group_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
@@ -334,6 +338,13 @@ class DFlashSpeculator(DraftModelSpeculator):
                             "DSpark partial draft boundary initialization requires "
                             f"an uncompressed, unquantized attention cache; got "
                             f"{layer_spec} for {name}."
+                        )
+                    if local_prefix_alignment % layer_spec.block_size != 0:
+                        raise ValueError(
+                            "DSpark partial draft boundary initialization requires "
+                            "local prefix-cache hits to align to each draft block; "
+                            f"got alignment {local_prefix_alignment} and block "
+                            f"size {layer_spec.block_size} for {name}."
                         )
                     attn = attn_layers[name]
                     if getattr(attn, "kv_sharing_target_layer_name", None) is not None:
