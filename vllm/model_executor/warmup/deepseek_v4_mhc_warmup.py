@@ -112,6 +112,10 @@ def _select_nvidia_mhc_warmup_token_sizes(
     return normal, broadcast
 
 
+def _select_nvidia_fused_mhc_warmup_token_sizes(max_tokens: int) -> list[int]:
+    return _normalize_token_sizes((1, 8, 17), max_tokens=max_tokens)
+
+
 def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
     for module in model.modules():
         if module.__class__.__name__ != "DeepseekV4DecoderLayer":
@@ -182,6 +186,7 @@ def _warmup_nvidia_layer_mhc(
     normal_token_sizes: list[int],
     broadcast_token_sizes: list[int],
     warmup_broadcast: bool,
+    max_tokens: int,
 ) -> None:
     from vllm.model_executor.kernels.mhc.tilelang import (
         mhc_fused_post_pre_tilelang,
@@ -215,8 +220,9 @@ def _warmup_nvidia_layer_mhc(
         ),
     )
 
+    fused_token_sizes = _select_nvidia_fused_mhc_warmup_token_sizes(max_tokens)
     residual = torch.zeros(
-        max(normal_token_sizes),
+        max(*normal_token_sizes, *fused_token_sizes),
         hc_mult,
         hidden_size,
         dtype=torch.bfloat16,
@@ -237,7 +243,7 @@ def _warmup_nvidia_layer_mhc(
             mhc_post_tilelang(layer_input, residual_slice, post_mix, comb_mix)
 
     # The fused path has separate small-FMA configurations below 17 tokens.
-    for size in _normalize_token_sizes((1, 8, 17), max_tokens=max(normal_token_sizes)):
+    for size in fused_token_sizes:
         residual_slice = residual[:size]
         attn_fn, attn_scale, attn_base, attn_norm = parameter_pairs[0]
         post_mix, comb_mix, layer_input = mhc_pre_tilelang(
@@ -412,6 +418,7 @@ def deepseek_v4_mhc_warmup(
                 normal_token_sizes=normal_token_sizes,
                 broadcast_token_sizes=broadcast_token_sizes,
                 warmup_broadcast=pp_group.is_first_rank,
+                max_tokens=max_tokens,
             )
         else:
             _warmup_custom_op_layer_mhc(layer, token_sizes)

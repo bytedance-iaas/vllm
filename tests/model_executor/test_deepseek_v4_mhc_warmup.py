@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     _compute_mhc_pre_num_split,
     _find_first_mhc_layer,
+    _select_nvidia_fused_mhc_warmup_token_sizes,
     _select_nvidia_mhc_warmup_token_sizes,
     _select_split_representative_token_sizes,
 )
@@ -104,6 +105,22 @@ def test_nvidia_warmup_covers_normal_and_broadcast_split_sets() -> None:
         15,
         16,
     }
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "expected"),
+    [
+        (1, [1]),
+        (8, [1, 8]),
+        (16, [1, 8]),
+        (64, [1, 8, 17]),
+    ],
+)
+def test_nvidia_fused_warmup_boundaries(
+    max_tokens: int,
+    expected: list[int],
+) -> None:
+    assert _select_nvidia_fused_mhc_warmup_token_sizes(max_tokens) == expected
 
 
 def test_finds_nvidia_mhc_layer_without_custom_ops() -> None:
