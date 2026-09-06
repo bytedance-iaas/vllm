@@ -16,9 +16,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
     KVCacheConfig,
     KVQuantMode,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -307,21 +307,32 @@ class DFlashSpeculator(DraftModelSpeculator):
                     )
                 }
             if self.method == "dspark":
-                if self.vllm_config.parallel_config.decode_context_parallel_size != 1:
-                    raise ValueError(
-                        "DSpark partial draft boundary initialization does not "
-                        "support decode context parallelism."
-                    )
+                from vllm.models.deepseek_v4.attention import DeepseekV4SWACache
+
                 attn_layers = get_layers_from_vllm_config(
                     self.vllm_config,
                     AttentionLayerBase,  # type: ignore[type-abstract]
                     layer_names,
                 )
+                deepseek_draft_layers = [
+                    (name, attn_layers[name])
+                    for name in layer_names
+                    if type(attn_layers[name]) is DeepseekV4SWACache
+                ]
+                if (
+                    deepseek_draft_layers
+                    and self.vllm_config.parallel_config.decode_context_parallel_size
+                    != 1
+                ):
+                    raise ValueError(
+                        "DeepSeek V4 DSpark partial draft boundary initialization "
+                        "does not support decode context parallelism."
+                    )
                 local_prefix_alignment = (
                     self.vllm_config.cache_config.prefix_match_unit
                     or self.vllm_config.cache_config.block_size
                 )
-                for name in layer_names:
+                for name, attn in deepseek_draft_layers:
                     gid = name_to_gid[name]
                     group_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
                     layer_spec = (
@@ -330,13 +341,22 @@ class DFlashSpeculator(DraftModelSpeculator):
                         else group_spec
                     )
                     if (
-                        not isinstance(layer_spec, AttentionSpec)
-                        or layer_spec.storage_block_size != layer_spec.block_size
-                        or layer_spec.kv_quant_mode != KVQuantMode.NONE
+                        type(layer_spec) is not SlidingWindowMLASpec
+                        or layer_spec.model_version != "deepseek_v4"
+                        or layer_spec.cache_dtype_str != "fp8_ds_mla"
+                        or layer_spec.kv_quant_mode != KVQuantMode.FP8_PER_TENSOR
+                        or layer_spec.dtype != torch.uint8
+                        or layer_spec.compress_ratio != 1
+                        or layer_spec.block_size != 64
+                        or layer_spec.storage_block_size != 64
+                        or layer_spec.num_kv_heads != 1
+                        or layer_spec.head_size != 512
+                        or layer_spec.alignment != 576
+                        or layer_spec.page_size_padded != 37440
                     ):
                         raise ValueError(
-                            "DSpark partial draft boundary initialization requires "
-                            f"an uncompressed, unquantized attention cache; got "
+                            "DeepSeek V4 DSpark partial boundary initialization "
+                            "requires the validated fp8_ds_mla SWA layout; got "
                             f"{layer_spec} for {name}."
                         )
                     if local_prefix_alignment % layer_spec.block_size != 0:
@@ -346,11 +366,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                             f"got alignment {local_prefix_alignment} and block "
                             f"size {layer_spec.block_size} for {name}."
                         )
-                    attn = attn_layers[name]
                     if getattr(attn, "kv_sharing_target_layer_name", None) is not None:
                         raise ValueError(
-                            "DSpark partial draft boundary initialization does not "
-                            f"support semantic KV sharing for {name}."
+                            "DeepSeek V4 DSpark partial boundary initialization "
+                            f"does not support semantic KV sharing for {name}."
                         )
                     self._draft_boundary_layers.append((attn, gid))
 
@@ -363,33 +382,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         for attn, gid in self._draft_boundary_layers:
             kv_cache = attn.kv_cache
             block_size = self.block_tables.kernel_block_sizes[gid]
-            if kv_cache.ndim == 3:
-                num_blocks, token_dim, content_size = kv_cache.shape
-                num_heads = 1
-                stride_head = 0
-                stride_token = kv_cache.stride(1)
-                stride_content = kv_cache.stride(2)
-            elif kv_cache.ndim == 4:
-                num_blocks, num_heads, token_dim, content_size = kv_cache.shape
-                stride_head = kv_cache.stride(1)
-                stride_token = kv_cache.stride(2)
-                stride_content = kv_cache.stride(3)
-            else:
+            if (
+                not kv_cache.is_cuda
+                or kv_cache.dtype != torch.uint8
+                or kv_cache.ndim != 3
+                or tuple(kv_cache.shape[1:]) != (64, 584)
+                or kv_cache.stride(1) != 584
+                or kv_cache.stride(2) != 1
+                or kv_cache.stride(0) < 37440
+                or block_size != 64
+            ):
                 raise ValueError(
-                    "Unsupported DSpark draft KV cache shape "
-                    f"{tuple(kv_cache.shape)}."
-                )
-            if token_dim != block_size:
-                raise ValueError(
-                    "DSpark draft KV cache token dimension does not match its "
-                    f"kernel block size: {token_dim} != {block_size}."
+                    "DeepSeek V4 DSpark partial boundary initialization got "
+                    f"unsupported runtime cache layout: shape={tuple(kv_cache.shape)}, "
+                    f"strides={kv_cache.stride()}, dtype={kv_cache.dtype}, "
+                    f"device={kv_cache.device}, block_size={block_size}."
                 )
 
             tile_size = 256
             _initialize_draft_boundary_kernel[
                 (
                     input_batch.num_reqs,
-                    triton.cdiv(block_size * num_heads * content_size, tile_size),
+                    triton.cdiv(block_size * (576 + 8), tile_size),
                 )
             ](
                 kv_cache,
@@ -400,13 +414,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 input_batch.positions,
                 TABLE_STRIDE=self.block_tables.input_block_tables[gid].stride(0),
                 STRIDE_BLOCK=kv_cache.stride(0),
-                STRIDE_HEAD=stride_head,
-                STRIDE_TOKEN=stride_token,
-                STRIDE_CONTENT=stride_content,
-                NUM_BLOCKS=num_blocks,
+                NUM_BLOCKS=kv_cache.shape[0],
                 BLOCK_SIZE=block_size,
-                NUM_HEADS=num_heads,
-                CONTENT_SIZE=content_size,
+                TOKEN_DATA_BYTES=576,
+                SCALE_BYTES=8,
                 TILE_SIZE=tile_size,
             )
 
@@ -726,13 +737,10 @@ def _initialize_draft_boundary_kernel(
     positions_ptr,
     TABLE_STRIDE: tl.constexpr,
     STRIDE_BLOCK: tl.constexpr,
-    STRIDE_HEAD: tl.constexpr,
-    STRIDE_TOKEN: tl.constexpr,
-    STRIDE_CONTENT: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    CONTENT_SIZE: tl.constexpr,
+    TOKEN_DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -766,19 +774,17 @@ def _initialize_draft_boundary_kernel(
         return
 
     offset = tl.program_id(1) * TILE_SIZE + tl.arange(0, TILE_SIZE)
-    token = offset // (NUM_HEADS * CONTENT_SIZE)
-    head = (offset // CONTENT_SIZE) % NUM_HEADS
-    content = offset % CONTENT_SIZE
-    kv_offset = (
-        block_id * STRIDE_BLOCK
-        + head * STRIDE_HEAD
-        + token * STRIDE_TOKEN
-        + content * STRIDE_CONTENT
+    data_bytes = remainder * TOKEN_DATA_BYTES
+    scale_bytes = remainder * SCALE_BYTES
+    block_offset = tl.where(
+        offset < data_bytes,
+        offset,
+        BLOCK_SIZE * TOKEN_DATA_BYTES + offset - data_bytes,
     )
     tl.store(
-        kv_cache_ptr + kv_offset,
+        kv_cache_ptr + block_id * STRIDE_BLOCK + block_offset,
         0,
-        mask=offset < remainder * NUM_HEADS * CONTENT_SIZE,
+        mask=offset < data_bytes + scale_bytes,
     )
 
 
