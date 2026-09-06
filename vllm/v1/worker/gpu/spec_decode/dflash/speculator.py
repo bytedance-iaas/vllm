@@ -7,20 +7,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
+from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    KVQuantMode,
-    SlidingWindowMLASpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -131,7 +125,6 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
-        self._draft_boundary_layers: list[tuple[AttentionLayerBase, int]] = []
 
     def _get_runtime_num_speculative_tokens(
         self, runtime_num_speculative_tokens: int | None
@@ -306,120 +299,50 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
-            if self.method == "dspark":
-                from vllm.models.deepseek_v4.attention import DeepseekV4SWACache
-
-                attn_layers = get_layers_from_vllm_config(
-                    self.vllm_config,
-                    AttentionLayerBase,  # type: ignore[type-abstract]
-                    layer_names,
-                )
-                deepseek_draft_layers = [
-                    (name, attn_layers[name])
-                    for name in layer_names
-                    if type(attn_layers[name]) is DeepseekV4SWACache
-                ]
-                if (
-                    deepseek_draft_layers
-                    and self.vllm_config.parallel_config.decode_context_parallel_size
-                    != 1
-                ):
+            if hasattr(self.model, "initialize_partial_draft_kv_boundaries"):
+                if self.vllm_config.parallel_config.decode_context_parallel_size != 1:
                     raise ValueError(
-                        "DeepSeek V4 DSpark partial draft boundary initialization "
-                        "does not support decode context parallelism."
+                        "Partial draft KV boundary initialization does not support "
+                        "decode context parallelism."
                     )
                 local_prefix_alignment = (
                     self.vllm_config.cache_config.prefix_match_unit
                     or self.vllm_config.cache_config.block_size
                 )
-                for name, attn in deepseek_draft_layers:
-                    gid = name_to_gid[name]
-                    group_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
-                    layer_spec = (
-                        group_spec.kv_cache_specs[name]
-                        if isinstance(group_spec, UniformTypeKVCacheSpecs)
-                        else group_spec
-                    )
-                    if (
-                        type(layer_spec) is not SlidingWindowMLASpec
-                        or layer_spec.model_version != "deepseek_v4"
-                        or layer_spec.cache_dtype_str != "fp8_ds_mla"
-                        or layer_spec.kv_quant_mode != KVQuantMode.FP8_PER_TENSOR
-                        or layer_spec.dtype != torch.uint8
-                        or layer_spec.compress_ratio != 1
-                        or layer_spec.block_size != 64
-                        or layer_spec.storage_block_size != 64
-                        or layer_spec.num_kv_heads != 1
-                        or layer_spec.head_size != 512
-                        or layer_spec.alignment != 576
-                        or layer_spec.page_size_padded != 37440
-                    ):
+                for gid in self.draft_kv_cache_group_ids:
+                    block_size = self.block_tables.kernel_block_sizes[gid]
+                    if local_prefix_alignment % block_size != 0:
                         raise ValueError(
-                            "DeepSeek V4 DSpark partial boundary initialization "
-                            "requires the validated fp8_ds_mla SWA layout; got "
-                            f"{layer_spec} for {name}."
-                        )
-                    if local_prefix_alignment % layer_spec.block_size != 0:
-                        raise ValueError(
-                            "DSpark partial draft boundary initialization requires "
+                            "Partial draft KV boundary initialization requires "
                             "local prefix-cache hits to align to each draft block; "
                             f"got alignment {local_prefix_alignment} and block "
-                            f"size {layer_spec.block_size} for {name}."
+                            f"size {block_size}."
                         )
-                    if getattr(attn, "kv_sharing_target_layer_name", None) is not None:
-                        raise ValueError(
-                            "DeepSeek V4 DSpark partial boundary initialization "
-                            f"does not support semantic KV sharing for {name}."
-                        )
-                    self._draft_boundary_layers.append((attn, gid))
 
-    def _initialize_partial_draft_boundaries(
-        self, input_batch: InputBatch
-    ) -> None:
-        if self.method != "dspark" or not input_batch.is_prefilling_np.any():
+    def _initialize_partial_draft_boundaries(self, input_batch: InputBatch) -> None:
+        initializer = getattr(
+            self.model, "initialize_partial_draft_kv_boundaries", None
+        )
+        if initializer is None or not input_batch.is_prefilling_np.any():
             return
 
-        for attn, gid in self._draft_boundary_layers:
-            kv_cache = attn.kv_cache
-            block_size = self.block_tables.kernel_block_sizes[gid]
-            if (
-                not kv_cache.is_cuda
-                or kv_cache.dtype != torch.uint8
-                or kv_cache.ndim != 3
-                or tuple(kv_cache.shape[1:]) != (64, 584)
-                or kv_cache.stride(1) != 584
-                or kv_cache.stride(2) != 1
-                or kv_cache.stride(0) < 37440
-                or block_size != 64
-            ):
-                raise ValueError(
-                    "DeepSeek V4 DSpark partial boundary initialization got "
-                    f"unsupported runtime cache layout: shape={tuple(kv_cache.shape)}, "
-                    f"strides={kv_cache.stride()}, dtype={kv_cache.dtype}, "
-                    f"device={kv_cache.device}, block_size={block_size}."
-                )
-
-            tile_size = 256
-            _initialize_draft_boundary_kernel[
-                (
-                    input_batch.num_reqs,
-                    triton.cdiv(block_size * (576 + 8), tile_size),
-                )
-            ](
-                kv_cache,
-                self.block_tables.input_block_tables[gid],
-                input_batch.idx_mapping,
-                self.num_cached_tokens,
-                input_batch.query_start_loc,
-                input_batch.positions,
-                TABLE_STRIDE=self.block_tables.input_block_tables[gid].stride(0),
-                STRIDE_BLOCK=kv_cache.stride(0),
-                NUM_BLOCKS=kv_cache.shape[0],
-                BLOCK_SIZE=block_size,
-                TOKEN_DATA_BYTES=576,
-                SCALE_BYTES=8,
-                TILE_SIZE=tile_size,
-            )
+        assert self._layer_group_idx is not None
+        initializer(
+            draft_block_tables=[
+                self.block_tables.input_block_tables[gid]
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            draft_block_sizes=[
+                self.block_tables.kernel_block_sizes[gid]
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            layer_group_indices=self._layer_group_idx,
+            idx_mapping=input_batch.idx_mapping,
+            num_cached_tokens=self.num_cached_tokens,
+            query_start_loc=input_batch.query_start_loc,
+            positions=input_batch.positions,
+            num_reqs=input_batch.num_reqs,
+        )
 
     @torch.inference_mode()
     def _run_model(
@@ -725,67 +648,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs, :num_speculative_tokens]
-
-
-@triton.jit
-def _initialize_draft_boundary_kernel(
-    kv_cache_ptr,
-    block_table_ptr,
-    idx_mapping_ptr,
-    num_cached_tokens_ptr,
-    query_start_loc_ptr,
-    positions_ptr,
-    TABLE_STRIDE: tl.constexpr,
-    STRIDE_BLOCK: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    TOKEN_DATA_BYTES: tl.constexpr,
-    SCALE_BYTES: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-    req_idx = tl.load(idx_mapping_ptr + batch_idx)
-    num_cached = tl.load(num_cached_tokens_ptr + req_idx)
-    remainder = num_cached % BLOCK_SIZE
-    context_start = tl.load(query_start_loc_ptr + batch_idx)
-    context_end = tl.load(query_start_loc_ptr + batch_idx + 1)
-    has_context = context_start < context_end
-    first_context_position = tl.load(
-        positions_ptr + context_start,
-        mask=has_context,
-        other=-1,
-    )
-
-    if (
-        (num_cached <= 0)
-        | (remainder == 0)
-        | ~has_context
-        | (first_context_position != num_cached)
-    ):
-        return
-
-    block_index = num_cached // BLOCK_SIZE
-    if block_index >= TABLE_STRIDE:
-        return
-    block_id = tl.load(
-        block_table_ptr + batch_idx.to(tl.int64) * TABLE_STRIDE + block_index
-    ).to(tl.int64)
-    if (block_id <= 0) | (block_id >= NUM_BLOCKS):
-        return
-
-    offset = tl.program_id(1) * TILE_SIZE + tl.arange(0, TILE_SIZE)
-    data_bytes = remainder * TOKEN_DATA_BYTES
-    scale_bytes = remainder * SCALE_BYTES
-    block_offset = tl.where(
-        offset < data_bytes,
-        offset,
-        BLOCK_SIZE * TOKEN_DATA_BYTES + offset - data_bytes,
-    )
-    tl.store(
-        kv_cache_ptr + block_id * STRIDE_BLOCK + block_offset,
-        0,
-        mask=offset < data_bytes + scale_bytes,
-    )
 
 
 @triton.jit

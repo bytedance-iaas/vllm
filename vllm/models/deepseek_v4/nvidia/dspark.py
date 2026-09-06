@@ -47,6 +47,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.triton_utils import tl, triton
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -60,6 +61,71 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+_DSPARK_SWA_BLOCK_SIZE = 64
+_DSPARK_SWA_TOKEN_DATA_BYTES = 576
+_DSPARK_SWA_SCALE_BYTES = 8
+_DSPARK_SWA_PAGE_BYTES = 37440
+
+
+@triton.jit
+def _initialize_partial_draft_kv_boundary_kernel(
+    kv_cache_ptr,
+    block_table_ptr,
+    idx_mapping_ptr,
+    num_cached_tokens_ptr,
+    query_start_loc_ptr,
+    positions_ptr,
+    TABLE_STRIDE: tl.constexpr,
+    STRIDE_BLOCK: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    TOKEN_DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    num_cached = tl.load(num_cached_tokens_ptr + req_idx)
+    remainder = num_cached % BLOCK_SIZE
+    context_start = tl.load(query_start_loc_ptr + batch_idx)
+    context_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    has_context = context_start < context_end
+    first_context_position = tl.load(
+        positions_ptr + context_start,
+        mask=has_context,
+        other=-1,
+    )
+
+    if (
+        (num_cached <= 0)
+        | (remainder == 0)
+        | ~has_context
+        | (first_context_position != num_cached)
+    ):
+        return
+
+    block_index = num_cached // BLOCK_SIZE
+    if block_index >= TABLE_STRIDE:
+        return
+    block_id = tl.load(
+        block_table_ptr + batch_idx.to(tl.int64) * TABLE_STRIDE + block_index
+    ).to(tl.int64)
+    if (block_id <= 0) | (block_id >= NUM_BLOCKS):
+        return
+
+    offset = tl.program_id(1) * TILE_SIZE + tl.arange(0, TILE_SIZE)
+    data_bytes = remainder * TOKEN_DATA_BYTES
+    scale_bytes = remainder * SCALE_BYTES
+    block_offset = tl.where(
+        offset < data_bytes,
+        offset,
+        BLOCK_SIZE * TOKEN_DATA_BYTES + offset - data_bytes,
+    )
+    tl.store(
+        kv_cache_ptr + block_id * STRIDE_BLOCK + block_offset,
+        0,
+        mask=offset < data_bytes + scale_bytes,
+    )
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -331,6 +397,76 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # DSV4 MLA path: each draft layer's sliding-window cache is a separate
         # layer, named by its prefix.
         return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
+
+    def initialize_partial_draft_kv_boundaries(
+        self,
+        draft_block_tables: list[torch.Tensor],
+        draft_block_sizes: list[int],
+        layer_group_indices: list[int],
+        idx_mapping: torch.Tensor,
+        num_cached_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Clear target-only restored rows in each DSpark SWA boundary block."""
+        for layer, group_idx in zip(
+            self.model.layers, layer_group_indices, strict=True
+        ):
+            swa_cache_layer = layer.attn.swa_cache_layer
+            kv_cache = swa_cache_layer.kv_cache
+            block_size = draft_block_sizes[group_idx]
+            if (
+                layer.attn.compress_ratio != 1
+                or swa_cache_layer.cache_config.cache_dtype != "fp8_ds_mla"
+                or getattr(swa_cache_layer, "kv_sharing_target_layer_name", None)
+                is not None
+                or not kv_cache.is_cuda
+                or kv_cache.dtype != torch.uint8
+                or kv_cache.ndim != 3
+                or tuple(kv_cache.shape[1:])
+                != (
+                    _DSPARK_SWA_BLOCK_SIZE,
+                    _DSPARK_SWA_TOKEN_DATA_BYTES + _DSPARK_SWA_SCALE_BYTES,
+                )
+                or kv_cache.stride(1)
+                != _DSPARK_SWA_TOKEN_DATA_BYTES + _DSPARK_SWA_SCALE_BYTES
+                or kv_cache.stride(2) != 1
+                or kv_cache.stride(0) < _DSPARK_SWA_PAGE_BYTES
+                or block_size != _DSPARK_SWA_BLOCK_SIZE
+            ):
+                raise ValueError(
+                    "DeepSeek V4 DSpark partial boundary initialization got "
+                    f"unsupported runtime cache layout: shape={tuple(kv_cache.shape)}, "
+                    f"strides={kv_cache.stride()}, dtype={kv_cache.dtype}, "
+                    f"device={kv_cache.device}, block_size={block_size}."
+                )
+
+            tile_size = 256
+            _initialize_partial_draft_kv_boundary_kernel[
+                (
+                    num_reqs,
+                    triton.cdiv(
+                        block_size
+                        * (_DSPARK_SWA_TOKEN_DATA_BYTES + _DSPARK_SWA_SCALE_BYTES),
+                        tile_size,
+                    ),
+                )
+            ](
+                kv_cache,
+                draft_block_tables[group_idx],
+                idx_mapping,
+                num_cached_tokens,
+                query_start_loc,
+                positions,
+                TABLE_STRIDE=draft_block_tables[group_idx].stride(0),
+                STRIDE_BLOCK=kv_cache.stride(0),
+                NUM_BLOCKS=kv_cache.shape[0],
+                BLOCK_SIZE=block_size,
+                TOKEN_DATA_BYTES=_DSPARK_SWA_TOKEN_DATA_BYTES,
+                SCALE_BYTES=_DSPARK_SWA_SCALE_BYTES,
+                TILE_SIZE=tile_size,
+            )
 
     def precompute_and_store_context_kv(
         self,
