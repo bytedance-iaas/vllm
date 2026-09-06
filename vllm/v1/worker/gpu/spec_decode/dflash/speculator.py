@@ -7,14 +7,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    KVQuantMode,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -125,6 +131,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._draft_boundary_layers: list[tuple[AttentionLayerBase, int]] = []
 
     def _get_runtime_num_speculative_tokens(
         self, runtime_num_speculative_tokens: int | None
@@ -299,6 +306,98 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+            if self.method == "dspark":
+                if self.vllm_config.parallel_config.decode_context_parallel_size != 1:
+                    raise ValueError(
+                        "DSpark partial draft boundary initialization does not "
+                        "support decode context parallelism."
+                    )
+                attn_layers = get_layers_from_vllm_config(
+                    self.vllm_config,
+                    AttentionLayerBase,  # type: ignore[type-abstract]
+                    layer_names,
+                )
+                for name in layer_names:
+                    gid = name_to_gid[name]
+                    group_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+                    layer_spec = (
+                        group_spec.kv_cache_specs[name]
+                        if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                        else group_spec
+                    )
+                    if (
+                        not isinstance(layer_spec, AttentionSpec)
+                        or layer_spec.storage_block_size != layer_spec.block_size
+                        or layer_spec.kv_quant_mode != KVQuantMode.NONE
+                    ):
+                        raise ValueError(
+                            "DSpark partial draft boundary initialization requires "
+                            f"an uncompressed, unquantized attention cache; got "
+                            f"{layer_spec} for {name}."
+                        )
+                    attn = attn_layers[name]
+                    if getattr(attn, "kv_sharing_target_layer_name", None) is not None:
+                        raise ValueError(
+                            "DSpark partial draft boundary initialization does not "
+                            f"support semantic KV sharing for {name}."
+                        )
+                    self._draft_boundary_layers.append((attn, gid))
+
+    def _initialize_partial_draft_boundaries(
+        self, input_batch: InputBatch
+    ) -> None:
+        if self.method != "dspark" or not input_batch.is_prefilling_np.any():
+            return
+
+        for attn, gid in self._draft_boundary_layers:
+            kv_cache = attn.kv_cache
+            block_size = self.block_tables.kernel_block_sizes[gid]
+            if kv_cache.ndim == 3:
+                num_blocks, token_dim, content_size = kv_cache.shape
+                num_heads = 1
+                stride_head = 0
+                stride_token = kv_cache.stride(1)
+                stride_content = kv_cache.stride(2)
+            elif kv_cache.ndim == 4:
+                num_blocks, num_heads, token_dim, content_size = kv_cache.shape
+                stride_head = kv_cache.stride(1)
+                stride_token = kv_cache.stride(2)
+                stride_content = kv_cache.stride(3)
+            else:
+                raise ValueError(
+                    "Unsupported DSpark draft KV cache shape "
+                    f"{tuple(kv_cache.shape)}."
+                )
+            if token_dim != block_size:
+                raise ValueError(
+                    "DSpark draft KV cache token dimension does not match its "
+                    f"kernel block size: {token_dim} != {block_size}."
+                )
+
+            tile_size = 256
+            _initialize_draft_boundary_kernel[
+                (
+                    input_batch.num_reqs,
+                    triton.cdiv(block_size * num_heads * content_size, tile_size),
+                )
+            ](
+                kv_cache,
+                self.block_tables.input_block_tables[gid],
+                input_batch.idx_mapping,
+                self.num_cached_tokens,
+                input_batch.query_start_loc,
+                input_batch.positions,
+                TABLE_STRIDE=self.block_tables.input_block_tables[gid].stride(0),
+                STRIDE_BLOCK=kv_cache.stride(0),
+                STRIDE_HEAD=stride_head,
+                STRIDE_TOKEN=stride_token,
+                STRIDE_CONTENT=stride_content,
+                NUM_BLOCKS=num_blocks,
+                BLOCK_SIZE=block_size,
+                NUM_HEADS=num_heads,
+                CONTENT_SIZE=content_size,
+                TILE_SIZE=tile_size,
+            )
 
     @torch.inference_mode()
     def _run_model(
@@ -513,6 +612,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
+        if not dummy_run and not is_profile:
+            self._initialize_partial_draft_boundaries(input_batch)
+
         if not dummy_run:
             for gid in self.draft_kv_cache_group_ids:
                 shift_draft_block_tables(
@@ -601,6 +703,72 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs, :num_speculative_tokens]
+
+
+@triton.jit
+def _initialize_draft_boundary_kernel(
+    kv_cache_ptr,
+    block_table_ptr,
+    idx_mapping_ptr,
+    num_cached_tokens_ptr,
+    query_start_loc_ptr,
+    positions_ptr,
+    TABLE_STRIDE: tl.constexpr,
+    STRIDE_BLOCK: tl.constexpr,
+    STRIDE_HEAD: tl.constexpr,
+    STRIDE_TOKEN: tl.constexpr,
+    STRIDE_CONTENT: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    CONTENT_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    num_cached = tl.load(num_cached_tokens_ptr + req_idx)
+    remainder = num_cached % BLOCK_SIZE
+    context_start = tl.load(query_start_loc_ptr + batch_idx)
+    context_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    has_context = context_start < context_end
+    first_context_position = tl.load(
+        positions_ptr + context_start,
+        mask=has_context,
+        other=-1,
+    )
+
+    if (
+        (num_cached <= 0)
+        | (remainder == 0)
+        | ~has_context
+        | (first_context_position != num_cached)
+    ):
+        return
+
+    block_index = num_cached // BLOCK_SIZE
+    if block_index >= TABLE_STRIDE:
+        return
+    block_id = tl.load(
+        block_table_ptr + batch_idx.to(tl.int64) * TABLE_STRIDE + block_index
+    ).to(tl.int64)
+    if (block_id <= 0) | (block_id >= NUM_BLOCKS):
+        return
+
+    offset = tl.program_id(1) * TILE_SIZE + tl.arange(0, TILE_SIZE)
+    token = offset // (NUM_HEADS * CONTENT_SIZE)
+    head = (offset // CONTENT_SIZE) % NUM_HEADS
+    content = offset % CONTENT_SIZE
+    kv_offset = (
+        block_id * STRIDE_BLOCK
+        + head * STRIDE_HEAD
+        + token * STRIDE_TOKEN
+        + content * STRIDE_CONTENT
+    )
+    tl.store(
+        kv_cache_ptr + kv_offset,
+        0,
+        mask=offset < remainder * NUM_HEADS * CONTENT_SIZE,
+    )
 
 
 @triton.jit
