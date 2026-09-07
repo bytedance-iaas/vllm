@@ -102,8 +102,10 @@ class FlashInferFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if act_quant_desc.group_shape != GroupShape(1, 128):
             return (
                 False,
-                "Supports only dynamic per token group activation "
-                "quantization with group_shape=(1,128).",
+                (
+                    "Supports only dynamic per token group activation "
+                    "quantization with group_shape=(1,128)."
+                ),
             )
 
         if not should_use_flashinfer_for_blockscale_fp8_gemm(
@@ -283,6 +285,7 @@ def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
             input,
             group_size=group_size,
             column_major_scales=True,
+            tma_aligned_scales=envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
             use_ue8m0=use_deep_gemm_e8m0,
         )
         output = torch.empty(
