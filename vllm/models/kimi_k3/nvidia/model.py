@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kimi-K3 multimodal model implementation for vLLM."""
 
+import inspect
 import math
 from collections.abc import Iterable
 from typing import Any, cast
@@ -257,6 +258,68 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
 
     _kimi_symm_buffer_cache: dict[tuple[object, ...], object] = {}
     _synchronized_ep_groups: set[tuple[int, int]] = set()
+
+    @staticmethod
+    def _resolve_mega_moe_decode_capacity(
+        vllm_config: VllmConfig,
+        sequence_parallel_size: int = 1,
+    ) -> int:
+        # Kimi's custom forward path still uses one full-size symmetric buffer.
+        del sequence_parallel_size
+        return vllm_config.scheduler_config.max_num_batched_tokens
+
+    @staticmethod
+    def _require_deepgemm_keywords(
+        deep_gemm: Any,
+        api_name: str,
+        keywords: tuple[str, ...],
+    ) -> None:
+        api = getattr(deep_gemm, api_name, None)
+        if api is None:
+            raise NotImplementedError(
+                f"Kimi K3 MegaMoE requires DeepGEMM.{api_name}."
+            )
+        try:
+            signature = inspect.signature(api)
+        except (TypeError, ValueError) as exc:
+            raise NotImplementedError(
+                f"Kimi K3 MegaMoE cannot verify DeepGEMM.{api_name} "
+                "supports SITU activation arguments."
+            ) from exc
+        parameters = signature.parameters
+        missing = [keyword for keyword in keywords if keyword not in parameters]
+        if missing:
+            raise NotImplementedError(
+                "Kimi K3 MegaMoE requires a DeepGEMM build with explicit "
+                f"SITU activation support in {api_name}; missing {missing}."
+            )
+
+    def _check_runtime_supported(self) -> None:
+        device = self.w13_weight.device
+        if (
+            device.type != "cuda"
+            or torch.cuda.get_device_capability(device)[0] != 10
+        ):
+            raise NotImplementedError("Kimi K3 MegaMoE requires SM100 GPUs.")
+        super()._check_runtime_supported()
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        self._require_deepgemm_keywords(
+            deep_gemm,
+            "get_symm_buffer_for_mega_moe",
+            ("activation",),
+        )
+        self._require_deepgemm_keywords(
+            deep_gemm,
+            "transform_weights_for_mega_moe",
+            ("activation",),
+        )
+        self._require_deepgemm_keywords(
+            deep_gemm,
+            "fp8_fp4_mega_moe",
+            ("activation", "activation_beta", "activation_linear_beta"),
+        )
 
     def __init__(
         self,
