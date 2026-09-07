@@ -1192,7 +1192,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             rm -rf /var/lib/apt/lists/* \
         ); \
         # Force-reinstall the matching CUDA wheel so the correct nixl_ep_cpp.so is installed.
-        uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR}; \
+        uv pip install --system --force-reinstall --no-deps nixl-cu${CUDA_MAJOR} && \
+        # The generic Mooncake wheel can link against a different CUDA runtime.
+        # Preserve the resolved package version while switching to the CUDA 13 wheel.
+        MOONCAKE_VERSION=$(python3 -c "import importlib.metadata as m; print(m.version('mooncake-transfer-engine'))" 2>/dev/null || true) && \
+        if [ "${CUDA_MAJOR}" = "13" ] && [ -n "${MOONCAKE_VERSION}" ]; then \
+            uv pip uninstall --system mooncake-transfer-engine && \
+            uv pip install --system "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"; \
+        fi; \
     fi
 
 # Optional override: install mooncake-transfer-engine from a URL instead of the
