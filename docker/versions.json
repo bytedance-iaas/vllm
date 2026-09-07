@@ -22,6 +22,15 @@
     "BUILD_OS": {
       "default": "ubuntu"
     },
+    "DEEPGEMM_GIT_REPOSITORY": {
+      "default": "https://github.com/vllm-project/DeepGEMM.git"
+    },
+    "DEEPGEMM_GIT_COMMIT": {
+      "default": "e21c821f39a2056d68067a466c64ddc942200106"
+    },
+    "DEEPGEMM_REQUIRE_SM90_MEGA_MOE": {
+      "default": "OFF"
+    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
