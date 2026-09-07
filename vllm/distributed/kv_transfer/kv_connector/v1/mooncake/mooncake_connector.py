@@ -2739,18 +2739,23 @@ class MooncakeConnectorWorker:
         speculative_method = getattr(
             self.vllm_config.speculative_config, "method", None
         )
-        is_mtp_speculative = speculative_method == "mtp" or (
-            isinstance(speculative_method, str)
-            and speculative_method.endswith("_mtp")
+        is_decode_local_draft = speculative_method in (
+            "mtp",
+            "eagle3",
+            "dspark",
+            "dflash",
+        ) or (
+            isinstance(speculative_method, str) and speculative_method.endswith("_mtp")
         )
         total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
 
         for layer_name, cache_or_caches in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
-            if is_mtp_speculative and layer_index >= total_num_hidden_layers:
+            if is_decode_local_draft and layer_index >= total_num_hidden_layers:
                 logger.debug(
-                    "Skipping MTP speculative KV cache layer %s outside the "
+                    "Skipping %s speculative KV cache layer %s outside the "
                     "base model layer range [0, %d)",
+                    speculative_method,
                     layer_name,
                     total_num_hidden_layers,
                 )
