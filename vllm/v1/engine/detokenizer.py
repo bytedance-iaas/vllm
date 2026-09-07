@@ -9,6 +9,7 @@ from packaging import version
 from tokenizers import Tokenizer
 from transformers import TokenizersBackend
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import (
@@ -42,6 +43,13 @@ class IncrementalDetokenizer:
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         self.token_ids.extend(new_token_ids)
         return None
+
+    def needs_async_update(
+        self,
+        new_token_ids: list[int],
+        stop_terminated: bool,
+    ) -> bool:
+        return False
 
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         return ""
@@ -174,6 +182,11 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.request_id = request.request_id
         self.skip_special_tokens = sampling_params.skip_special_tokens
+        async_min_prompt_tokens = envs.VLLM_V1_DETOKENIZER_ASYNC_MIN_PROMPT_TOKENS
+        self._async_prefill_eligible = (
+            async_min_prompt_tokens >= 0
+            and len(request.prompt_token_ids or ()) >= async_min_prompt_tokens
+        )
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
@@ -220,6 +233,20 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             self.last_special = is_special
 
         return token or ""
+
+    def needs_async_update(
+        self,
+        new_token_ids: list[int],
+        stop_terminated: bool,
+    ) -> bool:
+        num_tokens = len(new_token_ids)
+        if stop_terminated and not self.include_stop_str_in_output:
+            num_tokens -= 1
+        return (
+            self._async_prefill_eligible
+            and num_tokens > 0
+            and getattr(self.stream, "prefill_pending", False)
+        )
 
     def _protected_step(self, next_token_id: int) -> str | None:
         try:
