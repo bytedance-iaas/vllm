@@ -751,7 +751,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                     is_profile=is_profile,
                 )
-            self.step_timing.drafter_end()
 
         if uniform_decode and not is_profile:
             self._retain_completed_num_spec_tokens(
