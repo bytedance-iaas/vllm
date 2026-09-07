@@ -38,6 +38,7 @@ _BACKEND_NAME_MAP: dict[str, Fp8MoeBackend] = {
     "aiter": Fp8MoeBackend.AITER_MXFP8,
     "triton": Fp8MoeBackend.TRITON_MXFP8,
     "humming": Fp8MoeBackend.HUMMING,
+    "hpc": Fp8MoeBackend.HPC,
 }
 
 
@@ -74,6 +75,12 @@ def _mxfp8_backend_to_kernel_cls(
         )
 
         return [Mxfp8EmulationTritonExperts]
+    if backend == Fp8MoeBackend.HPC:
+        from vllm.model_executor.layers.fused_moe.hpc_moe import (
+            MiniMaxM3HPCExperts,
+        )
+
+        return [MiniMaxM3HPCExperts]
     return backend_to_kernel_cls(backend)
 
 

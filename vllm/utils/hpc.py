@@ -8,6 +8,7 @@ Users of vLLM should always import **only** these wrappers.
 import functools
 import importlib
 import importlib.util
+import inspect
 
 import torch
 
@@ -25,6 +26,27 @@ def has_hpc() -> bool:
         logger.warning_once(
             "HPC attention requires the hpc module to be installed. "
             "Please install it from https://github.com/Tencent/hpc-ops"
+        )
+        return False
+    return True
+
+
+@functools.cache
+def has_hpc_mxfp8_k32_moe() -> bool:
+    """Return whether hpc-ops exposes the MiniMax-M3 MXFP8 K32 kernel."""
+    if not has_hpc():
+        return False
+    try:
+        import hpc  # noqa: F401
+    except Exception as err:
+        logger.warning_once("Failed to import hpc package: %s", err)
+        return False
+
+    op_name = "fuse_moe_mxfp8_k32_bf16_candidate_out"
+    if not hasattr(torch.ops.hpc, op_name):
+        logger.warning_once(
+            "Installed hpc package is missing MiniMax-M3 MXFP8 K32 MoE op: %s",
+            op_name,
         )
         return False
     return True
@@ -129,6 +151,22 @@ def hpc_fuse_moe(
     )
 
 
+@functools.cache
+def _hpc_blockwise_supports_activation_clamp(fuse_moe_blockwise: object) -> bool:
+    try:
+        signature = inspect.signature(fuse_moe_blockwise)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        (
+            param_name == "activation_clamp"
+            and param.kind != inspect.Parameter.POSITIONAL_ONLY
+        )
+        or param.kind == inspect.Parameter.VAR_KEYWORD
+        for param_name, param in signature.parameters.items()
+    )
+
+
 # @torch.library.custom_op(
 #     "vllm::fuse_moe_blockwise_impl",
 #     mutates_args=[],
@@ -147,8 +185,35 @@ def fuse_moe_blockwise_impl(
     num_expert_total: int,
     shared_output: torch.Tensor = None,
     output: torch.Tensor = None,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     from hpc import fuse_moe_blockwise as fuse_moe_blockwise_
+
+    clamp = 0.0 if activation_clamp is None else float(activation_clamp)
+
+    # Preserve the original HPC-Ops call for regular SwiGLU. Only clipped
+    # SwiGLU requires the newer activation_clamp argument.
+    if clamp == 0.0:
+        return fuse_moe_blockwise_(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert_total,
+            shared_output,
+            output=output,
+        )
+
+    if not _hpc_blockwise_supports_activation_clamp(fuse_moe_blockwise_):
+        raise RuntimeError(
+            "HPC blockwise MoE requires hpc-ops with activation_clamp "
+            "support for DeepSeek-V4 clipped-SwiGLU."
+        )
 
     return fuse_moe_blockwise_(
         x,
@@ -163,6 +228,7 @@ def fuse_moe_blockwise_impl(
         num_expert_total,
         shared_output,
         output=output,
+        activation_clamp=clamp,
     )
 
 
@@ -182,6 +248,7 @@ def fuse_moe_blockwise_impl_fake(
     num_expert_total: int,
     shared_output: torch.Tensor = None,
     output: torch.Tensor = None,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -199,6 +266,7 @@ def hpc_fuse_moe_blockwise(
     num_expert_total: int,
     shared_output: torch.Tensor = None,
     output: torch.Tensor = None,
+    activation_clamp: float | None = None,
 ) -> torch.Tensor:
     return fuse_moe_blockwise_impl(
         x,
@@ -213,11 +281,65 @@ def hpc_fuse_moe_blockwise(
         num_expert_total,
         shared_output,
         output=output,
+        activation_clamp=activation_clamp,
     )
+
+
+def hpc_fuse_moe_mxfp8_k32_bf16_candidate_out(
+    hidden: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+    row_indices: torch.Tensor,
+    topk_pos: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    grouped_hidden: torch.Tensor,
+    grouped_hidden_scale: torch.Tensor,
+    gate_output: torch.Tensor,
+    activated_output: torch.Tensor,
+    activated_scale: torch.Tensor,
+    down_output: torch.Tensor,
+    activation_clamp: float = 7.0,
+    alpha: float = 1.702,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    import hpc  # noqa: F401
+
+    torch.ops.hpc.fuse_moe_mxfp8_k32_bf16_candidate_out(
+        hidden,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_weights,
+        output,
+        row_indices,
+        topk_pos,
+        seqlens,
+        cu_seqlens,
+        grouped_hidden,
+        grouped_hidden_scale,
+        gate_output,
+        activated_output,
+        activated_scale,
+        down_output,
+        activation_clamp,
+        alpha,
+        beta,
+    )
+    return output
 
 
 __all__ = [
     "has_hpc",
+    "has_hpc_mxfp8_k32_moe",
     "hpc_fuse_moe",
     "hpc_fuse_moe_blockwise",
+    "hpc_fuse_moe_mxfp8_k32_bf16_candidate_out",
 ]

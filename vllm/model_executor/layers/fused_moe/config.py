@@ -252,9 +252,7 @@ class FusedMoEQuantConfig:
     _w2: FusedMoEQuantDesc
     is_scale_swizzled: bool = True
 
-    # MXFP4-specific TRTLLM parameters for SwiGLU activation clamping.
-    # These correspond to gemm1_alpha, gemm1_beta, gemm1_clamp_limit
-    # in TrtLlmMxfp4ExpertsBase.
+    # Gated-activation parameters used by backends with SwiGLU clamping.
     gemm1_alpha: float | None = None
     gemm1_beta: float | None = None
     gemm1_clamp_limit: float | None = None
@@ -543,9 +541,9 @@ class FusedMoEQuantConfig:
         - is_scale_swizzled: Whether the activation scale-factor layout is
           swizzled. Pass through to the underlying quantization kernel for
           dtypes that distinguish layouts (nvfp4, mxfp8). Defaults to True.
-        - gemm1_alpha: Optional MXFP4 TRTLLM SwiGLU alpha parameter.
-        - gemm1_beta: Optional MXFP4 TRTLLM SwiGLU beta parameter.
-        - gemm1_clamp_limit: Optional MXFP4 TRTLLM SwiGLU clamp limit.
+        - gemm1_alpha: Optional SwiGLU alpha parameter.
+        - gemm1_beta: Optional SwiGLU beta parameter.
+        - gemm1_clamp_limit: Optional SwiGLU clamp limit.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
@@ -983,6 +981,9 @@ def int4_w4afp8_moe_quant_config(
     per_act_token_quant: bool = False,
     per_out_ch_quant: bool = False,
     block_shape: list[int] | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for fp8 activations and int4 weights.
@@ -997,6 +998,9 @@ def int4_w4afp8_moe_quant_config(
         per_out_ch_quant=per_out_ch_quant,
         block_shape=block_shape,
         weight_dtype="int4",  # weight dtype for weights
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
