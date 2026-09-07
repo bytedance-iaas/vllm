@@ -15,6 +15,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.distributed.utils import get_pp_indices
@@ -85,6 +86,54 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+
+def _shard_tp_token_rows(
+    tensor: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    *,
+    padding_value: int | float = 0,
+) -> tuple[torch.Tensor, int]:
+    num_tokens = tensor.shape[0]
+    local_num_tokens = cdiv(num_tokens, tp_size)
+    padded_num_tokens = local_num_tokens * tp_size
+    if padded_num_tokens > num_tokens:
+        padding = tensor.new_full(
+            (padded_num_tokens - num_tokens, *tensor.shape[1:]),
+            padding_value,
+        )
+        tensor = torch.cat((tensor, padding), dim=0)
+    start = tp_rank * local_num_tokens
+    valid_num_tokens = min(max(num_tokens - start, 0), local_num_tokens)
+    return tensor.narrow(0, start, local_num_tokens), valid_num_tokens
+
+
+def _local_tp_padding_mask(
+    global_padding_mask: torch.Tensor | None,
+    local_input: torch.Tensor,
+    valid_num_tokens: int,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor | None:
+    has_tp_padding = valid_num_tokens < local_input.shape[0]
+    if global_padding_mask is None and not has_tp_padding:
+        return None
+    if global_padding_mask is None:
+        local_padding_mask = local_input.new_zeros(
+            local_input.shape[0],
+            dtype=torch.bool,
+        )
+    else:
+        local_padding_mask, _ = _shard_tp_token_rows(
+            global_padding_mask,
+            tp_rank,
+            tp_size,
+            padding_value=True,
+        )
+    if has_tp_padding:
+        local_padding_mask[valid_num_tokens:] = True
+    return local_padding_mask
 
 
 class DeepseekV4MLP(nn.Module):
@@ -709,6 +758,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         topk_ids: torch.Tensor,
         *,
         activation_clamp: float | None,
+        is_padding: torch.Tensor | None = None,
         fast_math: bool = True,
     ) -> torch.Tensor:
         if hidden_states.shape[0] > self.max_num_batched_tokens:
@@ -727,6 +777,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             y,
             self.prefix,
             activation_clamp,
+            is_padding,
             fast_math,
         )
         return y
@@ -738,7 +789,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         topk_ids: torch.Tensor,
         y: torch.Tensor,
         activation_clamp: float | None,
-        fast_math: bool,
+        fast_math: bool = True,
+        *,
+        is_padding: torch.Tensor | None = None,
     ) -> None:
         # This method must have been already called during the weight loading phase.
         # We call it again here to cover the dummy weight loading case and to
@@ -746,8 +799,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.finalize_weights()
 
         num_tokens = hidden_states.shape[0]
-        is_padding = None
-        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        if (
+            is_padding is None
+            and envs.VLLM_MOE_SKIP_PADDING
+            and is_forward_context_available()
+        ):
             is_padding = get_forward_context().is_padding
             if is_padding is not None:
                 is_padding = is_padding[:num_tokens]
@@ -900,6 +956,7 @@ def _deepseek_v4_mega_moe_experts_op(
     out: torch.Tensor,
     layer_name: str,
     activation_clamp: float | None,
+    is_padding: torch.Tensor | None,
     fast_math: bool,
 ) -> None:
     self = get_forward_context().no_compile_layers[layer_name]
@@ -910,6 +967,7 @@ def _deepseek_v4_mega_moe_experts_op(
         out,
         activation_clamp,
         fast_math,
+        is_padding=is_padding,
     )
 
 
@@ -920,6 +978,7 @@ def _deepseek_v4_mega_moe_experts_op_fake(
     out: torch.Tensor,
     layer_name: str,
     activation_clamp: float | None,
+    is_padding: torch.Tensor | None,
     fast_math: bool,
 ) -> None:
     return None
@@ -933,6 +992,40 @@ direct_register_custom_op(
 )
 
 
+def _deepseek_v4_mega_moe_tp_dedup_op(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    out: torch.Tensor,
+    layer_name: str,
+    activation_clamp: float | None,
+) -> None:
+    self = get_forward_context().no_compile_layers[layer_name]
+    self._run_mega_moe_tp_dedup(
+        hidden_states,
+        input_ids,
+        out,
+        activation_clamp,
+    )
+
+
+def _deepseek_v4_mega_moe_tp_dedup_op_fake(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    out: torch.Tensor,
+    layer_name: str,
+    activation_clamp: float | None,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_mega_moe_tp_dedup",
+    op_func=_deepseek_v4_mega_moe_tp_dedup_op,
+    mutates_args=["out"],
+    fake_impl=_deepseek_v4_mega_moe_tp_dedup_op_fake,
+)
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -942,12 +1035,21 @@ class DeepseekV4MoE(nn.Module):
         super().__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        self.use_mega_moe_tp_dedup = (
+            self.use_mega_moe and self.tp_size > 1 and envs.VLLM_DSV4_MEGA_MOE_TP_DEDUP
+        )
+        if self.use_mega_moe_tp_dedup:
+            compilation_config = vllm_config.compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -1038,8 +1140,18 @@ class DeepseekV4MoE(nn.Module):
         self.ep_group = get_ep_group()
         self.ep_size = self.ep_group.world_size
         self.ep_rank = self.ep_group.rank_in_group
+        if self.use_mega_moe_tp_dedup:
+            self.tp_group = get_tp_group()
+            if self.tp_group.ranks != self.ep_group.ranks:
+                raise NotImplementedError(
+                    "DeepSeek V4 MegaMoE TP dedup requires identical TP and EP groups."
+                )
 
         eplb_config = vllm_config.parallel_config.eplb_config
+        if self.use_mega_moe_tp_dedup and vllm_config.parallel_config.enable_eplb:
+            raise NotImplementedError(
+                "DeepSeek V4 MegaMoE TP dedup does not yet support EPLB."
+            )
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts or 0
@@ -1118,6 +1230,68 @@ class DeepseekV4MoE(nn.Module):
             num_redundant_experts=eplb_config.num_redundant_experts,
         )
 
+    def _run_mega_moe_tp_dedup(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        out: torch.Tensor,
+        activation_clamp: float | None,
+    ) -> None:
+        num_tokens = hidden_states.shape[0]
+        if num_tokens == 0:
+            return
+
+        routed_input, valid_num_tokens = _shard_tp_token_rows(
+            hidden_states,
+            self.tp_rank,
+            self.tp_size,
+        )
+        routed_input_ids = None
+        if input_ids is not None:
+            routed_input_ids, _ = _shard_tp_token_rows(
+                input_ids,
+                self.tp_rank,
+                self.tp_size,
+            )
+
+        global_padding_mask = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            global_padding_mask = get_forward_context().is_padding
+            if global_padding_mask is not None:
+                global_padding_mask = global_padding_mask[:num_tokens]
+        routed_is_padding = _local_tp_padding_mask(
+            global_padding_mask,
+            routed_input,
+            valid_num_tokens,
+            self.tp_rank,
+            self.tp_size,
+        )
+
+        router_logits, _ = self.gate(routed_input)
+        topk_weights, topk_ids = fused_topk_bias(
+            hidden_states=routed_input,
+            gating_output=router_logits,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias.data
+            if self.gate.e_score_correction_bias is not None
+            else None,
+            topk=self.n_activated_experts,
+            renormalize=self.renormalize,
+            indices_type=self.hash_indices_dtype,
+            input_tokens=routed_input_ids,
+            hash_indices_table=self.gate.tid2eid,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+        local_output = self.experts(
+            routed_input,
+            topk_weights,
+            topk_ids,
+            activation_clamp=activation_clamp,
+            is_padding=routed_is_padding,
+        )
+        gathered_output = self.tp_group.all_gather(local_output, dim=0)
+        out.copy_(gathered_output[:num_tokens])
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -1128,30 +1302,43 @@ class DeepseekV4MoE(nn.Module):
             return self._forward_fused_moe(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
+        if self.use_mega_moe_tp_dedup:
+            final_hidden_states = torch.empty_like(
+                hidden_states,
+                dtype=torch.bfloat16,
+            )
+            torch.ops.vllm.deepseek_v4_mega_moe_tp_dedup(
+                hidden_states,
+                input_ids,
+                final_hidden_states,
+                self.prefix,
+                activation_clamp,
+            )
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
 
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
