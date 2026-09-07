@@ -32,8 +32,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 _C128A_TOPK_ALIGNMENT = 128
 
 
-class DeepseekV4FlashMLABackend(AttentionBackend):
-    """DeepSeek-V4 sparse-MLA backend.
+class DeepseekV4SparseMLABackend(AttentionBackend):
+    """DeepSeek-V4 sparse-MLA backend base.
 
     Subclasses ``AttentionBackend`` directly (not the V3.2
     ``FlashMLASparseBackend``): DeepSeek-V4 runs its own attention layer
@@ -58,8 +58,8 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         return "FLASHMLA_SPARSE_DSV4"
 
     @staticmethod
-    def get_builder_cls() -> type["DeepseekV4FlashMLAMetadataBuilder"]:
-        return DeepseekV4FlashMLAMetadataBuilder
+    def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
+        return DeepseekV4SparseMLAMetadataBuilder
 
     @staticmethod
     def get_impl_cls() -> type[Any]:
@@ -67,7 +67,7 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         # not the generic ``Attention``/``MLAAttention`` layer, so the backend's
         # impl class is never instantiated.
         raise NotImplementedError(
-            "DeepseekV4FlashMLABackend has no separate impl class; DeepSeek-V4 "
+            "DeepseekV4SparseMLABackend has no separate impl class; DeepSeek-V4 "
             "attention runs through DeepseekV4Attention."
         )
 
@@ -131,7 +131,7 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     c128a_prefill_topk_indices: torch.Tensor | None = None
 
 
-class DeepseekV4FlashMLAMetadataBuilder(
+class DeepseekV4SparseMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
@@ -417,3 +417,7 @@ def _build_c128a_topk_metadata_kernel(
                 tl.where(offset < num_compressed, offset, -1),
                 mask=mask,
             )
+
+
+DeepseekV4FlashMLABackend = DeepseekV4SparseMLABackend
+DeepseekV4FlashMLAMetadataBuilder = DeepseekV4SparseMLAMetadataBuilder
