@@ -181,7 +181,6 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.request_id = request.request_id
         self.skip_special_tokens = sampling_params.skip_special_tokens
-        self._first_step_pending = True
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
@@ -218,7 +217,6 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
-        self._first_step_pending = False
 
         if not self.spaces_between_special_tokens:
             special_token = self.added_token_ids.get(next_token_id)
@@ -238,7 +236,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         num_tokens = len(new_token_ids)
         if stop_terminated and not self.include_stop_str_in_output:
             num_tokens -= 1
-        return self._first_step_pending and num_tokens > 0
+        return num_tokens > 0 and getattr(self.stream, "prefill_pending", False)
 
     def _protected_step(self, next_token_id: int) -> str | None:
         try:
