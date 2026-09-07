@@ -50,6 +50,9 @@ def create_scheduler(
     model: str = "facebook/opt-125m",
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 8192,
+    max_num_scheduled_tokens: int | None = None,
+    enable_prefill_token_bucket_schedule: bool = False,
+    prefill_token_bucket_schedule: str = "",
     enable_chunked_prefill: bool = True,
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
@@ -65,7 +68,6 @@ def create_scheduler(
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
-    num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
@@ -96,6 +98,9 @@ def create_scheduler(
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_num_scheduled_tokens=max_num_scheduled_tokens,
+        enable_prefill_token_bucket_schedule=enable_prefill_token_bucket_schedule,
+        prefill_token_bucket_schedule=prefill_token_bucket_schedule,
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
@@ -137,15 +142,18 @@ def create_scheduler(
             kv_connector_extra_config={"shared_storage_path": "local_storage"},
         )
 
+    parallel_config = ParallelConfig(
+        pipeline_parallel_size=pipeline_parallel_size,
+        data_parallel_size=data_parallel_size,
+    )
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
         spec_kwargs: dict = dict(
-            model="ngram", num_speculative_tokens=num_speculative_tokens
+            model="ngram",
+            num_speculative_tokens=num_speculative_tokens,
+            target_model_config=model_config,
+            target_parallel_config=parallel_config,
         )
-        if num_speculative_tokens_per_batch_size is not None:
-            spec_kwargs["num_speculative_tokens_per_batch_size"] = (
-                num_speculative_tokens_per_batch_size
-            )
         if speculative_method is not None:
             spec_kwargs["method"] = speculative_method
             spec_kwargs["prompt_lookup_max"] = num_speculative_tokens
@@ -166,10 +174,7 @@ def create_scheduler(
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
-        parallel_config=ParallelConfig(
-            pipeline_parallel_size=pipeline_parallel_size,
-            data_parallel_size=data_parallel_size,
-        ),
+        parallel_config=parallel_config,
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
