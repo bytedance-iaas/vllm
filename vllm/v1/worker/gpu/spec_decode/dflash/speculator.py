@@ -35,13 +35,18 @@ def _set_draft_query_padding_mask(
     num_tokens_padded: int,
     *,
     dummy_run: bool,
+    valid_query_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert 0 <= num_query_tokens <= num_tokens_padded <= input_buffers.max_num_tokens
     is_padding = input_buffers.is_padding[:num_tokens_padded]
     if dummy_run:
         is_padding.fill_(True)
     else:
-        is_padding[:num_query_tokens].fill_(False)
+        if valid_query_mask is None:
+            is_padding[:num_query_tokens].fill_(False)
+        else:
+            assert valid_query_mask.shape[0] >= num_query_tokens
+            is_padding[:num_query_tokens].copy_(~valid_query_mask[:num_query_tokens])
         is_padding[num_query_tokens:].fill_(True)
     return is_padding
 
@@ -606,11 +611,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
 
+        valid_query_mask = None
+        if not dummy_run:
+            valid_query_mask = (
+                self.block_tables.slot_mappings[
+                    self.draft_kv_cache_group_id, :num_query_tokens
+                ]
+                != PAD_SLOT_ID
+            )
         _set_draft_query_padding_mask(
             self.input_buffers,
             num_query_tokens,
             num_tokens_padded,
             dummy_run=dummy_run,
+            valid_query_mask=valid_query_mask,
         )
 
         # Rebuild the draft attention metadata even when replaying the FULL
