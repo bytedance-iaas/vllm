@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -169,13 +170,14 @@ def test_fast_detokenizer_async_update_eligibility(dummy_test_vectors):
     output_processor.add_request(request, dummy_test_vectors.prompt_strings[0])
     detokenizer = output_processor.request_states[request.request_id].detokenizer
     assert isinstance(detokenizer, FastIncrementalDetokenizer)
+    detokenizer.stream = SimpleNamespace(prefill_pending=True)
 
     token_id = dummy_test_vectors.generation_tokens[0][0]
     assert not detokenizer.needs_async_update([], stop_terminated=False)
     assert not detokenizer.needs_async_update([token_id], stop_terminated=True)
     assert detokenizer.needs_async_update([token_id], stop_terminated=False)
 
-    detokenizer.update([token_id], stop_terminated=False)
+    detokenizer.stream.prefill_pending = False
     assert not detokenizer.needs_async_update([token_id], stop_terminated=False)
 
 
