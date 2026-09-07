@@ -22,6 +22,15 @@
     "FINAL_BASE_IMAGE": {
       "default": "nvidia/cuda:13.0.3-base-ubuntu24.04"
     },
+    "DEEPGEMM_GIT_REPOSITORY": {
+      "default": "https://github.com/deepseek-ai/DeepGEMM.git"
+    },
+    "DEEPGEMM_GIT_COMMIT": {
+      "default": "8b1392b978f5a03c828dd1711090d7fb50958b8a"
+    },
+    "DEEPGEMM_REQUIRE_SM90_MEGA_MOE": {
+      "default": "OFF"
+    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
