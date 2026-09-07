@@ -150,7 +150,11 @@ def test_incremental_detokenization(
     assert not output_processor.has_unfinished_requests()
 
 
-def test_fast_detokenizer_async_update_eligibility(dummy_test_vectors):
+def test_fast_detokenizer_async_update_eligibility(
+    dummy_test_vectors,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_V1_DETOKENIZER_ASYNC_MIN_PROMPT_TOKENS", "0")
     request = EngineCoreRequest(
         request_id="request",
         external_req_id="external",
@@ -176,9 +180,64 @@ def test_fast_detokenizer_async_update_eligibility(dummy_test_vectors):
     assert not detokenizer.needs_async_update([], stop_terminated=False)
     assert not detokenizer.needs_async_update([token_id], stop_terminated=True)
     assert detokenizer.needs_async_update([token_id], stop_terminated=False)
+    assert detokenizer.needs_async_update([token_id, token_id], stop_terminated=True)
+    detokenizer.include_stop_str_in_output = True
+    assert detokenizer.needs_async_update([token_id], stop_terminated=True)
 
     detokenizer.stream.prefill_pending = False
     assert not detokenizer.needs_async_update([token_id], stop_terminated=False)
+    del detokenizer.stream.prefill_pending
+    assert not detokenizer.needs_async_update([token_id], stop_terminated=False)
+
+
+@pytest.mark.parametrize(
+    ("threshold", "prompt_len", "expected"),
+    [
+        (None, 0, False),
+        (None, 4095, False),
+        (None, 4096, True),
+        ("0", 1, True),
+        ("8192", 4096, False),
+        ("8192", 8192, True),
+        ("-1", 65536, False),
+    ],
+)
+def test_fast_detokenizer_async_prompt_threshold(
+    dummy_test_vectors,
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: str | None,
+    prompt_len: int,
+    expected: bool,
+):
+    env_name = "VLLM_V1_DETOKENIZER_ASYNC_MIN_PROMPT_TOKENS"
+    if threshold is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, threshold)
+
+    base_tokens = dummy_test_vectors.prompt_tokens[0]
+    repeats = (prompt_len + len(base_tokens) - 1) // len(base_tokens)
+    prompt_token_ids = (base_tokens * repeats)[:prompt_len]
+    request = EngineCoreRequest(
+        request_id="request",
+        external_req_id="external",
+        prompt_token_ids=prompt_token_ids,
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+    )
+    detokenizer = FastIncrementalDetokenizer(
+        dummy_test_vectors.tokenizer,
+        request,
+    )
+    detokenizer.stream = SimpleNamespace(prefill_pending=True)
+
+    token_id = dummy_test_vectors.generation_tokens[0][0]
+    assert detokenizer.needs_async_update([token_id], stop_terminated=False) is expected
 
 
 class _BlockingFirstUpdateDetokenizer(IncrementalDetokenizer):

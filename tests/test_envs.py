@@ -38,6 +38,24 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_async_detokenizer_prompt_threshold_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    name = "VLLM_V1_DETOKENIZER_ASYNC_MIN_PROMPT_TOKENS"
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) == 4096
+
+    for value in ("0", "-1", "8192"):
+        monkeypatch.setenv(name, value)
+        assert getattr(envs, name) == int(value)
+
+    assert name not in envs.compile_factors()
+
+    monkeypatch.setenv(name, "not-an-int")
+    with pytest.raises(ValueError):
+        getattr(envs, name)
+
+
 def test_mooncake_pd_trace_env() -> None:
     with patch.dict(os.environ, {}, clear=True):
         assert environment_variables["VLLM_MOONCAKE_PD_TRACE"]() is False
