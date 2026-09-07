@@ -110,6 +110,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        valid_sample = idx_map >= 0
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -145,8 +146,13 @@ class DSparkSpeculator(DFlashSpeculator):
                 draft_sampled_i = self.model.map_draft_to_target(
                     logits_i.argmax(dim=-1)
                 )
+            draft_sampled_i = torch.where(
+                valid_sample[:, i],
+                draft_sampled_i,
+                torch.zeros_like(draft_sampled_i),
+            )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
-            prev = draft_sampled_i
+            prev = torch.where(valid_sample[:, i], draft_sampled_i, prev)
 
     def _generate_draft(
         self,
