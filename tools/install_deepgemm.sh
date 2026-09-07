@@ -5,17 +5,27 @@
 set -e
 
 # Default values
-# Keep DEEPGEMM_GIT_REF in sync with cmake/external_projects/deepgemm.cmake
-DEEPGEMM_GIT_REPO="https://github.com/vllm-project/DeepGEMM.git"
-# NOTE: This targets the vLLM fork's dev branch, which carries the sm120
+# Keep these defaults in sync with cmake/external_projects/deepgemm.cmake and
+# docker/Dockerfile.
+DEEPGEMM_GIT_REPO="${DEEPGEMM_GIT_REPOSITORY:-https://github.com/vllm-project/DeepGEMM.git}"
+# NOTE: This targets the vLLM fork's dev branch tip, which carries the sm120
 # and sm90 paged-MQA ports plus the SwiGLU alpha/beta and SiTU Mega MoE
-# activations, plus the CUDA 12.x layout header fix from vllm-project/DeepGEMM#12.
-DEEPGEMM_GIT_REF="e1f418c2a4f20818221f6b0e578b4c2f634d4c3f"
+# activations.
+DEEPGEMM_GIT_REF="${DEEPGEMM_GIT_COMMIT:-ad1f1726aa540a76c1d26d6a120effb8de21eaa4}"
 WHEEL_DIR=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --repo)
+            if [[ -z "$2" || "$2" =~ ^- ]]; then
+                echo "Error: --repo requires an argument." >&2
+                exit 1
+            fi
+            DEEPGEMM_GIT_REPO="$2"
+            shift 2
+            ;;
         --ref)
             if [[ -z "$2" || "$2" =~ ^- ]]; then
                 echo "Error: --ref requires an argument." >&2
@@ -43,7 +53,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo "Options:"
-            echo "  --ref REF          Git reference to checkout (default: $DEEPGEMM_GIT_REF)"
+            echo "  --repo URL         Git repository (default: $DEEPGEMM_GIT_REPO)"
+            echo "  --ref COMMIT       Exact 40-character commit (default: $DEEPGEMM_GIT_REF)"
             echo "  --cuda-version VER CUDA version (auto-detected if not provided)"
             echo "  --wheel-dir PATH   If set, build wheel into PATH but do not install"
             echo "  -h, --help         Show this help message"
@@ -55,6 +66,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "$DEEPGEMM_GIT_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo "Error: DeepGEMM ref must be an exact 40-character commit." >&2
+    exit 1
+fi
+DEEPGEMM_GIT_REF="${DEEPGEMM_GIT_REF,,}"
 
 # Auto-detect CUDA version if not provided
 if [ -z "$CUDA_VERSION" ]; then
@@ -87,12 +104,24 @@ echo "Reference: $DEEPGEMM_GIT_REF"
 INSTALL_DIR=$(mktemp -d)
 trap 'rm -rf "$INSTALL_DIR"' EXIT
 
-# Clone the repository
-git clone --recursive --shallow-submodules "$DEEPGEMM_GIT_REPO" "$INSTALL_DIR/deepgemm"
+# Fetch only the selected commit, then initialize its pinned submodules.
+git init "$INSTALL_DIR/deepgemm"
 pushd "$INSTALL_DIR/deepgemm"
+git remote add origin "$DEEPGEMM_GIT_REPO"
+git fetch --depth=1 origin "$DEEPGEMM_GIT_REF"
+git checkout --detach "$DEEPGEMM_GIT_REF"
+ACTUAL_COMMIT="$(git rev-parse HEAD)"
+if [ "$ACTUAL_COMMIT" != "$DEEPGEMM_GIT_REF" ]; then
+    echo "Error: DeepGEMM checkout mismatch: expected $DEEPGEMM_GIT_REF, got $ACTUAL_COMMIT" >&2
+    exit 1
+fi
+git submodule update --init --recursive --depth=1
 
-# Checkout the specific reference
-git checkout "$DEEPGEMM_GIT_REF"
+case "${DEEPGEMM_REQUIRE_SM90_MEGA_MOE:-0}" in
+    1|ON|on|TRUE|true|YES|yes)
+        python3 "$SCRIPT_DIR/check_deepgemm_source.py" "$PWD"
+        ;;
+esac
 
 # Clean previous build artifacts
 # (Based on https://github.com/deepseek-ai/DeepGEMM/blob/main/install.sh)
