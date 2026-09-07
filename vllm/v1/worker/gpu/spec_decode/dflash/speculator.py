@@ -248,6 +248,50 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+            if hasattr(self.model, "initialize_partial_draft_kv_boundaries"):
+                if self.vllm_config.parallel_config.decode_context_parallel_size != 1:
+                    raise ValueError(
+                        "Partial draft KV boundary initialization does not support "
+                        "decode context parallelism."
+                    )
+                local_prefix_alignment = (
+                    self.vllm_config.cache_config.prefix_match_unit
+                    or self.vllm_config.cache_config.block_size
+                )
+                for gid in self.draft_kv_cache_group_ids:
+                    block_size = self.block_tables.kernel_block_sizes[gid]
+                    if local_prefix_alignment % block_size != 0:
+                        raise ValueError(
+                            "Partial draft KV boundary initialization requires "
+                            "local prefix-cache hits to align to each draft block; "
+                            f"got alignment {local_prefix_alignment} and block "
+                            f"size {block_size}."
+                        )
+
+    def _initialize_partial_draft_boundaries(self, input_batch: InputBatch) -> None:
+        initializer = getattr(
+            self.model, "initialize_partial_draft_kv_boundaries", None
+        )
+        if initializer is None or not input_batch.is_prefilling_np.any():
+            return
+
+        assert self._layer_group_idx is not None
+        initializer(
+            draft_block_tables=[
+                self.block_tables.input_block_tables[gid]
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            draft_block_sizes=[
+                self.block_tables.kernel_block_sizes[gid]
+                for gid in self.draft_kv_cache_group_ids
+            ],
+            layer_group_indices=self._layer_group_idx,
+            idx_mapping=input_batch.idx_mapping,
+            num_cached_tokens=self.num_cached_tokens,
+            query_start_loc=input_batch.query_start_loc,
+            positions=input_batch.positions,
+            num_reqs=input_batch.num_reqs,
+        )
 
     @torch.inference_mode()
     def _run_model(
@@ -443,6 +487,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+
+        if not dummy_run and not is_profile:
+            self._initialize_partial_draft_boundaries(input_batch)
 
         if not dummy_run:
             for gid in self.draft_kv_cache_group_ids:
