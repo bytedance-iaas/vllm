@@ -12,6 +12,7 @@ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    KVTransferConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -61,6 +62,48 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    ("kv_transfer_config", "expected"),
+    [
+        (
+            KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_producer"),
+            True,
+        ),
+        (
+            KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_consumer"),
+            False,
+        ),
+        (
+            KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both"),
+            False,
+        ),
+        (KVTransferConfig(kv_role="kv_producer"), False),
+        (None, False),
+    ],
+)
+def test_v1_kv_producer_only_requires_active_pure_producer(
+    kv_transfer_config, expected
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+
+    assert runner._is_kv_producer_only_instance() is expected
+
+
+def test_calc_spec_decode_metadata_rejects_all_draft_schedule():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["req-0"])
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"req-0 has 3 scheduled tokens but 3 draft tokens",
+    ):
+        runner._calc_spec_decode_metadata(
+            num_draft_tokens=np.array([3], dtype=np.int32),
+            cu_num_scheduled_tokens=np.array([3], dtype=np.int32),
+        )
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

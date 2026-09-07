@@ -29,6 +29,23 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _set_draft_query_padding_mask(
+    input_buffers: InputBuffers,
+    num_query_tokens: int,
+    num_tokens_padded: int,
+    *,
+    dummy_run: bool,
+) -> torch.Tensor:
+    assert 0 <= num_query_tokens <= num_tokens_padded <= input_buffers.max_num_tokens
+    is_padding = input_buffers.is_padding[:num_tokens_padded]
+    if dummy_run:
+        is_padding.fill_(True)
+    else:
+        is_padding[:num_query_tokens].fill_(False)
+        is_padding[num_query_tokens:].fill_(True)
+    return is_padding
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -74,6 +91,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
         self.context_positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        # Target-only restored prefix tokens have no corresponding draft KV.
+        self.num_cached_tokens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
         )
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
@@ -159,6 +180,9 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> nn.Module:
         return load_dflash_model(target_model, self.vllm_config)
 
+    def set_num_cached_tokens(self, num_cached_tokens: torch.Tensor) -> None:
+        self.num_cached_tokens = num_cached_tokens
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -180,6 +204,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        draft_block_sizes = {
+            self.block_tables.kernel_block_sizes[gid]
+            for gid in self.draft_kv_cache_group_ids
+        }
+        assert len(draft_block_sizes) == 1, (
+            "DFlash requires a uniform kernel block size across draft KV cache "
+            f"groups, got {draft_block_sizes}."
+        )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -232,6 +264,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_padding=self.input_buffers.is_padding[:num_tokens],
         ):
             last_hidden_states = self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
@@ -351,6 +384,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
+            _set_draft_query_padding_mask(
+                self.input_buffers,
+                num_query_tokens,
+                num_query_tokens,
+                dummy_run=True,
+            )
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
@@ -392,6 +431,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
+                self.num_cached_tokens,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
@@ -400,6 +440,16 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+
+        if not dummy_run:
+            for gid in self.draft_kv_cache_group_ids:
+                shift_draft_block_tables(
+                    self.block_tables.input_block_tables[gid],
+                    input_batch.idx_mapping,
+                    self.num_cached_tokens,
+                    self.input_buffers.seq_lens,
+                    self.block_tables.kernel_block_sizes[gid],
+                )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -433,6 +483,13 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
+
+        _set_draft_query_padding_mask(
+            self.input_buffers,
+            num_query_tokens,
+            num_tokens_padded,
+            dummy_run=dummy_run,
+        )
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -498,6 +555,8 @@ def _prepare_dflash_inputs_kernel(
     # Block table for slot mapping lookup.
     block_table_ptr,
     block_table_stride,
+    # Cache-restored token counts indexed by request-state slot.
+    num_cached_tokens_ptr,
     # Scalars
     parallel_drafting_token_id,
     block_size,
@@ -587,9 +646,16 @@ def _prepare_dflash_inputs_kernel(
     if block_idx == 0:
         tl.store(out_query_start_loc_ptr + req_idx, query_base)
         # seq_lens is the absolute sequence length the draft attention
-        # reads up to (context + query), not just the count of accepted
-        # tokens this step.
-        tl.store(out_seq_lens_ptr + req_idx, last_valid_pos + 1 + num_query_per_req)
+        # reads up to. Restored whole blocks contain no draft KV, so hide them.
+        num_cached = tl.load(num_cached_tokens_ptr + req_state_idx)
+        num_shifted_slots = (num_cached // block_size) * block_size
+        tl.store(
+            out_seq_lens_ptr + req_idx,
+            tl.maximum(
+                last_valid_pos + 1 + num_query_per_req - num_shifted_slots,
+                num_query_per_req,
+            ),
+        )
         # Copy sampling state.
         tl.store(
             out_temperature_ptr + req_state_idx,
@@ -655,6 +721,8 @@ def prepare_dflash_inputs(
     # [max_num_reqs, max_num_blocks]
     block_table: torch.Tensor,
     block_size: int,
+    # [max_num_reqs]
+    num_cached_tokens: torch.Tensor,
     parallel_drafting_token_id: int,
     num_query_per_req: int,
     num_speculative_steps: int,
@@ -695,6 +763,7 @@ def prepare_dflash_inputs(
         input_seeds,
         block_table,
         block_table.stride(0),
+        num_cached_tokens,
         parallel_drafting_token_id,
         block_size,
         num_query_per_req,
@@ -705,4 +774,65 @@ def prepare_dflash_inputs(
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
+@triton.jit
+def _shift_draft_block_tables_kernel(
+    block_table_ptr,
+    block_table_stride,
+    idx_mapping_ptr,
+    num_cached_tokens_ptr,
+    seq_lens_ptr,
+    block_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    num_cached = tl.load(num_cached_tokens_ptr + req_state_idx)
+    shift = num_cached // block_size
+    if shift == 0:
+        return
+
+    row_ptr = block_table_ptr + req_idx.to(tl.int64) * block_table_stride
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    num_needed = (seq_len + block_size - 1) // block_size
+    num_remaining = tl.minimum(block_table_stride - shift, num_needed)
+    for i in tl.range(0, num_remaining, BLOCK_SIZE):
+        offset = i + tl.arange(0, BLOCK_SIZE)
+        mask = offset < num_remaining
+        block_ids = tl.load(row_ptr + offset + shift, mask=mask, other=0)
+        tl.store(row_ptr + offset, block_ids, mask=mask)
+
+
+def shift_draft_block_tables(
+    block_table: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_cached_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Hide target-only restored prefix blocks from draft attention."""
+    num_reqs = idx_mapping.shape[0]
+    if block_table.device.type == "cpu":
+        for req_idx in range(num_reqs):
+            req_state_idx = int(idx_mapping[req_idx])
+            shift = int(num_cached_tokens[req_state_idx]) // block_size
+            if shift == 0:
+                continue
+            num_needed = (int(seq_lens[req_idx]) + block_size - 1) // block_size
+            num_remaining = min(block_table.shape[1] - shift, num_needed)
+            block_table[req_idx, :num_remaining] = block_table[
+                req_idx, shift : shift + num_remaining
+            ].clone()
+        return
+
+    _shift_draft_block_tables_kernel[(num_reqs,)](
+        block_table,
+        block_table.stride(0),
+        idx_mapping,
+        num_cached_tokens,
+        seq_lens,
+        block_size,
+        BLOCK_SIZE=1024,  # type: ignore
     )
