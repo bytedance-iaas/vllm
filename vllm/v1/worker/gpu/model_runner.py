@@ -1698,10 +1698,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens[
                     input_batch.idx_mapping, :num_spec_tokens_to_schedule
                 ] = draft_tokens
-            if self.adaptive_verification is not None:
-                self.adaptive_verification.record_confidences(
-                    self.speculator.draft_token_confidence_probs, input_batch
-                )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
