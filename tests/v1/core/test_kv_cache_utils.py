@@ -1257,6 +1257,59 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+def test_deepseek_v4_projected_pp_groups_preserve_shared_layer_identity():
+    full_specs: dict[str, KVCacheSpec] = {
+        f"model.layers.{idx}.self_attn": MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1 if idx % 2 == 0 else 2,
+            head_size=64,
+            dtype=torch.float16,
+            model_version="deepseek_v4",
+        )
+        for idx in range(8)
+    }
+    swa_specs: dict[str, KVCacheSpec] = {
+        f"model.layers.{idx}.swa_attn": SlidingWindowMLASpec(
+            block_size=256,
+            num_kv_heads=1 if idx % 2 == 0 else 2,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=512,
+            model_version="deepseek_v4",
+        )
+        for idx in range(4, 8)
+    }
+    full_group = UniformTypeKVCacheSpecs.from_specs(full_specs)
+    swa_group = UniformTypeKVCacheSpecs.from_specs(swa_specs)
+    assert full_group is not None
+    assert swa_group is not None
+    global_groups = [
+        KVCacheGroupSpec(list(full_specs), full_group),
+        KVCacheGroupSpec(list(swa_specs), swa_group),
+    ]
+    worker_spec = {
+        **{
+            name: spec
+            for name, spec in full_specs.items()
+            if any(name.startswith(f"model.layers.{idx}.") for idx in range(4, 8))
+        },
+        **swa_specs,
+    }
+
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups, worker_spec
+    )
+
+    assert [group.layer_names for group in projected] == [
+        [f"model.layers.{idx}.self_attn" for idx in range(4, 8)],
+        [f"model.layers.{idx}.swa_attn" for idx in range(4, 8)],
+    ]
+    for group in projected:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        assert list(group.kv_cache_spec.kv_cache_specs) == group.layer_names
+    assert sorted(projected[0].kv_cache_spec.get_page_sizes()) == [32768, 65536]
+
+
 def test_merge_kv_cache_spec():
     same_layer_specs = [
         new_kv_cache_spec(num_kv_heads=32),

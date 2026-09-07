@@ -12,6 +12,7 @@ These tests verify correct behavior in three scenarios:
 """
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -38,6 +39,31 @@ def _make_get_num_new_matched_tokens(
         return value, async_load
 
     return get_num_new_matched_tokens
+
+
+def test_hybrid_invalid_block_recovery_uses_group_block_sizes():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 256
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.get_block_ids.return_value = (
+        [10, 11],
+        [20, 21, 22, 23, 24, 25, 26, 27],
+    )
+    scheduler.kv_cache_manager.get_block_sizes.return_value = (256, 64)
+    request = SimpleNamespace(request_id="hybrid", num_computed_tokens=512)
+
+    affected_req_ids, affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request],
+            invalid_block_ids={25},
+            num_scheduled_tokens={},
+        )
+    )
+
+    assert affected_req_ids == {"hybrid"}
+    assert request.num_computed_tokens == 256
+    assert affected_tokens == 256
+    assert blocks_to_evict == {11, 24, 25, 26, 27}
 
 
 @pytest.fixture

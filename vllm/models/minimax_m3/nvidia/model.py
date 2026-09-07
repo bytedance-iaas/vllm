@@ -358,6 +358,7 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        self.attn.total_num_kv_heads = self.total_num_kv_heads
 
     def forward(
         self,

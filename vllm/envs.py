@@ -219,6 +219,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
+    VLLM_MOONCAKE_PD_TRACE: bool = False
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
     MOONCAKE_REQUESTER_LOCAL_HOSTNAME: str | None = None
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
@@ -1640,6 +1641,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
         os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")
+    ),
+    # Emit request-scoped direct Mooncake P/D transfer diagnostics.
+    "VLLM_MOONCAKE_PD_TRACE": lambda: (
+        os.getenv("VLLM_MOONCAKE_PD_TRACE", "False").lower() in ("true", "1")
     ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),

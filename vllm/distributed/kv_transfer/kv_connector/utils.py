@@ -427,12 +427,33 @@ class TransferTopology:
         attn_backend = self.attn_backends[0]
         if not self.is_mamba:
             _MOCK_BLOCK_SIZE = 16
-            kv_cache_shape: tuple[int, ...] = attn_backend.get_kv_cache_shape(
-                num_blocks=1,
-                block_size=_MOCK_BLOCK_SIZE,
-                num_kv_heads=1,
-                head_size=1,
-            )
+            if self.is_mla:
+                kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    num_blocks=1,
+                    block_size=_MOCK_BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                )
+            else:
+                probed_shapes: list[tuple[int, ...]] = []
+                for candidate in self.attn_backends:
+                    candidate_shape = candidate.get_kv_cache_shape(
+                        num_blocks=1,
+                        block_size=_MOCK_BLOCK_SIZE,
+                        num_kv_heads=1,
+                        head_size=1,
+                    )
+                    probed_shapes.append(candidate_shape)
+                    if len(candidate_shape) == 4:
+                        attn_backend = candidate
+                        kv_cache_shape = candidate_shape
+                        break
+                else:
+                    raise AssertionError(
+                        "Attention KV cache layout must be standardized as "
+                        "[num_blocks, num_kv_heads, block_size, content_size], "
+                        f"got shapes {probed_shapes}."
+                    )
             logger.debug("Test kv_cache_shape: %s", kv_cache_shape)
             assert kv_cache_shape[0] == 1, (
                 "KV cache layout must be blocks-first; expected mocked "
