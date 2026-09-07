@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from vllm.config import KVTransferConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
@@ -88,6 +89,22 @@ def _make_runner(**overrides: Any) -> Any:
     for key, value in overrides.items():
         setattr(runner, key, value)
     return runner
+
+
+def test_v2_kv_producer_only_requires_active_pure_producer():
+    cases = [
+        (KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_producer"), True),
+        (KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_consumer"), False),
+        (KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both"), False),
+        (KVTransferConfig(kv_role="kv_producer"), False),
+        (None, False),
+    ]
+
+    for kv_transfer_config, expected in cases:
+        runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+        runner.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+
+        assert runner._is_kv_producer_only_instance() is expected
 
 
 def test_v2_load_model_registers_moe_with_eplb(monkeypatch):

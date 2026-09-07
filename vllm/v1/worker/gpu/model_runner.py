@@ -203,17 +203,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
-            if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+            method = self.speculative_config.method
+            is_aux_hidden_state_method = method in ("eagle3", "dflash", "dspark")
+            skip_draft_on_producer = (
+                is_aux_hidden_state_method and self._is_kv_producer_only_instance()
+            )
 
-            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
-                # Drafting may require auxiliary hidden states from target model outputs
-                self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
+            if not skip_draft_on_producer:
+                if self.is_last_pp_rank:
+                    self.speculator = init_speculator(self.vllm_config, self.device)
+
+                if is_aux_hidden_state_method:
+                    # Drafting may require auxiliary hidden states from target
+                    # model outputs.
+                    self.use_aux_hidden_state_outputs = True
+                    if self.use_pp:
+                        raise ValueError(
+                            f"{method} with pipeline parallel is not supported."
+                        )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -279,6 +286,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+    def _is_kv_producer_only_instance(self) -> bool:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        return (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_transfer_instance
+            and kv_transfer_config.is_kv_producer
+            and not kv_transfer_config.is_kv_consumer
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -522,6 +538,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 self.attn_groups,
             )
+            if hasattr(self.speculator, "set_num_cached_tokens"):
+                self.speculator.set_num_cached_tokens(
+                    self.req_states.num_cached_tokens.gpu
+                )
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.

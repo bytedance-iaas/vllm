@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -101,11 +101,10 @@ class DSparkDeepseekV4Model(nn.Module):
             dtype=torch.int32,
         )
 
-        current_vllm_config = get_current_vllm_config()
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
-                    current_vllm_config,
+                    vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
                     topk_indices_buffer=self.topk_indices_buffer,
                 )
