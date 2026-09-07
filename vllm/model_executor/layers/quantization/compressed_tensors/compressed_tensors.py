@@ -565,6 +565,10 @@ class CompressedTensorsConfig(QuantizationConfig):
     ) -> bool:
         if not weight_quant or not input_quant:
             return False
+        has_expected_types = (
+            weight_quant.type == QuantizationType.INT
+            and input_quant.type == QuantizationType.FLOAT
+        )
         is_weight_4_bits = weight_quant.num_bits == 4
         is_activation_8_bits = input_quant.num_bits == 8
         weight_strategy = weight_quant.strategy == QuantizationStrategy.GROUP.value
@@ -576,7 +580,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Only per-group symmetric weight (4bit)
         # + per-tok symmetric activation (8bit) quantization supported.
         return (
-            is_weight_4_bits
+            has_expected_types
+            and is_weight_4_bits
             and is_activation_8_bits
             and is_token
             and is_symmetric

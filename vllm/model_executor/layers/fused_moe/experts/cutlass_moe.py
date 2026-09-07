@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+import math
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -81,9 +83,7 @@ def _estimate_w4a8_batched_m(
     assert topk > 0
     assert global_num_experts > 0
 
-    return (
-        total_num_tokens * topk + global_num_experts - 1
-    ) // global_num_experts
+    return (total_num_tokens * topk + global_num_experts - 1) // global_num_experts
 
 
 def _select_w4a8_batched_schedule(
@@ -109,6 +109,46 @@ def _select_w4a8_batched_schedule(
     if m_expert <= 128:
         return "Kernel_256x128_2x1x1_Coop"
     return "Kernel_128x256_2x1x1_Coop"
+
+
+def _w4a8_float_eq(value: float | None, expected: float) -> bool:
+    return value is not None and math.isclose(
+        value,
+        expected,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    )
+
+
+def _select_w4a8_standard_schedule(
+    *,
+    input_tokens: int,
+    topk: int,
+    local_num_experts: int,
+    global_num_experts: int,
+    n: int,
+    k: int,
+    activation: MoEActivation,
+    gemm1_alpha: float | None,
+    gemm1_beta: float | None,
+    gemm1_clamp_limit: float | None,
+) -> str | None:
+    # MiniMax-M3 long-prefill chunks favor the narrower N tile. Keep the
+    # specialization constrained to the measured model shape and semantics.
+    if (
+        input_tokens == 8192
+        and topk == 4
+        and local_num_experts == 32
+        and global_num_experts == 128
+        and n == 3072
+        and k == 6144
+        and activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and _w4a8_float_eq(gemm1_alpha, 1.702)
+        and _w4a8_float_eq(gemm1_beta, 1.0)
+        and _w4a8_float_eq(gemm1_clamp_limit, 7.0)
+    ):
+        return "Kernel_256x32_1x1x1_Coop"
+    return None
 
 
 def _select_w4a8_compact_programs(
@@ -649,8 +689,13 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
         if self._permute_scratch is None and moe_permute_unpermute_supported():
             max_num_tokens = self.moe_config.max_num_tokens
             if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
-                # Standard DP/EP gathers every rank's tokens before the experts.
-                max_num_tokens *= self.moe_config.dp_size
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
                 max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
@@ -1594,6 +1639,18 @@ def run_cutlass_moe_w4a8_fp8(
             expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, True
         )
         expert_offsets = expert_first_token_offset[:-1]
+        schedule = _select_w4a8_standard_schedule(
+            input_tokens=hidden_states.size(0),
+            topk=topk,
+            local_num_experts=local_E,
+            global_num_experts=global_num_experts,
+            n=N,
+            k=K,
+            activation=activation,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+        )
 
     ops.cutlass_w4a8_moe_mm(
         mm1_out,
@@ -1791,7 +1848,12 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return cutlass_group_gemm_supported()
+        capability = current_platform.get_device_capability()
+        return (
+            capability is not None
+            and capability.major == 9
+            and cutlass_group_gemm_supported()
+        )
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -1815,7 +1877,10 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return True
+        return not (
+            moe_parallel_config.use_deepep_v2_kernels
+            or moe_parallel_config.use_fi_nvl_one_sided_kernels
+        )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         # topk weights and reduction are fused in moe_unpermute cuda kernel
@@ -1882,11 +1947,11 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
         assert self.w1_zp is None, "w1_zp is not supported in CUTLASS MoE"
         assert self.w2_zp is None, "w2_zp is not supported in CUTLASS MoE"
 
+        expert_num_tokens = None
         use_batched_format = (
             self.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
         )
-        expert_num_tokens = None
-        if expert_tokens_meta is not None:
+        if use_batched_format and expert_tokens_meta is not None:
             expert_num_tokens = expert_tokens_meta.expert_num_tokens
 
         in_dtype = hidden_states.dtype

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
@@ -22,21 +23,19 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
-        CutlassBatchedExpertsW4A8Fp8,
-        CutlassExpertsW4A8Fp8,
-    )
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 logger = init_logger(__name__)
 
 
 class W4A8MoeBackend(Enum):
     CUTLASS = "CUTLASS"
+    HUMMING = "HUMMING"
 
 
 def backend_to_kernel_cls(
     backend: W4A8MoeBackend,
-) -> list[type["CutlassExpertsW4A8Fp8"] | type["CutlassBatchedExpertsW4A8Fp8"]]:
+) -> list[type[mk.FusedMoEExperts]]:
     if backend == W4A8MoeBackend.CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassBatchedExpertsW4A8Fp8,
@@ -44,16 +43,51 @@ def backend_to_kernel_cls(
         )
 
         return [CutlassExpertsW4A8Fp8, CutlassBatchedExpertsW4A8Fp8]
+    elif backend == W4A8MoeBackend.HUMMING:
+        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+            HummingGroupedExperts,
+            HummingIndexedExperts,
+        )
+
+        return [
+            HummingGroupedExperts,
+            HummingIndexedExperts,
+        ]
     else:
         raise ValueError(f"Unknown W4A8 MoE backend: {backend.value}")
+
+
+def map_w4a8_backend(runner_backend: MoEBackend) -> W4A8MoeBackend:
+    backend_map = {
+        "auto": W4A8MoeBackend.CUTLASS,
+        "cutlass": W4A8MoeBackend.CUTLASS,
+        "humming": W4A8MoeBackend.HUMMING,
+    }
+    if runner_backend not in backend_map:
+        raise NotImplementedError(
+            f"moe_backend={runner_backend!r} is not supported for W4A8 MoE. "
+            "Supported backends are 'auto', 'cutlass', and 'humming'."
+        )
+    return backend_map[runner_backend]
 
 
 def select_w4a8_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None = kInt4Static,
     activation_key: QuantKey | None = kFp8DynamicTokenSym,
-) -> tuple[W4A8MoeBackend, type["CutlassExpertsW4A8Fp8"]]:
-    backend = W4A8MoeBackend.CUTLASS
+) -> tuple[W4A8MoeBackend, type[mk.FusedMoEExperts]]:
+    backend = map_w4a8_backend(config.moe_backend)
+
+    if (
+        backend == W4A8MoeBackend.HUMMING
+        and (
+            config.moe_parallel_config.use_batched_activation_format
+            or config.moe_parallel_config.use_fi_nvl_one_sided_kernels
+        )
+    ):
+        raise NotImplementedError(
+            "Humming W4A8 does not support the selected communication format."
+        )
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
@@ -173,7 +207,7 @@ def make_w4a8_moe_quant_config(
 def make_w4a8_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
-    experts_cls: type["CutlassExpertsW4A8Fp8"],
+    experts_cls: type[mk.FusedMoEExperts],
     b_strides1: torch.Tensor,
     b_strides2: torch.Tensor,
     group_size: int,
@@ -208,4 +242,104 @@ def make_w4a8_moe_kernel(
     return mk.FusedMoEKernel(
         prepare_finalize,
         experts,
+    )
+
+
+def make_humming_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    experts_cls: type[mk.FusedMoEExperts],
+    layer: "RoutedExperts",
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    from vllm.model_executor.layers.quantization.utils.humming_utils import (
+        make_humming_moe_kernel,
+    )
+
+    return make_humming_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=moe_config,
+        experts_cls=experts_cls,
+        layer=layer,
+        routing_tables=routing_tables,
+    )
+
+
+def _quant_args_to_humming_weight_config(
+    quant_args: Any,
+    *,
+    format: str,
+) -> dict[str, Any]:
+    def _value(value):
+        return value.value if hasattr(value, "value") else value
+
+    config = {
+        "quant_method": "compressed-tensors",
+        "format": format,
+        "type": _value(quant_args.type),
+        "num_bits": quant_args.num_bits,
+        "strategy": _value(quant_args.strategy),
+        "symmetric": quant_args.symmetric,
+    }
+    group_size = getattr(quant_args, "group_size", None)
+    if group_size is not None:
+        config["group_size"] = group_size
+    elif format != "pack-quantized":
+        config["group_size"] = 0
+    actorder = getattr(quant_args, "actorder", None)
+    if actorder is not None:
+        config["actorder"] = _value(actorder)
+    return config
+
+
+def _quant_args_to_humming_input_config(
+    quant_args: Any,
+    *,
+    format: str,
+) -> dict[str, Any]:
+    def _value(value):
+        return value.value if hasattr(value, "value") else value
+
+    return {
+        "quant_method": "compressed-tensors",
+        "format": format,
+        "type": _value(quant_args.type),
+        "num_bits": quant_args.num_bits,
+        "strategy": _value(quant_args.strategy),
+        "dynamic": quant_args.dynamic,
+        "group_size": getattr(quant_args, "group_size", None) or 0,
+        "symmetric": quant_args.symmetric,
+    }
+
+
+def convert_to_humming_w4a8_moe_kernel_format(
+    layer: "RoutedExperts",
+    weight_quant: Any,
+    input_quant: Any,
+) -> None:
+    from vllm.model_executor.layers.quantization.utils.humming_utils import (
+        convert_to_humming_moe_kernel_format,
+    )
+    from vllm.utils.humming import BaseInputSchema, BaseWeightSchema
+
+    weight_schema = BaseWeightSchema.from_config(
+        _quant_args_to_humming_weight_config(
+            weight_quant,
+            format="pack-quantized",
+        )
+    )
+    input_schema = BaseInputSchema.from_config(
+        _quant_args_to_humming_input_config(
+            input_quant,
+            format="float-quantized",
+        )
+    )
+
+    convert_to_humming_moe_kernel_format(
+        layer=layer,
+        quant_config=None,
+        weight_schema=weight_schema,
+        input_schema=input_schema,
+        sublayer_configs=None,
+        force_weight_schema=None,
     )
