@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 import torch
 
+import vllm.envs as envs
+
 logger = logging.getLogger(__name__)
 
 _cutedsl_available: bool | None = None
@@ -18,6 +20,8 @@ _cutedsl_available: bool | None = None
 
 def is_available() -> bool:
     global _cutedsl_available
+    if not envs.VLLM_USE_CUTEDSL_LL_BF16:
+        return False
     if _cutedsl_available is not None:
         return _cutedsl_available
     try:

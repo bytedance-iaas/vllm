@@ -5,7 +5,7 @@ DeepseekV4 MLA Attention Layer
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -87,6 +87,91 @@ def _fill_short_context_topk_indices(
     )
 
 
+def compute_dsv4_index_cache_skip_flags(
+    compress_ratios: Sequence[int],
+    num_hidden_layers: int,
+    *,
+    use_index_cache: bool = False,
+    index_topk_freq: int = 1,
+    index_topk_pattern: str | Sequence[str] | None = None,
+    index_skip_topk_offset: int = 2,
+    local_start_layer: int = 0,
+    local_end_layer: int | None = None,
+) -> tuple[bool, ...]:
+    """Compute DeepSeek V4 C4-layer IndexCache skip decisions.
+
+    The returned tuple is indexed by global decoder layer id. Only backbone C4
+    layers may skip top-k. Since each pipeline stage owns a rank-local top-k
+    buffer, its first local C4 layer is always kept as a producer.
+    """
+    if num_hidden_layers < 0:
+        raise ValueError(
+            f"num_hidden_layers must be non-negative, got {num_hidden_layers}"
+        )
+
+    ratios = list(compress_ratios[:num_hidden_layers])
+    if len(ratios) != num_hidden_layers:
+        raise ValueError(
+            "compress_ratios must contain at least num_hidden_layers entries, "
+            f"got {len(compress_ratios)} for {num_hidden_layers} layers"
+        )
+
+    if local_end_layer is None:
+        local_end_layer = num_hidden_layers
+    if not (0 <= local_start_layer <= local_end_layer <= num_hidden_layers):
+        raise ValueError(
+            "local layer range must satisfy "
+            "0 <= local_start_layer <= local_end_layer <= num_hidden_layers, "
+            f"got [{local_start_layer}, {local_end_layer}) for "
+            f"{num_hidden_layers} layers"
+        )
+
+    skip_flags = [False] * num_hidden_layers
+    c4_layer_ids = [layer_id for layer_id, ratio in enumerate(ratios) if ratio == 4]
+    if not c4_layer_ids or not use_index_cache:
+        return tuple(skip_flags)
+
+    if index_topk_pattern is not None:
+        pattern = list(index_topk_pattern)
+        invalid_values = set(pattern) - {"F", "S"}
+        if invalid_values:
+            raise ValueError(
+                "index_topk_pattern only supports 'F' for full indexer "
+                f"layers and 'S' for shared layers, got {sorted(invalid_values)}"
+            )
+        if len(pattern) != len(c4_layer_ids):
+            raise ValueError(
+                "index_topk_pattern length must match the number of C4 layers "
+                f"({len(c4_layer_ids)}), got {len(pattern)}"
+            )
+        if pattern[0] != "F":
+            raise ValueError("index_topk_pattern must start with 'F'")
+        for c4_rank, layer_id in enumerate(c4_layer_ids):
+            skip_flags[layer_id] = pattern[c4_rank] == "S"
+    else:
+        if index_topk_freq <= 0:
+            raise ValueError(f"index_topk_freq must be positive, got {index_topk_freq}")
+        if index_skip_topk_offset < 1:
+            raise ValueError(
+                "index_skip_topk_offset must be at least 1, got "
+                f"{index_skip_topk_offset}"
+            )
+        for c4_rank, layer_id in enumerate(c4_layer_ids):
+            skip_flags[layer_id] = (
+                max(c4_rank - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+            )
+
+    local_c4_layer_ids = [
+        layer_id
+        for layer_id in c4_layer_ids
+        if local_start_layer <= layer_id < local_end_layer
+    ]
+    if local_c4_layer_ids:
+        skip_flags[local_c4_layer_ids[0]] = False
+
+    return tuple(skip_flags)
+
+
 def _resolve_dsv4_kv_cache_dtype(
     use_fp8_ds_mla_layout: bool,
     kv_cache_dtype: str,
@@ -118,6 +203,25 @@ def _resolve_dsv4_kv_cache_dtype(
         return kv_cache_dtype, torch.float8_e4m3fn
     # auto / bfloat16 -> plain bf16 KV row.
     return kv_cache_dtype, torch.bfloat16
+
+
+def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
+    """Resolve (operational_compress_ratio, use_unscaled_rope) for a layer.
+
+    NOTE(zyongye) Compress ratio can't be 0; historically every layer_id >=
+    num_hidden_layers (the MTP draft layer) was mapped to 1 because "MTP layer
+    is not included in the compress ratio list". Some checkpoints DO include
+    their MTP draft layer in compress_ratios, with an entry of 0 meaning
+    uncompressed KV and plain (unscaled) rope. The operational ratio stays
+    clamped to >= 1 (KV-cache specs treat 1 as "no compression" and divide by
+    it); a raw 0 only selects unscaled rope for that layer.
+    """
+    if layer_id < config.num_hidden_layers:
+        return max(1, config.compress_ratios[layer_id]), False
+    if layer_id < len(config.compress_ratios):
+        raw_compress_ratio = config.compress_ratios[layer_id]
+        return max(1, raw_compress_ratio), raw_compress_ratio == 0
+    return 1, False
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -183,6 +287,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         eager_scratch_pool: "DeepseekV4EagerScratchPool | None" = None,
+        skip_topk: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -204,13 +309,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
-        # NOTE(zyongye) Compress ratio can't be 0
-        # we do this for because MTP layer is not included
-        # in the compress ratio list
-        if layer_id < config.num_hidden_layers:
-            self.compress_ratio = max(1, config.compress_ratios[layer_id])
-        else:
-            self.compress_ratio = 1
+        self.compress_ratio, use_unscaled_rope = resolve_layer_compress_ratio(
+            config, layer_id
+        )
+        self.skip_topk = skip_topk
+        if self.skip_topk:
+            if self.compress_ratio != 4:
+                raise ValueError("skip_topk is only valid for C4/indexer layers")
+            if topk_indices_buffer is None:
+                raise ValueError("skip_topk requires topk_indices_buffer")
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
@@ -242,11 +349,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        wo_a_quant_config = quant_config
+        if getattr(config, "expert_dtype", "fp4") == "fp8":
+            # Some DeepSeek V4 FP8 checkpoints keep wo_a in BF16 and omit a
+            # real wo_a.scale tensor. Keep wo_a unquantized so the attention
+            # wrapper can safely fall back to the BF16 reference o-proj path.
+            wo_a_quant_config = None
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
-            quant_config=quant_config,
+            quant_config=wo_a_quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_a",
         )
@@ -268,13 +381,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
+            use_unscaled_rope=use_unscaled_rope,
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
         self.eager_scratch_pool = eager_scratch_pool
 
         self.indexer = None
-        if self.compress_ratio == 4:
+        if self.compress_ratio == 4 and not self.skip_topk:
             # Only C4A uses sparse attention and hence has indexer.
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
@@ -425,7 +539,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             aux_fns[0] = compressor_kv_score
 
-        if self.indexer is not None:
+        if self.indexer is not None and not self.skip_topk:
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
@@ -465,8 +579,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr: torch.Tensor,
         kv: torch.Tensor,
         kv_score: torch.Tensor,
-        indexer_kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        indexer_kv_score: torch.Tensor | None,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
     ) -> None:
@@ -477,9 +591,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # on the default stream so q stays on its consumer stream (forward_mqa
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
-        if self.indexer is not None:
+        if self.indexer is not None and not self.skip_topk:
             aux_streams = self.aux_stream_list
             indexer = self.indexer
+            assert indexer_kv_score is not None
+            assert indexer_weights is not None
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
             compressor = self.compressor
