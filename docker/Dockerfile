@@ -1040,6 +1040,30 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
+# Optional patched tokenizers wheel for long-prefix DecodeStream.step() GIL
+# release. Install this after vLLM so dependency resolution cannot replace it.
+ARG TOKENIZERS_RELEASE_GIL_WHEEL_AARCH64
+ARG TOKENIZERS_RELEASE_GIL_WHEEL_X86_64
+ARG TOKENIZERS_RELEASE_GIL_SHA256_AARCH64
+ARG TOKENIZERS_RELEASE_GIL_SHA256_X86_64
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        TOKENIZERS_WHEEL="${TOKENIZERS_RELEASE_GIL_WHEEL_AARCH64}"; \
+        TOKENIZERS_SHA256="${TOKENIZERS_RELEASE_GIL_SHA256_AARCH64}"; \
+    else \
+        TOKENIZERS_WHEEL="${TOKENIZERS_RELEASE_GIL_WHEEL_X86_64}"; \
+        TOKENIZERS_SHA256="${TOKENIZERS_RELEASE_GIL_SHA256_X86_64}"; \
+    fi && \
+    if [ -n "${TOKENIZERS_WHEEL}" ] || [ -n "${TOKENIZERS_SHA256}" ]; then \
+        test -n "${TOKENIZERS_WHEEL}" && test -n "${TOKENIZERS_SHA256}" && \
+        export TOKENIZERS_WHEEL TOKENIZERS_SHA256 && \
+        python3 -c 'import hashlib, os, urllib.request; url = os.environ["TOKENIZERS_WHEEL"]; expected = os.environ["TOKENIZERS_SHA256"].lower(); dst = "/tmp/tokenizers-release-gil.whl"; urllib.request.urlretrieve(url, dst); actual = hashlib.sha256(open(dst, "rb").read()).hexdigest(); assert actual == expected, f"tokenizers wheel sha256 mismatch: expected {expected}, got {actual}"; print(f"tokenizers wheel sha256 verified: {actual}")' && \
+        uv pip install --system --force-reinstall --no-deps \
+            /tmp/tokenizers-release-gil.whl && \
+        python3 -c 'import importlib.metadata as metadata; version = metadata.version("tokenizers"); assert version == "0.23.2", f"unexpected tokenizers version: {version}"; print(f"tokenizers {version} installed")' && \
+        rm -f /tmp/tokenizers-release-gil.whl; \
+    fi
+
 RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
 uv pip list
