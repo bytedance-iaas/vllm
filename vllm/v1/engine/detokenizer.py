@@ -43,6 +43,13 @@ class IncrementalDetokenizer:
         self.token_ids.extend(new_token_ids)
         return None
 
+    def needs_async_update(
+        self,
+        new_token_ids: list[int],
+        stop_terminated: bool,
+    ) -> bool:
+        return False
+
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         return ""
 
@@ -174,6 +181,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.request_id = request.request_id
         self.skip_special_tokens = sampling_params.skip_special_tokens
+        self._first_step_pending = True
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
@@ -210,6 +218,7 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
     def decode_next(self, next_token_id: int) -> str:
         token = self._protected_step(next_token_id)
+        self._first_step_pending = False
 
         if not self.spaces_between_special_tokens:
             special_token = self.added_token_ids.get(next_token_id)
@@ -220,6 +229,16 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
             self.last_special = is_special
 
         return token or ""
+
+    def needs_async_update(
+        self,
+        new_token_ids: list[int],
+        stop_terminated: bool,
+    ) -> bool:
+        num_tokens = len(new_token_ids)
+        if stop_terminated and not self.include_stop_str_in_output:
+            num_tokens -= 1
+        return self._first_step_pending and num_tokens > 0
 
     def _protected_step(self, next_token_id: int) -> str | None:
         try:
