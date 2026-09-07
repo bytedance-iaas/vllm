@@ -45,6 +45,14 @@ ARG BUILD_BASE_IMAGE=pytorch/manylinux2_28-builder:cuda13.0-78e737ad29420ffc4800
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
+# Optional apt mirror for Ubuntu-based ByteIAAS CI builds.
+ARG UBUNTU_MIRROR
+
+# DeepGEMM source defaults. Override all three for builds that require the
+# fork-only SM90 MegaMoE APIs.
+ARG DEEPGEMM_GIT_REPOSITORY=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_GIT_COMMIT=8b1392b978f5a03c828dd1711090d7fb50958b8a
+ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE=OFF
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
 # installation of the GPG key of the PPA, as done by add-apt-repository, so we
@@ -106,6 +114,9 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
+ARG DEEPGEMM_GIT_REPOSITORY
+ARG DEEPGEMM_GIT_COMMIT
+ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE
 
 # Environment for uv
 # Declared BEFORE the installer + `uv venv` invocations below so the uv
@@ -430,7 +441,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Provision one bare Python per `requires-python` entry; cmake reads
 # DEEPGEMM_PYTHON_INTERPRETERS to build DeepGEMM `_C` for each. See
 # cmake/external_projects/deepgemm.cmake for the full picture.
-COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py \
+    tools/check_deepgemm_checkout.py tools/check_deepgemm_source.py tools/
 ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
 RUN --mount=type=cache,target=/root/.cache/uv \
     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
