@@ -52,6 +52,10 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 
+# Downstream builders can select a reachable Ubuntu archive mirror without
+# changing the base image's source files out of band.
+ARG UBUNTU_MIRROR_URL
+
 # The PyPA get-pip.py script is a self contained script+zip file, that provides
 # both the installer script and the pip base85-encoded zip archive. This allows
 # bootstrapping pip in environment where a distribution package does not exist.
@@ -737,6 +741,7 @@ ARG PYTHON_VERSION
 ARG NCCL_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
+ARG UBUNTU_MIRROR_URL
 ARG GET_PIP_URL
 
 # Keep the output image's CUDA metadata aligned with the selected toolkit.
@@ -753,7 +758,20 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
 # Install Python and system dependencies
-RUN apt-get update -y \
+RUN if [ -n "${UBUNTU_MIRROR_URL}" ]; then \
+        mirror="${UBUNTU_MIRROR_URL%/}"; \
+        sed -i -E \
+            "s#https?://(archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?#${mirror}/#g" \
+            /etc/apt/sources.list 2>/dev/null || true; \
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+            sed -i -E \
+                "s#https?://(archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?#${mirror}/#g" \
+                /etc/apt/sources.list.d/ubuntu.sources; \
+        fi; \
+    fi \
+    && printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-vllm-network-retries \
+    && apt-get update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
         curl \
