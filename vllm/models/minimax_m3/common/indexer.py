@@ -23,7 +23,8 @@ from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
+from vllm.distributed.cp_mapping import get_cp_local_seq_len
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -38,6 +39,7 @@ if current_platform.is_rocm():
 else:
     from vllm.models.minimax_m3.common.ops.index_topk import (
         minimax_m3_index_decode,
+        minimax_m3_index_decode_score,
         minimax_m3_index_score,
         minimax_m3_index_topk,
     )
@@ -50,7 +52,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_cp_local_seq_lens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -58,6 +63,29 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+def _stable_lexicographic_topk(
+    scores: torch.Tensor,
+    global_ids: torch.Tensor,
+    tiers: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Order by tier desc, FP32 score desc, then global block id asc."""
+    order = torch.argsort(global_ids, dim=-1, stable=True)
+    scores = scores.gather(-1, order)
+    global_ids = global_ids.gather(-1, order)
+    tiers = tiers.gather(-1, order)
+    order = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    scores = scores.gather(-1, order)
+    global_ids = global_ids.gather(-1, order)
+    tiers = tiers.gather(-1, order)
+    order = torch.argsort(tiers, dim=-1, descending=True, stable=True)[..., :k]
+    return (
+        scores.gather(-1, order),
+        global_ids.gather(-1, order),
+        tiers.gather(-1, order),
+    )
 
 
 class MiniMaxM3IndexerBackend(AttentionBackend):
@@ -192,6 +220,8 @@ class MiniMaxM3IndexerDecodeMetadata:
     max_seq_len: int
     decode_query_len: int
     max_decode_query_len: int
+    global_kv_lens: torch.Tensor | None = None  # [num_decode_tokens] int32
+    local_kv_lens: torch.Tensor | None = None  # [num_decode_tokens] int32
 
 
 @dataclass
@@ -245,7 +275,27 @@ class MiniMaxM3IndexerMetadataBuilder(
         else:
             assert tp_size % total_index_heads == 0
         self.num_index_heads = max(1, total_index_heads // tp_size)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.sparse_block_size = sparse_cfg["sparse_block_size"]
+        if self.dcp_world_size > 1:
+            if not current_platform.is_cuda():
+                raise NotImplementedError(
+                    "MiniMax M3 sparse-indexer DCP currently supports CUDA only."
+                )
+            if self.cp_kv_cache_interleave_size != self.sparse_block_size:
+                raise NotImplementedError(
+                    "MiniMax M3 sparse-indexer DCP requires block-level KV "
+                    f"interleave ({self.sparse_block_size}), got "
+                    f"{self.cp_kv_cache_interleave_size}."
+                )
+        self._init_reorder_batch_threshold(
+            1,
+            supports_spec_as_decode=True,
+            supports_dcp_with_varlen=True,
+        )
         assert self.reorder_batch_threshold is not None
         self.max_decode_query_len = self.reorder_batch_threshold
 
@@ -261,6 +311,22 @@ class MiniMaxM3IndexerMetadataBuilder(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
             device=device,
+        )
+        self.global_decode_kv_lens_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.local_decode_kv_lens_buffer = torch.empty_like(
+            self.global_decode_kv_lens_buffer
+        )
+
+    def _localize_max_seq_len(self, max_seq_len: int) -> int:
+        return get_cp_local_seq_len(
+            max_seq_len,
+            cp_world_size=self.dcp_world_size,
+            cp_rank=self.dcp_rank,
+            interleave_size=self.cp_kv_cache_interleave_size,
         )
 
 
@@ -318,12 +384,44 @@ class MiniMaxM3IndexerTritonMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
             )
             assert num_decode_tokens == num_decodes * decode_query_len
+            global_kv_lens: torch.Tensor | None = None
+            local_kv_lens: torch.Tensor | None = None
+            if self.dcp_world_size > 1:
+                q_offsets = torch.arange(
+                    1,
+                    decode_query_len + 1,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
+                global_kv_lens = self.global_decode_kv_lens_buffer[:num_decode_tokens]
+                global_kv_lens.copy_(
+                    (
+                        seq_lens[:num_decodes, None]
+                        - decode_query_len
+                        + q_offsets[None, :]
+                    )
+                    .clamp_min(0)
+                    .flatten()
+                )
+                local_kv_lens = self.local_decode_kv_lens_buffer[:num_decode_tokens]
+                local_kv_lens.copy_(
+                    get_cp_local_seq_lens(
+                        global_kv_lens,
+                        self.dcp_world_size,
+                        self.dcp_rank,
+                        self.cp_kv_cache_interleave_size,
+                    )
+                )
             decode_metadata = MiniMaxM3IndexerDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
-                max_seq_len=common_attn_metadata.max_seq_len,
+                max_seq_len=self._localize_max_seq_len(
+                    common_attn_metadata.max_seq_len
+                ),
                 decode_query_len=decode_query_len,
                 max_decode_query_len=self.max_decode_query_len,
+                global_kv_lens=global_kv_lens,
+                local_kv_lens=local_kv_lens,
             )
 
         return MiniMaxM3IndexerMetadata(
@@ -403,6 +501,104 @@ class MiniMaxM3IndexerImpl(nn.Module):
 class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
     """Triton indexer score + top-k for both prefill and decode."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        parallel_config = get_current_vllm_config().parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        if (
+            self.dcp_world_size > 1
+            and self.cp_kv_cache_interleave_size != self.block_size
+        ):
+            raise NotImplementedError(
+                "MiniMax M3 Triton indexer DCP requires block-level KV "
+                f"interleave ({self.block_size}), got "
+                f"{self.cp_kv_cache_interleave_size}."
+            )
+
+    def _select_dcp_global_topk(
+        self,
+        score: torch.Tensor,
+        global_kv_lens: torch.Tensor,
+        out: torch.Tensor,
+        max_local_blocks: int,
+    ) -> torch.Tensor:
+        """Select exact global block top-k, then localize to this owner rank."""
+        score = score[:, :, :max_local_blocks]
+        nan_mask = torch.isnan(score)
+        score = torch.where(nan_mask, score.new_full((), float("-inf")), score)
+        local_ids = torch.arange(
+            max_local_blocks, dtype=torch.int32, device=score.device
+        )
+        global_ids = local_ids * self.dcp_world_size + self.dcp_rank
+        global_num_blocks = (global_kv_lens + self.block_size - 1) // self.block_size
+        valid = global_ids[None, None, :] < global_num_blocks[None, :, None]
+        score = score.masked_fill(~valid, float("-inf"))
+
+        init_mask = global_ids[None, None, :] < self.init_blocks
+        local_start = (global_num_blocks - self.local_blocks).clamp_min(0)
+        local_mask = global_ids[None, None, :] >= local_start[None, :, None]
+        tiers = torch.zeros_like(score, dtype=torch.int32)
+        tiers = torch.where(valid & local_mask, tiers.new_full((), 1), tiers)
+        tiers = torch.where(valid & init_mask, tiers.new_full((), 2), tiers)
+        tiers.masked_fill_(~valid | (nan_mask & (tiers == 0)), -1)
+
+        local_k = min(self.topk_blocks, max_local_blocks)
+        expanded_global_ids = global_ids.view(1, 1, -1).expand_as(score)
+        candidate_scores, candidate_global_ids, candidate_tiers = (
+            _stable_lexicographic_topk(
+                score,
+                expanded_global_ids,
+                tiers,
+                local_k,
+            )
+        )
+        candidate_valid = candidate_tiers >= 0
+        candidate_global_ids.masked_fill_(~candidate_valid, -1)
+        candidate_tiers.masked_fill_(~candidate_valid, -1)
+        if local_k < self.topk_blocks:
+            pad = self.topk_blocks - local_k
+            candidate_scores = torch.nn.functional.pad(
+                candidate_scores, (0, pad), value=float("-inf")
+            )
+            candidate_global_ids = torch.nn.functional.pad(
+                candidate_global_ids, (0, pad), value=-1
+            )
+            candidate_tiers = torch.nn.functional.pad(
+                candidate_tiers, (0, pad), value=-1
+            )
+
+        packed = torch.stack(
+            (
+                candidate_scores,
+                candidate_global_ids.to(torch.float32),
+                candidate_tiers.to(torch.float32),
+            ),
+            dim=-1,
+        )
+        gathered = get_dcp_group().all_gather(packed.contiguous(), dim=2)
+        _, selected_global_ids, selected_tiers = _stable_lexicographic_topk(
+            gathered[..., 0],
+            gathered[..., 1].to(torch.int32),
+            gathered[..., 2].to(torch.int32),
+            self.topk_blocks,
+        )
+        selected_valid = selected_tiers >= 0
+        selected_global_ids.masked_fill_(~selected_valid, -1)
+        selected_tiers.masked_fill_(~selected_valid, -1)
+
+        owned = (selected_global_ids >= 0) & (
+            selected_global_ids % self.dcp_world_size == self.dcp_rank
+        )
+        localized = torch.where(
+            owned,
+            selected_global_ids // self.dcp_world_size,
+            selected_global_ids.new_full((), -1),
+        )
+        out.copy_(localized)
+        return out
+
     def forward(
         self,
         index_query: torch.Tensor,
@@ -431,21 +627,56 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         if index_md.num_decodes > 0:
             d = index_md.decode
             assert d is not None
-            decode_topk = minimax_m3_index_decode(
-                iq[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                out=buf_htk,
-            )
+            if self.dcp_world_size > 1:
+                assert d.global_kv_lens is not None
+                assert d.local_kv_lens is not None
+                if buf_htk is None:
+                    raise RuntimeError(
+                        "MiniMax M3 DCP requires a persistent top-k output buffer."
+                    )
+                score = minimax_m3_index_decode_score(
+                    iq[:nd],
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.max_seq_len,
+                    0,
+                    0,
+                    self.num_kv_heads,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    kv_lens=d.local_kv_lens,
+                )
+                max_local_blocks = (
+                    d.max_seq_len + self.block_size - 1
+                ) // self.block_size
+                decode_topk = self._select_dcp_global_topk(
+                    score,
+                    d.global_kv_lens,
+                    buf_htk[:, :nd, :],
+                    max_local_blocks,
+                )
+            else:
+                decode_topk = minimax_m3_index_decode(
+                    iq[:nd],
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.max_seq_len,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    out=buf_htk,
+                )
         if index_md.num_prefills > 0:
+            if self.dcp_world_size > 1:
+                raise NotImplementedError(
+                    "MiniMax M3 Triton DCP currently supports decode-only "
+                    "batches; sparse prefill DCP is not implemented."
+                )
             p = index_md.prefill
             assert p is not None
             score = minimax_m3_index_score(
@@ -489,6 +720,22 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
+    dcp_world_size = (
+        get_current_vllm_config().parallel_config.decode_context_parallel_size
+    )
+    if dcp_world_size > 1:
+        if indexer_kv_dtype != "bf16":
+            raise NotImplementedError(
+                "MiniMax M3 DCP requires the BF16 Triton indexer, got "
+                f"indexer_kv_dtype={indexer_kv_dtype!r}."
+            )
+        logger.info_once(
+            "MiniMax M3 indexer: selected Triton for DCP "
+            "[topk_blocks=%d, dcp_world_size=%d]",
+            topk_blocks,
+            dcp_world_size,
+        )
+        return MiniMaxM3IndexerTritonImpl
     is_sm100 = (
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
     )

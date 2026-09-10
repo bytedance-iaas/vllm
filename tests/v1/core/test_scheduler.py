@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -42,6 +43,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
+from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1200,6 +1202,246 @@ def test_preempt_during_execution():
     assert requests[1].output_token_ids[0] == 42
 
 
+def test_decode_only_dcp_running_allocation_failure_is_an_error():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=100,
+        block_size=16,
+        num_blocks=11,
+        enable_prefix_caching=False,
+    )
+    requests = create_requests(num_requests=2, num_tokens=80, block_size=16)
+
+    scheduler.add_request(requests[0])
+    scheduler_output0 = scheduler.schedule()
+    scheduler.add_request(requests[1])
+    scheduler_output1 = scheduler.schedule()
+
+    scheduler.update_from_output(
+        scheduler_output0,
+        ModelRunnerOutput(
+            req_ids=[requests[0].request_id],
+            req_id_to_index={requests[0].request_id: 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler._decode_only_dcp_no_preemption = True
+    scheduler._preempt_request = Mock(
+        side_effect=AssertionError("strict DCP must not preempt")
+    )
+    failed_output = scheduler.schedule()
+
+    error_outputs = scheduler.update_from_output(
+        scheduler_output1,
+        ModelRunnerOutput(
+            req_ids=[requests[1].request_id],
+            req_id_to_index={requests[1].request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    scheduler.update_from_output(
+        failed_output,
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+    )
+
+    scheduler._preempt_request.assert_not_called()
+    assert requests[0].status == RequestStatus.FINISHED_ERROR
+    assert requests[1].status == RequestStatus.RUNNING
+    failed_request_output = next(
+        output
+        for output in error_outputs[0].outputs
+        if output.request_id == requests[0].request_id
+    )
+    assert failed_request_output.finish_reason == FinishReason.ERROR
+
+
+@pytest.mark.parametrize(
+    (
+        "enabled",
+        "prompt_tokens",
+        "max_tokens",
+        "lookahead_tokens",
+        "max_model_len",
+        "expected",
+    ),
+    [
+        (True, 7000, 1500, 3, 16384, 8505),
+        (True, 9000, 9000, 3, 16384, 16384),
+        (False, 7000, 1500, 3, 16384, None),
+    ],
+)
+def test_decode_only_dcp_reserves_full_generation_budget(
+    enabled: bool,
+    prompt_tokens: int,
+    max_tokens: int,
+    lookahead_tokens: int,
+    max_model_len: int,
+    expected: int | None,
+):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._decode_only_dcp_no_preemption = enabled
+    scheduler.num_lookahead_tokens = lookahead_tokens
+    scheduler.max_model_len = max_model_len
+    request = SimpleNamespace(
+        num_prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+    )
+
+    assert scheduler._get_full_sequence_admission_tokens(request) == expected
+
+
+def test_decode_only_dcp_reserves_running_and_inflight_growth():
+    scheduler = Scheduler.__new__(Scheduler)
+    running = Mock(request_id="a")
+    inflight = Mock(request_id="b")
+    scheduler.running = [running]
+    scheduler._inflight_prefills = {running, inflight}
+    scheduler._request_remaining_blocks = Mock(
+        side_effect=lambda req: 6 if req is running else 9
+    )
+
+    assert scheduler._active_full_sequence_reserved_blocks() == 15
+    assert scheduler._active_full_sequence_reserved_blocks(exclude=running) == 9
+    assert scheduler._active_full_sequence_reserved_blocks(exclude=inflight) == 6
+
+
+@pytest.mark.parametrize(
+    ("required_blocks", "expected"),
+    [
+        (63, False),
+        (64, True),
+        (65, True),
+    ],
+)
+def test_decode_only_dcp_rejects_request_exceeding_usable_parent_blocks(
+    required_blocks: int,
+    expected: bool,
+):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._decode_only_dcp_no_preemption = True
+    scheduler.max_model_len = 32768
+    scheduler.block_size = 256
+    scheduler.num_lookahead_tokens = 0
+    scheduler.kv_cache_manager = SimpleNamespace(
+        block_pool=SimpleNamespace(num_gpu_blocks=64)
+    )
+    request = Mock(
+        num_prompt_tokens=required_blocks * scheduler.block_size,
+        max_tokens=0,
+    )
+
+    assert scheduler._decode_only_dcp_request_exceeds_capacity(request) is expected
+
+
+def test_decode_only_dcp_reserves_rejected_draft_tail_across_block_boundary():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._decode_only_dcp_no_preemption = True
+    scheduler.max_model_len = 512
+    scheduler.block_size = 256
+    scheduler.num_lookahead_tokens = 3
+    scheduler.kv_cache_manager = SimpleNamespace(
+        block_pool=SimpleNamespace(num_gpu_blocks=2)
+    )
+    request = Mock(num_prompt_tokens=200, max_tokens=53)
+
+    assert scheduler._get_full_sequence_admission_tokens(request) == 258
+    assert scheduler._decode_only_dcp_request_exceeds_capacity(request)
+
+
+def test_decode_only_dcp_admission_accounts_for_shared_prefix():
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=128,
+        max_model_len=128,
+        block_size=block_size,
+        num_blocks=10,  # 9 usable blocks.
+        enable_prefix_caching=True,
+    )
+    scheduler._decode_only_dcp_no_preemption = True
+    scheduler.scheduler_reserve_full_isl = False
+    requests = create_requests(
+        num_requests=2,
+        num_tokens=4 * block_size,
+        max_tokens=2 * block_size,
+        same_prompt=True,
+        block_size=block_size,
+    )
+
+    scheduler.add_request(requests[0])
+    first_output = scheduler.schedule()
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[requests[0].request_id],
+            req_id_to_index={requests[0].request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.add_request(requests[1])
+    shared_output = scheduler.schedule()
+
+    # Raw budgets need 12 blocks, but the four-block prompt is shared:
+    # 4 shared prompt blocks + 2 output blocks per request = 8 <= 9.
+    assert requests[1].request_id in {
+        request.req_id for request in shared_output.scheduled_new_reqs
+    }
+    assert len(scheduler.running) == 2
+    assert not scheduler.capacity_error_reqs
+
+
+def test_decode_only_dcp_oversized_request_fails_without_blocking_queue():
+    block_size = 16
+    scheduler = create_scheduler(
+        max_num_batched_tokens=256,
+        max_model_len=256,
+        block_size=block_size,
+        num_blocks=10,  # 9 usable blocks.
+        enable_prefix_caching=False,
+    )
+    scheduler._decode_only_dcp_no_preemption = True
+    [oversized] = create_requests(
+        num_requests=1,
+        num_tokens=9 * block_size,
+        max_tokens=block_size,
+        block_size=block_size,
+        req_ids=["oversized"],
+    )
+    [small] = create_requests(
+        num_requests=1,
+        num_tokens=block_size,
+        max_tokens=block_size,
+        block_size=block_size,
+        req_ids=["small"],
+    )
+
+    scheduler.add_request(oversized)
+    scheduler.add_request(small)
+
+    error_schedule = scheduler.schedule()
+    assert not error_schedule.num_scheduled_tokens
+    error_outputs = scheduler.update_from_output(
+        error_schedule,
+        ModelRunnerOutput(req_ids=[], req_id_to_index={}),
+    )
+    assert oversized.status == RequestStatus.FINISHED_ERROR
+    assert error_outputs[0].outputs[0].finish_reason == FinishReason.ERROR
+
+    next_output = scheduler.schedule()
+    assert small.request_id in {
+        request.req_id for request in next_output.scheduled_new_reqs
+    }
+
+
 def test_scheduler_reset_prefix_cache():
     scheduler = create_scheduler(enable_prefix_caching=True)
     requests = create_requests(num_requests=10)
@@ -1229,6 +1471,38 @@ def test_scheduler_reset_prefix_cache():
 
     for i, request in enumerate(requests):
         assert scheduler.waiting[i] == request
+
+
+def test_decode_only_dcp_rejects_forced_prefix_cache_reset():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._decode_only_dcp_no_preemption = True
+    scheduler.running = [Mock(status=RequestStatus.RUNNING)]
+    scheduler.kv_cache_manager = Mock()
+    scheduler._preempt_request = Mock()
+
+    with pytest.raises(RuntimeError, match="strict DCP decode"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    assert len(scheduler.running) == 1
+    scheduler._preempt_request.assert_not_called()
+    scheduler.kv_cache_manager.reset_prefix_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("core_cls", [EngineCore, EngineCoreProc])
+def test_keep_pause_rejects_unsafe_strict_dcp_cache_reset(core_cls):
+    core = core_cls.__new__(core_cls)
+    core.scheduler = Mock()
+    core.scheduler.validate_prefix_cache_reset.side_effect = RuntimeError(
+        "strict DCP decode"
+    )
+
+    with pytest.raises(RuntimeError, match="strict DCP decode"):
+        core.pause_scheduler(mode="keep", clear_cache=True)
+
+    core.scheduler.validate_prefix_cache_reset.assert_called_once_with(
+        reset_running_requests=True
+    )
+    core.scheduler.set_pause_state.assert_not_called()
 
 
 def test_reset_connector_cache_no_connector_is_no_op_success():

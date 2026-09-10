@@ -32,6 +32,21 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _get_eagle3_target_layer_count(vllm_config: VllmConfig) -> int:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    if getattr(
+        speculative_config,
+        "enable_eagle3_prefill_draft_kv",
+        False,
+    ):
+        target_layer_count = vllm_config.model_config.get_total_num_hidden_layers()
+        if target_layer_count != 60:
+            raise ValueError("EAGLE3 Prefill draft-KV requires 60 global target layers")
+        return target_layer_count
+    return vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+
+
 class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
@@ -278,9 +293,7 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         if getattr(self.config, "draft_vocab_size", None) is None:
             base_vocab_size = getattr(self.config, "vocab_size", None)
             self.config.draft_vocab_size = base_vocab_size
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        target_layer_num = _get_eagle3_target_layer_count(vllm_config)
 
         # Store target layer count in draft config for
         # proper layer_types indexing in draft models

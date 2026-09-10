@@ -291,6 +291,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
+        full_sequence_num_tokens: int | None = None,
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
@@ -318,6 +319,8 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
+            full_sequence_num_tokens: Optional full-sequence token budget for the
+                admission check. Defaults to the request's current token count.
             reserved_blocks: Number of free blocks that must be left available for
                 other in-flight sequences to complete. The actual allocation is only
                 made if it fits within (free blocks - reserved_blocks). Used to gate
@@ -410,7 +413,10 @@ class KVCacheManager:
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_num_tokens = min(
+                full_sequence_num_tokens or request.num_tokens,
+                self.max_model_len,
+            )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
@@ -422,7 +428,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
+            required_blocks = (
+                num_blocks_to_allocate + watermark_blocks + reserved_blocks
+            )
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 

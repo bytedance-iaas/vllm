@@ -16,6 +16,7 @@ from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
@@ -168,6 +169,20 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    enable_eagle3_prefill_draft_kv: bool = False
+    """Run EAGLE3 K=1 as a last-stage sidecar on a supported PP Prefill
+    producer to materialize prompt draft KV. This does not enable draft-KV
+    transfer or Decode consumption."""
+
+    enable_eagle3_replicated_draft_kv: bool = False
+    """Give the EAGLE3 draft layer full-temporal KV storage and effective-DCP1
+    attention on a supported DCP Decode instance."""
+
+    enable_eagle3_target_dense_full_temporal_kv: bool = False
+    """Give MiniMax-M3 target dense layers 0..2 full-temporal KV storage and
+    effective-DCP1 attention. Requires a supported Prefill draft-KV producer
+    or replicated-draft Decode configuration."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -325,6 +340,9 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        factors.append(self.enable_eagle3_prefill_draft_kv)
+        factors.append(self.enable_eagle3_replicated_draft_kv)
+        factors.append(self.enable_eagle3_target_dense_full_temporal_kv)
 
         if uses_aux_hidden_states and self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1203,6 +1221,113 @@ class SpeculativeConfig:
             return AttentionBackendEnum[value.upper()]
         return value
 
+    def _verify_eagle3_prefill_draft_kv(self) -> None:
+        errors: list[str] = []
+        parallel_config = self.target_parallel_config
+        target_architectures = self.target_model_config.architectures or []
+        draft_config = self.draft_model_config
+        if self.method != "eagle3":
+            errors.append("method must be eagle3")
+        if self.num_speculative_tokens != 1:
+            errors.append("num_speculative_tokens must be 1")
+        if not current_platform.is_cuda():
+            errors.append("CUDA is required")
+        if not any("MiniMaxM3" in str(arch) for arch in target_architectures):
+            errors.append("target architecture must be MiniMaxM3")
+        if self.target_model_config.get_total_num_hidden_layers() != 60:
+            errors.append("target model must contain exactly 60 layers")
+        if parallel_config.pipeline_parallel_size != 2:
+            errors.append("pipeline_parallel_size must be 2")
+        if parallel_config.tensor_parallel_size != 4:
+            errors.append("tensor_parallel_size must be 4")
+        if parallel_config.decode_context_parallel_size != 1:
+            errors.append("decode_context_parallel_size must be 1")
+        if self.parallel_drafting:
+            errors.append("parallel drafting must be disabled")
+        if self.uses_dynamic_speculative_decoding():
+            errors.append("dynamic speculative decoding must be disabled")
+        if draft_config is None:
+            errors.append("draft model config is required")
+        else:
+            draft_hf_config = draft_config.hf_config
+            if getattr(draft_hf_config, "num_hidden_layers", None) != 1:
+                errors.append("draft model must contain exactly one layer")
+            if getattr(draft_hf_config, "num_attention_heads", None) != 64:
+                errors.append("draft model must have 64 attention heads")
+            if getattr(draft_hf_config, "num_key_value_heads", None) != 64:
+                errors.append("draft model must have 64 KV heads")
+            if getattr(draft_hf_config, "head_dim", None) != 128:
+                errors.append("draft model head_dim must be 128")
+        draft_parallel_config = self.draft_parallel_config
+        if (
+            draft_parallel_config is None
+            or draft_parallel_config.tensor_parallel_size != 4
+        ):
+            errors.append("draft tensor_parallel_size must be 4")
+        if errors:
+            raise ValueError(
+                "EAGLE3 Prefill draft-KV requirements not met: " + "; ".join(errors)
+            )
+
+    def _verify_eagle3_replicated_draft_kv(self) -> None:
+        errors: list[str] = []
+        parallel_config = self.target_parallel_config
+        target_architectures = self.target_model_config.architectures or []
+        draft_config = self.draft_model_config
+        if self.method != "eagle3":
+            errors.append("method must be eagle3")
+        if self.num_speculative_tokens != 3:
+            errors.append("num_speculative_tokens must be 3")
+        if not current_platform.is_cuda():
+            errors.append("CUDA is required")
+        if not any("MiniMaxM3" in str(arch) for arch in target_architectures):
+            errors.append("target architecture must be MiniMaxM3")
+        if self.target_model_config.get_total_num_hidden_layers() != 60:
+            errors.append("target model must contain exactly 60 layers")
+        if parallel_config.pipeline_parallel_size != 1:
+            errors.append("pipeline_parallel_size must be 1")
+        if parallel_config.tensor_parallel_size != 8:
+            errors.append("tensor_parallel_size must be 8")
+        if parallel_config.decode_context_parallel_size not in (1, 2):
+            errors.append("decode_context_parallel_size must be 1 or 2")
+        if parallel_config.prefill_context_parallel_size != 1:
+            errors.append("prefill_context_parallel_size must be 1")
+        if parallel_config.data_parallel_size != 1:
+            errors.append("data_parallel_size must be 1")
+        if parallel_config.use_ubatching:
+            errors.append("ubatching must be disabled")
+        if self.parallel_drafting:
+            errors.append("parallel drafting must be disabled")
+        if self.uses_dynamic_speculative_decoding():
+            errors.append("dynamic speculative decoding must be disabled")
+        if draft_config is None:
+            errors.append("draft model config is required")
+        else:
+            draft_hf_config = draft_config.hf_config
+            if getattr(draft_hf_config, "num_hidden_layers", None) != 1:
+                errors.append("draft model must contain exactly one layer")
+            if getattr(draft_hf_config, "num_attention_heads", None) != 64:
+                errors.append("draft model must have 64 attention heads")
+            if getattr(draft_hf_config, "num_key_value_heads", None) != 64:
+                errors.append("draft model must have 64 KV heads")
+            if getattr(draft_hf_config, "head_dim", None) != 128:
+                errors.append("draft model head_dim must be 128")
+        draft_parallel_config = self.draft_parallel_config
+        if (
+            draft_parallel_config is None
+            or draft_parallel_config.tensor_parallel_size != 8
+        ):
+            errors.append("draft tensor_parallel_size must be 8")
+        if errors:
+            raise ValueError(
+                "EAGLE3 replicated draft-KV requirements not met: " + "; ".join(errors)
+            )
+
+    def _verify_eagle3_target_dense_full_temporal_kv(self) -> None:
+        # Execution-mode validation belongs to the Decode proposer, where the
+        # resolved CUDA Graph mode is available.
+        return None
+
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
         if self.tensor_parallel_size is not None:
@@ -1242,9 +1367,53 @@ class SpeculativeConfig:
             )
 
         if self.draft_model_config:
-            self.draft_model_config.verify_with_parallel_config(
-                self.draft_parallel_config
+            if self.uses_extract_hidden_states() or self.enable_eagle3_prefill_draft_kv:
+                pp_size = self.target_parallel_config.pipeline_parallel_size
+                if self.uses_extract_hidden_states():
+                    supports_transport = getattr(
+                        self.target_model_config.hf_text_config,
+                        "supports_pp_aux_hidden_state_transport",
+                        False,
+                    )
+                else:
+                    supports_transport = True
+                if pp_size > 1 and (
+                    not supports_transport or not current_platform.is_cuda()
+                ):
+                    raise NotImplementedError(
+                        "The target model does not support pipeline-parallel "
+                        "auxiliary hidden-state transport required by "
+                        f"{self.method}."
+                    )
+                # These modes instantiate their draft/cache writer only on
+                # the last target PP rank. They are sidecars, not
+                # pipeline-partitioned draft models. The target model has
+                # already been validated for PP.
+            else:
+                self.draft_model_config.verify_with_parallel_config(
+                    self.draft_parallel_config
+                )
+
+        if self.enable_eagle3_prefill_draft_kv:
+            self._verify_eagle3_prefill_draft_kv()
+        if self.enable_eagle3_replicated_draft_kv:
+            if self.enable_eagle3_prefill_draft_kv:
+                raise ValueError(
+                    "Prefill draft-KV production and Decode replicated "
+                    "draft-KV cannot be enabled together"
+                )
+            self._verify_eagle3_replicated_draft_kv()
+        if (
+            self.enable_eagle3_target_dense_full_temporal_kv
+            and not self.enable_eagle3_prefill_draft_kv
+            and not self.enable_eagle3_replicated_draft_kv
+        ):
+            raise ValueError(
+                "EAGLE3 target dense full-temporal KV requires either "
+                "Prefill draft-KV production or Decode replicated draft-KV"
             )
+        if self.enable_eagle3_target_dense_full_temporal_kv:
+            self._verify_eagle3_target_dense_full_temporal_kv()
 
         if (
             self.dynamic_sd_dp_batch_policy is not None

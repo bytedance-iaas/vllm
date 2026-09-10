@@ -852,6 +852,9 @@ class EngineCore:
         if mode == "wait":
             raise ValueError("'wait' mode can't be used in inproc-engine mode")
 
+        if mode == "keep" and clear_cache:
+            self.scheduler.validate_prefix_cache_reset(reset_running_requests=True)
+
         if mode == "abort":
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
 
@@ -1795,6 +1798,9 @@ class EngineCoreProc(EngineCore):
         """
         if mode not in ("keep", "abort", "wait"):
             raise ValueError(f"Invalid pause mode: {mode}")
+
+        if mode == "keep" and clear_cache:
+            self.scheduler.validate_prefix_cache_reset(reset_running_requests=True)
 
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             if clear_cache:

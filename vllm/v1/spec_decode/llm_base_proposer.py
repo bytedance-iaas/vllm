@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.vocab_mapping import VocabMapping
 
 from vllm.distributed.eplb.eplb_state import EplbState
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -39,7 +39,12 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    HiddenStateCacheSpec,
+    KVCacheConfig,
+    KVCacheTemporalLayout,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -49,16 +54,20 @@ from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
+    _advance_cpu_sequence_metadata,
     compute_new_slot_mapping,
     copy_and_expand_eagle_inputs_kernel,
     eagle_prepare_inputs_padded_kernel,
     eagle_prepare_next_token_padded_kernel,
     eagle_step_update_slot_mapping_and_metadata,
+    expand_dcp_parent_block_table,
     extend_all_queries_by_N,
+    get_eagle3_draft_attention_layer_name,
     next_power_of_2,
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -85,6 +94,21 @@ class SpecDecodeBaseProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        parallel_config = vllm_config.parallel_config
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.replicated_draft_kv = bool(
+            getattr(
+                self.speculative_config,
+                "enable_eagle3_replicated_draft_kv",
+                False,
+            )
+        )
+        self.draft_dcp_world_size = (
+            1 if self.replicated_draft_kv else self.dcp_world_size
+        )
+        self.draft_dcp_rank = 0 if self.replicated_draft_kv else self.dcp_rank
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
@@ -114,6 +138,7 @@ class SpecDecodeBaseProposer:
             1 if (self.pass_hidden_states_to_model and self.method != "dflash") else 0
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
+        self._validate_replicated_draft_kv_config()
 
         # When True, all draft steps reuse the same position as the
         # first step instead of advancing by one each iteration.
@@ -151,6 +176,9 @@ class SpecDecodeBaseProposer:
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
+        self._replicated_draft_impl: Any | None = None
+        self._replicated_draft_block_table: torch.Tensor | None = None
+        self._replicated_draft_reject_mask: torch.Tensor | None = None
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
@@ -317,6 +345,88 @@ class SpecDecodeBaseProposer:
 
             self.allowed_attn_types = tuple(rocm_types)
 
+    def _validate_replicated_draft_kv_config(self) -> None:
+        if not self.replicated_draft_kv:
+            return
+
+        parallel_config = self.vllm_config.parallel_config
+        draft_hf_config = self.draft_model_config.hf_config
+        target_architectures = self.vllm_config.model_config.architectures or []
+        errors = []
+        if self.method != "eagle3":
+            errors.append("speculative method must be eagle3")
+        if not any("MiniMaxM3" in str(arch) for arch in target_architectures):
+            errors.append("target architecture must be MiniMaxM3")
+        if self.vllm_config.model_config.get_num_layers(parallel_config) != 60:
+            errors.append("target model must contain exactly 60 layers")
+        if parallel_config.tensor_parallel_size != 8:
+            errors.append("tensor_parallel_size must be 8")
+        if (
+            self.replicated_draft_kv
+            and parallel_config.decode_context_parallel_size not in (1, 2)
+        ):
+            errors.append("decode_context_parallel_size must be 1 or 2")
+        if parallel_config.pipeline_parallel_size != 1:
+            errors.append("pipeline_parallel_size must be 1")
+        if parallel_config.prefill_context_parallel_size != 1:
+            errors.append("prefill_context_parallel_size must be 1")
+        if parallel_config.data_parallel_size != 1:
+            errors.append("data_parallel_size must be 1")
+        if parallel_config.use_ubatching:
+            errors.append("ubatching must be disabled")
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        if (
+            self.vllm_config.model_config.enforce_eager
+            and cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            errors.append("eager execution requires cudagraph_mode=NONE")
+        elif (
+            not self.vllm_config.model_config.enforce_eager
+            and cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+        ):
+            errors.append(
+                "non-eager execution requires cudagraph_mode=FULL_DECODE_ONLY"
+            )
+        if self.vllm_config.scheduler_config.async_scheduling:
+            errors.append("async scheduling must be disabled")
+        if self.vllm_config.cache_config.kv_offloading_size is not None:
+            errors.append("KV offloading must be disabled")
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is not None:
+            mooncake_consumer = (
+                kv_transfer_config.kv_connector == "MooncakeConnector"
+                and kv_transfer_config.kv_role == "kv_consumer"
+                and kv_transfer_config.kv_connector_module_path is None
+                and kv_transfer_config.kv_load_failure_policy == "fail"
+            )
+            if not mooncake_consumer:
+                errors.append(
+                    "KV transfer requires the built-in Mooncake consumer in fail mode"
+                )
+        if self.parallel_drafting:
+            errors.append("parallel drafting must be disabled")
+        if self.needs_extra_input_slots:
+            errors.append("extra-input-slot drafting is not supported")
+        if self.vllm_config.cache_config.block_size != 128:
+            errors.append("KV cache block size must be 128")
+        if (
+            self.replicated_draft_kv
+            and parallel_config.cp_kv_cache_interleave_size != 128
+        ):
+            errors.append("DCP KV cache interleave size must be 128")
+        if getattr(draft_hf_config, "num_hidden_layers", None) != 1:
+            errors.append("draft model must contain exactly one layer")
+        if getattr(draft_hf_config, "num_attention_heads", None) != 64:
+            errors.append("draft model must have 64 attention heads")
+        if getattr(draft_hf_config, "num_key_value_heads", None) != 64:
+            errors.append("draft model must have 64 KV heads")
+        if getattr(draft_hf_config, "head_dim", None) != 128:
+            errors.append("draft model head_dim must be 128")
+        if errors:
+            raise ValueError(
+                "EAGLE3 replicated draft-KV requirements not met: " + "; ".join(errors)
+            )
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -399,6 +509,12 @@ class SpecDecodeBaseProposer:
 
         If slot_mapping is provided, copies it into the buffer first.
         """
+        if self.replicated_draft_kv:
+            impl = self._replicated_draft_impl
+            if impl is None or impl.dcp_world_size != 1 or impl.dcp_rank != 0:
+                raise RuntimeError(
+                    "Replicated draft KV requires effective DCP1 attention"
+                )
         if slot_mapping is not None:
             num_actual = slot_mapping.shape[0]
             self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
@@ -499,6 +615,52 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def _build_replicated_draft_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_tokens: int,
+    ) -> CommonAttentionMetadata:
+        expanded_block_table = expand_dcp_parent_block_table(
+            common_attn_metadata.block_table_tensor,
+            dcp_world_size=self.dcp_world_size,
+            max_model_len=self.max_model_len,
+            kernel_block_size=self.block_size,
+        )
+        block_table_buffer = self._replicated_draft_block_table
+        if block_table_buffer is None:
+            raise RuntimeError("Replicated draft KV metadata is not initialized")
+        num_reqs, num_blocks = expanded_block_table.shape
+        block_table = block_table_buffer[:num_reqs, :num_blocks]
+        block_table.copy_(expanded_block_table)
+        block_table_buffer[:num_reqs, num_blocks:].zero_()
+        draft_metadata = common_attn_metadata.replace(
+            block_table_tensor=block_table,
+            dcp_local_seq_lens=None,
+            dcp_local_seq_lens_cpu=None,
+        )
+        positions = self._get_positions(num_tokens)
+        if positions.ndim > 1:
+            positions = positions[0]
+        reject_mask = self._replicated_draft_reject_mask
+        if reject_mask is None:
+            raise RuntimeError("Replicated draft KV reject mask is not initialized")
+        reject_mask[:num_tokens].zero_()
+        computed_slot_mapping = compute_new_slot_mapping(
+            cad=draft_metadata,
+            new_positions=positions,
+            is_rejected_token_mask=reject_mask[:num_tokens],
+            block_size=self.block_size,
+            num_new_tokens=0,
+            max_model_len=self.max_model_len,
+            dcp_world_size=1,
+            dcp_rank=0,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+        )
+        slot_mapping = self._slot_mapping_buffer[:num_tokens]
+        slot_mapping.copy_(computed_slot_mapping)
+        draft_metadata.slot_mapping = slot_mapping
+        return draft_metadata
+
     def propose(
         self,
         num_speculative_tokens,
@@ -553,6 +715,11 @@ class SpecDecodeBaseProposer:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         )
+        if self.replicated_draft_kv:
+            common_attn_metadata = self._build_replicated_draft_metadata(
+                common_attn_metadata,
+                num_tokens,
+            )
 
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
@@ -676,6 +843,10 @@ class SpecDecodeBaseProposer:
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
+            self._refresh_dcp_local_seq_lens(
+                common_attn_metadata,
+                batch_size,
+            )
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
@@ -792,6 +963,9 @@ class SpecDecodeBaseProposer:
             out_clamped_positions=out_pos,
             out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
             input_batch_size=input_batch_size,
+            dcp_world_size=self.draft_dcp_world_size,
+            dcp_rank=self.draft_dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
         common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:
@@ -809,14 +983,38 @@ class SpecDecodeBaseProposer:
             self.max_model_len,
         )
 
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu += 1
-        if common_attn_metadata._num_computed_tokens_cpu is not None:
-            common_attn_metadata._num_computed_tokens_cpu += 1
-        if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-            common_attn_metadata.seq_lens_cpu_upper_bound += 1
+        _advance_cpu_sequence_metadata(
+            common_attn_metadata,
+            self.max_model_len,
+        )
 
+        self._refresh_dcp_local_seq_lens(common_attn_metadata, batch_size)
         return positions
+
+    def _refresh_dcp_local_seq_lens(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_reqs: int,
+    ) -> None:
+        local_seq_lens = common_attn_metadata.dcp_local_seq_lens
+        if self.replicated_draft_kv:
+            common_attn_metadata.dcp_local_seq_lens = None
+            common_attn_metadata.dcp_local_seq_lens_cpu = None
+            return
+        if self.dcp_world_size == 1 or local_seq_lens is None:
+            return
+
+        prepare_dcp_local_seq_lens(
+            local_seq_lens,
+            common_attn_metadata.seq_lens,
+            num_reqs,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+        # This view aliases the runner's pinned H2D staging buffer. Do not
+        # overwrite it while its non-blocking copy may still be in flight.
+        common_attn_metadata.dcp_local_seq_lens_cpu = None
 
     def set_inputs_first_pass(
         self,
@@ -947,6 +1145,9 @@ class SpecDecodeBaseProposer:
                 block_size=self.block_size,
                 num_new_tokens=self.net_num_new_slots_per_request,
                 max_model_len=self.max_model_len,
+                dcp_world_size=self.draft_dcp_world_size,
+                dcp_rank=self.draft_dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
 
             # 3. Update the common attention metadata with the new (meta)data
@@ -956,6 +1157,7 @@ class SpecDecodeBaseProposer:
                 arange=self.arange,
                 new_slot_mapping=new_slot_mapping,
             )
+            self._refresh_dcp_local_seq_lens(new_cad, new_cad.num_reqs)
 
             return total_num_output_tokens, token_indices_to_sample, new_cad
 
@@ -1154,6 +1356,10 @@ class SpecDecodeBaseProposer:
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
+        self._refresh_dcp_local_seq_lens(
+            spec_common_attn_metadata,
+            spec_common_attn_metadata.num_reqs,
+        )
 
         return (
             spec_common_attn_metadata,
@@ -1265,6 +1471,10 @@ class SpecDecodeBaseProposer:
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
+        self._refresh_dcp_local_seq_lens(
+            spec_common_attn_metadata,
+            spec_common_attn_metadata.num_reqs,
+        )
 
         return spec_common_attn_metadata, token_indices
 
@@ -1327,6 +1537,81 @@ class SpecDecodeBaseProposer:
             )
         return model
 
+    def _configure_replicated_draft_attention(
+        self,
+        all_attn_layers: dict[str, AttentionLayerBase],
+    ) -> None:
+        if not self.replicated_draft_kv:
+            return
+
+        expected_layer = get_eagle3_draft_attention_layer_name(
+            self.vllm_config.model_config.get_total_num_hidden_layers()
+        )
+        if self._draft_attn_layer_names != {expected_layer}:
+            raise ValueError(
+                "Replicated draft KV requires exactly "
+                f"{expected_layer!r}, got {sorted(self._draft_attn_layer_names)!r}"
+            )
+
+        draft_layer = all_attn_layers[expected_layer]
+        backend_name = draft_layer.get_attn_backend().get_name()
+        if backend_name != AttentionBackendEnum.FLASH_ATTN.name:
+            raise ValueError(
+                f"Replicated draft KV requires FLASH_ATTN, got {backend_name}"
+            )
+        if (
+            getattr(draft_layer, "num_heads", None) != 8
+            or getattr(draft_layer, "num_kv_heads", None) != 8
+            or getattr(draft_layer, "head_size", None) != 128
+        ):
+            raise ValueError(
+                "Replicated draft KV requires TP-local Q/KV/head_dim = 8/8/128"
+            )
+
+        impl = draft_layer.impl
+        impl.dcp_world_size = 1
+        impl.dcp_rank = 0
+        impl.total_cp_world_size = impl.pcp_world_size
+        impl.total_cp_rank = impl.pcp_rank
+        self._replicated_draft_impl = impl
+        logger.info_once(
+            "Enabled replicated temporal KV and DCP1-equivalent attention for %s",
+            expected_layer,
+        )
+
+    def _validate_prefill_draft_kv_layers(
+        self,
+        all_attn_layers: dict[str, AttentionLayerBase],
+    ) -> None:
+        if not getattr(
+            self.speculative_config,
+            "enable_eagle3_prefill_draft_kv",
+            False,
+        ):
+            return
+        expected_layer = get_eagle3_draft_attention_layer_name(
+            self.vllm_config.model_config.get_total_num_hidden_layers()
+        )
+        if self._draft_attn_layer_names != {expected_layer}:
+            raise ValueError(
+                "EAGLE3 Prefill draft-KV requires exactly "
+                f"{expected_layer!r}, got {sorted(self._draft_attn_layer_names)!r}"
+            )
+        hidden_layers = [
+            name
+            for name, layer in all_attn_layers.items()
+            if isinstance(
+                layer.get_kv_cache_spec(self.vllm_config),
+                HiddenStateCacheSpec,
+            )
+            or name.startswith("cache_only_layers.")
+        ]
+        if hidden_layers:
+            raise ValueError(
+                "EAGLE3 Prefill draft-KV must not allocate hidden-state cache "
+                f"layers, got {sorted(hidden_layers)!r}"
+            )
+
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = set(
             get_layers_from_vllm_config(
@@ -1348,6 +1633,8 @@ class SpecDecodeBaseProposer:
             for name in (set(all_attn_layers.keys()) - target_attn_layer_names)
             if all_attn_layers[name].get_kv_cache_spec(self.vllm_config) is not None
         }
+        self._validate_prefill_draft_kv_layers(all_attn_layers)
+        self._configure_replicated_draft_attention(all_attn_layers)
 
         if self.supports_mm_inputs:
             # Even if the target model is multimodal, we can also use
@@ -1763,14 +2050,79 @@ class SpecDecodeBaseProposer:
                         self.device,
                         kernel_block_size=kernel_block_size,
                     )
+                    if self.replicated_draft_kv:
+                        builder = attn_group.get_metadata_builder()
+                        if not hasattr(builder, "dcp_world_size"):
+                            raise ValueError(
+                                "Replicated draft KV requires a "
+                                "DCP-aware attention metadata builder"
+                            )
+                        builder.dcp_world_size = 1
+                        builder.dcp_rank = 0
                     attention_groups[backend_key] = attn_group
                 else:
                     attention_groups[backend_key].layer_names.append(layer_name)
 
         self.draft_attn_groups = list(attention_groups.values())
+        if getattr(
+            self.speculative_config,
+            "enable_eagle3_prefill_draft_kv",
+            False,
+        ):
+            if len(self.draft_attn_groups) != 1:
+                raise ValueError(
+                    "EAGLE3 Prefill draft-KV requires one draft attention group"
+                )
+            if isinstance(
+                self.draft_attn_groups[0].kv_cache_spec,
+                HiddenStateCacheSpec,
+            ):
+                raise ValueError(
+                    "EAGLE3 Prefill draft-KV requires an attention KV cache"
+                )
+        if self.replicated_draft_kv:
+            draft_layer = next(iter(self._draft_attn_layer_names))
+            draft_tensors = [
+                tensor
+                for tensor in kv_cache_config.kv_cache_tensors
+                if draft_layer in tensor.shared_by
+            ]
+            if len(draft_tensors) != 1 or draft_tensors[0].shared_by != [draft_layer]:
+                raise ValueError(
+                    "Replicated draft KV requires a dedicated draft KV tensor"
+                )
+            draft_spec = self.draft_attn_groups[0].kv_cache_spec
+            if draft_spec.temporal_layout != KVCacheTemporalLayout.FULL_TEMPORAL:
+                raise ValueError(
+                    "Replicated draft KV requires a FULL_TEMPORAL draft spec"
+                )
+            expected_size = (
+                kv_cache_config.num_blocks
+                * self.dcp_world_size
+                * draft_spec.page_size_bytes
+            )
+            if draft_tensors[0].size != expected_size:
+                raise ValueError(
+                    "Replicated draft KV allocation mismatch: expected "
+                    f"{expected_size} bytes, got {draft_tensors[0].size}"
+                )
         self.block_size = (
             self.draft_attn_groups[0].get_metadata_builder().kv_cache_spec.block_size
         )
+        if self.replicated_draft_kv:
+            max_child_blocks = (
+                self.max_model_len + self.block_size - 1
+            ) // self.block_size
+            self._replicated_draft_block_table = torch.zeros(
+                (self.max_batch_size, max_child_blocks),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._replicated_draft_reject_mask = torch.zeros(
+                self.max_num_tokens,
+                dtype=torch.bool,
+                device=self.device,
+            )
         logger.debug("Using block size %d for drafting layers", self.block_size)
 
     def _determine_batch_execution_and_padding(

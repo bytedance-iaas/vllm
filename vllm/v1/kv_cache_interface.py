@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -96,6 +96,47 @@ class KVCacheSpecKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class KVCacheTemporalLayout(str, Enum):
+    """How one KV region is distributed over context-parallel ranks."""
+
+    SHARDED_DCP = "sharded_dcp"
+    FULL_TEMPORAL = "full_temporal"
+
+
+class KVCacheChildPageMapping(str, Enum):
+    """How scheduler parent pages map to one region's physical pages."""
+
+    IDENTITY = "identity"
+    GLOBAL_PAGE_MODULO = "global_page_modulo"
+
+
+@dataclass(frozen=True)
+class KVCacheRegionIdentity:
+    """Stable transfer identity for a layer and its temporal layout."""
+
+    layer_name: str
+    temporal_layout: KVCacheTemporalLayout
+    protocol_version: int
+    child_page_mapping: KVCacheChildPageMapping
+    child_page_factor: int
+
+    def __post_init__(self) -> None:
+        if self.protocol_version <= 0:
+            raise ValueError("protocol_version must be positive")
+        if self.child_page_factor <= 0:
+            raise ValueError("child_page_factor must be positive")
+
+    @property
+    def protocol_key(self) -> tuple[str, str, int, str, int]:
+        return (
+            self.layer_name,
+            self.temporal_layout.value,
+            self.protocol_version,
+            self.child_page_mapping.value,
+            self.child_page_factor,
+        )
+
+
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
@@ -104,6 +145,10 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    temporal_layout: KVCacheTemporalLayout = field(
+        default=KVCacheTemporalLayout.SHARDED_DCP,
+        kw_only=True,
+    )
 
     @property
     def page_size_bytes(self) -> int:
@@ -297,6 +342,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            temporal_layout=specs[0].temporal_layout,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -424,18 +470,21 @@ class MLAAttentionSpec(FullAttentionSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        temporal_layout_set = set(spec.temporal_layout for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(block_stride_set) == 1
+            and len(temporal_layout_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, model version, and KV block "
-            "stride indexing."
+            "quantization method, compress ratio, model version, KV block "
+            "stride indexing, and temporal layout."
         )
         return cls(
             block_size=specs[0].block_size,
+            temporal_layout=specs[0].temporal_layout,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -481,6 +530,7 @@ class RSWASpec(FullAttentionSpec):
         base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
         return cls(
             block_size=base.block_size,
+            temporal_layout=base.temporal_layout,
             num_kv_heads=base.num_kv_heads,
             head_size=base.head_size,
             head_size_v=base.head_size_v,
@@ -652,19 +702,22 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        temporal_layout_set = set(spec.temporal_layout for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(block_stride_set) == 1
+            and len(temporal_layout_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, model version, sliding "
-            "window size, and KV block stride indexing."
+            "window size, KV block stride indexing, and temporal layout."
         )
         return cls(
             block_size=specs[0].block_size,
+            temporal_layout=specs[0].temporal_layout,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -786,6 +839,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            temporal_layout=specs[0].temporal_layout,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,

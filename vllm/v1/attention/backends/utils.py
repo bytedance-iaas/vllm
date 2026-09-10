@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm.envs as envs
+from vllm.distributed.cp_mapping import (
+    get_cp_local_seq_lens as get_canonical_cp_local_seq_lens,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     get_kv_connector_cache_layout,
 )
@@ -897,37 +900,12 @@ def get_cp_local_seq_lens(
     context-parallel shards and ``cp_rank`` selects one shard. When ``cp_rank``
     is ``None``, the returned tensor contains every rank's local length.
     """
-    seq_lens_i32 = seq_lens.to(torch.int32)
-    if cp_rank is None:
-        rank_offsets = torch.arange(
-            cp_world_size,
-            dtype=torch.int32,
-            device=seq_lens.device,
-        ).view(
-            *((1,) * seq_lens_i32.dim()),
-            cp_world_size,
-        )
-        seq_lens_tiled = seq_lens_i32.unsqueeze(-1)
-    else:
-        rank_offsets = torch.tensor(
-            cp_rank,
-            dtype=torch.int32,
-            device=seq_lens.device,
-        )
-        seq_lens_tiled = seq_lens_i32
-    base = (
-        seq_lens_tiled
-        // cp_kv_cache_interleave_size
-        // cp_world_size
-        * cp_kv_cache_interleave_size
+    return get_canonical_cp_local_seq_lens(
+        seq_lens,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+        interleave_size=cp_kv_cache_interleave_size,
     )
-    remainder = seq_lens_tiled - base * cp_world_size
-    remainder = torch.clip(
-        remainder - rank_offsets * cp_kv_cache_interleave_size,
-        0,
-        cp_kv_cache_interleave_size,
-    )
-    return base + remainder
 
 
 def get_dcp_local_seq_lens(

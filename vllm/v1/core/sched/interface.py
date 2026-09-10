@@ -240,6 +240,11 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def validate_prefix_cache_reset(self, reset_running_requests: bool = False) -> None:
+        """Raise if the requested prefix-cache reset is unsupported."""
+        raise NotImplementedError
+
+    @abstractmethod
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
