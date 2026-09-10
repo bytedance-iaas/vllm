@@ -181,7 +181,16 @@ if TYPE_CHECKING:
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
-    VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+    VLLM_HUMMING_MOE_GEMM_TYPE: (
+        Literal[
+            "indexed",
+            "grouped",
+            "grouped_contiguous",
+            "grouped_masked",
+            "auto",
+        ]
+        | None
+    ) = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1476,10 +1485,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HUMMING_USE_F16_ACCUM": lambda: maybe_convert_bool(
         os.environ.get("VLLM_HUMMING_USE_F16_ACCUM", "0")
     ),
-    # Whether to use indexed gemm for humming moe
-    # if 1, force use indexed gemm
-    # if 0, force use grouped gemm
-    # if None, choose better gemm type automatically
+    # Humming MoE GEMM type. When unset or "auto", choose by activation format:
+    # batched activation uses grouped_masked; standard activation lets the
+    # backend selector choose between grouped_contiguous and indexed.
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
     ),
