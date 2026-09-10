@@ -1118,9 +1118,9 @@ def _align_transfer_regions(
                 continue
             shared_pairs = _shared_alias_group_pairs(local_region, remote_region)
             if shared_pairs and any(
-                (remote_idx, alias, layer_index, remote_group)
+                (remote_idx, alias, layer_index, remote_group, region_part)
                 not in matched_remote_keys
-                for alias, layer_index, _, remote_group in shared_pairs
+                for alias, layer_index, _, remote_group, region_part in shared_pairs
             ):
                 return (
                     [],
@@ -1158,7 +1158,7 @@ def _mapped_group_indices_for_regions(
             sorted(
                 {
                     (local_group, remote_group)
-                    for _, _, local_group, remote_group in alias_pairs
+                    for _, _, local_group, remote_group, _ in alias_pairs
                     if 0 <= local_group < local_num_groups
                     and 0 <= remote_group < remote_num_groups
                 }
@@ -2541,7 +2541,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], 0, 0, 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -3772,7 +3772,7 @@ class MooncakeConnectorWorker:
                 if not local_block_ids:
                     continue
                 active_group_indices = tuple(
-                    local_group_index
+                    remote_group_index
                     for local_group_index, remote_group_index in region_group_pairs
                     if remote_block_ids_per_group[remote_group_index]
                 )
@@ -3976,10 +3976,17 @@ class MooncakeConnectorWorker:
         )
         transfers_eagle3_draft = bool(
             speculative_method == "eagle3"
-            and getattr(
-                self.vllm_config.speculative_config,
-                "enable_eagle3_prefill_draft_kv",
-                False,
+            and (
+                getattr(
+                    self.vllm_config.speculative_config,
+                    "enable_eagle3_prefill_draft_kv",
+                    False,
+                )
+                or getattr(
+                    self.vllm_config.speculative_config,
+                    "enable_eagle3_replicated_draft_kv",
+                    False,
+                )
             )
         )
         is_decode_local_draft = speculative_method in (
