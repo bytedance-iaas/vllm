@@ -27,6 +27,29 @@ USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+DETOKENIZATION_OFFSET = 32
+MIN_SAFE_SUFFIX_TOKENS = 4
+INVALID_UTF8_REPLACEMENT_CHAR = "\ufffd"
+
+
+def _get_safe_decode_stream_prompt_suffix(
+    tokenizer: Tokenizer,
+    prompt_token_ids: list[int] | None,
+    skip_special_tokens: bool,
+) -> list[int] | None:
+    if prompt_token_ids is None or len(prompt_token_ids) <= DETOKENIZATION_OFFSET:
+        return prompt_token_ids
+
+    for suffix_len in range(DETOKENIZATION_OFFSET, MIN_SAFE_SUFFIX_TOKENS - 1, -1):
+        suffix = prompt_token_ids[-suffix_len:]
+        try:
+            decoded = tokenizer.decode(suffix, skip_special_tokens=skip_special_tokens)
+        except Exception:
+            return prompt_token_ids
+        if decoded and INVALID_UTF8_REPLACEMENT_CHAR not in decoded:
+            return suffix
+
+    return prompt_token_ids
 
 
 class IncrementalDetokenizer:
@@ -190,12 +213,18 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
-        # Use native prefill to prime the decode stream with prompt tokens.
+        # Use native prefill with bounded prompt tail context to prime the
+        # decode stream without doing O(prompt_len) work on the first step.
         # Look up DecodeStream on the module so backend patches (e.g. the
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
+        prompt_suffix = _get_safe_decode_stream_prompt_suffix(
+            self.tokenizer,
+            request.prompt_token_ids,
+            self.skip_special_tokens,
+        )
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=prompt_suffix,
             skip_special_tokens=self.skip_special_tokens,
         )
 

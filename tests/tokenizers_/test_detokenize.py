@@ -15,6 +15,7 @@ from vllm.v1.engine.detokenizer import (
     FastIncrementalDetokenizer,
     IncrementalDetokenizer,
     SlowIncrementalDetokenizer,
+    _get_safe_decode_stream_prompt_suffix,
 )
 
 SPECIAL_TOKS_TRUTH = [
@@ -46,6 +47,91 @@ TOKENIZERS = [
     "codellama/CodeLlama-7b-hf",
     "mistralai/Pixtral-12B-2409",
 ]
+
+
+class _SafeSuffixTokenizer:
+    def __init__(
+        self,
+        bad_lengths: set[int] | None = None,
+        empty_lengths: set[int] | None = None,
+        raises: bool = False,
+    ):
+        self.bad_lengths = bad_lengths or set()
+        self.empty_lengths = empty_lengths or set()
+        self.raises = raises
+        self.calls: list[tuple[list[int], bool]] = []
+
+    def decode(self, token_ids, skip_special_tokens: bool = False):
+        self.calls.append((list(token_ids), skip_special_tokens))
+        if self.raises:
+            raise RuntimeError("decode failed")
+        suffix_len = len(token_ids)
+        if suffix_len in self.empty_lengths:
+            return ""
+        if suffix_len in self.bad_lengths:
+            return "\ufffd"
+        return "safe"
+
+
+def test_safe_decode_stream_suffix_preserves_short_prompts():
+    tokenizer = _SafeSuffixTokenizer()
+    prompt_token_ids = list(range(32))
+
+    assert _get_safe_decode_stream_prompt_suffix(tokenizer, None, True) is None
+    assert (
+        _get_safe_decode_stream_prompt_suffix(tokenizer, prompt_token_ids, True)
+        is prompt_token_ids
+    )
+    assert tokenizer.calls == []
+
+
+def test_safe_decode_stream_suffix_prefers_largest_safe_tail():
+    tokenizer = _SafeSuffixTokenizer()
+    prompt_token_ids = list(range(64))
+
+    suffix = _get_safe_decode_stream_prompt_suffix(
+        tokenizer,
+        prompt_token_ids,
+        True,
+    )
+
+    assert suffix == prompt_token_ids[-32:]
+    assert tokenizer.calls == [(prompt_token_ids[-32:], True)]
+
+
+def test_safe_decode_stream_suffix_walks_to_safe_boundary():
+    tokenizer = _SafeSuffixTokenizer(bad_lengths={32, 31})
+    prompt_token_ids = list(range(64))
+
+    suffix = _get_safe_decode_stream_prompt_suffix(
+        tokenizer,
+        prompt_token_ids,
+        False,
+    )
+
+    assert suffix == prompt_token_ids[-30:]
+    assert tokenizer.calls == [
+        (prompt_token_ids[-32:], False),
+        (prompt_token_ids[-31:], False),
+        (prompt_token_ids[-30:], False),
+    ]
+
+
+def test_safe_decode_stream_suffix_falls_back_to_full_prompt():
+    prompt_token_ids = list(range(64))
+    empty_tokenizer = _SafeSuffixTokenizer(
+        empty_lengths=set(range(4, 33)),
+    )
+    raising_tokenizer = _SafeSuffixTokenizer(raises=True)
+
+    assert (
+        _get_safe_decode_stream_prompt_suffix(empty_tokenizer, prompt_token_ids, True)
+        is prompt_token_ids
+    )
+    assert (
+        _get_safe_decode_stream_prompt_suffix(raising_tokenizer, prompt_token_ids, True)
+        is prompt_token_ids
+    )
 
 
 def _run_incremental_decode(
