@@ -99,12 +99,14 @@ def _mock_paged_mqa_metadata(monkeypatch: pytest.MonkeyPatch):
         seq_lens: torch.Tensor,
         block_size: int,
         num_sms: int,
+        indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         calls.append(
             {
                 "seq_lens": seq_lens.detach().clone(),
                 "block_size": block_size,
                 "num_sms": num_sms,
+                "indices": indices,
             }
         )
         return torch.full(
