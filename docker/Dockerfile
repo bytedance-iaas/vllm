@@ -436,6 +436,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # cmake/external_projects/deepgemm.cmake for the full picture.
 COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
 ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
+ARG DEEPGEMM_PYTHON_VERSIONS
 RUN --mount=type=cache,target=/root/.cache/uv \
     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
 

@@ -57,6 +57,7 @@ jobs:
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
       BYTEIAAS_DEEPGEMM_WHEEL_X86_64: https://github.com/wangyicong52/DeepGEMM/releases/download/deep_gemm-2.5.0-vllm/deep_gemm-2.5.0%2Blocal-260630mega_moe-cp312-cp312-linux_x86_64.whl
       BYTEIAAS_DEEPGEMM_WHEEL_X86_64_SHA256: ba77537585ab41aa5d075d8db84545ab38e9e717f7b413fcfd6c7dbcda45c47b
+      DEEPGEMM_PYTHON_VERSIONS: "3.12"
       BYTEIAAS_HPC_OPS_REPO: https://github.com/wangyicong52/hpc-ops.git
       BYTEIAAS_HPC_OPS_REF: 915755b437257e1118a80f5cbb07509037faad05
       BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
@@ -261,6 +262,7 @@ jobs:
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
               --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON \
+              --build-arg DEEPGEMM_PYTHON_VERSIONS="${DEEPGEMM_PYTHON_VERSIONS}" \
               --build-arg INSTALL_KV_CONNECTORS=true \
               --build-arg INSTALL_VLLM_ROUTER=true \
               --build-arg INSTALL_HPC_OPS=true \

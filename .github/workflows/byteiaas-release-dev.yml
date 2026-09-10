@@ -21,6 +21,11 @@ on:
         description: "CSV of image formats to build: oci,zstd,nydus"
         required: false
         default: "oci,zstd,nydus"
+      build_wheel:
+        description: "Build and upload the standalone multi-Python wheel"
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: byteiaas-vllm-dev-${{ github.ref_name }}
@@ -28,7 +33,7 @@ concurrency:
 
 jobs:
   build-wheel:
-    if: github.repository == 'bytedance-iaas/vllm'
+    if: github.repository == 'bytedance-iaas/vllm' && (github.event_name != 'workflow_dispatch' || inputs.build_wheel)
     uses: ./.github/workflows/_byteiaas-build-wheel.yml
     with:
       checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_ref || 'refs/heads/iaas_main' }}
