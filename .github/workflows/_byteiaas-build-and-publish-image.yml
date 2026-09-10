@@ -174,8 +174,6 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          ubuntu_version="22.04"
-          final_base_image="nvidia/cuda:${{ inputs.cuda_version }}-base-ubuntu${ubuntu_version}"
           openai_metadata_file="/tmp/byteiaas-vllm-openai-image.json"
           openai_devel_metadata_file="/tmp/byteiaas-vllm-openai-devel-image.json"
           openai_zstd_metadata_file="/tmp/byteiaas-vllm-openai-zstd-image.json"
@@ -259,7 +257,6 @@ jobs:
               --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}" \
               -f docker/Dockerfile \
               --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
-              --build-arg FINAL_BASE_IMAGE="${final_base_image}" \
               --build-arg UBUNTU_MIRROR_URL=http://mirrors.volces.com/ubuntu \
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
