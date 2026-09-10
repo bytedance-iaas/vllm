@@ -40,7 +40,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.utils import (
+    make_empty_intermediate_tensors_factory,
+    maybe_prefix,
+)
 from vllm.models.deepseek_v4.common.ops import (
     fused_mtp_input_rmsnorm,
     mtp_shared_head_rmsnorm,
@@ -258,7 +262,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -269,6 +273,13 @@ class DeepSeekV4MTP(nn.Module):
         )
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        # The draft is instantiated only on the last PP stage for DSpark. This
+        # satisfies the model config PP capability check for the draft config.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], self.config.hidden_size
+            )
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -1344,8 +1344,12 @@ class LocalArgmaxMixin:
 class EagleModelMixin:
     start_layer: int
     aux_hidden_state_layers: tuple[int, ...] = ()
+
+    # Set by models that forward auxiliary hidden states between PP stages.
     supports_aux_hidden_states_over_pp: ClassVar[bool] = False
     AUX_HIDDEN_STATE_KEY: ClassVar[str] = "aux_hidden_states_"
+
+    # Cached at setup: deriving the PP layout is not compile-friendly.
     _aux_slot_base_cached: int = 0
     _aux_upstream_total_cached: int = 0
 
@@ -1356,11 +1360,13 @@ class EagleModelMixin:
         self._cache_aux_pp_layout()
 
     def _cache_aux_pp_layout(self) -> None:
+        """Resolve this rank's aux slot layout, off the forward path."""
         from vllm.distributed.parallel_state import (
             get_pp_group,
             model_parallel_is_initialized,
         )
 
+        # Models can be constructed outside a distributed worker.
         if not model_parallel_is_initialized():
             return
         pp = get_pp_group()
@@ -1378,7 +1384,7 @@ class EagleModelMixin:
         aux_hidden_states: list[torch.Tensor],
         layer_idx: int,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+        residual: torch.Tensor | None,
     ) -> list[torch.Tensor]:
         if layer_idx in self.aux_hidden_state_layers:
             value = hidden_states + residual if residual is not None else hidden_states
@@ -1388,6 +1394,7 @@ class EagleModelMixin:
     def pack_local_aux_hidden_states(
         self, aux_hidden_states: list[torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        """Add this stage's auxiliary hidden states to the PP handoff."""
         if not aux_hidden_states:
             return {}
         base = self._aux_slot_base_cached
@@ -1399,6 +1406,7 @@ class EagleModelMixin:
     def collect_remote_aux_hidden_states(
         self, intermediate_tensors: "IntermediateTensors | None"
     ) -> list[torch.Tensor]:
+        """Read earlier stages' auxiliary hidden states in layer order."""
         total = self._aux_upstream_total_cached
         if total == 0:
             return []

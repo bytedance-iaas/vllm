@@ -1397,6 +1397,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        pp_input_intermediate_tensors = None
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -1412,7 +1413,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else v[:n].copy_(intermediate_tensors.tensors[k][:n])
                 for k, v in self.intermediate_tensors.tensors.items()
             }
-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+            pp_input_intermediate_tensors = IntermediateTensors(new_tensors)
+            model_inputs["intermediate_tensors"] = pp_input_intermediate_tensors
             del intermediate_tensors
 
         # Update the EPLB meta.
@@ -1489,7 +1491,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
             return self.pp_handler.relay_aux_hidden_states(
-                model_inputs["intermediate_tensors"], output_intermediate_tensors
+                pp_input_intermediate_tensors, output_intermediate_tensors
             )
         return None
 
@@ -1540,15 +1542,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
-
-        if self.pp_handler is not None:
-            # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            self.pp_handler.broadcast(
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                input_batch,
-            )
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
@@ -1632,19 +1625,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.idx_mapping, :num_spec_tokens_to_schedule
                 ] = draft_tokens
 
+        pp_draft_tokens = None
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            pp_draft_tokens = self.req_states.draft_tokens[
+                :, :num_spec_tokens_to_schedule
+            ]
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[
-                    input_batch.idx_mapping, :num_spec_tokens_to_schedule
-                ],
+                pp_draft_tokens[input_batch.idx_mapping],
             )
-            if self.pp_handler is not None:
-                self.pp_handler.broadcast_drafts(
-                    self.req_states.draft_tokens, input_batch
-                )
+
+        if self.pp_handler is not None:
+            # Keep sampled outputs and the next draft proposals in one PP frame.
+            self.pp_handler.broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch,
+                pp_draft_tokens,
+            )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
@@ -1654,7 +1655,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.draft_tokens_handler.get_draft_tokens()
+        return self.draft_tokens_handler.get_draft_tokens(
+            allow_placeholder_tokens=not self.scheduler_config.async_scheduling
+        )
 
     @torch.inference_mode()
     @step_eplb_after()

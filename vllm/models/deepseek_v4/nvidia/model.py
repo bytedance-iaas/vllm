@@ -1589,11 +1589,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
+        if self.use_mega_moe and input_ids is not None:
             input_ids = input_ids.to(torch.int64)
 
+        remote_aux: list[torch.Tensor] = []
+        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
+            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         residual, post_mix, res_mix = None, None, None
-        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
@@ -1625,12 +1627,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {
-                    "hidden_states": hidden_states,
-                    **self.pack_local_aux_hidden_states(aux_hidden_states),
-                }
-            )
+            # Merged by unpacking rather than dict.update: the compile wrapper
+            # rejects a forward whose bytecode names `update`.
+            tensors = {
+                "hidden_states": hidden_states,
+                **self.pack_local_aux_hidden_states(aux_hidden_states),
+            }
+            return IntermediateTensors(tensors)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
