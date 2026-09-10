@@ -42,12 +42,20 @@ class DraftTokensHandler:
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
 
-    def get_draft_tokens(self) -> DraftTokenIds | None:
+    def get_draft_tokens(
+        self, allow_placeholder_tokens: bool = True
+    ) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
+        elif self.req_ids and not allow_placeholder_tokens:
+            # No CPU-side draft tokens were requested. This is the common async
+            # scheduling path without structured output; the scheduler output
+            # already carries placeholder draft width while the worker keeps the
+            # real draft ids on GPU. Returning invalid ids here would overwrite
+            # that scheduled width with all-rejected tokens.
+            return None
         else:
-            # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
 

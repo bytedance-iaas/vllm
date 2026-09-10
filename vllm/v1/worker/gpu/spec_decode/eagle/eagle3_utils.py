@@ -51,6 +51,7 @@ def verify_supports_aux_hidden_states_over_pp(model: nn.Module, method: str) -> 
 
 
 def aux_hidden_state_relay_keys(model: nn.Module) -> tuple[str, ...]:
+    """Auxiliary hidden-state keys this stage forwards."""
     from vllm.distributed.parallel_state import get_pp_group
 
     pp = get_pp_group()
@@ -126,5 +127,12 @@ def get_eagle3_aux_layers_from_config(
                 if layer_ids:
                     break
     if layer_ids and isinstance(layer_ids, (list, tuple)):
-        return tuple(layer_ids)
+        layer_ids = tuple(layer_ids)
+        target_model_config = getattr(spec_config, "target_model_config", None)
+        target_architectures = getattr(target_model_config, "architectures", None) or ()
+        if any("DeepseekV4" in str(arch) for arch in target_architectures):
+            # DeepSeek V4 records post-layer states only, so it cannot produce
+            # the pre-layer embedding state represented by layer 0.
+            return tuple(i for i in layer_ids if i > 0)
+        return layer_ids
     return None
