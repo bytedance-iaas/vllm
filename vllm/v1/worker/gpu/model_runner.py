@@ -1310,6 +1310,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    def _clamp_sampled_to_remaining_len(
+        self,
+        input_batch: InputBatch,
+        sampler_output: SamplerOutput,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_speculative_steps <= 0:
+            return num_sampled, num_rejected
+
+        rows = num_sampled.numel()
+        if rows == 0:
+            return num_sampled, num_rejected
+
+        idx_mapping_np = input_batch.idx_mapping_np[:rows]
+        safe_idx_mapping_np = np.maximum(idx_mapping_np, 0)
+        max_seq_len = torch.as_tensor(
+            self.req_states.max_seq_len[safe_idx_mapping_np],
+            dtype=num_sampled.dtype,
+            device=self.device,
+        )
+        idx_mapping = input_batch.idx_mapping[:rows]
+        safe_idx_mapping = torch.clamp(idx_mapping, min=0).long()
+        total_len = self.req_states.total_len.gpu[safe_idx_mapping].to(
+            dtype=num_sampled.dtype
+        )
+        remaining = torch.clamp(max_seq_len - total_len, min=0)
+        remaining = torch.where(
+            idx_mapping >= 0,
+            remaining,
+            torch.zeros_like(remaining),
+        )
+
+        clamped_num_sampled = torch.minimum(num_sampled, remaining)
+        clamped_num_rejected = num_rejected + (num_sampled - clamped_num_sampled)
+        sampler_output.num_sampled = clamped_num_sampled
+        sampler_output.num_rejected = clamped_num_rejected
+        return clamped_num_sampled, clamped_num_rejected
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1613,6 +1652,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
+        )
+        num_sampled, num_rejected = self._clamp_sampled_to_remaining_len(
+            input_batch, sampler_output, num_sampled, num_rejected
         )
 
         assert self.prompt_logprobs_worker is not None
