@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -37,6 +37,8 @@ class RegisterWorkerPayload(BaseModel):
     pcp_rank: int = 0
     pcp_size: int = 1
     cp_block_pairing_version: int = 0
+    layer_start: int | None = None
+    layer_end: int | None = None
     addr: WorkerAddr
 
 
@@ -47,6 +49,8 @@ class EngineEntry:
     cp_block_pairing_version: int
     # {tp_rank: {pp_rank: {pcp_rank: worker_addr}}}
     worker_addr: dict[int, dict[int, dict[int, WorkerAddr]]]
+    # Base-model layer range for each PP stage.
+    pp_layer_ranges: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 class MooncakeBootstrapServer:
@@ -139,6 +143,28 @@ class MooncakeBootstrapServer:
                     f"got {payload.cp_block_pairing_version}"
                 ),
             )
+        if (payload.layer_start is None) != (payload.layer_end is None):
+            raise HTTPException(
+                status_code=400,
+                detail="Both layer_start and layer_end must be provided together",
+            )
+        if payload.layer_start is not None and payload.layer_end is not None:
+            layer_range = (payload.layer_start, payload.layer_end)
+            if not 0 <= payload.layer_start <= payload.layer_end:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid PP layer range: {layer_range}",
+                )
+            registered_range = dp_entry.pp_layer_ranges.get(payload.pp_rank)
+            if registered_range is not None and registered_range != layer_range:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"PP layer range mismatch for pp_rank={payload.pp_rank}: "
+                        f"expected {registered_range}, got {layer_range}"
+                    ),
+                )
+            dp_entry.pp_layer_ranges[payload.pp_rank] = layer_range
         if payload.tp_rank not in dp_entry.worker_addr:
             dp_entry.worker_addr[payload.tp_rank] = {}
 

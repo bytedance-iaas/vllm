@@ -12,6 +12,7 @@ These tests verify correct behavior in three scenarios:
 """
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -54,6 +55,117 @@ def recompute_scheduler():
     vllm_config = create_vllm_config()
     vllm_config.kv_transfer_config.kv_load_failure_policy = "recompute"
     return create_scheduler(vllm_config)
+
+
+def test_hybrid_groups_recover_from_common_token_boundary():
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 64
+    scheduler.recompute_kv_load_failures = True
+    scheduler._free_request_blocks = Mock()
+
+    group_16 = list(range(100, 116))
+    group_64 = list(range(200, 204))
+    group_16_blocks = [
+        SimpleNamespace(block_id=block_id, is_null=False) for block_id in group_16
+    ]
+    group_64_blocks = [
+        SimpleNamespace(block_id=block_id, is_null=False) for block_id in group_64
+    ]
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.coordinator.single_type_managers = (
+        SimpleNamespace(
+            block_size=16,
+            get_num_skipped_tokens=lambda _: 0,
+            req_to_blocks={"req": group_16_blocks},
+        ),
+        SimpleNamespace(
+            block_size=64,
+            get_num_skipped_tokens=lambda _: 0,
+            req_to_blocks={"req": group_64_blocks},
+        ),
+    )
+
+    request = Mock(request_id="req", num_computed_tokens=256)
+    affected, num_affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request],
+            invalid_block_ids={group_16[5]},
+            num_scheduled_tokens={},
+        )
+    )
+
+    assert affected == {"req"}
+    assert request.num_computed_tokens == 64
+    assert num_affected_tokens == 192
+    assert blocks_to_evict == set(group_16[4:] + group_64[1:])
+    scheduler._free_request_blocks.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_block_idx", [1, 5])
+def test_hybrid_groups_full_reset_when_replay_history_was_discarded(
+    invalid_block_idx: int,
+):
+    scheduler = object.__new__(Scheduler)
+    scheduler.block_size = 64
+    scheduler.recompute_kv_load_failures = True
+    scheduler._free_request_blocks = Mock()
+    scheduler.encoder_cache_manager = Mock()
+    scheduler._inflight_prefills = set()
+    scheduler.waiting = Mock()
+    scheduler.reset_preempted_req_ids = set()
+    scheduler.log_stats = False
+
+    group_16 = [
+        SimpleNamespace(block_id=block_id, is_null=False)
+        for block_id in range(100, 116)
+    ]
+    group_64 = [
+        SimpleNamespace(block_id=0, is_null=True),
+        SimpleNamespace(block_id=0, is_null=True),
+        SimpleNamespace(block_id=0, is_null=True),
+        SimpleNamespace(block_id=203, is_null=False),
+    ]
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.coordinator.single_type_managers = (
+        SimpleNamespace(
+            block_size=16,
+            get_num_skipped_tokens=lambda _: 0,
+            req_to_blocks={"req": group_16},
+        ),
+        SimpleNamespace(
+            block_size=64,
+            get_num_skipped_tokens=lambda num_tokens: max(0, num_tokens - 64 + 1),
+            req_to_blocks={"req": group_64},
+        ),
+    )
+
+    request = Mock(
+        request_id="req",
+        num_computed_tokens=256,
+        status=RequestStatus.RUNNING,
+        spec_token_ids=[],
+        num_preemptions=0,
+    )
+    scheduler.running = [request]
+    affected, num_affected_tokens, blocks_to_evict = (
+        scheduler._update_requests_with_invalid_blocks(
+            [request],
+            invalid_block_ids={group_16[invalid_block_idx].block_id},
+            num_scheduled_tokens={},
+        )
+    )
+
+    allocated_block_ids = {block.block_id for block in group_16} | {203}
+    assert affected == {"req"}
+    assert request.num_computed_tokens == 0
+    assert num_affected_tokens == 256
+    assert blocks_to_evict == allocated_block_ids
+    scheduler.kv_cache_manager.evict_blocks.assert_called_once_with(allocated_block_ids)
+    assert scheduler.running == []
+    assert request.status == RequestStatus.PREEMPTED
+    assert scheduler.reset_preempted_req_ids == {"req"}
+    scheduler._free_request_blocks.assert_called_once_with(request)
+    scheduler.waiting.prepend_request.assert_called_once_with(request)
 
 
 def test_sync_recompute_blocks_not_freed_for_running_requests(
