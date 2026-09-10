@@ -1586,7 +1586,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
+        if self.use_mega_moe and input_ids is not None:
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
