@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _align_transfer_regions,
     _compute_sender_transfer_plan,
     _get_full_temporal_suffix_blocks,
+    _get_overlapping_remote_pp_ranks,
     _get_owned_dcp_suffix_blocks,
     _index_full_temporal_region_page_maps,
     _pair_cp_block_ids,
@@ -49,6 +50,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     MOONCAKE_KV_REGION_LAYOUT_VERSION,
     MooncakeBootstrapServer,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.kv_cache_interface import (
@@ -3182,6 +3184,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pcp_rank": 0,
         "pcp_size": 2,
         "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        "layer_start": 0,
+        "layer_end": 2,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -3197,6 +3201,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pcp_rank": 1,
         "pcp_size": 2,
         "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        "layer_start": 0,
+        "layer_end": 2,
         "addr": "tcp://1.1.1.2:1112",
     }
     async with httpx.AsyncClient() as client:
@@ -3211,6 +3217,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "pcp_rank": 0,
         "pcp_size": 2,
         "cp_block_pairing_version": MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+        "layer_start": 2,
+        "layer_end": 4,
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
@@ -3232,6 +3240,10 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert data["0"]["worker_addr"]["0"]["0"]["0"] == ("tcp://1.1.1.1:1111")
         assert data["0"]["worker_addr"]["0"]["0"]["1"] == ("tcp://1.1.1.2:1112")
         assert data["0"]["worker_addr"]["0"]["1"]["0"] == ("tcp://2.2.2.2:2222")
+        assert data["0"]["pp_layer_ranges"] == {
+            "0": [0, 2],
+            "1": [2, 4],
+        }
 
     payload_version_mismatch = {
         "engine_id": "eng-1",
@@ -3550,24 +3562,53 @@ def test_worker_initializes_mooncake_with_configured_device(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("local_pp_size", "local_pp_rank", "expected_addrs"),
+    (
+        "local_pp_size",
+        "local_pp_rank",
+        "remote_pp_size",
+        "total_num_hidden_layers",
+        "expected_pp_ranks",
+    ),
     [
-        (1, 0, ["tcp://producer-pp0:1234", "tcp://producer-pp1:1234"]),
-        (2, 1, ["tcp://producer-pp1:1234"]),
+        (1, 0, 2, 4, [0, 1]),
+        (2, 1, 2, 4, [1]),
+        (2, 0, 4, 61, [0, 1, 2]),
+        (2, 1, 4, 61, [2, 3]),
+        (4, 2, 2, 61, [0, 1]),
     ],
-    ids=["heterogeneous_pp_pulls_all_remote_pp", "matching_pp_pulls_same_rank"],
+    ids=[
+        "single_consumer_stage_pulls_all_producer_stages",
+        "matching_pp_pulls_same_rank",
+        "uneven_pp4_to_pp2_first_consumer_stage",
+        "uneven_pp4_to_pp2_second_consumer_stage",
+        "uneven_pp2_to_pp4_boundary_consumer_stage",
+    ],
 )
 async def test_receive_kv_selects_remote_pp_workers(
     local_pp_size: int,
     local_pp_rank: int,
-    expected_addrs: list[str],
+    remote_pp_size: int,
+    total_num_hidden_layers: int,
+    expected_pp_ranks: list[int],
 ):
-    """Decode workers should not hard-code producer pp_rank 0."""
+    """Decode workers pull every producer stage with overlapping layers."""
 
     decode_worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     decode_worker.shutdown = MagicMock()
     decode_worker.pp_size = local_pp_size
     decode_worker.pp_rank = local_pp_rank
+    decode_worker.model_config = SimpleNamespace(
+        get_total_num_hidden_layers=lambda: total_num_hidden_layers
+    )
+    local_layer_ranges = [
+        get_pp_indices(total_num_hidden_layers, rank, local_pp_size)
+        for rank in range(local_pp_size)
+    ]
+    remote_layer_ranges = [
+        get_pp_indices(total_num_hidden_layers, rank, remote_pp_size)
+        for rank in range(remote_pp_size)
+    ]
+    decode_worker.pp_layer_range = local_layer_ranges[local_pp_rank]
     decode_worker.pcp_size = 1
     decode_worker.pcp_rank = 0
     decode_worker.transfer_topo = SimpleNamespace(
@@ -3576,13 +3617,16 @@ async def test_receive_kv_selects_remote_pp_workers(
     decode_worker._remote_agents = {
         "p-engine": {
             0: {
-                0: {0: "tcp://producer-pp0:1234"},
-                1: {0: "tcp://producer-pp1:1234"},
+                pp_rank: {0: f"tcp://producer-pp{pp_rank}:1234"}
+                for pp_rank in range(remote_pp_size)
             }
         }
     }
     decode_worker._tp_size = {"p-engine": 1}
     decode_worker._pcp_size = {"p-engine": 1}
+    decode_worker._remote_pp_layer_ranges = {
+        "p-engine": dict(enumerate(remote_layer_ranges))
+    }
 
     pull_metas = {
         "d-req-1": PullReqMeta(
@@ -3608,8 +3652,32 @@ async def test_receive_kv_selects_remote_pp_workers(
         decode_worker.receive_kv("p-engine", pull_metas)
         await asyncio.sleep(0)
 
-    assert seen_addrs == expected_addrs
+    assert seen_addrs == [
+        f"tcp://producer-pp{pp_rank}:1234" for pp_rank in expected_pp_ranks
+    ]
     assert pull_metas["d-req-1"].pull_tasks_count == 0
+
+
+def test_overlapping_pp_ranks_follow_uneven_layer_boundaries():
+    producer_ranges = [(0, 15), (15, 30), (30, 46), (46, 61)]
+    assert _get_overlapping_remote_pp_ranks(61, (0, 31), producer_ranges) == [
+        0,
+        1,
+        2,
+    ]
+    assert _get_overlapping_remote_pp_ranks(61, (31, 61), producer_ranges) == [
+        2,
+        3,
+    ]
+
+
+def test_overlapping_pp_ranks_use_remote_explicit_partitions():
+    producer_ranges = [(0, 10), (10, 30), (30, 50), (50, 61)]
+    assert _get_overlapping_remote_pp_ranks(61, (0, 31), producer_ranges) == [
+        0,
+        1,
+        2,
+    ]
 
 
 def test_receive_kv_rejects_legacy_producer_for_consumer_dcp():
@@ -3723,23 +3791,24 @@ def test_receive_kv_rejects_pcp_producer_for_consumer_dcp():
     assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
-def test_receive_kv_rejects_consumer_pp_fanout():
-    """A producer PP stage cannot serve multiple consumer PP stages safely."""
+@pytest.mark.asyncio
+async def test_receive_kv_supports_consumer_pp_fanout():
+    """One producer stage can serve multiple overlapping consumer stages."""
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.shutdown = MagicMock()
     worker.pp_size = 2
     worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 4)
+    worker.pp_layer_range = (0, 2)
     worker.pcp_size = 1
     worker.pcp_rank = 0
     worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda _size: [0])
     worker._remote_agents = {"p-engine": {0: {0: {0: "tcp://producer-pp0:1234"}}}}
     worker._tp_size = {"p-engine": 1}
     worker._pcp_size = {"p-engine": 1}
-    worker._invalid_block_ids_lock = threading.Lock()
-    worker._invalid_block_ids = set()
-    worker.finished_recving_reqs = set()
-    worker.receive_kv_from_single_worker = MagicMock()
+    worker._remote_pp_layer_ranges = {"p-engine": {0: (0, 4)}}
+    worker.receive_kv_from_single_worker = AsyncMock()
     pull_meta = PullReqMeta(
         d_req_id="d-req-pp-fanout",
         transfer_id="xfer-pp-fanout",
@@ -3749,11 +3818,13 @@ def test_receive_kv_rejects_consumer_pp_fanout():
     )
 
     worker.receive_kv("p-engine", {pull_meta.d_req_id: pull_meta})
+    await asyncio.sleep(0)
 
-    worker.receive_kv_from_single_worker.assert_not_called()
-    assert pull_meta.pull_failed is True
-    assert worker.finished_recving_reqs == {pull_meta.d_req_id}
-    assert worker.get_block_ids_with_load_errors() == {100, 101}
+    worker.receive_kv_from_single_worker.assert_awaited_once_with(
+        "tcp://producer-pp0:1234",
+        {pull_meta.d_req_id: pull_meta},
+    )
+    assert pull_meta.pull_tasks_count == 1
 
 
 @pytest.mark.asyncio
@@ -3764,6 +3835,8 @@ async def test_receive_kv_waits_for_every_remote_pp_pcp_worker():
     worker.shutdown = MagicMock()
     worker.pp_size = 1
     worker.pp_rank = 0
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 4)
+    worker.pp_layer_range = (0, 4)
     worker.pcp_size = 1
     worker.pcp_rank = 0
     worker.transfer_topo = SimpleNamespace(handshake_target_ranks=lambda _size: [0])
@@ -3783,6 +3856,12 @@ async def test_receive_kv_waits_for_every_remote_pp_pcp_worker():
     }
     worker._tp_size = {"p-engine": 1}
     worker._pcp_size = {"p-engine": 2}
+    worker._remote_pp_layer_ranges = {
+        "p-engine": {
+            0: (0, 2),
+            1: (2, 4),
+        }
+    }
     worker.finished_recving_reqs = set()
     pull_metas = {
         "d-req-1": PullReqMeta(
@@ -3905,13 +3984,16 @@ def test_multi_shard_late_failure_waits_for_quiesce_and_invalidates_blocks():
     assert worker.get_block_ids_with_load_errors() == {100, 101}
 
 
-def test_resolve_need_send_accounts_for_remote_tp_fanout():
-    """Producer-side completion waits for every paired consumer TP pull."""
+def test_resolve_need_send_accounts_for_remote_tp_and_pp_fanout():
+    """Producer completion waits for every overlapping consumer worker."""
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = True
     worker.is_kv_producer = True
+    worker.pp_size = 4
+    worker.pp_rank = 2
+    worker.model_config = SimpleNamespace(get_total_num_hidden_layers=lambda: 61)
     send_meta = SendBlockMeta(
         p_req_id="p-req-1",
         transfer_id="xfer-req-1",
@@ -3919,9 +4001,13 @@ def test_resolve_need_send_accounts_for_remote_tp_fanout():
         ready=asyncio.Event(),
     )
 
-    worker.resolve_need_send(send_meta, remote_tp_ranks=[0, 1])
+    worker.resolve_need_send(
+        send_meta,
+        remote_tp_ranks=[0, 1],
+        remote_pp_ranks=[0, 1],
+    )
 
-    assert send_meta.need_send == 2
+    assert send_meta.need_send == 4
 
 
 def test_finish_failed_send_attempts_release_after_all_targets():
@@ -4199,6 +4285,7 @@ async def test_kv_consumuer(monkeypatch):
 
         assert sent_meta.remote_hostname == "127.0.0.1"
         assert sent_meta.remote_port == 54321
+        assert sent_meta.remote_pp_layer_ranges == decode_worker.pp_layer_ranges
         assert sent_meta.req_blocks["d-req-1"] == ("xfer-req-1", [[100, 101]])
         assert sent_meta.kv_caches_base_addr == [0x1000]
         assert sent_meta.block_lens == [4096]
