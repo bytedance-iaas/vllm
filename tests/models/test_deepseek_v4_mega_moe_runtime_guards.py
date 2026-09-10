@@ -320,6 +320,13 @@ def test_resolve_mega_moe_decode_capacity_accounts_for_sequence_parallel():
     )
 
 
+def test_sm90_mega_moe_rejects_unsupported_num_sms(monkeypatch):
+    monkeypatch.setattr(dsv4_model.envs, "VLLM_DSV4_MEGA_MOE_NUM_SMS", 77)
+
+    with pytest.raises(ValueError, match="0, 76, or 78"):
+        _make_fp4_experts()
+
+
 def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
     experts.max_num_tokens = 80
@@ -928,6 +935,7 @@ def test_sm90_run_mega_moe_uses_skip_padding_sentinel_for_idle_rows(monkeypatch)
     experts._use_sm90_fp4_mega_moe = True
     experts._transformed_l1_weights = object()
     experts._transformed_l2_weights = object()
+    experts._sm90_mega_moe_num_sms = 0
     monkeypatch.setattr(experts, "finalize_weights", lambda: None)
     monkeypatch.setattr(
         experts,
@@ -983,3 +991,107 @@ def test_sm90_run_mega_moe_uses_skip_padding_sentinel_for_idle_rows(monkeypatch)
 
     assert torch.equal(captured["topk_ids"], torch.full_like(topk_ids, -1))
     assert torch.equal(captured["topk_weights"], torch.zeros_like(topk_weights))
+
+
+def test_sm90_fp4_mega_moe_passes_num_sms_override(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_sm90_fp4_mega_moe = True
+    experts._transformed_l1_weights = object()
+    experts._transformed_l2_weights = object()
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda n: SimpleNamespace(
+            x=torch.empty(n, 4),
+            x_sf=torch.empty(n, 1),
+            topk_idx=torch.empty(n, 2, dtype=torch.int64),
+            topk_weights=torch.empty(n, 2),
+        ),
+    )
+    monkeypatch.setattr(
+        dsv4_model,
+        "prepare_megamoe_inputs_sm90",
+        lambda *args, **kwargs: None,
+    )
+
+    calls = []
+
+    class FakeDeepGemm:
+        def fp8_fp4_mega_moe(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+
+    experts._run_mega_moe_sm90(
+        torch.randn(2, 4),
+        torch.randn(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        torch.empty(2, 4),
+        activation_clamp=None,
+        fast_math=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["num_sms"] == 76
+
+
+def test_sm90_mega_moe_keeps_sm76_before_last_pp_stage(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        dsv4_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=2, is_last_rank=False),
+    )
+
+    assert experts._get_effective_sm90_mega_moe_num_sms() == 76
+
+
+def test_sm90_mega_moe_uses_sm78_on_last_pp_stage(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        dsv4_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=2, is_last_rank=True),
+    )
+
+    assert experts._get_effective_sm90_mega_moe_num_sms() == 78
+
+
+def test_sm90_fp8_mega_moe_rejects_num_sms_override(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_sm90_fp4_mega_moe = False
+    experts._transformed_l1_weights = object()
+    experts._transformed_l2_weights = object()
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda n: SimpleNamespace(
+            x=torch.empty(n, 4),
+            x_sf=torch.empty(n, 1),
+            topk_idx=torch.empty(n, 2, dtype=torch.int64),
+            topk_weights=torch.empty(n, 2),
+        ),
+    )
+    monkeypatch.setattr(
+        dsv4_model,
+        "prepare_megamoe_inputs_sm90",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="only supported for the SM90 FP4"):
+        experts._run_mega_moe_sm90(
+            torch.randn(2, 4),
+            torch.randn(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            torch.empty(2, 4),
+            activation_clamp=None,
+            fast_math=True,
+        )
