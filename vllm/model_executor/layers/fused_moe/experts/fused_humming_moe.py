@@ -66,19 +66,29 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def get_humming_moe_gemm_type() -> str:
+def get_humming_moe_gemm_type(
+    activation_format: mk.FusedMoEActivationFormat | None = None,
+) -> str | None:
     env_gemm_type: str | None = envs.VLLM_HUMMING_MOE_GEMM_TYPE
-    gemm_type = "indexed"
-    if env_gemm_type is not None:
+    gemm_type: str | None = None
+    if env_gemm_type is None or env_gemm_type.lower() == "auto":
+        if activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+            gemm_type = "grouped_masked"
+    else:
         env_gemm_type = env_gemm_type.lower()
         if env_gemm_type == "indexed":
             gemm_type = env_gemm_type
         elif env_gemm_type in ["grouped_contiguous", "grouped"]:
             gemm_type = "grouped_contiguous"
+        elif env_gemm_type in ["grouped_masked", "batched_grouped"]:
+            gemm_type = "grouped_masked"
         else:
             gemm_type = "indexed"
 
-    logger.info_once(f"Using {gemm_type} gemm for humming moe")  # noqa
+    if gemm_type is None:
+        logger.info_once("Using auto gemm selection for humming moe")
+    else:
+        logger.info_once(f"Using {gemm_type} gemm for humming moe")  # noqa
     return gemm_type
 
 
@@ -135,14 +145,21 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
+            max_num_tokens = self.moe_config.max_num_tokens
+            if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
-                max_num_tokens=self.moe_config.max_num_tokens,
+                max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
                 device=torch.device(self.moe_config.device),
-                hidden_size=self.moe_config.hidden_dim,
-                hidden_dtype=self.moe_config.in_dtype,
             )
         return self._permute_scratch
 
@@ -486,13 +503,14 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         if supported:
             assert hasattr(cls, "humming_gemm_type")
             gemm_type = cls.humming_gemm_type().value.lower()
-            preferred_gemm_type = get_humming_moe_gemm_type()
-            supported = preferred_gemm_type.lower() == gemm_type
-            if not supported:
-                reason = (
-                    f"preferred gemm type {preferred_gemm_type} != "
-                    f"supported gemm type {gemm_type}"
-                )
+            preferred_gemm_type = get_humming_moe_gemm_type(activation_format)
+            if preferred_gemm_type is not None:
+                supported = preferred_gemm_type.lower() == gemm_type
+                if not supported:
+                    reason = (
+                        f"preferred gemm type {preferred_gemm_type} != "
+                        f"supported gemm type {gemm_type}"
+                    )
 
         return supported, reason
 
