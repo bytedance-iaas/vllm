@@ -34,13 +34,18 @@ def _set_draft_query_padding_mask(
     num_tokens_padded: int,
     *,
     dummy_run: bool,
+    valid_query_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert 0 <= num_query_tokens <= num_tokens_padded <= input_buffers.max_num_tokens
     is_padding = input_buffers.is_padding[:num_tokens_padded]
     if dummy_run:
         is_padding.fill_(True)
     else:
-        is_padding[:num_query_tokens].fill_(False)
+        if valid_query_mask is None:
+            is_padding[:num_query_tokens].fill_(False)
+        else:
+            assert valid_query_mask.shape[0] >= num_query_tokens
+            is_padding[:num_query_tokens].copy_(~valid_query_mask[:num_query_tokens])
         is_padding[num_query_tokens:].fill_(True)
     return is_padding
 
@@ -543,11 +548,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
 
+        valid_query_mask = None
+        if not dummy_run:
+            valid_query_mask = (
+                self.block_tables.slot_mappings[
+                    self.draft_kv_cache_group_id, :num_query_tokens
+                ]
+                != PAD_SLOT_ID
+            )
         _set_draft_query_padding_mask(
             self.input_buffers,
             num_query_tokens,
             num_tokens_padded,
             dummy_run=dummy_run,
+            valid_query_mask=valid_query_mask,
         )
 
         # Rebuild the draft attention metadata even when replaying the FULL
@@ -633,7 +647,9 @@ def _prepare_dflash_inputs_kernel(
     num_ctx = ctx_end - ctx_start
 
     num_rejected = tl.load(num_rejected_ptr + req_idx)
-    valid_ctx_end = ctx_end - num_rejected
+    valid_ctx_len = num_ctx - num_rejected
+    has_valid_ctx = valid_ctx_len > 0
+    valid_ctx_end = ctx_start + tl.maximum(valid_ctx_len, 0)
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
@@ -642,45 +658,53 @@ def _prepare_dflash_inputs_kernel(
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
-    last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+    last_valid_idx = tl.where(has_valid_ctx, valid_ctx_end - 1, ctx_start)
+    last_valid_pos = tl.load(target_positions_ptr + last_valid_idx)
+    last_valid_pos = tl.where(has_valid_ctx, last_valid_pos, last_valid_pos - 1)
     query_base = req_idx * num_query_per_req
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    is_ctx = j < num_ctx
+    is_ctx_slot = j < num_ctx
+    is_valid_ctx = j < valid_ctx_len
     is_query = (j >= num_ctx) & (j < num_ctx + num_query_per_req)
     query_off = j - num_ctx
 
     # --- Context positions / slots ---
-    ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
-    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+    ctx_pos_idx = ctx_start + tl.where(is_ctx_slot, j, 0)
+    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
     ctx_block_num = ctx_pos // block_size
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
-        mask=is_ctx,
+        mask=is_valid_ctx,
         other=0,
     ).to(tl.int64)
     ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
-    tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
-    tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+    ctx_slot = tl.where(is_valid_ctx, ctx_slot, PAD_SLOT_ID)
+    tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx_slot)
+    tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx_slot)
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
     query_idx = query_base + query_off
     is_bonus = is_query & (query_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
+    input_id = tl.where(has_valid_ctx, input_id, 0)
 
     q_block_num = query_pos // block_size
     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
     q_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + q_block_num,
-        mask=is_query,
+        mask=is_query & has_valid_ctx,
         other=0,
     ).to(tl.int64)
     q_slot = q_block_id * block_size + (query_pos % block_size)
+    q_slot = tl.where(has_valid_ctx, q_slot, PAD_SLOT_ID)
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
-    clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
+    clamped_query_pos = tl.where(
+        has_valid_ctx, tl.minimum(query_pos, max_model_len - 1), 0
+    )
     tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
     tl.store(out_query_slot_mapping_ptr + query_idx, q_slot, mask=is_query)
 
@@ -690,12 +714,39 @@ def _prepare_dflash_inputs_kernel(
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
+    is_sample_slot = is_query & (query_off >= sample_off)
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
-    tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
-    tl.store(out_sample_pos_ptr + sample_idx, sample_pos, mask=is_sample)
-    tl.store(out_sample_idx_mapping_ptr + sample_idx, req_state_idx, mask=is_sample)
+    tl.store(
+        out_sample_indices_ptr + sample_idx,
+        query_idx,
+        mask=is_sample_slot & has_valid_ctx,
+    )
+    tl.store(
+        out_sample_pos_ptr + sample_idx,
+        sample_pos,
+        mask=is_sample_slot & has_valid_ctx,
+    )
+    tl.store(
+        out_sample_idx_mapping_ptr + sample_idx,
+        req_state_idx,
+        mask=is_sample_slot & has_valid_ctx,
+    )
+    tl.store(
+        out_sample_indices_ptr + sample_idx,
+        0,
+        mask=is_sample_slot & ~has_valid_ctx,
+    )
+    tl.store(
+        out_sample_pos_ptr + sample_idx,
+        0,
+        mask=is_sample_slot & ~has_valid_ctx,
+    )
+    tl.store(
+        out_sample_idx_mapping_ptr + sample_idx,
+        -1,
+        mask=is_sample_slot & ~has_valid_ctx,
+    )
 
     if block_idx == 0:
         tl.store(out_query_start_loc_ptr + req_idx, query_base)
@@ -703,12 +754,13 @@ def _prepare_dflash_inputs_kernel(
         # reads up to. Restored whole blocks contain no draft KV, so hide them.
         num_cached = tl.load(num_cached_tokens_ptr + req_state_idx)
         num_shifted_slots = (num_cached // block_size) * block_size
+        seq_len = tl.maximum(
+            last_valid_pos + 1 + num_query_per_req - num_shifted_slots,
+            num_query_per_req,
+        )
         tl.store(
             out_seq_lens_ptr + req_idx,
-            tl.maximum(
-                last_valid_pos + 1 + num_query_per_req - num_shifted_slots,
-                num_query_per_req,
-            ),
+            tl.where(has_valid_ctx, seq_len, 0),
         )
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
