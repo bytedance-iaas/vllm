@@ -897,6 +897,12 @@ class VllmConfig:
                 "remains disabled under DP > 1."
             )
 
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                "Dynamic speculative decoding with data_parallel_size > 1 "
+                "requires the V2 model runner."
+            )
+
         if (
             speculative_config.method == "dspark"
             and self.scheduler_config.async_scheduling is False
