@@ -20,6 +20,7 @@ from vllm.distributed import (
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
@@ -86,6 +87,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+logger = init_logger(__name__)
 
 
 def _shard_tp_token_rows(
@@ -249,6 +252,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self._use_sm90_mega_moe = False
         self._use_sm90_fp4_mega_moe = False
         self._use_sm90_fp8_mega_moe = False
+        self._sm90_mega_moe_num_sms = envs.VLLM_DSV4_MEGA_MOE_NUM_SMS
+        if self._sm90_mega_moe_num_sms not in (0, 76, 78):
+            raise ValueError(
+                "VLLM_DSV4_MEGA_MOE_NUM_SMS must be one of 0, 76, or 78 "
+                f"for SM90 FP4 MegaMoE, got {self._sm90_mega_moe_num_sms}."
+            )
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -271,6 +280,20 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _get_effective_sm90_mega_moe_num_sms(self) -> int:
+        num_sms = self._sm90_mega_moe_num_sms
+        if num_sms != 76:
+            return num_sms
+
+        try:
+            pp_group = get_pp_group()
+        except AssertionError:
+            return num_sms
+
+        if pp_group.world_size > 1 and pp_group.is_last_rank:
+            return 78
+        return num_sms
 
     @staticmethod
     def _ceil_div_128(value: int) -> int:
@@ -922,18 +945,43 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
-        if self._use_sm90_fp4_mega_moe:
-            deep_gemm.fp8_fp4_mega_moe(
-                y,
-                self._transformed_l1_weights,
-                self._transformed_l2_weights,
-                symm_buffer,
-                recipe=(1, 1, 32),
-                activation="swiglu",
-                activation_clamp=activation_clamp,
-                fast_math=fast_math,
+        effective_num_sms = self._get_effective_sm90_mega_moe_num_sms()
+        if self._sm90_mega_moe_num_sms:
+            logger.info_once(
+                "Using VLLM_DSV4_MEGA_MOE_NUM_SMS=%d "
+                "(effective num_sms=%d) for SM90 MegaMoE.",
+                self._sm90_mega_moe_num_sms,
+                effective_num_sms,
             )
+        if self._use_sm90_fp4_mega_moe:
+            try:
+                mega_moe_kwargs = {}
+                if effective_num_sms:
+                    mega_moe_kwargs["num_sms"] = effective_num_sms
+                deep_gemm.fp8_fp4_mega_moe(
+                    y,
+                    self._transformed_l1_weights,
+                    self._transformed_l2_weights,
+                    symm_buffer,
+                    recipe=(1, 1, 32),
+                    activation="swiglu",
+                    activation_clamp=activation_clamp,
+                    fast_math=fast_math,
+                    **mega_moe_kwargs,
+                )
+            except TypeError as err:
+                if effective_num_sms:
+                    raise RuntimeError(
+                        "VLLM_DSV4_MEGA_MOE_NUM_SMS requires a DeepGEMM "
+                        "build with fp8_fp4_mega_moe(..., num_sms=...)."
+                    ) from err
+                raise
         else:
+            if effective_num_sms:
+                raise RuntimeError(
+                    "VLLM_DSV4_MEGA_MOE_NUM_SMS is only supported for the "
+                    "SM90 FP4 MegaMoE path."
+                )
             deep_gemm.fp8_mega_moe(
                 y,
                 self._transformed_l1_weights,

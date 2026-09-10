@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = False
     VLLM_DSV4_MEGA_MOE_TP_DEDUP: bool = False
+    VLLM_DSV4_MEGA_MOE_NUM_SMS: int = 0
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1539,6 +1540,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather routed outputs before adding the unchanged shared expert path.
     "VLLM_DSV4_MEGA_MOE_TP_DEDUP": lambda: bool(
         int(os.getenv("VLLM_DSV4_MEGA_MOE_TP_DEDUP", "0"))
+    ),
+    # DeepSeek V4 SM90 MegaMoE grid override. 0 keeps DeepGEMM's default.
+    "VLLM_DSV4_MEGA_MOE_NUM_SMS": lambda: int(
+        os.getenv("VLLM_DSV4_MEGA_MOE_NUM_SMS", "0")
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
