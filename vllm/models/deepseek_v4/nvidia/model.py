@@ -64,6 +64,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import (
@@ -1421,6 +1422,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1486,7 +1489,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if skip
         )
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1586,9 +1589,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_mega_moe:
+        if self.use_mega_moe and input_ids is not None:
             input_ids = input_ids.to(torch.int64)
 
+        remote_aux: list[torch.Tensor] = []
+        if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
+            remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
@@ -1621,7 +1627,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            # Merged by unpacking rather than dict.update: the compile wrapper
+            # rejects a forward whose bytecode names `update`.
+            tensors = {
+                "hidden_states": hidden_states,
+                **self.pack_local_aux_hidden_states(aux_hidden_states),
+            }
+            return IntermediateTensors(tensors)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -1636,6 +1648,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1674,7 +1687,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         for name, loaded_weight in weights:
             if pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
+                loaded_weight = self._pad_shared_expert_weight(
+                    self.quant_config, name, loaded_weight
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -1749,15 +1764,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         return loaded_params
 
+    @staticmethod
     def _pad_shared_expert_weight(
-        self, name: str, loaded_weight: torch.Tensor
+        quant_config: QuantizationConfig | None,
+        name: str,
+        loaded_weight: torch.Tensor,
     ) -> torch.Tensor:
         """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
         axis so the standard TP loaders split it into even, block-aligned shards
         (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
         down (w2 -> down_proj) [H, I] pads dim 1.
         """
-        block_size = getattr(self.quant_config, "weight_block_size", None)
+        block_size = getattr(quant_config, "weight_block_size", None)
         assert block_size is not None
         # Round the intermediate axis up to a whole number of TP shards. The axis
         # is in elements for weights (step = block) and in blocks for scales.

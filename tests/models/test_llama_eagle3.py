@@ -33,14 +33,14 @@ def test_eagle3_prefill_draft_uses_global_target_layer_count() -> None:
     assert _get_eagle3_target_layer_count(config) == 60
 
 
-def test_eagle3_default_path_keeps_local_target_layer_count() -> None:
+def test_eagle3_default_path_uses_global_target_layer_count() -> None:
     config = _config(
         prefill_draft_kv=False,
         total_layers=60,
         local_layers=30,
     )
 
-    assert _get_eagle3_target_layer_count(config) == 30
+    assert _get_eagle3_target_layer_count(config) == 60
 
 
 def test_eagle3_prefill_draft_rejects_non_minimax_layer_count() -> None:

@@ -25,6 +25,8 @@ def _temperature_kernel(
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+    if req_state_idx < 0:
+        return
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
     if temperature == 0.0 or temperature == 1.0:
         # Early return to avoid loading logits.
@@ -181,6 +183,15 @@ def _gumbel_sample_kernel(
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     block_idx = tl.program_id(1)
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+    if req_state_idx < 0:
+        tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, 0)
+        tl.store(
+            local_max_ptr + token_idx * local_max_stride + block_idx,
+            float("-inf"),
+        )
+        return
+
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block < vocab_size
     logits = tl.load(

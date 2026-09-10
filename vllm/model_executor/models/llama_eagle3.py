@@ -44,7 +44,7 @@ def _get_eagle3_target_layer_count(vllm_config: VllmConfig) -> int:
         if target_layer_count != 60:
             raise ValueError("EAGLE3 Prefill draft-KV requires 60 global target layers")
         return target_layer_count
-    return vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    return vllm_config.model_config.get_total_num_hidden_layers()
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
