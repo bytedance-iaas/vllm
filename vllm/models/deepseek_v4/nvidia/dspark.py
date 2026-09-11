@@ -38,15 +38,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_dspark import (
     DSparkMarkovHead,
 )
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import (
+    make_empty_intermediate_tensors_factory,
+    maybe_prefix,
+)
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
     sp_shard,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 
 from .model import (
@@ -357,7 +362,7 @@ def _insert_context_kv(
         )
 
 
-class DSparkDeepseekV4ForCausalLM(nn.Module):
+class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
@@ -384,6 +389,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # The DSpark draft only runs on the last PP stage. This factory exists
+        # to satisfy the SupportsPP protocol during config validation.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], self.config.hidden_size
+            )
+        )
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -482,9 +494,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Returns the pre-norm hc_head hidden ([T, hidden_size]).
+        assert intermediate_tensors is None
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

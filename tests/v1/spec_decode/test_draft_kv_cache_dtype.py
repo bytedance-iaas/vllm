@@ -109,9 +109,7 @@ def _install_draft_loader_stubs(monkeypatch, *, has_non_causal: bool):
     monkeypatch.setitem(sys.modules, "vllm.compilation.backends", backend_module)
 
     qwen3_dflash_module = ModuleType("vllm.model_executor.models.qwen3_dflash")
-    qwen3_dflash_module.dflash_has_any_non_causal = (
-        lambda _hf_config: has_non_causal
-    )
+    qwen3_dflash_module.dflash_has_any_non_causal = lambda _hf_config: has_non_causal
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.models.qwen3_dflash",
@@ -197,8 +195,7 @@ def test_load_dspark_model_preserves_draft_kernel_and_quant_config(
     monkeypatch.setattr(dspark_utils, "replace", _replace_namespace)
     monkeypatch.setattr(dspark_utils, "get_model", fake_get_model)
     monkeypatch.setattr(
-        dspark_utils,
-        "get_pp_group",
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils.get_pp_group",
         lambda: SimpleNamespace(world_size=1),
     )
     monkeypatch.setattr(dspark_utils, "_should_share", lambda *_args: False)
@@ -247,9 +244,7 @@ def test_dspark_layers_use_passed_draft_config_and_topk_buffer(monkeypatch):
     class FakeDecoderLayer(nn.Module):
         def __init__(self, vllm_config, prefix, *args, **kwargs):
             super().__init__()
-            captured_layers.append(
-                (vllm_config, prefix, kwargs["topk_indices_buffer"])
-            )
+            captured_layers.append((vllm_config, prefix, kwargs["topk_indices_buffer"]))
 
     monkeypatch.setattr(
         "vllm.models.deepseek_v4.nvidia.dspark.VocabParallelEmbedding",
