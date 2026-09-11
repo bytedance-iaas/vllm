@@ -7,6 +7,7 @@ loader-side parameter shapes and FP8 scale sharding logic, which are pure
 PyTorch/host operations and do not require a GPU.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -80,6 +81,207 @@ def _make_fp4_experts(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [0, 1, 7, 8, 9, 31, 32, 33, 383, 384])
+@pytest.mark.parametrize("shape_tail", [(), (3,), (2, 2)])
+def test_shard_tp_token_rows_preserves_order_and_marks_padding(
+    num_tokens: int,
+    shape_tail: tuple[int, ...],
+):
+    tp_size = 8
+    shape = (num_tokens, *shape_tail)
+    tensor = torch.arange(max(1, math.prod(shape)), dtype=torch.int64)[
+        : math.prod(shape)
+    ]
+    tensor = tensor.reshape(shape)
+
+    shards = []
+    valid_counts = []
+    for tp_rank in range(tp_size):
+        shard, valid_count = dsv4_model._shard_tp_token_rows(
+            tensor,
+            tp_rank,
+            tp_size,
+            padding_value=-1,
+        )
+        shards.append(shard)
+        valid_counts.append(valid_count)
+
+        if valid_count < shard.shape[0]:
+            assert torch.all(shard[valid_count:] == -1)
+
+    reconstructed = torch.cat(shards, dim=0)[:num_tokens]
+    assert torch.equal(reconstructed, tensor)
+    assert sum(valid_counts) == num_tokens
+    assert len(set(shard.shape[0] for shard in shards)) == 1
+
+
+@pytest.mark.parametrize(
+    "num_tokens,tp_rank,expected",
+    [
+        (9, 0, [False, True]),
+        (9, 1, [False, False]),
+        (9, 4, [False, True]),
+        (1, 0, [False]),
+        (1, 7, [True]),
+    ],
+)
+def test_local_tp_padding_mask_combines_scheduler_and_shard_padding(
+    num_tokens: int,
+    tp_rank: int,
+    expected: list[bool],
+):
+    tp_size = 8
+    global_padding_mask = torch.zeros(num_tokens, dtype=torch.bool)
+    if num_tokens > 1:
+        global_padding_mask[1] = True
+    local_input, valid_num_tokens = dsv4_model._shard_tp_token_rows(
+        torch.zeros(num_tokens, 2),
+        tp_rank,
+        tp_size,
+    )
+
+    actual = dsv4_model._local_tp_padding_mask(
+        global_padding_mask,
+        local_input,
+        valid_num_tokens,
+        tp_rank,
+        tp_size,
+    )
+
+    assert actual.tolist() == expected
+
+
+def test_local_tp_padding_mask_skips_allocation_without_padding():
+    local_input = torch.zeros(3, 2)
+
+    actual = dsv4_model._local_tp_padding_mask(
+        None,
+        local_input,
+        valid_num_tokens=3,
+        tp_rank=0,
+        tp_size=8,
+    )
+
+    assert actual is None
+
+
+def test_local_tp_padding_mask_marks_tp_tail_without_scheduler_padding():
+    local_input = torch.zeros(2, 2)
+
+    actual = dsv4_model._local_tp_padding_mask(
+        None,
+        local_input,
+        valid_num_tokens=1,
+        tp_rank=4,
+        tp_size=8,
+    )
+
+    assert actual is not None
+    assert actual.tolist() == [False, True]
+
+
+@pytest.mark.parametrize(
+    "num_tokens,tp_rank,expected_padding",
+    [
+        (8, 3, None),
+        (9, 4, [False, True]),
+        (1, 7, [True]),
+    ],
+)
+def test_run_mega_moe_tp_dedup_restores_routed_output(
+    monkeypatch,
+    num_tokens: int,
+    tp_rank: int,
+    expected_padding: list[bool] | None,
+):
+    tp_size = 8
+    hidden_states = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(
+        num_tokens, 2
+    )
+    input_ids = torch.arange(num_tokens, dtype=torch.int64)
+    out = torch.empty_like(hidden_states)
+
+    class FakeGate(torch.nn.Module):
+        e_score_correction_bias = None
+        tid2eid = None
+
+        def forward(self, local_input):
+            return torch.zeros(local_input.shape[0], 4), None
+
+    class FakeExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.padding = None
+
+        def forward(
+            self,
+            local_input,
+            topk_weights,
+            topk_ids,
+            *,
+            activation_clamp,
+            is_padding,
+        ):
+            self.padding = None if is_padding is None else is_padding.tolist()
+            return local_input + 10
+
+    padded_tokens = math.ceil(num_tokens / tp_size) * tp_size
+    padding = torch.zeros(padded_tokens - num_tokens, 2)
+    gathered_output = torch.cat((hidden_states, padding), dim=0) + 10
+
+    class FakeGroup:
+        def all_gather(self, local_output, dim):
+            assert dim == 0
+            expected_local, _ = dsv4_model._shard_tp_token_rows(
+                hidden_states,
+                tp_rank,
+                tp_size,
+            )
+            assert torch.equal(local_output, expected_local + 10)
+            return gathered_output
+
+    routed_input_ids = []
+
+    def fake_fused_topk_bias(**kwargs):
+        routed_input_ids.append(kwargs["input_tokens"].clone())
+        return (
+            torch.ones(kwargs["hidden_states"].shape[0], 2),
+            torch.zeros(kwargs["hidden_states"].shape[0], 2, dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(dsv4_model, "fused_topk_bias", fake_fused_topk_bias)
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "0")
+
+    moe = object.__new__(dsv4_model.DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    moe.tp_rank = tp_rank
+    moe.tp_size = tp_size
+    moe.tp_group = FakeGroup()
+    moe.gate = FakeGate()
+    moe.experts = FakeExperts()
+    moe.scoring_func = "sqrtsoftplus"
+    moe.n_activated_experts = 2
+    moe.renormalize = True
+    moe.hash_indices_dtype = torch.int64
+    moe.routed_scaling_factor = 1.0
+
+    moe._run_mega_moe_tp_dedup(
+        hidden_states,
+        input_ids=input_ids,
+        out=out,
+        activation_clamp=None,
+    )
+
+    assert torch.equal(out, hidden_states + 10)
+    assert moe.experts.padding == expected_padding
+    expected_input_ids, _ = dsv4_model._shard_tp_token_rows(
+        input_ids,
+        tp_rank,
+        tp_size,
+    )
+    assert torch.equal(routed_input_ids[0], expected_input_ids)
+
+
 def test_resolve_mega_moe_decode_capacity_defaults_to_decode_capacity():
     cfg = _make_vllm_config(max_num_batched_tokens=512, max_num_seqs=16)
     assert DeepseekV4MegaMoEExperts._resolve_mega_moe_decode_capacity(cfg) == 16
@@ -116,6 +318,13 @@ def test_resolve_mega_moe_decode_capacity_accounts_for_sequence_parallel():
         )
         == 20
     )
+
+
+def test_sm90_mega_moe_rejects_unsupported_num_sms(monkeypatch):
+    monkeypatch.setattr(dsv4_model.envs, "VLLM_DSV4_MEGA_MOE_NUM_SMS", 77)
+
+    with pytest.raises(ValueError, match="0, 76, or 78"):
+        _make_fp4_experts()
 
 
 def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
@@ -726,6 +935,7 @@ def test_sm90_run_mega_moe_uses_skip_padding_sentinel_for_idle_rows(monkeypatch)
     experts._use_sm90_fp4_mega_moe = True
     experts._transformed_l1_weights = object()
     experts._transformed_l2_weights = object()
+    experts._sm90_mega_moe_num_sms = 0
     monkeypatch.setattr(experts, "finalize_weights", lambda: None)
     monkeypatch.setattr(
         experts,
@@ -781,3 +991,107 @@ def test_sm90_run_mega_moe_uses_skip_padding_sentinel_for_idle_rows(monkeypatch)
 
     assert torch.equal(captured["topk_ids"], torch.full_like(topk_ids, -1))
     assert torch.equal(captured["topk_weights"], torch.zeros_like(topk_weights))
+
+
+def test_sm90_fp4_mega_moe_passes_num_sms_override(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_sm90_fp4_mega_moe = True
+    experts._transformed_l1_weights = object()
+    experts._transformed_l2_weights = object()
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda n: SimpleNamespace(
+            x=torch.empty(n, 4),
+            x_sf=torch.empty(n, 1),
+            topk_idx=torch.empty(n, 2, dtype=torch.int64),
+            topk_weights=torch.empty(n, 2),
+        ),
+    )
+    monkeypatch.setattr(
+        dsv4_model,
+        "prepare_megamoe_inputs_sm90",
+        lambda *args, **kwargs: None,
+    )
+
+    calls = []
+
+    class FakeDeepGemm:
+        def fp8_fp4_mega_moe(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+
+    experts._run_mega_moe_sm90(
+        torch.randn(2, 4),
+        torch.randn(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        torch.empty(2, 4),
+        activation_clamp=None,
+        fast_math=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["num_sms"] == 76
+
+
+def test_sm90_mega_moe_keeps_sm76_before_last_pp_stage(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        dsv4_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=2, is_last_rank=False),
+    )
+
+    assert experts._get_effective_sm90_mega_moe_num_sms() == 76
+
+
+def test_sm90_mega_moe_uses_sm78_on_last_pp_stage(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        dsv4_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=2, is_last_rank=True),
+    )
+
+    assert experts._get_effective_sm90_mega_moe_num_sms() == 78
+
+
+def test_sm90_fp8_mega_moe_rejects_num_sms_override(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_sm90_fp4_mega_moe = False
+    experts._transformed_l1_weights = object()
+    experts._transformed_l2_weights = object()
+    experts._sm90_mega_moe_num_sms = 76
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda n: SimpleNamespace(
+            x=torch.empty(n, 4),
+            x_sf=torch.empty(n, 1),
+            topk_idx=torch.empty(n, 2, dtype=torch.int64),
+            topk_weights=torch.empty(n, 2),
+        ),
+    )
+    monkeypatch.setattr(
+        dsv4_model,
+        "prepare_megamoe_inputs_sm90",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="only supported for the SM90 FP4"):
+        experts._run_mega_moe_sm90(
+            torch.randn(2, 4),
+            torch.randn(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            torch.empty(2, 4),
+            activation_clamp=None,
+            fast_math=True,
+        )

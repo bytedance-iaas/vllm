@@ -181,7 +181,16 @@ if TYPE_CHECKING:
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
-    VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+    VLLM_HUMMING_MOE_GEMM_TYPE: (
+        Literal[
+            "indexed",
+            "grouped",
+            "grouped_contiguous",
+            "grouped_masked",
+            "auto",
+        ]
+        | None
+    ) = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -199,6 +208,8 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
+    VLLM_DSV4_MEGA_MOE_TP_DEDUP: bool = False
+    VLLM_DSV4_MEGA_MOE_NUM_SMS: int = 0
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1476,10 +1487,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HUMMING_USE_F16_ACCUM": lambda: maybe_convert_bool(
         os.environ.get("VLLM_HUMMING_USE_F16_ACCUM", "0")
     ),
-    # Whether to use indexed gemm for humming moe
-    # if 1, force use indexed gemm
-    # if 0, force use grouped gemm
-    # if None, choose better gemm type automatically
+    # Humming MoE GEMM type. When unset or "auto", choose by activation format:
+    # batched activation uses grouped_masked; standard activation lets the
+    # backend selector choose between grouped_contiguous and indexed.
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
     ),
@@ -1559,6 +1569,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serving.
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT", "0"))
+    ),
+    # Shard replicated DeepSeek V4 MegaMoE token rows across the TP group and
+    # all-gather routed outputs before adding the unchanged shared expert path.
+    "VLLM_DSV4_MEGA_MOE_TP_DEDUP": lambda: bool(
+        int(os.getenv("VLLM_DSV4_MEGA_MOE_TP_DEDUP", "0"))
+    ),
+    # DeepSeek V4 SM90 MegaMoE grid override. 0 keeps DeepGEMM's default.
+    "VLLM_DSV4_MEGA_MOE_NUM_SMS": lambda: int(
+        os.getenv("VLLM_DSV4_MEGA_MOE_NUM_SMS", "0")
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).

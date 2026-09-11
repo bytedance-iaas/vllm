@@ -154,10 +154,16 @@ def moe_permute(
             scratch.validate(hidden_states, topk_ids)
             hidden_numel = permuted_row_size * n_hidden
             scratch_hidden_states = scratch.permuted_hidden_states
-            assert scratch_hidden_states is not None
-            permuted_hidden_states = scratch_hidden_states[:hidden_numel].view(
-                permuted_row_size, n_hidden
-            )
+            if scratch_hidden_states is None:
+                permuted_hidden_states = torch.empty(
+                    (permuted_row_size, n_hidden),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            else:
+                permuted_hidden_states = scratch_hidden_states[:hidden_numel].view(
+                    permuted_row_size, n_hidden
+                )
     assert permuted_hidden_states.size() == (permuted_row_size, n_hidden), (
         f"Expected permuted hidden states to be {(permuted_row_size, n_hidden)}"
         f" but got {permuted_hidden_states.size()}"
