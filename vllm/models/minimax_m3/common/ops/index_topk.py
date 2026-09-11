@@ -298,6 +298,7 @@ def _decode_index_score_kernel(
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
+    kv_lens,  # optional per-query local KV lengths: [total_q]
     num_idx_heads: tl.constexpr,
     head_dim: tl.constexpr,
     init_blocks,
@@ -316,6 +317,7 @@ def _decode_index_score_kernel(
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks,
+    HAS_KV_LENS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
@@ -331,11 +333,14 @@ def _decode_index_score_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    seq_len = tl.load(seq_lens + pid_r)
-    query_pos = seq_len - decode_query_len + q_offsets
-    # Full-CG padding uses zero-length request rows. Clamp to an empty
-    # attention range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
+    if HAS_KV_LENS:
+        kv_len = tl.load(kv_lens + q_ids, mask=q_mask, other=0)
+    else:
+        seq_len = tl.load(seq_lens + pid_r)
+        query_pos = seq_len - decode_query_len + q_offsets
+        # Full-CG padding uses zero-length request rows. Clamp to an empty
+        # attention range instead of letting padded rows produce negative lengths.
+        kv_len = tl.maximum(query_pos + 1, 0)
     num_blocks_q = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     kv_len_max = tl.max(tl.where(q_mask, kv_len, 0), axis=0)
     num_blocks = (kv_len_max + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
@@ -769,6 +774,7 @@ def minimax_m3_index_decode_score(
     decode_query_len: int,
     max_decode_query_len: int,
     score_out: torch.Tensor | None = None,
+    kv_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode index block-score (split-K, cudagraph-safe); no top-k.
 
@@ -784,6 +790,9 @@ def minimax_m3_index_decode_score(
     )
     assert decode_query_len <= max_decode_query_len
     assert total_q == seq_lens.shape[0] * decode_query_len
+    if kv_lens is not None:
+        assert kv_lens.shape == (total_q,)
+        assert kv_lens.dtype == torch.int32
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     use_pdl = current_platform.is_arch_support_pdl()
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
@@ -824,12 +833,14 @@ def minimax_m3_index_decode_score(
     )
     num_kv_chunks = 1 << (target.bit_length() - 1)
     grid_score = (seq_lens.shape[0], num_kv_chunks)
+    kv_lens_arg = kv_lens if kv_lens is not None else seq_lens
     _decode_index_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
         score,
         block_table,
         seq_lens,
+        kv_lens_arg,
         num_idx_heads,
         head_dim,
         init_blocks,
@@ -848,6 +859,7 @@ def minimax_m3_index_decode_score(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         num_kv_chunks=num_kv_chunks,
+        HAS_KV_LENS=kv_lens is not None,
         USE_PDL=use_pdl,
         **score_kwargs,
     )

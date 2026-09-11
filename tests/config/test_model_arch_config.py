@@ -4,10 +4,12 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from transformers import PretrainedConfig
 
+import vllm.config.speculative as speculative_config_module
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
@@ -189,3 +191,176 @@ def test_draft_model_arch_config(
     _assert_model_config_methods(
         model_config, expected, check_head_size=check_head_size
     )
+
+
+def _prefill_draft_kv_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        method="eagle3",
+        num_speculative_tokens=1,
+        target_model_config=SimpleNamespace(
+            architectures=["MiniMaxM3SparseForConditionalGeneration"],
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        target_parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        parallel_drafting=False,
+        uses_dynamic_speculative_decoding=lambda: False,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_hidden_layers=1,
+                num_attention_heads=64,
+                num_key_value_heads=64,
+                head_dim=128,
+            )
+        ),
+        draft_parallel_config=SimpleNamespace(tensor_parallel_size=4),
+    )
+
+
+def test_minimax_eagle3_prefill_draft_kv_accepts_supported_config(
+    monkeypatch,
+) -> None:
+    config = _prefill_draft_kv_config()
+    monkeypatch.setattr(
+        speculative_config_module.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+
+    SpeculativeConfig._verify_eagle3_prefill_draft_kv(config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("method", "eagle", "method must be eagle3"),
+        ("num_speculative_tokens", 3, "num_speculative_tokens must be 1"),
+        (
+            "target_parallel_config.prefill_context_parallel_size",
+            2,
+            "prefill_context_parallel_size must be 1",
+        ),
+    ],
+)
+def test_minimax_eagle3_prefill_draft_kv_rejects_unsupported_config(
+    monkeypatch,
+    field: str,
+    value,
+    expected: str,
+) -> None:
+    config = _prefill_draft_kv_config()
+    target = config
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+    setattr(target, parts[-1], value)
+    monkeypatch.setattr(
+        speculative_config_module.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        SpeculativeConfig._verify_eagle3_prefill_draft_kv(config)
+
+
+def _replicated_draft_kv_config(dcp_size: int = 2) -> SimpleNamespace:
+    return SimpleNamespace(
+        method="eagle3",
+        num_speculative_tokens=3,
+        target_model_config=SimpleNamespace(
+            architectures=["MiniMaxM3SparseForConditionalGeneration"],
+            get_total_num_hidden_layers=lambda: 60,
+        ),
+        target_parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=8,
+            decode_context_parallel_size=dcp_size,
+            prefill_context_parallel_size=1,
+            data_parallel_size=1,
+            use_ubatching=False,
+        ),
+        parallel_drafting=False,
+        uses_dynamic_speculative_decoding=lambda: False,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                num_hidden_layers=1,
+                num_attention_heads=64,
+                num_key_value_heads=64,
+                head_dim=128,
+            )
+        ),
+        draft_parallel_config=SimpleNamespace(tensor_parallel_size=8),
+    )
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_minimax_eagle3_replicated_draft_kv_accepts_supported_config(
+    monkeypatch,
+    dcp_size: int,
+) -> None:
+    config = _replicated_draft_kv_config(dcp_size)
+    monkeypatch.setattr(
+        speculative_config_module.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+
+    SpeculativeConfig._verify_eagle3_replicated_draft_kv(config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("num_speculative_tokens", 1, "num_speculative_tokens must be 3"),
+        (
+            "target_parallel_config.decode_context_parallel_size",
+            3,
+            "decode_context_parallel_size must be 1 or 2",
+        ),
+    ],
+)
+def test_minimax_eagle3_replicated_draft_kv_rejects_unsupported_config(
+    monkeypatch,
+    field: str,
+    value,
+    expected: str,
+) -> None:
+    config = _replicated_draft_kv_config()
+    target = config
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+    setattr(target, parts[-1], value)
+    monkeypatch.setattr(
+        speculative_config_module.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        SpeculativeConfig._verify_eagle3_replicated_draft_kv(config)
+
+
+def test_minimax_eagle3_target_dense_full_temporal_kv_defers_execution_mode() -> None:
+    eager_config = SimpleNamespace(
+        enable_eagle3_replicated_draft_kv=True,
+        target_model_config=SimpleNamespace(enforce_eager=True),
+    )
+    SpeculativeConfig._verify_eagle3_target_dense_full_temporal_kv(eager_config)
+
+    graph_config = SimpleNamespace(
+        enable_eagle3_replicated_draft_kv=True,
+        target_model_config=SimpleNamespace(enforce_eager=False),
+    )
+    SpeculativeConfig._verify_eagle3_target_dense_full_temporal_kv(graph_config)
+
+    prefill_graph_config = SimpleNamespace(
+        enable_eagle3_replicated_draft_kv=False,
+        target_model_config=SimpleNamespace(enforce_eager=False),
+    )
+    SpeculativeConfig._verify_eagle3_target_dense_full_temporal_kv(prefill_graph_config)

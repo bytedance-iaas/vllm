@@ -44,8 +44,9 @@ _FP8_DTYPES = (
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_QH": lambda args: (
+            args["BLOCK_SIZE_Q"] * triton.next_power_of_2(args["gqa_group_size"])
+        ),
     }
 )
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -237,10 +238,12 @@ def _gqa_sparse_decode_kernel(
     k_scale_ptr,
     v_scale_ptr,
     t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    topk_valid_counts,  # optional [num_kv_heads, total_q]
     o_ptr,  # partial out: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
     lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
+    kv_lens,  # optional per-query local KV lengths: [total_q]
     total_q,
     gqa_group_size,
     head_dim,
@@ -261,6 +264,8 @@ def _gqa_sparse_decode_kernel(
     stride_th,
     stride_tn,
     stride_tk,
+    stride_tvc_h,
+    stride_tvc_n,
     stride_o_c,
     stride_o_b,
     stride_o_h,
@@ -275,6 +280,9 @@ def _gqa_sparse_decode_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
+    HAS_KV_LENS: tl.constexpr,
+    HAS_TOPK_VALID_COUNTS: tl.constexpr,
+    ALIGNED_TOPK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -292,16 +300,26 @@ def _gqa_sparse_decode_kernel(
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    seq_len = tl.load(seq_lens + req_id)
-    query_pos = seq_len - decode_query_len + q_offset
-    # Full-CG padding uses zero-length request rows. Clamp to an empty
-    # attention range instead of letting padded rows produce negative lengths.
-    kv_len = tl.maximum(query_pos + 1, 0)
+    if HAS_KV_LENS:
+        kv_len = tl.load(kv_lens + pid_b)
+    else:
+        seq_len = tl.load(seq_lens + req_id)
+        query_pos = seq_len - decode_query_len + q_offset
+        # Full-CG padding uses zero-length request rows. Clamp to an empty
+        # attention range instead of letting padded rows produce negative lengths.
+        kv_len = tl.maximum(query_pos + 1, 0)
 
     # Valid block count from seq_len (no sentinel): min(topk, cdiv(kv_len, blk)).
     idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
     num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     real_topk = tl.minimum(max_topk, num_blocks)
+    if ALIGNED_TOPK:
+        real_topk = max_topk
+    elif HAS_TOPK_VALID_COUNTS:
+        real_topk = tl.minimum(
+            real_topk,
+            tl.load(topk_valid_counts + pid_kh * stride_tvc_h + pid_b * stride_tvc_n),
+        )
     chunk_end_topk = tl.minimum(chunk_end_compiletime, real_topk)
 
     off_n = tl.arange(0, BLOCK_SIZE_K)
@@ -324,12 +342,15 @@ def _gqa_sparse_decode_kernel(
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
-        blk = tl.load(cur_idx_ptr).to(tl.int32)
+        raw_blk = tl.load(cur_idx_ptr).to(tl.int32)
+        valid_blk = raw_blk >= 0
+        blk = tl.maximum(raw_blk, 0)
         cur_idx_ptr = cur_idx_ptr + stride_tk
         c = blk * BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = c + off_n
-        pos_mask = pos < kv_len
+        pos_mask = valid_blk & (pos < kv_len)
+        update_state = valid_blk & (c < kv_len)
         k = tl.load(
             kv_cache_ptr
             + page * stride_kv_blk
@@ -355,10 +376,15 @@ def _gqa_sparse_decode_kernel(
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
+        m_ij = tl.where(
+            update_state,
+            tl.maximum(m_i, tl.max(qk, axis=1)),
+            m_i,
+        )
+        p = tl.where(update_state, tl.exp2(qk - m_ij[:, None]), 0.0)
         l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+        rescale = tl.where(update_state, tl.exp2(m_i - m_ij), 1.0)
+        acc_o = acc_o * rescale[:, None]
         v = tl.load(
             kv_cache_ptr
             + page * stride_kv_blk
@@ -383,13 +409,13 @@ def _gqa_sparse_decode_kernel(
                 v = (v * v_scale[:, None]).to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        next_lse = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        lse_i = tl.where(update_state, next_lse, lse_i)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
-    # Empty chunks for active rows must store zero output; otherwise the merge
-    # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
+    # Empty chunks store the neutral state: zero output and -inf LSE.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
     o_ptrs = tl.make_block_ptr(
@@ -420,6 +446,7 @@ def _merge_topk_attn_out_kernel(
     o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
     lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
     out_ptr,  # merged out: [total_q, num_heads, head_dim]
+    merged_lse_ptr,  # optional merged lse (log2): [total_q, num_heads]
     head_dim,
     stride_o_c,
     stride_o_b,
@@ -431,8 +458,11 @@ def _merge_topk_attn_out_kernel(
     stride_out_n,
     stride_out_h,
     stride_out_d,
+    stride_ml_n,
+    stride_ml_h,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
@@ -456,13 +486,21 @@ def _merge_topk_attn_out_kernel(
     o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp2(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    has_values = lse_max > float("-inf")
+    weights = tl.where(has_values, tl.exp2(lse - lse_max), 0.0)
+    weights_sum = tl.sum(weights, axis=0)
+    weights = tl.where(has_values, weights / weights_sum, 0.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     out_ptrs = (
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     )
     tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
+    if RETURN_LSE:
+        merged_lse = tl.where(has_values, lse_max + tl.log2(weights_sum), float("-inf"))
+        tl.store(
+            merged_lse_ptr + pid_b * stride_ml_n + pid_h * stride_ml_h,
+            merged_lse,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -610,10 +648,21 @@ def minimax_m3_sparse_attn_decode(
     decode_query_len: int,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
-) -> None:
+    kv_lens: torch.Tensor | None = None,
+    topk_valid_counts: torch.Tensor | None = None,
+    return_lse: bool = False,
+    return_partials: bool = False,
+    aligned_topk: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
     total_q, num_heads, head_dim = q.shape
     assert total_q == seq_lens.shape[0] * decode_query_len
+    if kv_lens is not None:
+        assert kv_lens.shape == (total_q,)
+        assert kv_lens.dtype == torch.int32
+    if topk_valid_counts is not None:
+        assert topk_valid_counts.shape == (num_kv_heads, total_q)
+        assert topk_valid_counts.dtype == torch.int32
     max_topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     use_fp8 = kv_cache.dtype in _FP8_DTYPES
@@ -649,10 +698,19 @@ def minimax_m3_sparse_attn_decode(
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
     num_topk_chunks = 1 << (target.bit_length() - 1)
     o_partial = torch.empty(
-        num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
+        num_topk_chunks,
+        total_q,
+        num_heads,
+        head_dim,
+        dtype=output.dtype,
+        device=q.device,
     )
     lse_partial = torch.empty(
         num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
+    )
+    kv_lens_arg = kv_lens if kv_lens is not None else seq_lens
+    topk_valid_counts_arg = (
+        topk_valid_counts if topk_valid_counts is not None else topk_idx
     )
     grid = (total_q * num_topk_chunks, num_kv_heads)
     _gqa_sparse_decode_kernel[grid](
@@ -661,10 +719,12 @@ def minimax_m3_sparse_attn_decode(
         k_scale_arg,
         v_scale_arg,
         topk_idx,
+        topk_valid_counts_arg,
         o_partial,
         lse_partial,
         block_table,
         seq_lens,
+        kv_lens_arg,
         total_q,
         gqa_group_size,
         head_dim,
@@ -685,6 +745,8 @@ def minimax_m3_sparse_attn_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
+        topk_valid_counts_arg.stride(0),
+        topk_valid_counts_arg.stride(1),
         o_partial.stride(0),
         o_partial.stride(1),
         o_partial.stride(2),
@@ -697,14 +759,46 @@ def minimax_m3_sparse_attn_decode(
         NUM_TOPK_CHUNKS=num_topk_chunks,
         USE_FP8=use_fp8,
         KV_SCALE_MODE=kv_scale_mode,
+        HAS_KV_LENS=kv_lens is not None,
+        HAS_TOPK_VALID_COUNTS=topk_valid_counts is not None,
+        ALIGNED_TOPK=aligned_topk,
         USE_PDL=use_pdl,
         **pdl_launch,
+    )
+    if return_partials:
+        return o_partial, lse_partial
+    return minimax_m3_merge_sparse_partials(
+        o_partial,
+        lse_partial,
+        output,
+        return_lse=return_lse,
+    )
+
+
+@torch.no_grad()
+def minimax_m3_merge_sparse_partials(
+    o_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | None:
+    num_topk_chunks, total_q, num_heads, head_dim = o_partial.shape
+    assert lse_partial.shape == (num_topk_chunks, total_q, num_heads)
+    assert output.shape == (total_q, num_heads, head_dim)
+    use_pdl = current_platform.is_arch_support_pdl()
+    pdl_launch = {"launch_pdl": True} if use_pdl else {}
+    merged_lse = (
+        torch.empty((total_q, num_heads), dtype=torch.float32, device=output.device)
+        if return_lse
+        else output
     )
     merge_grid = (total_q, num_heads)
     _merge_topk_attn_out_kernel[merge_grid](
         o_partial,
         lse_partial,
         output,
+        merged_lse,
         head_dim,
         o_partial.stride(0),
         o_partial.stride(1),
@@ -716,7 +810,11 @@ def minimax_m3_sparse_attn_decode(
         output.stride(0),
         output.stride(1),
         output.stride(2),
+        merged_lse.stride(0),
+        merged_lse.stride(1),
         NUM_TOPK_CHUNKS=num_topk_chunks,
+        RETURN_LSE=return_lse,
         USE_PDL=use_pdl,
         **pdl_launch,
     )
+    return merged_lse if return_lse else None

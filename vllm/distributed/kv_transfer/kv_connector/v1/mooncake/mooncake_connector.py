@@ -22,6 +22,10 @@ import zmq.asyncio
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed.cp_mapping import (
+    get_suffix_global_page_range,
+    iter_owned_suffix_pages,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     TransferTopology,
@@ -36,6 +40,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+    MOONCAKE_CP_BLOCK_PAIRING_VERSION,
+    MOONCAKE_KV_REGION_LAYOUT_VERSION,
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
 )
@@ -43,6 +49,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -55,20 +63,28 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, get_kv_cache_layout
+from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheChildPageMapping,
     KVCacheSpec,
+    KVCacheTemporalLayout,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import RequestStatus
+from vllm.v1.spec_decode.utils import (
+    MINIMAX_M3_DENSE_TARGET_LAYER_IDS,
+    get_prompt_draft_kv_coverage,
+)
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
+T = TypeVar("T")
 
 try:
     from mooncake.engine import TransferEngine
@@ -93,6 +109,23 @@ TransferCoverageKey = tuple[int, int]
 _T = TypeVar("_T")
 
 
+class MooncakeRegionIdentity(msgspec.Struct):
+    layer_name: str
+    temporal_layout: str
+    protocol_version: int
+    child_page_mapping: str
+    child_page_factor: int
+
+
+class MooncakeRequestPageMap(msgspec.Struct):
+    region_index: int
+    group_index: int
+    valid_start_token: int
+    valid_end_token_exclusive: int
+    global_page_ids: list[int]
+    dst_physical_block_ids: list[int]
+
+
 @dataclass(frozen=True)
 class TransferRegion:
     """A registered KV region plus its logical cache identities."""
@@ -108,6 +141,8 @@ class TransferRegion:
     layer_indices: tuple[int, ...] = ()
     logical_group_indices: tuple[int, ...] = ()
     alias_group_indices: tuple[tuple[int, ...], ...] = ()
+    region_index: int = 0
+    identity: MooncakeRegionIdentity | None = None
 
     @property
     def match_layer_names(self) -> tuple[str, ...]:
@@ -116,6 +151,72 @@ class TransferRegion:
     @property
     def match_layer_indices(self) -> tuple[int, ...]:
         return self.layer_indices or (self.layer_index,)
+
+
+def _validate_full_temporal_stage_coverage(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+    *,
+    speculative_config: Any,
+    total_target_layers: int,
+    pp_rank: int,
+    pp_size: int,
+) -> str | None:
+    full_temporal = KVCacheTemporalLayout.FULL_TEMPORAL.value
+
+    def full_temporal_indices(regions: list[TransferRegion]) -> set[int]:
+        return {
+            layer_index
+            for region in regions
+            if region.identity is not None
+            and region.identity.temporal_layout == full_temporal
+            for layer_index in region.match_layer_indices
+        }
+
+    local_indices = full_temporal_indices(local_regions)
+    remote_indices = full_temporal_indices(remote_regions)
+    target_dense_enabled = bool(
+        speculative_config is not None
+        and getattr(
+            speculative_config,
+            "enable_eagle3_target_dense_full_temporal_kv",
+            False,
+        )
+    )
+    prefill_draft_enabled = bool(
+        speculative_config is not None
+        and getattr(
+            speculative_config,
+            "enable_eagle3_prefill_draft_kv",
+            False,
+        )
+    )
+    if not target_dense_enabled and not prefill_draft_enabled:
+        if not local_indices.issubset(remote_indices):
+            return (
+                "Mooncake producer full-temporal layers are not present "
+                "with the same layout on the consumer"
+            )
+        return None
+
+    expected_indices: set[int] = set()
+    if target_dense_enabled and pp_rank == 0:
+        expected_indices.update(MINIMAX_M3_DENSE_TARGET_LAYER_IDS)
+    if prefill_draft_enabled and pp_rank == pp_size - 1:
+        expected_indices.add(total_target_layers)
+
+    if local_indices != expected_indices:
+        return (
+            "Mooncake producer PP stage has incomplete full-temporal coverage: "
+            f"pp_rank={pp_rank}, expected layer indices "
+            f"{sorted(expected_indices)!r}, got {sorted(local_indices)!r}"
+        )
+    if not expected_indices.issubset(remote_indices):
+        return (
+            "Mooncake consumer is missing producer full-temporal layer indices: "
+            f"expected {sorted(expected_indices)!r}, got {sorted(remote_indices)!r}"
+        )
+    return None
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -152,6 +253,7 @@ def _expand_transfer_regions(
     layer_index_aliases: list[list[int]] | None = None,
     logical_group_indices: list[list[int]] | None = None,
     alias_group_indices: list[list[list[int]]] | None = None,
+    region_identities: list[MooncakeRegionIdentity] | None = None,
 ) -> list[TransferRegion]:
     """Expand registered KV tensors into the regions transferred by Mooncake."""
     assert (
@@ -217,6 +319,12 @@ def _expand_transfer_regions(
                 "Mooncake transfer region logical groups must equal the union "
                 f"of alias-group ownership at region {idx}."
             )
+    if region_identities is not None:
+        assert len(region_identities) == len(layer_names), (
+            "Mooncake transfer regions require matching layout metadata, "
+            f"got region_identities={len(region_identities)}, "
+            f"layer_names={len(layer_names)}."
+        )
     regions: list[TransferRegion] = []
     for idx, (
         base_addr,
@@ -226,23 +334,37 @@ def _expand_transfer_regions(
         layer_index,
         group_index,
         split_kv_region,
-    ) in enumerate(zip(
-        base_addrs,
-        block_lens,
-        kv_block_lens,
-        layer_names,
-        layer_indices,
-        group_indices,
-        split_kv_regions,
-    )):
+    ) in enumerate(
+        zip(
+            base_addrs,
+            block_lens,
+            kv_block_lens,
+            layer_names,
+            layer_indices,
+            group_indices,
+            split_kv_regions,
+        )
+    ):
         aliases = _get_region_metadata(layer_aliases, idx)
         index_aliases = _get_region_metadata(layer_index_aliases, idx)
-        region_logical_group_indices = _get_region_metadata(
-            logical_group_indices, idx
-        )
+        region_logical_group_indices = _get_region_metadata(logical_group_indices, idx)
         region_alias_group_indices = tuple(
-            tuple(groups)
-            for groups in _get_region_metadata(alias_group_indices, idx)
+            tuple(groups) for groups in _get_region_metadata(alias_group_indices, idx)
+        )
+        identity = (
+            region_identities[idx]
+            if region_identities is not None
+            else MooncakeRegionIdentity(
+                layer_name=layer_name,
+                temporal_layout=KVCacheTemporalLayout.SHARDED_DCP.value,
+                protocol_version=0,
+                child_page_mapping=KVCacheChildPageMapping.IDENTITY.value,
+                child_page_factor=1,
+            )
+        )
+        assert identity.layer_name == layer_name, (
+            "Mooncake region identity layer name mismatch: "
+            f"{identity.layer_name!r} != {layer_name!r}"
         )
         regions.append(
             TransferRegion(
@@ -256,6 +378,8 @@ def _expand_transfer_regions(
                 layer_indices=index_aliases,
                 logical_group_indices=region_logical_group_indices,
                 alias_group_indices=region_alias_group_indices,
+                region_index=len(regions),
+                identity=identity,
             )
         )
         if split_kv_region:
@@ -272,27 +396,23 @@ def _expand_transfer_regions(
                     layer_indices=index_aliases,
                     logical_group_indices=region_logical_group_indices,
                     alias_group_indices=region_alias_group_indices,
+                    region_index=len(regions),
+                    identity=identity,
                 )
             )
     return regions
 
 
-def _get_region_metadata(
-    metadata: list[list[_T]] | None, idx: int
-) -> tuple[_T, ...]:
+def _get_region_metadata(metadata: list[list[_T]] | None, idx: int) -> tuple[_T, ...]:
     if metadata is not None and idx < len(metadata) and metadata[idx]:
         return tuple(metadata[idx])
     return ()
 
 
-def _region_group_indices(
-    region: TransferRegion, num_groups: int
-) -> tuple[int, ...]:
+def _region_group_indices(region: TransferRegion, num_groups: int) -> tuple[int, ...]:
     group_indices = region.logical_group_indices or (region.group_index,)
     return tuple(
-        group_index
-        for group_index in group_indices
-        if 0 <= group_index < num_groups
+        group_index for group_index in group_indices if 0 <= group_index < num_groups
     )
 
 
@@ -339,8 +459,7 @@ def _infer_total_num_kv_heads(
         if (
             local_kv_block_len % local_heads == 0
             and remote_kv_block_len % remote_heads == 0
-            and local_kv_block_len // local_heads
-            == remote_kv_block_len // remote_heads
+            and local_kv_block_len // local_heads == remote_kv_block_len // remote_heads
         ):
             candidates.append(total_num_kv_heads)
     if total_num_kv_heads_hint in candidates:
@@ -403,9 +522,7 @@ def _compute_sender_transfer_plan(
                     == local_replica
                 )
             overlap_start = max(local_start, remote_start)
-            overlap_end = min(
-                local_start + local_count, remote_start + remote_count
-            )
+            overlap_end = min(local_start + local_count, remote_start + remote_count)
             if not canonical or overlap_start >= overlap_end:
                 return False, 0, 0, 0
             local_head_len = local_kv_block_len // local_count
@@ -535,8 +652,7 @@ def _validate_asymmetric_region_lengths(
             layer_head_counts = {
                 total_num_kv_heads_by_layer[name]
                 for name in names
-                if total_num_kv_heads_by_layer
-                and name in total_num_kv_heads_by_layer
+                if total_num_kv_heads_by_layer and name in total_num_kv_heads_by_layer
             }
             if len(layer_head_counts) > 1:
                 return (
@@ -589,6 +705,83 @@ def _validate_asymmetric_region_lengths(
                     f"{idx}: local={local_region.kv_block_len}, "
                     f"remote={remote_region.kv_block_len}, tp_ratio={tp_ratio}."
                 )
+
+    return None
+
+
+def _validate_region_layouts(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+    *,
+    producer_dcp_size: int,
+    consumer_dcp_size: int,
+) -> str | None:
+    full_temporal = KVCacheTemporalLayout.FULL_TEMPORAL.value
+    strict = any(
+        region.identity is not None and region.identity.temporal_layout == full_temporal
+        for region in (*local_regions, *remote_regions)
+    )
+    if not strict:
+        return None
+    if producer_dcp_size != 1 or consumer_dcp_size <= 0:
+        return "Mooncake full-temporal transfer requires a DCP1 producer"
+
+    for index, (local_region, remote_region) in enumerate(
+        zip(local_regions, remote_regions)
+    ):
+        local = local_region.identity
+        remote = remote_region.identity
+        if local is None or remote is None:
+            return f"Mooncake region {index} is missing layout identity"
+        if (
+            local.protocol_version != MOONCAKE_KV_REGION_LAYOUT_VERSION
+            or remote.protocol_version != MOONCAKE_KV_REGION_LAYOUT_VERSION
+        ):
+            return (
+                f"Mooncake region {index} requires layout protocol "
+                f"v{MOONCAKE_KV_REGION_LAYOUT_VERSION}"
+            )
+        if local.layer_name != local_region.layer_name:
+            return f"Mooncake producer region {index} has a wrong layer identity"
+        if remote.layer_name != remote_region.layer_name:
+            return f"Mooncake consumer region {index} has a wrong layer identity"
+        if local.temporal_layout != remote.temporal_layout:
+            return (
+                f"Mooncake region {index} temporal layout mismatch: "
+                f"producer={local.temporal_layout}, "
+                f"consumer={remote.temporal_layout}"
+            )
+
+        if local.temporal_layout == full_temporal:
+            if (
+                local.child_page_mapping != KVCacheChildPageMapping.IDENTITY.value
+                or local.child_page_factor != 1
+            ):
+                return (
+                    f"Mooncake producer full-temporal region {index} must use "
+                    "identity pages with factor 1"
+                )
+            expected_mapping = (
+                KVCacheChildPageMapping.IDENTITY.value
+                if consumer_dcp_size == 1
+                else KVCacheChildPageMapping.GLOBAL_PAGE_MODULO.value
+            )
+            if (
+                remote.child_page_mapping != expected_mapping
+                or remote.child_page_factor != consumer_dcp_size
+            ):
+                return (
+                    f"Mooncake consumer full-temporal region {index} must use "
+                    f"{expected_mapping} pages with factor {consumer_dcp_size}"
+                )
+        elif (
+            local.temporal_layout != KVCacheTemporalLayout.SHARDED_DCP.value
+            or local.child_page_mapping != KVCacheChildPageMapping.IDENTITY.value
+            or remote.child_page_mapping != KVCacheChildPageMapping.IDENTITY.value
+            or local.child_page_factor != 1
+            or remote.child_page_factor != 1
+        ):
+            return f"Mooncake sharded region {index} has invalid page mapping"
 
     return None
 
@@ -665,6 +858,8 @@ def _legacy_region_as_alias(region: TransferRegion) -> TransferRegion:
         layer_indices=(region.layer_index,),
         logical_group_indices=(region.group_index,),
         alias_group_indices=((region.group_index,),),
+        region_index=region.region_index,
+        identity=region.identity,
     )
 
 
@@ -836,9 +1031,7 @@ def _align_transfer_regions(
         for remote_idx, remote_region in enumerate(alias_remote_regions):
             if not _regions_share_layer_identity(local_region, remote_region):
                 continue
-            if not _regions_have_bound_alias_layer_indices(
-                local_region, remote_region
-            ):
+            if not _regions_have_bound_alias_layer_indices(local_region, remote_region):
                 index_mismatch_region = index_mismatch_region or remote_region
                 continue
             shared_keys = _shared_alias_group_keys(local_region, remote_region)
@@ -1004,6 +1197,376 @@ def _select_region_block_ids(
     return local_block_ids, remote_block_ids, None
 
 
+def _pair_cp_block_ids(
+    local_block_ids: list[int],
+    remote_block_ids: list[int],
+    *,
+    producer_dcp_size: int,
+    producer_dcp_rank: int,
+    consumer_dcp_size: int,
+    consumer_dcp_rank: int,
+    consumer_cp_block_pairing_version: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Pair producer and consumer pages for the legacy non-DCP topology."""
+    if producer_dcp_size <= 0 or consumer_dcp_size <= 0:
+        return [], [], "DCP world sizes must be positive"
+    if not 0 <= producer_dcp_rank < producer_dcp_size:
+        return [], [], "Invalid producer DCP rank"
+    if not 0 <= consumer_dcp_rank < consumer_dcp_size:
+        return [], [], "Invalid consumer DCP rank"
+    if producer_dcp_size > 1:
+        return [], [], "Mooncake producer DCP is not supported"
+    if (
+        consumer_cp_block_pairing_version < MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        and consumer_dcp_size > 1
+    ):
+        return [], [], "Mooncake consumer DCP requires CP block pairing capability"
+    if consumer_dcp_size > 1:
+        return (
+            [],
+            [],
+            "Mooncake consumer DCP requires global page identity pairing",
+        )
+
+    if len(local_block_ids) < len(remote_block_ids):
+        return [], [], "P num blocks less than D"
+    if len(local_block_ids) > len(remote_block_ids):
+        local_block_ids = local_block_ids[-len(remote_block_ids) :]
+    return list(local_block_ids), list(remote_block_ids), None
+
+
+def _get_owned_dcp_suffix_blocks(
+    block_ids: list[int],
+    *,
+    total_tokens: int,
+    num_external_tokens: int,
+    external_start_token: int,
+    dcp_size: int,
+    dcp_rank: int,
+    page_size: int,
+    interleave_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Describe compact DCP blocks with explicit global page identities."""
+    if external_start_token + num_external_tokens != total_tokens:
+        return [], [], "Mooncake DCP transfer requires an exact suffix token range"
+    if page_size != interleave_size:
+        return [], [], "Mooncake DCP v2 requires page size equal to interleave"
+    try:
+        owned_pages = list(
+            iter_owned_suffix_pages(
+                total_tokens,
+                external_start_token,
+                dcp_size,
+                dcp_rank,
+                page_size,
+                interleave_size,
+            )
+        )
+    except ValueError as exc:
+        return [], [], str(exc)
+    if not owned_pages:
+        return [], [], None
+    if not block_ids:
+        return [], [], "DCP compact block list is missing owned global pages"
+    retained_owned_pages = _retain_trailing_suffix_items(owned_pages, len(block_ids))
+    if len(block_ids) < len(retained_owned_pages):
+        return [], [], "DCP compact block list is missing owned global pages"
+    if len(block_ids) < len(owned_pages):
+        return (
+            list(block_ids),
+            [global_page for global_page, _ in retained_owned_pages],
+            None,
+        )
+    suffix_first_local_page = owned_pages[0][1]
+    selected_blocks: list[int] = []
+    global_pages: list[int] = []
+    for global_page, local_page in retained_owned_pages:
+        block_offset = local_page - suffix_first_local_page
+        if not 0 <= block_offset < len(block_ids):
+            return [], [], "DCP compact block list is missing owned global pages"
+        selected_blocks.append(block_ids[block_offset])
+        global_pages.append(global_page)
+    return selected_blocks, global_pages, None
+
+
+def _get_full_temporal_suffix_blocks(
+    parent_block_ids: list[int],
+    *,
+    total_tokens: int,
+    num_external_tokens: int,
+    external_start_token: int,
+    child_page_factor: int,
+    page_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Map scheduler parent blocks to full-temporal physical child pages."""
+    if external_start_token + num_external_tokens != total_tokens:
+        return [], [], "Mooncake full-temporal transfer requires an exact suffix"
+    if child_page_factor <= 0:
+        return [], [], "Mooncake full-temporal transfer requires positive child factor"
+    if page_size <= 0:
+        return [], [], "Mooncake full-temporal transfer requires positive page size"
+    if num_external_tokens <= 0:
+        return [], [], None
+
+    try:
+        global_pages = list(
+            get_suffix_global_page_range(
+                total_tokens,
+                external_start_token,
+                page_size,
+            )
+        )
+    except ValueError as exc:
+        return [], [], str(exc)
+    if not global_pages:
+        return [], [], None
+    if not parent_block_ids:
+        return [], [], "Full-temporal parent block list is missing global pages"
+
+    total_parent_pages = cdiv(
+        total_tokens,
+        page_size * child_page_factor,
+    )
+    first_parent_page = (
+        0
+        if len(parent_block_ids) >= total_parent_pages
+        else total_parent_pages - len(parent_block_ids)
+    )
+    child_block_ids: list[int] = []
+    for global_page in global_pages:
+        parent_page = global_page // child_page_factor
+        parent_offset = parent_page - first_parent_page
+        if not 0 <= parent_offset < len(parent_block_ids):
+            return [], [], "Full-temporal parent block list is missing global pages"
+        parent_block = parent_block_ids[parent_offset]
+        if parent_block == NULL_BLOCK_ID:
+            return [], [], "Full-temporal parent block list contains a null block"
+        child_block_ids.append(
+            child_page_factor * parent_block + global_page % child_page_factor
+        )
+
+    if len(child_block_ids) != len(set(child_block_ids)):
+        return [], [], "Full-temporal child block IDs must be unique"
+    return child_block_ids, global_pages, None
+
+
+def _retain_trailing_suffix_items(items: list[T], block_count: int) -> list[T]:
+    if block_count <= 0:
+        return []
+    if block_count < len(items):
+        return items[-block_count:]
+    return items
+
+
+def _pair_dcp_blocks_by_global_page(
+    local_block_ids: list[int],
+    remote_block_ids: list[int],
+    remote_global_page_ids: list[int],
+    *,
+    total_tokens: int,
+    num_external_tokens: int,
+    external_start_token: int,
+    consumer_dcp_size: int,
+    consumer_dcp_rank: int,
+    page_size: int,
+    interleave_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Pair producer and DCP-consumer blocks by canonical global page ID."""
+    if external_start_token + num_external_tokens != total_tokens:
+        return [], [], "Mooncake DCP transfer requires an exact suffix token range"
+    if page_size != interleave_size:
+        return [], [], "Mooncake DCP v2 requires page size equal to interleave"
+    if len(remote_block_ids) != len(remote_global_page_ids):
+        return [], [], "DCP block and global page identity counts differ"
+    if remote_global_page_ids != sorted(set(remote_global_page_ids)):
+        return [], [], "DCP global page identities must be unique and increasing"
+
+    try:
+        source_global_pages = list(
+            get_suffix_global_page_range(
+                total_tokens,
+                external_start_token,
+                page_size,
+            )
+        )
+        expected_remote_pages = _retain_trailing_suffix_items(
+            [
+                global_page
+                for global_page, _ in iter_owned_suffix_pages(
+                    total_tokens,
+                    external_start_token,
+                    consumer_dcp_size,
+                    consumer_dcp_rank,
+                    page_size,
+                    interleave_size,
+                )
+            ],
+            len(remote_block_ids),
+        )
+    except ValueError as exc:
+        return [], [], str(exc)
+    if remote_global_page_ids != expected_remote_pages:
+        return [], [], "DCP global page identities do not match owner suffix"
+    if not source_global_pages:
+        return [], [], None
+    source_end_page = source_global_pages[-1] + 1
+    if len(local_block_ids) >= source_end_page:
+        source_blocks = [
+            local_block_ids[global_page] for global_page in source_global_pages
+        ]
+    elif len(local_block_ids) <= len(source_global_pages):
+        source_global_pages = _retain_trailing_suffix_items(
+            source_global_pages,
+            len(local_block_ids),
+        )
+        source_blocks = list(local_block_ids)
+    else:
+        return [], [], "Producer block list is missing suffix global pages"
+    source_by_page = dict(zip(source_global_pages, source_blocks))
+    if len(source_by_page) != len(source_global_pages):
+        return [], [], "Producer global page identities are not unique"
+    try:
+        paired_local = [source_by_page[page] for page in remote_global_page_ids]
+    except KeyError:
+        return [], [], "Producer is missing a requested DCP global page"
+    return paired_local, list(remote_block_ids), None
+
+
+def _pair_full_temporal_blocks_by_global_page(
+    local_block_ids: list[int],
+    remote_child_block_ids: list[int],
+    remote_global_page_ids: list[int],
+    *,
+    total_tokens: int,
+    num_external_tokens: int,
+    external_start_token: int,
+    page_size: int,
+) -> tuple[list[int], list[int], str | None]:
+    """Pair producer DCP1 pages with consumer full-temporal child pages."""
+    if external_start_token + num_external_tokens != total_tokens:
+        return [], [], "Mooncake full-temporal transfer requires an exact suffix"
+    if len(remote_child_block_ids) != len(remote_global_page_ids):
+        return [], [], "Full-temporal block and global page counts differ"
+    if remote_global_page_ids != sorted(set(remote_global_page_ids)):
+        return [], [], "Full-temporal global pages must be unique and increasing"
+
+    try:
+        source_global_pages = list(
+            get_suffix_global_page_range(
+                total_tokens,
+                external_start_token,
+                page_size,
+            )
+        )
+    except ValueError as exc:
+        return [], [], str(exc)
+    if remote_global_page_ids != source_global_pages:
+        return [], [], "Full-temporal global pages do not match the source suffix"
+    if not source_global_pages:
+        return [], [], None
+
+    source_end_page = source_global_pages[-1] + 1
+    if len(local_block_ids) >= source_end_page:
+        source_blocks = [
+            local_block_ids[global_page] for global_page in source_global_pages
+        ]
+    elif len(local_block_ids) == len(source_global_pages):
+        source_blocks = list(local_block_ids)
+    else:
+        return [], [], "Producer block list is missing full-temporal pages"
+    return source_blocks, list(remote_child_block_ids), None
+
+
+def _index_full_temporal_region_page_maps(
+    page_maps: list[MooncakeRequestPageMap],
+    remote_regions: list[TransferRegion],
+    *,
+    valid_start_token: int,
+    valid_end_token_exclusive: int,
+) -> tuple[dict[int, MooncakeRequestPageMap], str | None]:
+    """Validate and index request-scoped full-temporal destination pages."""
+    full_temporal = KVCacheTemporalLayout.FULL_TEMPORAL.value
+    expected_regions = {
+        region.region_index: region
+        for region in remote_regions
+        if region.identity is not None
+        and region.identity.temporal_layout == full_temporal
+    }
+    indexed: dict[int, MooncakeRequestPageMap] = {}
+    for page_map in page_maps:
+        if page_map.region_index in indexed:
+            return {}, (
+                "Mooncake full-temporal request has duplicate region page maps "
+                f"for region {page_map.region_index}"
+            )
+        region = expected_regions.get(page_map.region_index)
+        if region is None:
+            return {}, (
+                "Mooncake request page map refers to a non-full-temporal "
+                f"region {page_map.region_index}"
+            )
+        valid_group_indices = set(region.logical_group_indices or (region.group_index,))
+        if page_map.group_index not in valid_group_indices:
+            return {}, (
+                "Mooncake full-temporal page map has an invalid KV group for "
+                f"region {page_map.region_index}"
+            )
+        if (
+            page_map.valid_start_token != valid_start_token
+            or page_map.valid_end_token_exclusive != valid_end_token_exclusive
+        ):
+            return {}, (
+                "Mooncake full-temporal page map token range does not match "
+                f"the request for region {page_map.region_index}"
+            )
+        if len(page_map.global_page_ids) != len(page_map.dst_physical_block_ids):
+            return {}, (
+                "Mooncake full-temporal page and child-block counts differ "
+                f"for region {page_map.region_index}"
+            )
+        if page_map.global_page_ids != sorted(set(page_map.global_page_ids)):
+            return {}, (
+                "Mooncake full-temporal global pages must be unique and "
+                f"increasing for region {page_map.region_index}"
+            )
+        if (
+            len(page_map.dst_physical_block_ids)
+            != len(set(page_map.dst_physical_block_ids))
+            or NULL_BLOCK_ID in page_map.dst_physical_block_ids
+        ):
+            return {}, (
+                "Mooncake full-temporal child block IDs must be non-null and "
+                f"unique for region {page_map.region_index}"
+            )
+        assert region.identity is not None
+        child_page_factor = region.identity.child_page_factor
+        if child_page_factor <= 0:
+            return {}, (
+                "Mooncake full-temporal child page factor must be positive "
+                f"for region {page_map.region_index}"
+            )
+        if any(
+            child_block % child_page_factor != global_page % child_page_factor
+            for global_page, child_block in zip(
+                page_map.global_page_ids,
+                page_map.dst_physical_block_ids,
+            )
+        ):
+            return {}, (
+                "Mooncake full-temporal child block parity does not match "
+                f"global pages for region {page_map.region_index}"
+            )
+        indexed[page_map.region_index] = page_map
+
+    missing_regions = sorted(set(expected_regions) - set(indexed))
+    if missing_regions:
+        return {}, (
+            "Mooncake request is missing full-temporal region page maps: "
+            f"{missing_regions}"
+        )
+    return indexed, None
+
+
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
@@ -1023,6 +1586,21 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     block_lens: list[int]
     kv_block_lens: list[int]
+    remote_pcp_size: int = 1
+    remote_pcp_rank: int = 0
+    remote_dcp_size: int = 1
+    remote_dcp_rank: int = 0
+    remote_cp_kv_cache_interleave_size: int = 1
+    remote_cp_block_pairing_version: int = 0
+    req_total_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    req_num_external_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    req_external_start_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    req_global_page_ids: dict[ReqId, list[list[int]]] = msgspec.field(
+        default_factory=dict
+    )
+    req_region_page_maps: dict[ReqId, list[MooncakeRequestPageMap]] = msgspec.field(
+        default_factory=dict
+    )
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
@@ -1035,6 +1613,9 @@ class MooncakeXferMetadata(
         default_factory=list
     )
     registered_alias_group_indices: list[list[list[int]]] = msgspec.field(
+        default_factory=list
+    )
+    registered_region_identities: list[MooncakeRegionIdentity] = msgspec.field(
         default_factory=list
     )
 
@@ -1069,6 +1650,9 @@ class PullReqMeta:
     local_block_ids: list[list[int]]
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
+    total_tokens: int = 0
+    num_external_tokens: int = 0
+    external_start_token: int = 0
     # Set expire time to avoid infinitely sending requests.
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
@@ -1076,12 +1660,10 @@ class PullReqMeta:
     pull_failed: bool = False
     requires_kv_transfer: bool = False
     received_kv: bool = False
-    required_region_bytes: dict[TransferCoverageKey, int] = field(
+    required_region_bytes: dict[TransferCoverageKey, int] = field(default_factory=dict)
+    received_region_ranges: dict[TransferCoverageKey, list[tuple[int, int]]] = field(
         default_factory=dict
     )
-    received_region_ranges: dict[
-        TransferCoverageKey, list[tuple[int, int]]
-    ] = field(default_factory=dict)
     saw_region_coverage: bool = False
     saw_legacy_coverage: bool = False
 
@@ -1112,6 +1694,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        total_tokens: int = 0,
+        num_external_tokens: int = 0,
+        external_start_token: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -1122,6 +1707,9 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                total_tokens=total_tokens,
+                num_external_tokens=num_external_tokens,
+                external_start_token=external_start_token,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -1129,12 +1717,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class MooncakeCompletionMetadata(KVConnectorWorkerMetadata):
-    finished_sending: dict[tuple[ReqId, TransferId], int] = field(
-        default_factory=dict
-    )
-    finished_recving: dict[tuple[ReqId, TransferId], int] = field(
-        default_factory=dict
-    )
+    finished_sending: dict[tuple[ReqId, TransferId], int] = field(default_factory=dict)
+    finished_recving: dict[tuple[ReqId, TransferId], int] = field(default_factory=dict)
 
     def aggregate(
         self, other: KVConnectorWorkerMetadata
@@ -1351,7 +1935,8 @@ class MooncakeConnectorScheduler:
         kv_cache_config: "KVCacheConfig",
     ):
         self.vllm_config = vllm_config
-        self.block_size = vllm_config.cache_config.block_size
+        self.kv_cache_config = kv_cache_config
+        self.block_size, _ = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
 
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
@@ -1374,19 +1959,37 @@ class MooncakeConnectorScheduler:
         self._has_mamba = kv_cache_config.has_mamba_layers
         self._request_transfer_ids: dict[ReqId, TransferId] = {}
         self._completion_counts: dict[tuple[str, ReqId, TransferId], int] = {}
+        speculative_config = vllm_config.speculative_config
+        self._has_full_temporal_draft = bool(
+            speculative_config is not None
+            and getattr(
+                speculative_config,
+                "enable_eagle3_replicated_draft_kv",
+                False,
+            )
+        )
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
+        self._reqs_need_recv: dict[
+            ReqId, tuple[Request, list[list[int]], int, int, int]
+        ] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[TransferId] = set()
 
         # Compute sliding window block counts per KV cache group.
+        cp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
         sw_sizes_tokens: list[tuple[int, int]] = [
-            (g.kv_cache_spec.sliding_window, g.kv_cache_spec.block_size)
+            (
+                g.kv_cache_spec.sliding_window,
+                g.kv_cache_spec.block_size * cp_world_size,
+            )
             if isinstance(g.kv_cache_spec, SlidingWindowSpec)
             else (0, self.block_size)
             for g in kv_cache_config.kv_cache_groups
@@ -1477,11 +2080,37 @@ class MooncakeConnectorScheduler:
         ]
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        """D-side only. Returns N-1 for Mamba models since the decoder
-        always recomputes the last token and must start from h(N-1)."""
+        """Return external prompt coverage, leaving the final token local."""
+        if self._has_full_temporal_draft:
+            return max(num_prompt_tokens - 1, 0)
         if self._has_mamba and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return num_prompt_tokens
+
+    def _get_remote_prefill_transfer_range(
+        self,
+        num_prompt_tokens: int,
+        num_external_tokens: int,
+    ) -> tuple[int, int]:
+        total_tokens = self._get_remote_prefill_token_count(num_prompt_tokens)
+        if not 0 <= num_external_tokens <= total_tokens:
+            raise ValueError("external token count must be within remote prefill range")
+        external_start_token = total_tokens - num_external_tokens
+        if self._has_full_temporal_draft and num_prompt_tokens > 0:
+            coverage = get_prompt_draft_kv_coverage(
+                prompt_tokens=num_prompt_tokens,
+                target_prefix_tokens=external_start_token,
+                compatible_draft_prefix_tokens=external_start_token,
+            )
+            if coverage.transfer_token_count != num_external_tokens:
+                raise ValueError(
+                    "Target and Draft prefix coverage must share one parent range"
+                )
+            return (
+                coverage.transfer_end_token_exclusive,
+                coverage.transfer_start_token,
+            )
+        return total_tokens, external_start_token
 
     def _truncate_mamba_request_for_prefill(self, request: "Request") -> None:
         """P-side only: drop the last prompt token so the prefiller computes
@@ -1577,14 +2206,25 @@ class MooncakeConnectorScheduler:
                 # If remote_blocks and num_external_tokens = 0, we have
                 # a full prefix cache hit on the D worker. We need to call
                 # send_notif in _read_blocks to free the memory on the P.
-                unhashed_block_ids = (
-                    blocks.get_unhashed_block_ids_all_groups()
-                    if num_external_tokens > 0
-                    else ()
+                if num_external_tokens > 0:
+                    unhashed_block_ids = blocks.get_unhashed_block_ids_all_groups()
+                    local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                else:
+                    local_block_ids = [[] for _ in self.kv_cache_config.kv_cache_groups]
+                total_tokens, external_start_token = (
+                    self._get_remote_prefill_transfer_range(
+                        request.num_prompt_tokens,
+                        num_external_tokens,
+                    )
                 )
-                local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
                 # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                    total_tokens,
+                    num_external_tokens,
+                    external_start_token,
+                )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -1610,12 +2250,21 @@ class MooncakeConnectorScheduler:
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
-            for req_id, (req, block_ids) in self._reqs_need_recv.items():
+            for req_id, (
+                req,
+                block_ids,
+                total_tokens,
+                num_external_tokens,
+                external_start_token,
+            ) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    total_tokens=total_tokens,
+                    num_external_tokens=num_external_tokens,
+                    external_start_token=external_start_token,
                 )
             self._reqs_need_recv.clear()
 
@@ -1663,7 +2312,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], 0, 0, 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -1810,7 +2459,7 @@ class MooncakeConnectorWorker:
             self.rpc_port,
         )
 
-        self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = {}
+        self._remote_agents: dict[EngineId, dict[int, dict[int, dict[int, str]]]] = {}
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
@@ -1825,6 +2474,7 @@ class MooncakeConnectorWorker:
         self.registered_layer_index_aliases: list[list[int]] = []
         self.registered_logical_group_indices: list[list[int]] = []
         self.registered_alias_group_indices: list[list[list[int]]] = []
+        self.registered_region_identities: list[MooncakeRegionIdentity] = []
         self.seen_base_addresses: list[int] = []
 
         assert (parallel_config := vllm_config.parallel_config)
@@ -1833,6 +2483,13 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1877,12 +2534,8 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
-        self.finished_sending_transfer_counts: dict[
-            tuple[ReqId, TransferId], int
-        ] = {}
-        self.finished_recving_transfer_counts: dict[
-            tuple[ReqId, TransferId], int
-        ] = {}
+        self.finished_sending_transfer_counts: dict[tuple[ReqId, TransferId], int] = {}
+        self.finished_recving_transfer_counts: dict[tuple[ReqId, TransferId], int] = {}
         self._staged_finished_sending: dict[tuple[ReqId, TransferId], int] = {}
         self._staged_finished_recving: dict[tuple[ReqId, TransferId], int] = {}
         self._pd_trace_pull_started: dict[tuple[ReqId, TransferId], float] = {}
@@ -1910,14 +2563,11 @@ class MooncakeConnectorWorker:
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
-        self._layer_specs: dict[str, KVCacheSpec] = {}
-        for group in kv_cache_config.kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            specs_by_layer = getattr(group_spec, "kv_cache_specs", {})
-            for layer_name in group.layer_names:
-                self._layer_specs[layer_name] = specs_by_layer.get(
-                    layer_name, group_spec
-                )
+        self._pcp_size: dict[EngineId, int] = {self.engine_id: self.pcp_size}
+        self._cp_block_pairing_version: dict[EngineId, int] = {
+            self.engine_id: MOONCAKE_KV_REGION_LAYOUT_VERSION
+        }
+        self._layer_specs = self._build_layer_specs()
         self._layer_group_indices: dict[str, int] = {
             layer: group_index
             for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -1991,6 +2641,9 @@ class MooncakeConnectorWorker:
             dp_rank=self.dp_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            pcp_rank=self.pcp_rank,
+            pcp_size=self.pcp_size,
+            cp_block_pairing_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
             addr=worker_addr,
         )
         while True:
@@ -2108,8 +2761,7 @@ class MooncakeConnectorWorker:
             default=0,
         )
         return (
-            max_blocks * self.logical_block_size
-            >= self.large_request_threshold_tokens
+            max_blocks * self.logical_block_size >= self.large_request_threshold_tokens
         )
 
     @staticmethod
@@ -2183,8 +2835,9 @@ class MooncakeConnectorWorker:
             self.registered_layer_index_aliases,
             self.registered_logical_group_indices,
             self.registered_alias_group_indices,
+            self.registered_region_identities or None,
         )
-        remote_regions = self._get_transfer_regions(
+        registered_remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
             meta.block_lens,
             meta.kv_block_lens,
@@ -2195,10 +2848,84 @@ class MooncakeConnectorWorker:
             meta.registered_layer_index_aliases,
             meta.registered_logical_group_indices,
             meta.registered_alias_group_indices,
+            meta.registered_region_identities or None,
         )
+        full_temporal = KVCacheTemporalLayout.FULL_TEMPORAL.value
+        local_full_temporal_layers = {
+            region.layer_name
+            for region in local_regions
+            if region.identity is not None
+            and region.identity.temporal_layout == full_temporal
+        }
+        remote_full_temporal_layers = {
+            region.layer_name
+            for region in registered_remote_regions
+            if region.identity is not None
+            and region.identity.temporal_layout == full_temporal
+        }
+        speculative_config = self.vllm_config.speculative_config
+        full_temporal_feature_enabled = bool(
+            speculative_config is not None
+            and (
+                getattr(
+                    speculative_config,
+                    "enable_eagle3_target_dense_full_temporal_kv",
+                    False,
+                )
+                or getattr(
+                    speculative_config,
+                    "enable_eagle3_prefill_draft_kv",
+                    False,
+                )
+            )
+        )
+        if (
+            local_full_temporal_layers
+            or remote_full_temporal_layers
+            or full_temporal_feature_enabled
+        ):
+            layout_error = None
+            if meta.remote_cp_block_pairing_version < MOONCAKE_KV_REGION_LAYOUT_VERSION:
+                layout_error = (
+                    "Mooncake full-temporal transfer requires region layout "
+                    f"protocol v{MOONCAKE_KV_REGION_LAYOUT_VERSION}"
+                )
+            else:
+                layout_error = _validate_full_temporal_stage_coverage(
+                    local_regions,
+                    registered_remote_regions,
+                    speculative_config=speculative_config,
+                    total_target_layers=(
+                        self.vllm_config.model_config.get_total_num_hidden_layers()
+                    ),
+                    pp_rank=self.pp_rank,
+                    pp_size=self.pp_size,
+                )
+            if layout_error is not None:
+                response = MooncakeXferResponse(
+                    status=MooncakeXferResponseStatus.ERROR,
+                    err_msg=layout_error,
+                )
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+                return
+        for d_req_id in meta.req_blocks:
+            _, page_map_err = _index_full_temporal_region_page_maps(
+                meta.req_region_page_maps.get(d_req_id, []),
+                registered_remote_regions,
+                valid_start_token=meta.req_external_start_tokens.get(d_req_id, 0),
+                valid_end_token_exclusive=meta.req_total_tokens.get(d_req_id, 0),
+            )
+            if page_map_err is not None:
+                response = MooncakeXferResponse(
+                    status=MooncakeXferResponseStatus.ERROR,
+                    err_reqs=[d_req_id],
+                    err_msg=page_map_err,
+                )
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+                return
         local_regions, remote_regions, align_err = _align_transfer_regions(
             local_regions,
-            remote_regions,
+            registered_remote_regions,
             allow_partial_layers=(
                 meta.remote_pp_size > 1 and meta.remote_pp_size != self.pp_size
             ),
@@ -2210,29 +2937,43 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
-        validation_err = self._validate_head_resharding_layout(
-            meta.remote_tp_size, local_regions
-        ) or _validate_asymmetric_region_lengths(
-            local_regions=local_regions,
-            remote_regions=remote_regions,
-            local_tp_size=self.tp_size,
-            remote_tp_size=meta.remote_tp_size,
-            producer_cache_replicated=self._producer_cache_is_replicated(),
-            unique_kv_head_layers={
-                name
-                for name, spec in self._layer_specs.items()
-                if _spec_transfers_unique_kv_heads(spec)
-            },
-            fully_replicated_layers={
-                name
-                for name, spec in self._layer_specs.items()
-                if _spec_transfers_fully_replicated(spec)
-            },
-            total_num_kv_heads_hint=self.transfer_topo.total_num_kv_heads,
-            total_num_kv_heads_by_layer={
-                name: self._get_layer_total_num_kv_heads(name)
-                for name in self._layer_specs
-            },
+        layout_err = _validate_region_layouts(
+            local_regions,
+            remote_regions,
+            producer_dcp_size=self.dcp_size,
+            consumer_dcp_size=meta.remote_dcp_size,
+        )
+        if layout_err is not None:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg=layout_err,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+        validation_err = (
+            self._validate_head_resharding_layout(meta.remote_tp_size, local_regions)
+            or _validate_asymmetric_region_lengths(
+                local_regions=local_regions,
+                remote_regions=remote_regions,
+                local_tp_size=self.tp_size,
+                remote_tp_size=meta.remote_tp_size,
+                producer_cache_replicated=self._producer_cache_is_replicated(),
+                unique_kv_head_layers={
+                    name
+                    for name, spec in self._layer_specs.items()
+                    if _spec_transfers_unique_kv_heads(spec)
+                },
+                fully_replicated_layers={
+                    name
+                    for name, spec in self._layer_specs.items()
+                    if _spec_transfers_fully_replicated(spec)
+                },
+                total_num_kv_heads_hint=self.transfer_topo.total_num_kv_heads,
+                total_num_kv_heads_by_layer={
+                    name: self._get_layer_total_num_kv_heads(name)
+                    for name in self._layer_specs
+                },
+            )
         )
         if validation_err is not None:
             response = MooncakeXferResponse(
@@ -2376,16 +3117,17 @@ class MooncakeConnectorWorker:
                         err_req_set.add(d_req_id)
                     ok_ready_reqs = []
 
+            ok_ready_req_ids = {d_req_id for d_req_id, _ in ok_ready_reqs}
             for d_req_id, send_meta in ready_reqs:
                 send_meta.sending -= 1
-
-                if d_req_id in err_req_set:
+                if d_req_id not in ok_ready_req_ids:
                     continue
-
                 send_meta.sent += 1
                 if (
-                    send_meta.sent == send_meta.need_send
-                    and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
+                    send_meta.sent >= send_meta.need_send
+                    and send_meta.sending == 0
+                    and self.reqs_need_send.pop(send_meta.transfer_id, None)
+                    is not None
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
                     key = (send_meta.p_req_id, send_meta.transfer_id)
@@ -2447,20 +3189,27 @@ class MooncakeConnectorWorker:
         if self._physical_blocks_per_logical_kv_block == 1:
             return block_ids
 
+        return [
+            self._logical_group_to_kernel_block_ids(group, i)
+            for i, group in enumerate(block_ids)
+        ]
+
+    def _logical_group_to_kernel_block_ids(
+        self, block_ids: list[int], group_index: int
+    ) -> list[int]:
+        if self._physical_blocks_per_logical_kv_block == 1:
+            return list(block_ids)
+        group_spec = self.kv_cache_config.kv_cache_groups[group_index].kv_cache_spec
+        if isinstance(group_spec, MambaSpec):
+            return list(block_ids)
         block_arange = np.arange(self._physical_blocks_per_logical_kv_block).reshape(
             1, -1
         )
-        group_specs = self.kv_cache_config.kv_cache_groups
-        return [
-            BlockTable.map_to_kernel_blocks(
-                np.array(group),
-                self._physical_blocks_per_logical_kv_block,
-                block_arange,
-            ).tolist()
-            if not isinstance(group_specs[i].kv_cache_spec, MambaSpec)
-            else group
-            for i, group in enumerate(block_ids)
-        ]
+        return BlockTable.map_to_kernel_blocks(
+            np.array(block_ids),
+            self._physical_blocks_per_logical_kv_block,
+            block_arange,
+        ).tolist()
 
     async def _build_transfer_params(
         self,
@@ -2483,96 +3232,76 @@ class MooncakeConnectorWorker:
         err_reqs: list[ReqId] = []
         err_msg: str | None = None
         transferred_reqs: set[ReqId] = set()
-        transferred_region_ranges: dict[
-            ReqId, set[TransferCoverage]
-        ] = defaultdict(set)
+        transferred_region_ranges: dict[ReqId, set[TransferCoverage]] = defaultdict(set)
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
         for d_req_id, send_meta in ready_reqs:
             num_descriptors_before = len(src_ptrs)
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
-
-            if not remote_block_ids_per_group or all(
-                len(g) == 0 for g in remote_block_ids_per_group
-            ):
-                continue
-
-            if len(send_meta.local_block_ids) != len(remote_block_ids_per_group):
-                logger.error(
-                    "req %s: KV group count mismatch: local=%d, remote=%d",
-                    d_req_id,
-                    len(send_meta.local_block_ids),
-                    len(remote_block_ids_per_group),
-                )
+            remote_global_page_ids_per_group = agent_meta.req_global_page_ids.get(
+                d_req_id
+            )
+            aligned_full_temporal_region_indices = {
+                region.region_index
+                for region in remote_regions
+                if region.identity is not None
+                and region.identity.temporal_layout
+                == KVCacheTemporalLayout.FULL_TEMPORAL.value
+            }
+            relevant_region_page_maps = [
+                page_map
+                for page_map in agent_meta.req_region_page_maps.get(d_req_id, [])
+                if page_map.region_index in aligned_full_temporal_region_indices
+            ]
+            region_page_maps, page_map_error = _index_full_temporal_region_page_maps(
+                relevant_region_page_maps,
+                remote_regions,
+                valid_start_token=agent_meta.req_external_start_tokens.get(d_req_id, 0),
+                valid_end_token_exclusive=agent_meta.req_total_tokens.get(d_req_id, 0),
+            )
+            if page_map_error is not None:
                 err_reqs.append(d_req_id)
                 if err_msg is None:
-                    err_msg = "KV group count mismatch"
+                    err_msg = page_map_error
                 continue
 
-            # Keep KV-cache group identity. Hybrid/HMA groups can carry
-            # different semantics (e.g. full-attention KV pages vs GDN/Mamba
-            # inner-state slots), so their block IDs must not be flattened and
-            # reused for every registered region.
-            local_block_ids_by_group: list[list[int]] = []
-            remote_block_ids_by_group: list[list[int]] = []
-            has_block_error = False
-            group_specs = self.kv_cache_config.kv_cache_groups
-            for group_index, (local_group, remote_group) in enumerate(
-                zip(send_meta.local_block_ids, remote_block_ids_per_group)
+            if agent_meta.remote_dcp_size <= 1 and (
+                not remote_block_ids_per_group
+                or all(len(g) == 0 for g in remote_block_ids_per_group)
             ):
-                is_mamba_group = isinstance(
-                    group_specs[group_index].kv_cache_spec,
-                    MambaSpec,
-                )
-                if is_mamba_group:
-                    # Mamba/GDN prefix caching can use null blocks only as
-                    # align-mode placeholders. They do not carry transferable
-                    # state, so skip them on both producer and consumer sides.
-                    local_group = [
-                        block_id
-                        for block_id in local_group
-                        if block_id != NULL_BLOCK_ID
-                    ]
-                    remote_group = [
-                        block_id
-                        for block_id in remote_group
-                        if block_id != NULL_BLOCK_ID
-                    ]
+                continue
 
-                n_local = len(local_group)
-                n_remote = len(remote_group)
-                if n_local < n_remote:
-                    logger.error(
-                        "req %s: local blocks(%d) < remote blocks(%d) "
-                        "in a KV cache group (is_mamba_group=%s)",
-                        d_req_id,
-                        n_local,
-                        n_remote,
-                        is_mamba_group,
+            if agent_meta.remote_dcp_size > 1 and (
+                getattr(self, "dcp_size", 1) != 1
+                or getattr(self, "pcp_size", 1) != 1
+                or agent_meta.remote_pcp_size != 1
+            ):
+                err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = (
+                        "Mooncake DCP v2 requires producer DCP1 and PCP1 on both sides"
                     )
-                    has_block_error = True
-                    break
-                elif n_local > n_remote:
-                    # Partial prefix cache hit: just read uncomputed blocks.
-                    local_group = local_group[-n_remote:] if n_remote > 0 else []
-                local_block_ids_by_group.append(local_group)
-                remote_block_ids_by_group.append(remote_group)
-
-            if has_block_error:
+                continue
+            if agent_meta.remote_dcp_size > 1 and (
+                agent_meta.remote_cp_block_pairing_version
+                < MOONCAKE_CP_BLOCK_PAIRING_VERSION
+                or remote_global_page_ids_per_group is None
+                or len(remote_global_page_ids_per_group)
+                != len(remote_block_ids_per_group)
+            ):
                 err_reqs.append(d_req_id)
                 if err_msg is None:
-                    err_msg = "P num blocks less than D"
+                    err_msg = "Mooncake DCP requires protocol v2 global page identities"
                 continue
 
-            if not any(local_block_ids_by_group):
+            group_specs = self.kv_cache_config.kv_cache_groups
+            if len(group_specs) != len(send_meta.local_block_ids):
+                err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = "Producer KV cache spec and request group counts differ"
                 continue
-
-            local_block_ids_by_group = self._logical_to_kernel_block_ids(
-                local_block_ids_by_group
-            )
-            remote_block_ids_by_group = self._logical_to_kernel_block_ids(
-                remote_block_ids_by_group
-            )
+            if not any(send_meta.local_block_ids):
+                continue
 
             selected_region_blocks: list[
                 tuple[
@@ -2584,38 +3313,179 @@ class MooncakeConnectorWorker:
                 ]
             ] = []
             selected_block_count = 0
-            num_groups = len(remote_block_ids_by_group)
+            has_block_error = False
             for local_region, remote_region in zip(local_regions, remote_regions):
+                is_full_temporal_region = (
+                    remote_region.identity is not None
+                    and remote_region.identity.temporal_layout
+                    == KVCacheTemporalLayout.FULL_TEMPORAL.value
+                )
                 region_group_indices = _common_group_indices_for_regions(
-                    local_region, remote_region, num_groups
+                    local_region,
+                    remote_region,
+                    min(
+                        len(send_meta.local_block_ids),
+                        len(remote_block_ids_per_group),
+                    ),
                 )
-                (
-                    local_block_ids,
-                    remote_block_ids,
-                    select_err,
-                ) = _select_region_block_ids(
-                    local_block_ids_by_group,
-                    remote_block_ids_by_group,
-                    region_group_indices,
-                )
-                if select_err is not None:
-                    logger.error(
-                        "req %s: local blocks < remote blocks for KV groups %s",
-                        d_req_id,
-                        region_group_indices,
-                    )
-                    err_reqs.append(d_req_id)
+                if not region_group_indices:
+                    has_block_error = True
                     if err_msg is None:
-                        err_msg = select_err
+                        err_msg = (
+                            "No compatible producer/consumer KV group mapping "
+                            f"for {local_region.match_layer_names}"
+                        )
+                    break
+                if is_full_temporal_region and len(region_group_indices) != 1:
+                    has_block_error = True
+                    if err_msg is None:
+                        err_msg = (
+                            "Mooncake full-temporal regions require exactly "
+                            "one producer/consumer KV group mapping"
+                        )
+                    break
+
+                local_block_ids: list[int] = []
+                remote_block_ids: list[int] = []
+                for group_index in region_group_indices:
+                    local_group = list(send_meta.local_block_ids[group_index])
+                    remote_pages: list[int] | None = None
+                    if is_full_temporal_region:
+                        page_map = region_page_maps.get(remote_region.region_index)
+                        if page_map is None or page_map.group_index != group_index:
+                            pair_error = (
+                                "Mooncake full-temporal region page map does "
+                                "not match its KV group"
+                            )
+                            has_block_error = True
+                            if err_msg is None:
+                                err_msg = pair_error
+                            break
+                        remote_group = list(page_map.dst_physical_block_ids)
+                        remote_pages = list(page_map.global_page_ids)
+                    else:
+                        remote_group = list(remote_block_ids_per_group[group_index])
+                    if not remote_group:
+                        continue
+
+                    group_spec = group_specs[group_index].kv_cache_spec
+                    if isinstance(group_spec, MambaSpec):
+                        if agent_meta.remote_dcp_size > 1:
+                            pair_error = "Mooncake DCP v2 does not support Mamba state"
+                            has_block_error = True
+                            if err_msg is None:
+                                err_msg = pair_error
+                            break
+                        local_group = [
+                            block_id
+                            for block_id in local_group
+                            if block_id != NULL_BLOCK_ID
+                        ]
+                        remote_group = [
+                            block_id
+                            for block_id in remote_group
+                            if block_id != NULL_BLOCK_ID
+                        ]
+
+                    if is_full_temporal_region:
+                        assert remote_pages is not None
+                        local_group, remote_group, pair_error = (
+                            _pair_full_temporal_blocks_by_global_page(
+                                local_group,
+                                remote_group,
+                                remote_pages,
+                                total_tokens=agent_meta.req_total_tokens.get(
+                                    d_req_id, 0
+                                ),
+                                num_external_tokens=(
+                                    agent_meta.req_num_external_tokens.get(d_req_id, 0)
+                                ),
+                                external_start_token=(
+                                    agent_meta.req_external_start_tokens.get(
+                                        d_req_id, 0
+                                    )
+                                ),
+                                page_size=group_spec.block_size,
+                            )
+                        )
+                    elif agent_meta.remote_dcp_size > 1:
+                        assert remote_global_page_ids_per_group is not None
+                        remote_pages = list(
+                            remote_global_page_ids_per_group[group_index]
+                        )
+                        local_group, remote_group, pair_error = (
+                            _pair_dcp_blocks_by_global_page(
+                                local_group,
+                                remote_group,
+                                remote_pages,
+                                total_tokens=agent_meta.req_total_tokens.get(
+                                    d_req_id, 0
+                                ),
+                                num_external_tokens=(
+                                    agent_meta.req_num_external_tokens.get(d_req_id, 0)
+                                ),
+                                external_start_token=(
+                                    agent_meta.req_external_start_tokens.get(
+                                        d_req_id, 0
+                                    )
+                                ),
+                                consumer_dcp_size=agent_meta.remote_dcp_size,
+                                consumer_dcp_rank=agent_meta.remote_dcp_rank,
+                                page_size=group_spec.block_size,
+                                interleave_size=(
+                                    agent_meta.remote_cp_kv_cache_interleave_size
+                                ),
+                            )
+                        )
+                    else:
+                        local_group, remote_group, pair_error = _pair_cp_block_ids(
+                            local_group,
+                            remote_group,
+                            producer_dcp_size=getattr(self, "dcp_size", 1),
+                            producer_dcp_rank=getattr(self, "dcp_rank", 0),
+                            consumer_dcp_size=agent_meta.remote_dcp_size,
+                            consumer_dcp_rank=agent_meta.remote_dcp_rank,
+                            consumer_cp_block_pairing_version=(
+                                agent_meta.remote_cp_block_pairing_version
+                            ),
+                        )
+                    if pair_error is not None:
+                        logger.error(
+                            "req %s: failed to pair CP blocks for KV group "
+                            "%d: %s",
+                            d_req_id,
+                            group_index,
+                            pair_error,
+                        )
+                        has_block_error = True
+                        if err_msg is None:
+                            err_msg = pair_error
+                        break
+
+                    local_block_ids.extend(
+                        self._logical_group_to_kernel_block_ids(
+                            local_group, group_index
+                        )
+                    )
+                    remote_block_ids.extend(
+                        self._logical_group_to_kernel_block_ids(
+                            remote_group, group_index
+                        )
+                    )
+
+                if has_block_error:
                     selected_region_blocks = []
                     break
                 if not local_block_ids:
                     continue
-                active_group_indices = tuple(
-                    group_index
-                    for group_index in region_group_indices
-                    if remote_block_ids_by_group[group_index]
-                )
+                if is_full_temporal_region:
+                    active_group_indices = tuple(region_group_indices)
+                else:
+                    active_group_indices = tuple(
+                        group_index
+                        for group_index in region_group_indices
+                        if remote_block_ids_per_group[group_index]
+                    )
                 selected_block_count += len(local_block_ids)
                 selected_region_blocks.append(
                     (
@@ -2626,6 +3496,12 @@ class MooncakeConnectorWorker:
                         active_group_indices,
                     )
                 )
+
+            if has_block_error:
+                err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = "Failed to map Mooncake KV groups"
+                continue
 
             if not selected_region_blocks:
                 continue
@@ -2803,17 +3679,38 @@ class MooncakeConnectorWorker:
         self.registered_layer_index_aliases = []
         self.registered_logical_group_indices = []
         self.registered_alias_group_indices = []
+        self.registered_region_identities = []
         overlay_to_region: dict[tuple[int, int, int, int], int] = {}
         speculative_method = getattr(
             self.vllm_config.speculative_config, "method", None
         )
+        transfers_eagle3_draft = bool(
+            speculative_method == "eagle3"
+            and getattr(
+                self.vllm_config.speculative_config,
+                "enable_eagle3_prefill_draft_kv",
+                False,
+            )
+        )
+        uses_replicated_eagle3_draft = bool(
+            speculative_method == "eagle3"
+            and getattr(
+                self.vllm_config.speculative_config,
+                "enable_eagle3_replicated_draft_kv",
+                False,
+            )
+        )
         is_decode_local_draft = speculative_method in (
             "mtp",
-            "eagle3",
             "dspark",
             "dflash",
         ) or (
             isinstance(speculative_method, str) and speculative_method.endswith("_mtp")
+        )
+        is_decode_local_draft |= (
+            speculative_method == "eagle3"
+            and not transfers_eagle3_draft
+            and not uses_replicated_eagle3_draft
         )
         total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
 
@@ -2835,6 +3732,7 @@ class MooncakeConnectorWorker:
                     layer_name,
                 )
                 continue
+            region_identity = self._get_region_identity(layer_name)
             if isinstance(layer_spec, MambaSpec):
                 conv, _ = cache_or_caches
                 cache_list = [conv]
@@ -2875,6 +3773,19 @@ class MooncakeConnectorWorker:
                 )
                 if overlay_key in overlay_to_region:
                     region_idx = overlay_to_region[overlay_key]
+                    existing_identity = self.registered_region_identities[region_idx]
+                    if (
+                        existing_identity.temporal_layout
+                        != region_identity.temporal_layout
+                        or existing_identity.child_page_mapping
+                        != region_identity.child_page_mapping
+                        or existing_identity.child_page_factor
+                        != region_identity.child_page_factor
+                    ):
+                        raise ValueError(
+                            "Mooncake aliased KV layers must have identical "
+                            "temporal layouts"
+                        )
                     if layer_name not in self.registered_layer_aliases[region_idx]:
                         self.registered_layer_aliases[region_idx].append(layer_name)
                         self.registered_layer_index_aliases[region_idx].append(
@@ -2906,6 +3817,7 @@ class MooncakeConnectorWorker:
                 self.registered_layer_index_aliases.append([layer_index])
                 self.registered_logical_group_indices.append(list(logical_groups))
                 self.registered_alias_group_indices.append([list(logical_groups)])
+                self.registered_region_identities.append(region_identity)
 
         shared_metadata = [
             len(aliases) > 1 or len(logical_groups) > 1
@@ -2945,7 +3857,6 @@ class MooncakeConnectorWorker:
             self.block_len_per_layer,
             self.kv_block_len_per_layer,
         )
-
         # No need to launch server for D node.
         if self.is_kv_consumer:
             return
@@ -3056,8 +3967,10 @@ class MooncakeConnectorWorker:
             if block_id != NULL_BLOCK_ID
         }
         if invalid_blocks:
-            with self._invalid_block_ids_lock:
-                self._invalid_block_ids.update(invalid_blocks)
+            invalid_block_ids_lock = getattr(self, "_invalid_block_ids_lock", None)
+            if invalid_block_ids_lock is not None:
+                with invalid_block_ids_lock:
+                    self._invalid_block_ids.update(invalid_blocks)
         self.finished_recving_reqs.add(pull_meta.d_req_id)
         key = (pull_meta.d_req_id, pull_meta.transfer_id)
         self.finished_recving_transfer_counts[key] = 1
@@ -3106,7 +4019,158 @@ class MooncakeConnectorWorker:
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
-        req_ids = set(pull_metas)
+        req_blocks: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
+        req_global_page_ids: dict[ReqId, list[list[int]]] = {}
+        req_region_page_maps: dict[ReqId, list[MooncakeRequestPageMap]] = {}
+        consumer_regions = self._get_transfer_regions(
+            self.kv_caches_base_addr,
+            self.block_len_per_layer,
+            self.kv_block_len_per_layer,
+            self.registered_layer_names,
+            self.registered_layer_indices,
+            self.registered_group_indices,
+            self.registered_layer_aliases,
+            self.registered_layer_index_aliases,
+            self.registered_logical_group_indices,
+            self.registered_alias_group_indices,
+            self.registered_region_identities or None,
+        )
+        has_full_temporal_regions = any(
+            region.identity is not None
+            and region.identity.temporal_layout
+            == KVCacheTemporalLayout.FULL_TEMPORAL.value
+            for region in consumer_regions
+        )
+        for req_id, pull_meta in pull_metas.items():
+            if self.dcp_size <= 1 and not has_full_temporal_regions:
+                req_blocks[req_id] = (
+                    pull_meta.transfer_id,
+                    pull_meta.local_block_ids,
+                )
+                pull_meta.requires_kv_transfer = self._has_transferable_blocks(
+                    pull_meta.local_block_ids
+                )
+                pull_meta.required_region_bytes = self._get_required_region_bytes(
+                    pull_meta.local_block_ids,
+                    regions=consumer_regions,
+                )
+                continue
+
+            filtered_groups: list[list[int]] = []
+            page_id_groups: list[list[int]] = []
+            region_page_maps: list[MooncakeRequestPageMap] = []
+            preflight_error: str | None = None
+            group_specs = self.kv_cache_config.kv_cache_groups
+            local_block_ids = pull_meta.local_block_ids
+            if pull_meta.num_external_tokens == 0 and not local_block_ids:
+                local_block_ids = [[] for _ in group_specs]
+
+            if len(local_block_ids) != len(group_specs):
+                preflight_error = "DCP KV group count mismatch"
+            elif self.dcp_size <= 1:
+                filtered_groups = [list(block_ids) for block_ids in local_block_ids]
+                page_id_groups = [[] for _ in group_specs]
+            else:
+                for group_index, block_ids in enumerate(local_block_ids):
+                    group_spec = group_specs[group_index].kv_cache_spec
+                    if isinstance(group_spec, MambaSpec):
+                        preflight_error = "Mooncake DCP v2 does not support Mamba state"
+                        break
+                    blocks, global_pages, preflight_error = (
+                        _get_owned_dcp_suffix_blocks(
+                            block_ids,
+                            total_tokens=pull_meta.total_tokens,
+                            num_external_tokens=pull_meta.num_external_tokens,
+                            external_start_token=pull_meta.external_start_token,
+                            dcp_size=self.dcp_size,
+                            dcp_rank=self.dcp_rank,
+                            page_size=group_spec.block_size,
+                            interleave_size=self.cp_kv_cache_interleave_size,
+                        )
+                    )
+                    if preflight_error is not None:
+                        break
+                    filtered_groups.append(blocks)
+                    page_id_groups.append(global_pages)
+            if preflight_error is None:
+                for region in consumer_regions:
+                    identity = region.identity
+                    if (
+                        identity is None
+                        or identity.temporal_layout
+                        != KVCacheTemporalLayout.FULL_TEMPORAL.value
+                    ):
+                        continue
+                    region_group_indices = tuple(
+                        region.logical_group_indices or (region.group_index,)
+                    )
+                    if len(region_group_indices) != 1:
+                        preflight_error = (
+                            "Mooncake full-temporal regions require exactly "
+                            "one KV cache group"
+                        )
+                        break
+                    group_index = region_group_indices[0]
+                    if not 0 <= group_index < len(local_block_ids):
+                        preflight_error = (
+                            "Mooncake full-temporal region has an invalid "
+                            "KV cache group"
+                        )
+                        break
+                    layer_spec = self._get_layer_spec(region.layer_name)
+                    if layer_spec is None or isinstance(layer_spec, MambaSpec):
+                        preflight_error = (
+                            "Mooncake full-temporal region requires an "
+                            "attention KV cache spec"
+                        )
+                        break
+                    child_blocks, global_pages, preflight_error = (
+                        _get_full_temporal_suffix_blocks(
+                            local_block_ids[group_index],
+                            total_tokens=pull_meta.total_tokens,
+                            num_external_tokens=pull_meta.num_external_tokens,
+                            external_start_token=pull_meta.external_start_token,
+                            child_page_factor=identity.child_page_factor,
+                            page_size=layer_spec.block_size,
+                        )
+                    )
+                    if preflight_error is not None:
+                        break
+                    region_page_maps.append(
+                        MooncakeRequestPageMap(
+                            region_index=region.region_index,
+                            group_index=group_index,
+                            valid_start_token=(pull_meta.external_start_token),
+                            valid_end_token_exclusive=pull_meta.total_tokens,
+                            global_page_ids=global_pages,
+                            dst_physical_block_ids=child_blocks,
+                        )
+                    )
+            if preflight_error is not None:
+                logger.error(
+                    "Mooncake DCP preflight failed for request %s: %s",
+                    req_id,
+                    preflight_error,
+                )
+                self._account_failed_pull_tasks(pull_metas, [req_id])
+                continue
+            pull_meta.requires_kv_transfer = self._has_transferable_blocks(
+                filtered_groups
+            ) or any(
+                page_map.dst_physical_block_ids for page_map in region_page_maps
+            )
+            pull_meta.required_region_bytes = self._get_required_region_bytes(
+                filtered_groups,
+                regions=consumer_regions,
+                region_page_maps=region_page_maps,
+            )
+            req_blocks[req_id] = (pull_meta.transfer_id, filtered_groups)
+            req_global_page_ids[req_id] = page_id_groups
+            req_region_page_maps[req_id] = region_page_maps
+
+        req_ids = list(req_blocks)
+        if not req_ids:
+            return
         outstanding_req_ids = set(req_ids)
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
@@ -3114,13 +4178,33 @@ class MooncakeConnectorWorker:
             remote_tp_size=self.tp_size,
             remote_tp_rank=self.tp_rank,
             remote_pp_size=self.pp_size,
-            req_blocks={
-                req_id: (pull_meta.transfer_id, pull_meta.local_block_ids)
-                for req_id, pull_meta in pull_metas.items()
-            },
+            req_blocks=req_blocks,
             kv_caches_base_addr=self.kv_caches_base_addr,
             block_lens=self.block_len_per_layer,
             kv_block_lens=self.kv_block_len_per_layer,
+            remote_pcp_size=self.pcp_size,
+            remote_pcp_rank=self.pcp_rank,
+            remote_dcp_size=self.dcp_size,
+            remote_dcp_rank=self.dcp_rank,
+            remote_cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            remote_cp_block_pairing_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            req_total_tokens={
+                req_id: pull_meta.total_tokens
+                for req_id, pull_meta in pull_metas.items()
+                if req_id in req_blocks
+            },
+            req_num_external_tokens={
+                req_id: pull_meta.num_external_tokens
+                for req_id, pull_meta in pull_metas.items()
+                if req_id in req_blocks
+            },
+            req_external_start_tokens={
+                req_id: pull_meta.external_start_token
+                for req_id, pull_meta in pull_metas.items()
+                if req_id in req_blocks
+            },
+            req_global_page_ids=req_global_page_ids,
+            req_region_page_maps=req_region_page_maps,
             registered_layer_names=self.registered_layer_names,
             registered_layer_indices=self.registered_layer_indices,
             registered_group_indices=self.registered_group_indices,
@@ -3128,6 +4212,7 @@ class MooncakeConnectorWorker:
             registered_layer_index_aliases=self.registered_layer_index_aliases,
             registered_logical_group_indices=self.registered_logical_group_indices,
             registered_alias_group_indices=self.registered_alias_group_indices,
+            registered_region_identities=self.registered_region_identities,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -3158,9 +4243,7 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         self.xfer_stats.record_failed_recv()
-                        self._account_failed_pull_tasks(
-                            pull_metas, outstanding_req_ids
-                        )
+                        self._account_failed_pull_tasks(pull_metas, outstanding_req_ids)
                         return
                     accounted_req_ids = self.process_pulling_result(
                         response, pull_metas
@@ -3215,8 +4298,7 @@ class MooncakeConnectorWorker:
                 pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
                 mixed_coverage_protocols = (
-                    pull_meta.saw_region_coverage
-                    and pull_meta.saw_legacy_coverage
+                    pull_meta.saw_region_coverage and pull_meta.saw_legacy_coverage
                 )
                 coverage_complete = (
                     pull_meta.received_kv
@@ -3224,8 +4306,10 @@ class MooncakeConnectorWorker:
                     else bool(pull_meta.required_region_bytes)
                     and self._has_complete_transfer_coverage(pull_meta)
                 )
-                if pull_meta.pull_failed or mixed_coverage_protocols or (
-                    pull_meta.requires_kv_transfer and not coverage_complete
+                if (
+                    pull_meta.pull_failed
+                    or mixed_coverage_protocols
+                    or (pull_meta.requires_kv_transfer and not coverage_complete)
                 ):
                     self._mark_pull_failed(pull_meta)
                 else:
@@ -3258,14 +4342,24 @@ class MooncakeConnectorWorker:
                 data: dict = response.json()
                 for _, dp_entry in data.items():
                     remote_engine_id = dp_entry["engine_id"]
-                    self._remote_agents[remote_engine_id] = {
-                        int(tp_rank): {
-                            int(pp_rank): worker_addr
-                            for pp_rank, worker_addr in tp_entry.items()
-                        }
-                        for tp_rank, tp_entry in dp_entry["worker_addr"].items()
-                    }
+                    remote_agents: dict[int, dict[int, dict[int, str]]] = {}
+                    for tp_rank, tp_entry in dp_entry["worker_addr"].items():
+                        pp_agents: dict[int, dict[int, str]] = {}
+                        for pp_rank, pp_entry in tp_entry.items():
+                            if isinstance(pp_entry, str):
+                                pp_agents[int(pp_rank)] = {0: pp_entry}
+                            else:
+                                pp_agents[int(pp_rank)] = {
+                                    int(pcp_rank): worker_addr
+                                    for pcp_rank, worker_addr in pp_entry.items()
+                                }
+                        remote_agents[int(tp_rank)] = pp_agents
+                    self._remote_agents[remote_engine_id] = remote_agents
                     self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
+                    self._pcp_size[remote_engine_id] = int(dp_entry.get("pcp_size", 1))
+                    self._cp_block_pairing_version[remote_engine_id] = int(
+                        dp_entry.get("cp_block_pairing_version", 0)
+                    )
         except Exception as e:
             logger.error(
                 "Failed to connect to bootstrap server %s: %s",
@@ -3294,31 +4388,55 @@ class MooncakeConnectorWorker:
         )
 
     def _get_required_region_bytes(
-        self, block_ids: list[list[int]]
+        self,
+        block_ids: list[list[int]],
+        regions: list[TransferRegion] | None = None,
+        region_page_maps: list[MooncakeRequestPageMap] | None = None,
     ) -> dict[TransferCoverageKey, int]:
-        regions = self._get_transfer_regions(
-            self.kv_caches_base_addr,
-            self.block_len_per_layer,
-            self.kv_block_len_per_layer,
-            self.registered_layer_names,
-            self.registered_layer_indices,
-            self.registered_group_indices,
-            self.registered_layer_aliases,
-            self.registered_layer_index_aliases,
-            self.registered_logical_group_indices,
-            self.registered_alias_group_indices,
-        )
+        if regions is None:
+            regions = self._get_transfer_regions(
+                self.kv_caches_base_addr,
+                self.block_len_per_layer,
+                self.kv_block_len_per_layer,
+                self.registered_layer_names,
+                self.registered_layer_indices,
+                self.registered_group_indices,
+                self.registered_layer_aliases,
+                self.registered_layer_index_aliases,
+                self.registered_logical_group_indices,
+                self.registered_alias_group_indices,
+            )
+        region_page_maps_by_index = {
+            page_map.region_index: page_map for page_map in region_page_maps or ()
+        }
         required_region_bytes: dict[TransferCoverageKey, int] = {}
         for region in regions:
-            for group_index in _region_group_indices(region, len(block_ids)):
-                if not self._group_has_transferable_blocks(
-                    group_index, block_ids[group_index]
+            is_full_temporal_region = (
+                region.identity is not None
+                and region.identity.temporal_layout
+                == KVCacheTemporalLayout.FULL_TEMPORAL.value
+            )
+            region_page_map = region_page_maps_by_index.get(region.region_index)
+            if is_full_temporal_region:
+                if (
+                    region_page_map is None
+                    or not region_page_map.dst_physical_block_ids
+                ):
+                    continue
+                region_group_indices = (region_page_map.group_index,)
+            else:
+                region_group_indices = _region_group_indices(region, len(block_ids))
+
+            for group_index in region_group_indices:
+                if (
+                    not is_full_temporal_region
+                    and not self._group_has_transferable_blocks(
+                        group_index, block_ids[group_index]
+                    )
                 ):
                     continue
                 key = (region.base_addr, group_index)
-                previous = required_region_bytes.setdefault(
-                    key, region.kv_block_len
-                )
+                previous = required_region_bytes.setdefault(key, region.kv_block_len)
                 assert previous == region.kv_block_len, (
                     "Mooncake destination region has conflicting transfer "
                     f"lengths for coverage key {key}: "
@@ -3373,6 +4491,34 @@ class MooncakeConnectorWorker:
         remote_engine_id: EngineId,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        remote_cp_version = getattr(self, "_cp_block_pairing_version", {}).get(
+            remote_engine_id, 0
+        )
+        requires_region_layout = any(
+            identity.temporal_layout == KVCacheTemporalLayout.FULL_TEMPORAL.value
+            for identity in getattr(
+                self,
+                "registered_region_identities",
+                [],
+            )
+        )
+        required_cp_version = (
+            MOONCAKE_KV_REGION_LAYOUT_VERSION
+            if requires_region_layout
+            else MOONCAKE_CP_BLOCK_PAIRING_VERSION
+        )
+        if (
+            requires_region_layout or getattr(self, "dcp_size", 1) > 1
+        ) and remote_cp_version < required_cp_version:
+            logger.error(
+                "Mooncake producer engine %s does not advertise protocol v%d",
+                remote_engine_id,
+                required_cp_version,
+            )
+            for pull_meta in pull_metas.values():
+                pull_meta.pull_failed = True
+                self._mark_pull_failed(pull_meta)
+            return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
@@ -3381,8 +4527,7 @@ class MooncakeConnectorWorker:
             for remote_tp_rank in remote_tp_ranks
         }
         if any(
-            remote_pp_size < self.pp_size
-            for remote_pp_size in remote_pp_sizes.values()
+            remote_pp_size < self.pp_size for remote_pp_size in remote_pp_sizes.values()
         ):
             logger.error(
                 "Unsupported Mooncake PP topology for engine %s: "
@@ -3397,14 +4542,46 @@ class MooncakeConnectorWorker:
             return
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
+        remote_pcp_size = self._pcp_size[remote_engine_id]
+        requires_dcp_transfer = (
+            requires_region_layout or getattr(self, "dcp_size", 1) > 1
+        )
+        if requires_dcp_transfer and (
+            self.pcp_size != 1 or remote_pcp_size != 1
+        ):
+            logger.error(
+                "Mooncake DCP transfer requires PCP1 on both sides for engine %s",
+                remote_engine_id,
+            )
+            for pull_meta in pull_metas.values():
+                pull_meta.pull_failed = True
+                self._mark_pull_failed(pull_meta)
+            return
         for remote_tp_rank in remote_tp_ranks:
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
+            pp_to_pcp = self._remote_agents[remote_engine_id][remote_tp_rank]
+            if self.pp_size == len(pp_to_pcp) and self.pp_rank in pp_to_pcp:
                 pp_ranks = [self.pp_rank]
             else:
-                pp_ranks = sorted(pp_to_addr)
+                pp_ranks = sorted(pp_to_pcp)
             selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+            for pp_rank in pp_ranks:
+                pcp_to_addr = pp_to_pcp[pp_rank]
+                if isinstance(pcp_to_addr, str):
+                    worker_addrs.append(pcp_to_addr)
+                    continue
+                pcp_rank = 0 if requires_dcp_transfer else self.pcp_rank
+                if pcp_rank not in pcp_to_addr:
+                    logger.error(
+                        "Missing producer PCP rank %d for TP=%d PP=%d",
+                        pcp_rank,
+                        remote_tp_rank,
+                        pp_rank,
+                    )
+                    for pull_meta in pull_metas.values():
+                        pull_meta.pull_failed = True
+                        self._mark_pull_failed(pull_meta)
+                    return
+                worker_addrs.append(pcp_to_addr[pcp_rank])
 
         count = len(worker_addrs)
         logger.debug(
@@ -3416,14 +4593,10 @@ class MooncakeConnectorWorker:
         )
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
-            pull_meta.requires_kv_transfer = self._has_transferable_blocks(
-                pull_meta.local_block_ids
-            )
+            pull_meta.requires_kv_transfer = False
             pull_meta.received_kv = False
             pull_meta.pull_failed = False
-            pull_meta.required_region_bytes = self._get_required_region_bytes(
-                pull_meta.local_block_ids
-            )
+            pull_meta.required_region_bytes = {}
             pull_meta.received_region_ranges.clear()
             pull_meta.saw_region_coverage = False
             pull_meta.saw_legacy_coverage = False
@@ -3512,8 +4685,8 @@ class MooncakeConnectorWorker:
                         ready=asyncio.Event(),
                     )
         for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id)
-            if send_meta:
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
@@ -3558,16 +4731,21 @@ class MooncakeConnectorWorker:
         return None
 
     def _get_layer_total_num_kv_heads(self, layer_name: str) -> int:
-        layer = self.vllm_config.compilation_config.static_forward_context.get(
-            layer_name
-        )
-        return int(
+        static_forward_context = getattr(
             getattr(
-                layer,
-                "total_num_kv_heads",
-                self.transfer_topo.total_num_kv_heads,
-            )
+                getattr(self, "vllm_config", None),
+                "compilation_config",
+                None,
+            ),
+            "static_forward_context",
+            {},
         )
+        layer = static_forward_context.get(layer_name)
+        fallback = getattr(self.transfer_topo, "total_num_kv_heads", None)
+        if fallback is None:
+            layer_spec = self._get_layer_spec(layer_name)
+            fallback = getattr(layer_spec, "num_kv_heads", 1)
+        return int(getattr(layer, "total_num_kv_heads", fallback))
 
     def _get_region_transfer_policy(
         self, region: TransferRegion
@@ -3614,6 +4792,7 @@ class MooncakeConnectorWorker:
         layer_index_aliases: list[list[int]] | None = None,
         logical_group_indices: list[list[int]] | None = None,
         alias_group_indices: list[list[list[int]]] | None = None,
+        region_identities: list[MooncakeRegionIdentity] | None = None,
     ) -> list[TransferRegion]:
         if not group_indices:
             group_indices = [
@@ -3624,7 +4803,7 @@ class MooncakeConnectorWorker:
         if self.transfer_topo.virtually_split_kv_in_blocks:
             split_kv_regions = [
                 not isinstance(
-                    self._layer_specs[layer_name],
+                    self._get_layer_spec(layer_name),
                     (MambaSpec, MLAAttentionSpec, SlidingWindowMLASpec),
                 )
                 for layer_name in layer_names
@@ -3642,6 +4821,7 @@ class MooncakeConnectorWorker:
             layer_index_aliases=layer_index_aliases,
             logical_group_indices=logical_group_indices,
             alias_group_indices=alias_group_indices,
+            region_identities=region_identities,
         )
 
     def _get_sender_transfer_plan(
@@ -3669,6 +4849,41 @@ class MooncakeConnectorWorker:
             transfer_unique_kv_heads=transfer_unique_kv_heads,
             total_num_kv_heads=total_num_kv_heads,
         )
+
+    def _build_layer_specs(self) -> dict[str, KVCacheSpec]:
+        layer_specs: dict[str, KVCacheSpec] = {}
+        for group in self.kv_cache_config.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            specs_by_layer = getattr(group_spec, "kv_cache_specs", {})
+            for layer_name in group.layer_names:
+                layer_specs[layer_name] = specs_by_layer.get(layer_name, group_spec)
+        return layer_specs
+
+    def _get_region_identity(self, layer_name: str) -> MooncakeRegionIdentity:
+        layer_spec = self._get_layer_spec(layer_name)
+        if layer_spec is None:
+            raise ValueError(f"No KV cache spec is present for {layer_name}")
+        temporal_layout = layer_spec.temporal_layout
+        if temporal_layout == KVCacheTemporalLayout.FULL_TEMPORAL and self.dcp_size > 1:
+            child_page_mapping = KVCacheChildPageMapping.GLOBAL_PAGE_MODULO
+            child_page_factor = self.dcp_size
+        else:
+            child_page_mapping = KVCacheChildPageMapping.IDENTITY
+            child_page_factor = 1
+        return MooncakeRegionIdentity(
+            layer_name=layer_name,
+            temporal_layout=temporal_layout.value,
+            protocol_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            child_page_mapping=child_page_mapping.value,
+            child_page_factor=child_page_factor,
+        )
+
+    def _get_layer_spec(self, layer_name: str) -> KVCacheSpec | None:
+        layer_specs = getattr(self, "_layer_specs", None)
+        if layer_specs is None:
+            layer_specs = self._build_layer_specs()
+            self._layer_specs = layer_specs
+        return layer_specs.get(layer_name)
 
     def _log_debug_cache_registration(
         self, layer_name: str, cache: torch.Tensor

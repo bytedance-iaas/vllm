@@ -41,6 +41,23 @@ def test_dcp_allows_other_speculative_methods():
     VllmConfig.validate_block_size(config)
 
 
+def test_dcp_rejects_draft_model_spec_decode():
+    config = _make_block_size_config("draft_model")
+
+    with pytest.raises(NotImplementedError, match="Draft-model speculative decoding"):
+        VllmConfig.validate_block_size(config)
+
+
+def test_dcp_rejects_step3p5_mtp_spec_decode():
+    config = _make_block_size_config("mtp")
+    config.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="step3p5_mtp")
+    )
+
+    with pytest.raises(NotImplementedError, match="Step3 MTP speculative decoding"):
+        VllmConfig.validate_block_size(config)
+
+
 def test_explicit_v1_runner_rejected_for_dspark(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
     config = SimpleNamespace(
@@ -49,6 +66,65 @@ def test_explicit_v1_runner_rejected_for_dspark(monkeypatch):
 
     with pytest.raises(ValueError, match="requires the V2 model runner"):
         VllmConfig.use_v2_model_runner.fget(config)
+
+
+def test_v2_runner_rejects_replicated_eagle3_draft_kv():
+    config = SimpleNamespace(
+        model_config=None,
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            parallel_drafting=False,
+            enable_eagle3_replicated_draft_kv=True,
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=8,
+            distributed_executor_backend=None,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
+            enable_elastic_ep=False,
+        ),
+        compilation_config=SimpleNamespace(
+            mode=None,
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+        ec_transfer_config=None,
+    )
+
+    unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
+
+    assert "EAGLE3 replicated draft KV" in unsupported
+
+
+def test_v2_runner_rejects_eagle3_target_dense_full_temporal_kv():
+    config = SimpleNamespace(
+        model_config=None,
+        speculative_config=SimpleNamespace(
+            method="eagle3",
+            parallel_drafting=False,
+            enable_eagle3_replicated_draft_kv=False,
+            enable_eagle3_target_dense_full_temporal_kv=True,
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=8,
+            distributed_executor_backend=None,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
+            enable_elastic_ep=False,
+        ),
+        compilation_config=SimpleNamespace(
+            mode=None,
+            pass_config=SimpleNamespace(enable_sp=False),
+        ),
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
+        ec_transfer_config=None,
+    )
+
+    unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
+
+    assert "EAGLE3 target dense full-temporal KV" in unsupported
 
 
 def test_dspark_rejects_dynamic_sd_k_below_checkpoint_block_size(monkeypatch):
