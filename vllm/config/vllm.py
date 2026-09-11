@@ -880,7 +880,7 @@ class VllmConfig:
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
-    def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
+    def _verify_dynamic_sd_dp_config(self) -> None:
         speculative_config = self.speculative_config
         if (
             speculative_config is None
@@ -889,15 +889,33 @@ class VllmConfig:
         ):
             return
 
-        logger.warning_once(
-            "Dynamic speculative decoding is not supported with data "
-            "parallelism because data-parallel ranks can select different "
-            "speculative-token counts, causing DP divergence and deadlocks. "
-            "Disabling num_speculative_tokens_per_batch_size and falling back "
-            "to static num_speculative_tokens=%d.",
-            speculative_config.num_speculative_tokens,
-        )
-        speculative_config.num_speculative_tokens_per_batch_size = None
+        if speculative_config.dynamic_sd_dp_batch_policy is None:
+            logger.warning_once(
+                "Dynamic speculative decoding is not supported with data "
+                "parallelism unless dynamic_sd_dp_batch_policy='global_max' "
+                "is set. Disabling num_speculative_tokens_per_batch_size and "
+                "falling back to static num_speculative_tokens=%d.",
+                speculative_config.num_speculative_tokens,
+            )
+            speculative_config.num_speculative_tokens_per_batch_size = None
+            return
+
+        if not speculative_config.uses_dynamic_sd_dp_global_max_policy():
+            raise ValueError(
+                "num_speculative_tokens_per_batch_size with data_parallel_size > 1 "
+                "only supports dynamic_sd_dp_batch_policy='global_max'."
+            )
+
+        if (
+            speculative_config.method == "dspark"
+            and self.scheduler_config.async_scheduling is False
+        ):
+            raise ValueError(
+                "DSpark Dynamic SD with data_parallel_size > 1 requires "
+                "async_scheduling. The DSpark proposer generates the static maximum "
+                "draft width without async placeholders, so Dynamic SD would not "
+                "control the verification width."
+            )
 
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
@@ -1151,6 +1169,8 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
+        self._verify_dynamic_sd_dp_config()
+
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
                 if self.parallel_config.data_parallel_size > 1 and (
@@ -1313,7 +1333,6 @@ class VllmConfig:
                 "optimization level defaults."
             )
 
-        self._maybe_disable_dynamic_sd_for_data_parallel()
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (

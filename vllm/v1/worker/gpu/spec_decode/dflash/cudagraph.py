@@ -97,6 +97,9 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 causal=causal,
             )
             attn_metadata, slot_mappings = attn_state
+            num_query_per_req = desc.uniform_token_count or (
+                num_tokens // max(num_reqs, 1)
+            )
 
             return lambda cg_mode: forward_fn(
                 num_reqs,
@@ -105,6 +108,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 slot_mappings,
                 num_tokens_across_dp,
                 cg_mode,
+                num_query_per_req=num_query_per_req,
             )
 
         super().capture(create_forward_fn, progress_bar_desc)

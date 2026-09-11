@@ -82,6 +82,18 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def set_dynamic_sd_batch_size_override(self, batch_size: int | None) -> None:
+        """Set a per-step Dynamic SD batch-size override."""
+        del batch_size
+
+    def get_num_spec_tokens_to_schedule_for_dummy_batch(self) -> int | None:
+        """Return the runtime K to use for a dummy decode batch."""
+        return None
+
+    def get_dynamic_sd_local_batch_pressure(self) -> int:
+        """Return a cheap local decode-pressure estimate for DP Dynamic SD."""
+        return 0
+
     @abstractmethod
     def get_grammar_bitmask(
         self, scheduler_output: "SchedulerOutput"

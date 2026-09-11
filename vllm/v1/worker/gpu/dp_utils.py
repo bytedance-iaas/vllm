@@ -62,7 +62,7 @@ def sync_cudagraph_and_dp_padding(
         "where synced_cg_mode must be NONE across all DP ranks"
     )
     synced_num_tokens = int(num_tokens_across_dp.max().item())
-    synced_uniform_token_count = uniform_token_counts_across_dp[0]
+    synced_uniform_token_count = int(uniform_token_counts_across_dp[0].item())
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     if synced_uniform_token_count == 0 or not torch.all(
         uniform_token_counts_across_dp == synced_uniform_token_count
