@@ -63,7 +63,10 @@ def create_scheduler(
     block_size: int = 16,
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
+    num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+    dynamic_sd_dp_batch_policy: str | None = None,
     speculative_method: str | None = None,
+    speculative_model: str = "ngram",
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -146,14 +149,23 @@ def create_scheduler(
         pipeline_parallel_size=pipeline_parallel_size,
         data_parallel_size=data_parallel_size,
     )
+
     speculative_config: SpeculativeConfig | None = None
     if num_speculative_tokens is not None:
+        is_ngram_gpu = speculative_model == "ngram_gpu"
         spec_kwargs: dict = dict(
-            model="ngram",
+            model=None if is_ngram_gpu else speculative_model,
+            method="ngram_gpu" if is_ngram_gpu else None,
             num_speculative_tokens=num_speculative_tokens,
             target_model_config=model_config,
             target_parallel_config=parallel_config,
         )
+        if num_speculative_tokens_per_batch_size is not None:
+            spec_kwargs["num_speculative_tokens_per_batch_size"] = (
+                num_speculative_tokens_per_batch_size
+            )
+        if dynamic_sd_dp_batch_policy is not None:
+            spec_kwargs["dynamic_sd_dp_batch_policy"] = dynamic_sd_dp_batch_policy
         if speculative_method is not None:
             spec_kwargs["method"] = speculative_method
             spec_kwargs["prompt_lookup_max"] = num_speculative_tokens
