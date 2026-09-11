@@ -5,6 +5,12 @@ from collections.abc import Generator
 from typing import Any
 
 import pytest
+import tokenizers
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from tokenizers.decoders import DecodeStream
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPreTokenizer
+from tokenizers.trainers import BpeTrainer
 from transformers import AutoTokenizer, PythonBackend, TokenizersBackend
 
 from vllm.sampling_params import SamplingParams
@@ -15,6 +21,7 @@ from vllm.v1.engine.detokenizer import (
     FastIncrementalDetokenizer,
     IncrementalDetokenizer,
     SlowIncrementalDetokenizer,
+    _get_safe_decode_stream_prompt_suffix,
 )
 
 SPECIAL_TOKS_TRUTH = [
@@ -44,6 +51,176 @@ TOKENIZERS = [
     "codellama/CodeLlama-7b-hf",
     "mistralai/Pixtral-12B-2409",
 ]
+
+
+class _SafeSuffixTokenizer:
+    def __init__(
+        self,
+        bad_lengths: set[int] | None = None,
+        empty_lengths: set[int] | None = None,
+        raises: bool = False,
+        decoder_type: str | None = "ByteLevel",
+    ):
+        self.bad_lengths = bad_lengths or set()
+        self.empty_lengths = empty_lengths or set()
+        self.raises = raises
+        self.decoder = (
+            type(decoder_type, (), {})() if decoder_type is not None else None
+        )
+        self.calls: list[tuple[list[int], bool]] = []
+
+    def decode(self, token_ids, skip_special_tokens: bool = False):
+        self.calls.append((list(token_ids), skip_special_tokens))
+        if self.raises:
+            raise RuntimeError("decode failed")
+        suffix_len = len(token_ids)
+        if suffix_len in self.empty_lengths:
+            return ""
+        if suffix_len in self.bad_lengths:
+            return "\ufffd"
+        return "safe"
+
+
+def test_safe_decode_stream_suffix_preserves_short_prompts():
+    tokenizer = _SafeSuffixTokenizer()
+    prompt_token_ids = list(range(32))
+
+    assert _get_safe_decode_stream_prompt_suffix(tokenizer, None, True) is None
+    assert (
+        _get_safe_decode_stream_prompt_suffix(tokenizer, prompt_token_ids, True)
+        is prompt_token_ids
+    )
+    assert tokenizer.calls == []
+
+
+def test_safe_decode_stream_suffix_prefers_largest_safe_tail():
+    tokenizer = _SafeSuffixTokenizer()
+    prompt_token_ids = list(range(64))
+
+    suffix = _get_safe_decode_stream_prompt_suffix(
+        tokenizer,
+        prompt_token_ids,
+        True,
+    )
+
+    assert suffix == prompt_token_ids[-32:]
+    assert tokenizer.calls == [(prompt_token_ids[-32:], True)]
+
+
+def test_safe_decode_stream_suffix_walks_to_safe_boundary():
+    tokenizer = _SafeSuffixTokenizer(bad_lengths={32, 31})
+    prompt_token_ids = list(range(64))
+
+    suffix = _get_safe_decode_stream_prompt_suffix(
+        tokenizer,
+        prompt_token_ids,
+        False,
+    )
+
+    assert suffix == prompt_token_ids[-30:]
+    assert tokenizer.calls == [
+        (prompt_token_ids[-32:], False),
+        (prompt_token_ids[-31:], False),
+        (prompt_token_ids[-30:], False),
+    ]
+
+
+def test_safe_decode_stream_suffix_falls_back_to_full_prompt():
+    prompt_token_ids = list(range(64))
+    empty_tokenizer = _SafeSuffixTokenizer(
+        empty_lengths=set(range(4, 33)),
+    )
+    raising_tokenizer = _SafeSuffixTokenizer(raises=True)
+    unknown_decoder_tokenizer = _SafeSuffixTokenizer(decoder_type="Fuse")
+
+    assert (
+        _get_safe_decode_stream_prompt_suffix(empty_tokenizer, prompt_token_ids, True)
+        is prompt_token_ids
+    )
+    assert (
+        _get_safe_decode_stream_prompt_suffix(raising_tokenizer, prompt_token_ids, True)
+        is prompt_token_ids
+    )
+    assert (
+        _get_safe_decode_stream_prompt_suffix(
+            unknown_decoder_tokenizer,
+            prompt_token_ids,
+            True,
+        )
+        is prompt_token_ids
+    )
+    assert unknown_decoder_tokenizer.calls == []
+
+
+def _make_byte_level_tokenizer() -> tokenizers.Tokenizer:
+    tokenizer = tokenizers.Tokenizer(BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = ByteLevelPreTokenizer(add_prefix_space=False)
+    tokenizer.decoder = ByteLevelDecoder()
+    trainer = BpeTrainer(
+        vocab_size=256,
+        special_tokens=["<unk>", "<special>"],
+    )
+    tokenizer.train_from_iterator(
+        [
+            "hello streaming world with a pepper emoji 🌶️ and repeated bytes",
+            "the prompt tail must preserve byte level decoder context",
+            "bounded prompt priming should match full prompt priming",
+        ],
+        trainer,
+    )
+    return tokenizer
+
+
+def _decode_stream_text(
+    tokenizer: tokenizers.Tokenizer,
+    prompt_token_ids: list[int],
+    continuation_token_ids: list[int],
+    skip_special_tokens: bool,
+) -> str:
+    stream = DecodeStream(
+        ids=prompt_token_ids,
+        skip_special_tokens=skip_special_tokens,
+    )
+    return "".join(
+        stream.step(tokenizer, token_id) or "" for token_id in continuation_token_ids
+    )
+
+
+@pytest.mark.parametrize("skip_special_tokens", [True, False])
+def test_safe_decode_stream_suffix_matches_full_byte_level_stream(
+    skip_special_tokens: bool,
+):
+    tokenizer = _make_byte_level_tokenizer()
+    special_token_id = tokenizer.token_to_id("<special>")
+    assert special_token_id is not None
+    token_ids = tokenizer.encode(
+        ("hello streaming world with a pepper emoji 🌶️ " * 24)
+        + "bounded prompt priming should match full prompt priming"
+    ).ids
+    prompt_token_ids = token_ids[:64] + [special_token_id]
+    continuation_token_ids = token_ids[64:96]
+    assert len(prompt_token_ids) > 32
+    assert continuation_token_ids
+
+    suffix = _get_safe_decode_stream_prompt_suffix(
+        tokenizer,
+        prompt_token_ids,
+        skip_special_tokens,
+    )
+
+    assert suffix is not None
+    assert 4 <= len(suffix) <= 32
+    assert _decode_stream_text(
+        tokenizer,
+        suffix,
+        continuation_token_ids,
+        skip_special_tokens,
+    ) == _decode_stream_text(
+        tokenizer,
+        prompt_token_ids,
+        continuation_token_ids,
+        skip_special_tokens,
+    )
 
 
 def _run_incremental_decode(
