@@ -135,8 +135,17 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
+            max_num_tokens = self.moe_config.max_num_tokens
+            if self.activation_format() == mk.FusedMoEActivationFormat.Standard:
+                parallel_config = self.moe_config.moe_parallel_config
+                num_dispatchers = (
+                    parallel_config.ep_size
+                    if parallel_config.use_ep
+                    else parallel_config.dp_size
+                )
+                max_num_tokens *= num_dispatchers
             self._permute_scratch = MoEPermuteScratch(
-                max_num_tokens=self.moe_config.max_num_tokens,
+                max_num_tokens=max_num_tokens,
                 topk=self.moe_config.experts_per_token,
                 num_experts=self.moe_config.num_experts,
                 num_local_experts=self.moe_config.num_local_experts,
