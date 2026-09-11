@@ -202,6 +202,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # a single connector to load.
         # Propagated from scheduler to worker side via the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
+        self._pending_worker_metadata: list[KVConnectorWorkerMetadata | None] = [
+            None
+        ] * len(self._connectors)
+        self._finished_sending_this_step: set[str] = set()
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
@@ -337,6 +341,7 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     self._extra_async_saves[req_id] = extra_pending - 1
 
+        self._finished_sending_this_step = set(finished_sending)
         return finished_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -362,14 +367,32 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         return None
 
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
-        metadata_list: list[KVConnectorWorkerMetadata | None] | None = None
+        metadata_list: list[KVConnectorWorkerMetadata | None] = []
         for i, c in enumerate(self._connectors):
-            kv_connector_worker_meta = c.build_connector_worker_meta()
-            if metadata_list is None and kv_connector_worker_meta is not None:
-                metadata_list = [None] * i
-            if metadata_list is not None:
-                metadata_list.append(kv_connector_worker_meta)
-        if metadata_list is None:
+            current = c.build_connector_worker_meta()
+            pending = self._pending_worker_metadata[i]
+            if pending is None:
+                combined = current
+            elif current is None:
+                combined = pending
+            else:
+                combined = pending.aggregate(current)
+            if combined is None:
+                metadata_list.append(None)
+                continue
+            split_finished_sending = getattr(
+                combined, "split_finished_sending", None
+            )
+            if split_finished_sending is None:
+                released, pending = combined, None
+            else:
+                released, pending = split_finished_sending(
+                    self._finished_sending_this_step
+                )
+            self._pending_worker_metadata[i] = pending
+            metadata_list.append(released)
+        self._finished_sending_this_step = set()
+        if not any(metadata is not None for metadata in metadata_list):
             return None
         return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))
 

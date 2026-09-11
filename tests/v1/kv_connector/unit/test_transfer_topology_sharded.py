@@ -22,6 +22,23 @@ class _FakeAttentionBackend:
         return (num_blocks, num_kv_heads, block_size, 2 * head_size)
 
 
+class _FakeIndexerBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[int, int, int]:
+        return (num_blocks, block_size, head_size)
+
+
+class _UnexpectedBackend:
+    @staticmethod
+    def get_kv_cache_shape(*args, **kwargs):
+        raise AssertionError("backend should not be probed")
+
+
 def _make_topology(
     *,
     tp_rank: int = 1,
@@ -38,6 +55,51 @@ def _make_topology(
         total_num_kv_heads=total_num_kv_heads,
         attn_backends=[_FakeAttentionBackend],
     )
+
+
+def test_standard_topology_skips_nonstandard_indexer_backend() -> None:
+    topology = TransferTopology(
+        tp_rank=0,
+        tp_size=4,
+        block_size=16,
+        engine_id="local-engine",
+        is_mla=False,
+        is_mamba=False,
+        total_num_kv_heads=8,
+        attn_backends=[_FakeIndexerBackend, _FakeAttentionBackend],
+    )
+
+    assert topology.local_physical_heads == 2
+
+
+def test_standard_topology_stops_after_first_standard_backend() -> None:
+    topology = TransferTopology(
+        tp_rank=0,
+        tp_size=4,
+        block_size=16,
+        engine_id="local-engine",
+        is_mla=False,
+        is_mamba=False,
+        total_num_kv_heads=8,
+        attn_backends=[_FakeAttentionBackend, _UnexpectedBackend],
+    )
+
+    assert topology.local_physical_heads == 2
+
+
+def test_mla_topology_only_probes_first_backend() -> None:
+    topology = TransferTopology(
+        tp_rank=0,
+        tp_size=4,
+        block_size=16,
+        engine_id="local-engine",
+        is_mla=True,
+        is_mamba=False,
+        total_num_kv_heads=8,
+        attn_backends=[_FakeIndexerBackend, _UnexpectedBackend],
+    )
+
+    assert topology.local_physical_heads == 2
 
 
 def test_legacy_register_remote_engine_uses_pp_rank_zero() -> None:

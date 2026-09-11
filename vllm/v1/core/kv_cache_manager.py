@@ -708,6 +708,12 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def get_block_sizes(self) -> tuple[int, ...]:
+        """Get the effective token block size for each KV cache group."""
+        return tuple(
+            manager.block_size for manager in self.coordinator.single_type_managers
+        )
+
     def get_block_ids_for_computed_tokens(
         self,
         request_id: str,

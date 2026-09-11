@@ -167,6 +167,12 @@ class KVConnectorWorkerMetadata(ABC):
         """
         pass
 
+    def split_finished_sending(
+        self, completed_req_ids: set[str]
+    ) -> tuple["KVConnectorWorkerMetadata | None", "KVConnectorWorkerMetadata | None"]:
+        """Split metadata into released and still-gated send completions."""
+        return self, None
+
 
 class KVConnectorBase_V1(ABC):
     """

@@ -21,6 +21,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     supports_hma,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
+    MooncakeCompletionMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
     MultiKVConnectorStats,
@@ -997,6 +1000,29 @@ def test_multi_connector_worker_metadata(mc):
     mc.update_connector_output(kv_connector_output)
     assert_update_connector_output_called(mc)
     assert kv_connector_output.kv_connector_worker_meta == mc_worker_meta_01a_01b
+
+
+def test_multi_connector_gates_completion_worker_metadata(mc: MultiConnector):
+    completion_meta = MooncakeCompletionMetadata(
+        finished_sending={("req", "transfer"): 1}
+    )
+    mc._extra_async_saves = {"req": 1}
+    mc._connectors[0].get_finished.return_value = ({"req"}, None)
+    mc._connectors[1].get_finished.return_value = (None, None)
+    mc._connectors[0].build_connector_worker_meta.return_value = completion_meta
+    mc._connectors[1].build_connector_worker_meta.return_value = None
+
+    assert mc.get_finished(set()) == (None, None)
+    assert mc.build_connector_worker_meta() is None
+
+    mc._connectors[0].get_finished.return_value = (None, None)
+    mc._connectors[1].get_finished.return_value = ({"req"}, None)
+    mc._connectors[0].build_connector_worker_meta.return_value = None
+
+    assert mc.get_finished(set()) == ({"req"}, None)
+    released = mc.build_connector_worker_meta()
+    assert isinstance(released, MultiKVConnectorWorkerMetadata)
+    assert released.metadata == (completion_meta, None)
 
 
 def _make_multi_connector(connector_names: list[str]) -> MultiConnector:
