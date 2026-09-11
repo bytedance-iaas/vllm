@@ -90,7 +90,9 @@ def _make_indexer_builder(
     )
 
 
-def _mock_paged_mqa_metadata(monkeypatch: pytest.MonkeyPatch):
+def _mock_paged_mqa_metadata(
+    monkeypatch: pytest.MonkeyPatch, *, schedule_rows: int | None = None
+):
     calls: list[dict[str, torch.Tensor | int]] = []
 
     monkeypatch.setattr(indexer_module, "has_deep_gemm", lambda: True)
@@ -108,7 +110,7 @@ def _mock_paged_mqa_metadata(monkeypatch: pytest.MonkeyPatch):
             }
         )
         return torch.full(
-            (num_sms + 1, 2),
+            (num_sms + 1 if schedule_rows is None else schedule_rows, 2),
             7,
             dtype=torch.int32,
             device=seq_lens.device,
@@ -120,6 +122,25 @@ def _mock_paged_mqa_metadata(monkeypatch: pytest.MonkeyPatch):
         fake_get_paged_mqa_logits_metadata,
     )
     return calls
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_indexer_builder_returns_actual_scheduler_metadata_view(monkeypatch):
+    device = torch.device("cuda")
+    builder = _make_indexer_builder(
+        monkeypatch, device, compress_ratio=4, num_sms=78
+    )
+    _mock_paged_mqa_metadata(monkeypatch, schedule_rows=40)
+    common = _make_decode_common_metadata([256, 512], device)
+
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert metadata.decode is not None
+    schedule = metadata.decode.schedule_metadata
+    assert schedule.shape == (40, 2)
+    assert schedule.data_ptr() == builder.scheduler_metadata_buffer.data_ptr()
+    assert builder.scheduler_metadata_buffer.shape == (79, 2)
+    assert torch.all(schedule == 7)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
