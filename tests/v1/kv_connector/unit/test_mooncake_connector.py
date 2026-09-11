@@ -2668,7 +2668,13 @@ def test_register_kv_caches():
             assert not worker._requires_alias_protocol
 
 
-def test_register_kv_caches_skips_mtp_layers_outside_base_model():
+@pytest.mark.parametrize(
+    "speculative_method",
+    ["mtp", "deepseek_mtp", "eagle3", "dspark", "dflash"],
+)
+def test_register_kv_caches_skips_decode_local_draft_layers_outside_base_model(
+    speculative_method,
+):
     num_hidden_layers = 32
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.use_mla = False
@@ -2676,7 +2682,7 @@ def test_register_kv_caches_skips_mtp_layers_outside_base_model():
         get_total_num_hidden_layers=lambda: num_hidden_layers
     )
     worker.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(method="mtp")
+        speculative_config=SimpleNamespace(method=speculative_method)
     )
     worker.kv_cache_config = _make_test_kv_cache_config()
     worker.transfer_topo = SimpleNamespace(
@@ -2695,12 +2701,12 @@ def test_register_kv_caches_skips_mtp_layers_outside_base_model():
         num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
     )
     normal_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
-    mtp_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    draft_cache = torch.zeros(*kv_cache_shape, dtype=torch.float16)
     normal_layer = "model.layers.0.self_attn"
-    mtp_layer = f"model.layers.{num_hidden_layers}.attn.swa_cache"
+    draft_layer = f"model.layers.{num_hidden_layers}.attn.swa_cache"
     kv_caches = {
         normal_layer: normal_cache,
-        mtp_layer: mtp_cache,
+        draft_layer: draft_cache,
     }
     worker._layer_specs = {
         name: FullAttentionSpec(
@@ -2711,8 +2717,8 @@ def test_register_kv_caches_skips_mtp_layers_outside_base_model():
         )
         for name in kv_caches
     }
-    worker._layer_group_indices = {normal_layer: 0, mtp_layer: 0}
-    worker._layer_logical_group_indices = {normal_layer: [0], mtp_layer: [0]}
+    worker._layer_group_indices = {normal_layer: 0, draft_layer: 0}
+    worker._layer_logical_group_indices = {normal_layer: [0], draft_layer: [0]}
 
     worker.register_kv_caches(kv_caches)
 
