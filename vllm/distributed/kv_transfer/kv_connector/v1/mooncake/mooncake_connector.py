@@ -56,6 +56,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -239,6 +240,37 @@ def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
         f"by local tensor parallel size {local_tp_size}."
     )
     return -(remote_tp_size // local_tp_size)
+
+
+def _get_overlapping_remote_pp_ranks(
+    total_num_hidden_layers: int,
+    local_layer_range: tuple[int, int],
+    remote_layer_ranges: list[tuple[int, int]],
+) -> list[int]:
+    """Return remote PP stages whose base-model layers overlap this stage."""
+    local_start, local_end = local_layer_range
+    if not 0 <= local_start <= local_end <= total_num_hidden_layers:
+        raise ValueError(
+            f"Invalid local PP layer range {local_layer_range} for "
+            f"{total_num_hidden_layers} layers."
+        )
+    overlapping_ranks: list[int] = []
+    expected_start = 0
+    for remote_pp_rank, (remote_start, remote_end) in enumerate(remote_layer_ranges):
+        if remote_start != expected_start or not remote_start <= remote_end:
+            raise ValueError(
+                "Remote PP layer ranges must be contiguous and ordered: "
+                f"{remote_layer_ranges}."
+            )
+        if max(local_start, remote_start) < min(local_end, remote_end):
+            overlapping_ranks.append(remote_pp_rank)
+        expected_start = remote_end
+    if expected_start != total_num_hidden_layers:
+        raise ValueError(
+            "Remote PP layer ranges do not cover the base model: "
+            f"{remote_layer_ranges}."
+        )
+    return overlapping_ranks
 
 
 def _expand_transfer_regions(
@@ -1781,6 +1813,9 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     block_lens: list[int]
     kv_block_lens: list[int]
+    remote_pp_size: int = 1
+    remote_pp_rank: int = 0
+    remote_pp_layer_ranges: list[tuple[int, int]] = msgspec.field(default_factory=list)
     remote_pcp_size: int = 1
     remote_pcp_rank: int = 0
     remote_dcp_size: int = 1
@@ -2744,6 +2779,12 @@ class MooncakeConnectorWorker:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
+        total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
+        self.pp_layer_ranges = [
+            get_pp_indices(total_num_hidden_layers, rank, self.pp_size)
+            for rank in range(self.pp_size)
+        ]
+        self.pp_layer_range = self.pp_layer_ranges[self.pp_rank]
         self.use_mla = self.model_config.use_mla
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
@@ -2758,6 +2799,9 @@ class MooncakeConnectorWorker:
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
         self._pcp_size: dict[EngineId, int] = {self.engine_id: self.pcp_size}
+        self._remote_pp_layer_ranges: dict[EngineId, dict[int, tuple[int, int]]] = {
+            self.engine_id: dict(enumerate(self.pp_layer_ranges))
+        }
         self._cp_block_pairing_version: dict[EngineId, int] = {
             self.engine_id: MOONCAKE_KV_REGION_LAYOUT_VERSION
         }
@@ -2838,6 +2882,8 @@ class MooncakeConnectorWorker:
             pcp_rank=self.pcp_rank,
             pcp_size=self.pcp_size,
             cp_block_pairing_version=MOONCAKE_KV_REGION_LAYOUT_VERSION,
+            layer_start=self.pp_layer_range[0],
+            layer_end=self.pp_layer_range[1],
             addr=worker_addr,
         )
         while True:
@@ -3010,6 +3056,45 @@ class MooncakeConnectorWorker:
                 "This D tp_rank "
                 f"{meta.remote_tp_rank} is not paired with P tp_rank "
                 f"{self.tp_rank}; expected one of {remote_tp_ranks}."
+            )
+            logger.error(msg)
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg=msg,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+        remote_pp_layer_ranges = meta.remote_pp_layer_ranges
+        try:
+            if not remote_pp_layer_ranges and meta.remote_pp_size == self.pp_size:
+                remote_pp_ranks = [self.pp_rank]
+            else:
+                total_num_hidden_layers = (
+                    self.model_config.get_total_num_hidden_layers()
+                )
+                local_layer_range = getattr(self, "pp_layer_range", None)
+                if local_layer_range is None or (
+                    len(remote_pp_layer_ranges) != meta.remote_pp_size
+                ):
+                    raise ValueError(
+                        "Mooncake heterogeneous PP requires layer-range metadata."
+                    )
+                remote_pp_ranks = _get_overlapping_remote_pp_ranks(
+                    total_num_hidden_layers,
+                    local_layer_range,
+                    remote_pp_layer_ranges,
+                )
+        except ValueError as e:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg=f"Invalid Mooncake PP topology: {e}",
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+        if meta.remote_pp_rank not in remote_pp_ranks:
+            msg = (
+                f"This D pp_rank {meta.remote_pp_rank} does not overlap "
+                f"P pp_rank {self.pp_rank}; expected one of {remote_pp_ranks}."
             )
             logger.error(msg)
             response = MooncakeXferResponse(
@@ -3229,7 +3314,11 @@ class MooncakeConnectorWorker:
                     # Mark it sending to avoid expiration.
                     send_meta.sending += 1
                     if not send_meta.need_send:
-                        self.resolve_need_send(send_meta, remote_tp_ranks)
+                        self.resolve_need_send(
+                            send_meta,
+                            remote_tp_ranks,
+                            remote_pp_ranks,
+                        )
                     ready_reqs.append((d_req_id, send_meta))
                 else:
                     # Otherwise (expired, very unlikely), just forget it.
@@ -3348,14 +3437,16 @@ class MooncakeConnectorWorker:
         self,
         send_meta: SendBlockMeta,
         remote_tp_ranks: list[int],
+        remote_pp_ranks: list[int],
     ):
-        # Prepare for heterogeneous TP (one P pairs to multiple D)
-        send_meta.need_send = len(remote_tp_ranks)
+        send_meta.need_send = len(remote_tp_ranks) * len(remote_pp_ranks)
         logger.debug(
-            "Mooncake request %s will be served by %d consumer TP workers: TP ranks=%s",
+            "Mooncake request %s will be served by %d consumer workers: "
+            "TP ranks=%s, PP ranks=%s",
             send_meta.transfer_id,
             send_meta.need_send,
             remote_tp_ranks,
+            remote_pp_ranks,
         )
 
     def _logical_to_kernel_block_ids(
@@ -4349,6 +4440,9 @@ class MooncakeConnectorWorker:
             remote_port=self.rpc_port,
             remote_tp_size=self.tp_size,
             remote_tp_rank=self.tp_rank,
+            remote_pp_size=self.pp_size,
+            remote_pp_rank=self.pp_rank,
+            remote_pp_layer_ranges=self.pp_layer_ranges,
             req_blocks=req_blocks,
             kv_caches_base_addr=self.kv_caches_base_addr,
             block_lens=self.block_len_per_layer,
@@ -4525,6 +4619,12 @@ class MooncakeConnectorWorker:
                     }
                     self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
                     self._pcp_size[remote_engine_id] = int(dp_entry.get("pcp_size", 1))
+                    self._remote_pp_layer_ranges[remote_engine_id] = {
+                        int(pp_rank): tuple(layer_range)
+                        for pp_rank, layer_range in dp_entry.get(
+                            "pp_layer_ranges", {}
+                        ).items()
+                    }
                     self._cp_block_pairing_version[remote_engine_id] = int(
                         dp_entry.get("cp_block_pairing_version", 0)
                     )
@@ -4664,24 +4764,6 @@ class MooncakeConnectorWorker:
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
-        remote_pp_sizes = {
-            remote_tp_rank: len(self._remote_agents[remote_engine_id][remote_tp_rank])
-            for remote_tp_rank in remote_tp_ranks
-        }
-        if any(
-            remote_pp_size < self.pp_size for remote_pp_size in remote_pp_sizes.values()
-        ):
-            logger.error(
-                "Unsupported Mooncake PP topology for engine %s: "
-                "producer PP sizes=%s, consumer PP size=%d",
-                remote_engine_id,
-                remote_pp_sizes,
-                self.pp_size,
-            )
-            for pull_meta in pull_metas.values():
-                pull_meta.pull_failed = True
-                self._mark_pull_failed(pull_meta)
-            return
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
         selected_remote_pcp: dict[tuple[int, int], list[int]] = {}
@@ -4711,10 +4793,62 @@ class MooncakeConnectorWorker:
             return
         for remote_tp_rank in remote_tp_ranks:
             pp_to_pcp = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_pcp) and self.pp_rank in pp_to_pcp:
-                pp_ranks = [self.pp_rank]
-            else:
-                pp_ranks = sorted(pp_to_pcp)
+            remote_pp_size = len(pp_to_pcp)
+            available_pp_ranks = sorted(pp_to_pcp)
+            if available_pp_ranks != list(range(remote_pp_size)):
+                logger.error(
+                    "Incomplete producer PP topology for engine %s TP=%d: "
+                    "expected=%s, got=%s",
+                    remote_engine_id,
+                    remote_tp_rank,
+                    list(range(remote_pp_size)),
+                    available_pp_ranks,
+                )
+                for pull_meta in pull_metas.values():
+                    pull_meta.pull_failed = True
+                    self._mark_pull_failed(pull_meta)
+                return
+            remote_layer_range_map = getattr(self, "_remote_pp_layer_ranges", {}).get(
+                remote_engine_id, {}
+            )
+            remote_layer_ranges = [
+                remote_layer_range_map[rank]
+                for rank in range(remote_pp_size)
+                if rank in remote_layer_range_map
+            ]
+            try:
+                if not remote_layer_ranges and remote_pp_size == self.pp_size:
+                    pp_ranks = [self.pp_rank]
+                else:
+                    if len(remote_layer_ranges) != remote_pp_size:
+                        raise ValueError(
+                            "Mooncake heterogeneous PP requires remote layer ranges."
+                        )
+                    pp_ranks = _get_overlapping_remote_pp_ranks(
+                        self.model_config.get_total_num_hidden_layers(),
+                        self.pp_layer_range,
+                        remote_layer_ranges,
+                    )
+            except ValueError as e:
+                logger.error(
+                    "Invalid Mooncake PP topology for engine %s: %s",
+                    remote_engine_id,
+                    e,
+                )
+                for pull_meta in pull_metas.values():
+                    pull_meta.pull_failed = True
+                    self._mark_pull_failed(pull_meta)
+                return
+            if not pp_ranks:
+                logger.error(
+                    "No producer PP stage overlaps consumer PP rank %d for engine %s",
+                    self.pp_rank,
+                    remote_engine_id,
+                )
+                for pull_meta in pull_metas.values():
+                    pull_meta.pull_failed = True
+                    self._mark_pull_failed(pull_meta)
+                return
             selected_remote_pp[remote_tp_rank] = pp_ranks
             for pp_rank in pp_ranks:
                 pcp_to_addr = pp_to_pcp[pp_rank]
