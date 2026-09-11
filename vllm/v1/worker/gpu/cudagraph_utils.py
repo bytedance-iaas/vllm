@@ -285,6 +285,31 @@ class CudaGraphManager:
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
 
+        if separate_decode_routine and decode_mode:
+            for decode_query_len, num_active_loras in product(
+                decode_query_lens, self.lora_capture_cases
+            ):
+                max_tail_reqs = min(
+                    self.max_num_reqs,
+                    max_cg_capture_size // decode_query_len,
+                )
+                tail_num_tokens = max_tail_reqs * decode_query_len
+                if tail_num_tokens <= 0:
+                    continue
+                desc = BatchExecutionDescriptor(
+                    cg_mode=decode_mode,
+                    num_tokens=tail_num_tokens,
+                    num_reqs=max_tail_reqs,
+                    uniform_token_count=decode_query_len,
+                    num_active_loras=num_active_loras,
+                )
+                if desc not in descs_by_mode[decode_mode]:
+                    descs_by_mode[decode_mode].append(desc)
+                    uniform_descs[(decode_query_len, num_active_loras)].append(desc)
+                    descs_by_token_lora[(tail_num_tokens, num_active_loras)].append(
+                        desc
+                    )
+
         if not descs_by_token_lora:
             return
 

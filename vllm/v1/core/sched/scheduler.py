@@ -2500,16 +2500,18 @@ class Scheduler(SchedulerInterface):
     def get_dynamic_sd_local_batch_pressure(self) -> int:
         """Return a cheap local decode pressure estimate for DP Dynamic SD.
 
-        This intentionally ignores newly admitted prefills. The first DP-safe
-        Dynamic SD policy targets decode-side verification width, and the
-        scheduler still keeps the static maximum lookahead/KV allocation.
+        Include ready waiting requests because the pressure sync runs before
+        admission and its result controls the upcoming scheduling step.
         """
         if self._dynamic_sd is None:
             return 0
         num_decode_reqs = sum(
             1 for request in self.running if not request.is_prefill_chunk
         )
-        return min(num_decode_reqs, self.scheduler_config.max_num_seqs)
+        return min(
+            num_decode_reqs + len(self.waiting),
+            self.scheduler_config.max_num_seqs,
+        )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:

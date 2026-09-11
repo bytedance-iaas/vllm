@@ -51,6 +51,19 @@ def _cleanup_warmup_requests(
     worker_execute_model(cleanup_output)
 
 
+def _warmup_block_count(
+    num_tokens: int,
+    spec: Any,
+    max_encoder_len: int,
+) -> int:
+    if isinstance(spec, CrossAttentionSpec):
+        num_tokens = max_encoder_len
+    num_blocks = cdiv(num_tokens, spec.block_size)
+    if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+        num_blocks += spec.num_speculative_blocks
+    return num_blocks
+
+
 def _run_parallel_draft_full_k_warmup(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
@@ -67,10 +80,24 @@ def _run_parallel_draft_full_k_warmup(
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
-    block_sizes = [group.kv_cache_spec.block_size for group in kv_cache_groups]
-    prefill_block_counts = [cdiv(prompt_len, block_size) for block_size in block_sizes]
+    kv_cache_specs = [group.kv_cache_spec for group in kv_cache_groups]
+    max_encoder_len = getattr(model_runner.model_state, "max_encoder_len", 0)
+    lookahead_tokens = model_runner.speculative_config.num_drafter_query_tokens
+    prefill_block_counts = [
+        _warmup_block_count(
+            prompt_len + lookahead_tokens,
+            spec,
+            max_encoder_len,
+        )
+        for spec in kv_cache_specs
+    ]
     decode_block_counts = [
-        cdiv(prompt_len + 1, block_size) for block_size in block_sizes
+        _warmup_block_count(
+            prompt_len + 1 + lookahead_tokens,
+            spec,
+            max_encoder_len,
+        )
+        for spec in kv_cache_specs
     ]
     decode_block_deltas = [
         decode - prefill
@@ -298,20 +325,15 @@ def warmup_kernels(
             )
         ]
 
-    # Compute per-request block counts for each KV cache group.
-    def _warmup_block_count(num_tokens: int, spec: Any) -> int:
-        if isinstance(spec, CrossAttentionSpec):
-            num_tokens = max_encoder_len
-        num_blocks = cdiv(num_tokens, spec.block_size)
-        if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
-            # Align mode reserves extra blocks beyond the token range for the
-            # speculative-decode running-state snapshots.
-            num_blocks += spec.num_speculative_blocks
-        return num_blocks
-
     kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
-    prefill_block_counts = [_warmup_block_count(prompt_len, s) for s in kv_cache_specs]
-    decode_block_counts = [_warmup_block_count(decode_len, s) for s in kv_cache_specs]
+    prefill_block_counts = [
+        _warmup_block_count(prompt_len, spec, max_encoder_len)
+        for spec in kv_cache_specs
+    ]
+    decode_block_counts = [
+        _warmup_block_count(decode_len, spec, max_encoder_len)
+        for spec in kv_cache_specs
+    ]
     max_blocks_per_req = sum(decode_block_counts)
 
     num_reqs = min(
@@ -424,7 +446,7 @@ def warmup_kernels(
                     num_tokens = decode_query_len if use_spec else 1
                     after = req_computed[i] + num_tokens
                     deltas = [
-                        _warmup_block_count(after, spec) - held
+                        _warmup_block_count(after, spec, max_encoder_len) - held
                         for spec, held in zip(kv_cache_specs, req_blocks[i])
                     ]
                     cached_req_data.new_block_ids.append(
