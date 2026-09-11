@@ -108,6 +108,7 @@ ARG TARGETPLATFORM
 ARG INSTALL_RUBIN_PRERELEASE
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
+ARG UBUNTU_MIRROR
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
 ARG SCCACHE_ENDPOINT
@@ -751,6 +752,7 @@ ARG NCCL_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
+ARG UBUNTU_MIRROR
 
 # Keep the output image's CUDA metadata aligned with the selected toolkit.
 # This also normalizes prerelease base images with four-component metadata for
@@ -766,7 +768,16 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
 # Install Python and system dependencies
-RUN apt-get update -y \
+RUN if [ -n "${UBUNTU_MIRROR}" ]; then \
+        if [ -f /etc/apt/sources.list ]; then \
+            sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
+        fi; \
+        if [ -d /etc/apt/sources.list.d ]; then \
+            find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) \
+                -exec sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" {} +; \
+        fi; \
+    fi \
+    && apt-get -o Acquire::Retries=5 update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
         curl \
@@ -1216,11 +1227,14 @@ ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_VERSION=0.1.15
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1311,12 +1325,19 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         /tmp/install_triton_from_source.sh \
         /tmp/triton-source-wheel.sha256
 
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
+        uv pip install --system "vllm-router==${VLLM_ROUTER_VERSION}" && \
+        command -v vllm-router && \
+        python3 -m pip show vllm-router >/dev/null; \
+    fi
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-openai:dev}
-LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       org.opencontainers.image.url="${VLLM_BUILD_URL}" \
