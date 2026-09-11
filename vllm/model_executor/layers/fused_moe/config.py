@@ -983,6 +983,9 @@ def int4_w4afp8_moe_quant_config(
     per_act_token_quant: bool = False,
     per_out_ch_quant: bool = False,
     block_shape: list[int] | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for fp8 activations and int4 weights.
@@ -997,6 +1000,9 @@ def int4_w4afp8_moe_quant_config(
         per_out_ch_quant=per_out_ch_quant,
         block_shape=block_shape,
         weight_dtype="int4",  # weight dtype for weights
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 

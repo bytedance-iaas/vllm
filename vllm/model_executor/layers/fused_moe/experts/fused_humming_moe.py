@@ -251,6 +251,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SWIGLUSTEP,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
@@ -490,6 +491,16 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             activation_format,
         )
 
+        if supported and moe_config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            params = {
+                "swiglu_alpha": moe_config.swiglu_alpha,
+                "swiglu_beta": moe_config.swiglu_beta,
+                "swiglu_limit": moe_config.swiglu_limit,
+            }
+            missing = [name for name, value in params.items() if value is None]
+            if missing:
+                return False, "kernel requires " + ", ".join(missing)
+
         if supported:
             assert hasattr(cls, "humming_gemm_type")
             gemm_type = cls.humming_gemm_type().value.lower()
@@ -513,7 +524,22 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         if activation == MoEActivation.SILU and swiglu_limit is not None:
             swiglu_limit_func(output=output, input=input, swiglu_limit=swiglu_limit)
         else:
-            self.activation(activation=activation, input=input, output=output)
+            self.activation(
+                activation=activation,
+                input=input,
+                output=output,
+                clamp_limit=swiglu_limit,
+                alpha=(
+                    1.0
+                    if self.quant_config.gemm1_alpha is None
+                    else self.quant_config.gemm1_alpha
+                ),
+                beta=(
+                    0.0
+                    if self.quant_config.gemm1_beta is None
+                    else self.quant_config.gemm1_beta
+                ),
+            )
 
 
 class HummingIndexedExperts(HummingExpertsBase):

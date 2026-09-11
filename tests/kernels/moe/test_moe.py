@@ -8,6 +8,7 @@ Run `pytest tests/kernels/test_moe.py`.
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from torch.nn import Parameter
 from torch.nn import functional as F
 
 import vllm.model_executor.layers.fused_moe  # noqa
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import (
     fused_moe,
     make_dummy_moe_config,
@@ -1247,6 +1249,146 @@ def _make_humming_indexed_experts(activation: MoEActivation):
         quant_config,
     )
     return experts
+
+
+def test_humming_supports_minimax_uninterleaved_swiglu_metadata():
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        HummingIndexedExperts,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8DynamicTokenSym,
+        kInt4Static,
+    )
+
+    config = make_dummy_moe_config(
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    )
+    config.swiglu_alpha = 1.702
+    config.swiglu_beta = 1.0
+    config.swiglu_limit = 7.0
+
+    assert HummingIndexedExperts._supports_activation(
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            HummingIndexedExperts,
+            "_supports_current_device",
+            staticmethod(lambda: True),
+        )
+        supported, reason = HummingIndexedExperts.is_supported_config(
+            HummingIndexedExperts,
+            config,
+            weight_key=kInt4Static,
+            activation_key=kFp8DynamicTokenSym,
+            activation_format=mk.FusedMoEActivationFormat.Standard,
+        )
+
+    assert supported
+    assert reason is None
+
+
+def test_humming_rejects_missing_minimax_swiglu_params():
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        HummingIndexedExperts,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8DynamicTokenSym,
+        kInt4Static,
+    )
+
+    config = make_dummy_moe_config(
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    )
+    config.swiglu_alpha = 1.702
+    config.swiglu_beta = None
+    config.swiglu_limit = 7.0
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            HummingIndexedExperts,
+            "_supports_current_device",
+            staticmethod(lambda: True),
+        )
+        supported, reason = HummingIndexedExperts.is_supported_config(
+            HummingIndexedExperts,
+            config,
+            weight_key=kInt4Static,
+            activation_key=kFp8DynamicTokenSym,
+            activation_format=mk.FusedMoEActivationFormat.Standard,
+        )
+
+    assert not supported
+    assert reason is not None
+    assert "swiglu_beta" in reason
+
+
+def test_humming_quant_config_preserves_minimax_swiglu_params():
+    from vllm.model_executor.layers.quantization.utils.humming_utils import (
+        get_humming_moe_quant_config,
+    )
+
+    layer = SimpleNamespace(
+        input_schemas={
+            "w13": SimpleNamespace(a_dtype=None),
+        },
+        weight_schemas={
+            "w13": SimpleNamespace(
+                weight_scale_group_size=128,
+                weight_scale_group_size_n=1,
+                b_dtype="int4",
+            ),
+        },
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        swiglu_limit=7.0,
+    )
+
+    quant_config = get_humming_moe_quant_config(layer)
+
+    assert quant_config.gemm1_alpha == 1.702
+    assert quant_config.gemm1_beta == 1.0
+    assert quant_config.gemm1_clamp_limit == 7.0
+
+
+def test_humming_activation_forwards_minimax_swiglu_params():
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        HummingIndexedExperts,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_activation(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    experts = object.__new__(HummingIndexedExperts)
+    object.__setattr__(
+        experts,
+        "quant_config",
+        SimpleNamespace(
+            gemm1_alpha=1.702,
+            gemm1_beta=1.0,
+            gemm1_clamp_limit=7.0,
+        ),
+    )
+    object.__setattr__(experts, "activation", fake_activation)
+    output = torch.empty((1, 1))
+    input_tensor = torch.empty((1, 2))
+
+    experts.apply_activation(
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        output=output,
+        input=input_tensor,
+    )
+
+    kwargs = captured["kwargs"]
+    assert kwargs["activation"] == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+    assert kwargs["input"] is input_tensor
+    assert kwargs["output"] is output
+    assert kwargs["clamp_limit"] == 7.0
+    assert kwargs["alpha"] == 1.702
+    assert kwargs["beta"] == 1.0
 
 
 @pytest.mark.parametrize(

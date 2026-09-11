@@ -574,6 +574,13 @@ def get_humming_moe_quant_config(
     gemm1_beta: float | None = None,
     gemm1_clamp_limit: float | None = None,
 ):
+    if gemm1_alpha is None:
+        gemm1_alpha = getattr(layer, "swiglu_alpha", None)
+    if gemm1_beta is None:
+        gemm1_beta = getattr(layer, "swiglu_beta", None)
+    if gemm1_clamp_limit is None:
+        gemm1_clamp_limit = getattr(layer, "swiglu_limit", None)
+
     input_schema = layer.input_schemas["w13"]
     weight_schema = layer.weight_schemas["w13"]
 
@@ -607,6 +614,9 @@ def get_humming_moe_quant_config(
         w2_gscale=getattr(layer, "w2_global_scale", None),
         w2_zp=getattr(layer, "w2_zero_point", None),
         w2_bias=getattr(layer, "w2_bias", None),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 

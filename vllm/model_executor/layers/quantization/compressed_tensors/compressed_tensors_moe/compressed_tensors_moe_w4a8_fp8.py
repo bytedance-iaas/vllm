@@ -210,6 +210,9 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             w2_scale=layer.w2_weight_scale,
             g1_alphas=layer.w13_weight_chan_scale,
             g2_alphas=layer.w2_weight_chan_scale,
+            gemm1_alpha=self.moe.swiglu_alpha,
+            gemm1_beta=self.moe.swiglu_beta,
+            gemm1_clamp_limit=self.moe.swiglu_limit,
         )
 
     def apply(
