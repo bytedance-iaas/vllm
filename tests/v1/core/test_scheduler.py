@@ -17,6 +17,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.config.scheduler import parse_prefill_token_bucket_schedule
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -214,6 +215,172 @@ def test_schedule_multimodal_requests():
     assert len(output.scheduled_encoder_inputs) == 10
     for req_id, encoder_input in output.scheduled_encoder_inputs.items():
         assert len(encoder_input) == 1
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected", "error"),
+    [
+        ("", ((4095, 8192), (16383, 4096), (-1, 8192)), None),
+        ("4:8,-1:4", ((4, 8), (-1, 4)), None),
+        ("4:0,-1:4", None, "step budget must be positive"),
+        ("8:4,4:4,-1:4", None, "strictly increasing"),
+        ("4:4,8:4", None, "must end with -1 catch-all"),
+    ],
+)
+def test_prefill_token_bucket_schedule_parser(schedule, expected, error):
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            parse_prefill_token_bucket_schedule(schedule)
+        return
+
+    assert parse_prefill_token_bucket_schedule(schedule) == expected
+
+
+def test_prefill_token_bucket_boundaries_and_cap():
+    cases = [
+        (3500, None, 3500),
+        (8000, None, 4096),
+        (32000, None, 8192),
+        (8000, 1024, 1024),
+    ]
+    for num_prompt_tokens, max_num_scheduled_tokens, expected_chunk in cases:
+        scheduler = create_scheduler(
+            max_num_batched_tokens=8192,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            max_model_len=65536,
+            enable_prefill_token_bucket_schedule=True,
+        )
+        (request,) = create_requests(num_requests=1, num_tokens=num_prompt_tokens)
+        scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        assert output.num_scheduled_tokens == {request.request_id: expected_chunk}
+
+
+def test_prefill_token_bucket_schedules_only_same_bucket_in_step():
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        enable_prefill_token_bucket_schedule=True,
+        prefill_token_bucket_schedule="4:8,-1:4",
+    )
+    short_a, short_b = create_requests(
+        num_requests=2,
+        num_tokens=4,
+        req_ids=["short-a", "short-b"],
+    )
+    (long_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["long"],
+    )
+    for request in (short_a, long_req, short_b):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"short-a": 4, "short-b": 4}
+    assert sum(output.num_scheduled_tokens.values()) <= 8
+    assert "long" not in output.num_scheduled_tokens
+
+
+def test_prefill_token_bucket_counts_decode_tokens_against_step_budget():
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        enable_prefill_token_bucket_schedule=True,
+        prefill_token_bucket_schedule="-1:4",
+    )
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["decode"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["decode"],
+            req_id_to_index={"decode": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    (prefill_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill_req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"decode": 1, "prefill": 3}
+
+
+def test_prefill_token_bucket_allows_async_kv_load_after_bucket_cap():
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=8,
+        max_model_len=64,
+        enable_prefill_token_bucket_schedule=True,
+        prefill_token_bucket_schedule="-1:4",
+    )
+    (prefill_req,) = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        req_ids=["prefill"],
+    )
+    scheduler.add_request(prefill_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["prefill"],
+            req_id_to_index={"prefill": 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.side_effect = lambda request, _: (
+        (4, True) if request.request_id == "remote" else (0, False)
+    )
+    blocked_req, remote_req = create_requests(
+        num_requests=2,
+        num_tokens=8,
+        req_ids=["blocked", "remote"],
+    )
+    scheduler.add_request(blocked_req)
+    scheduler.add_request(remote_req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"prefill": 4}
+    assert blocked_req in scheduler.skipped_waiting
+    assert remote_req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.connector.update_state_after_alloc.assert_called_once()
+
+
+def test_prefill_token_bucket_rejects_mamba_cache():
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    with pytest.raises(ValueError, match="does not support Mamba"):
+        create_scheduler(
+            enable_prefill_token_bucket_schedule=True,
+            kv_cache_spec=mamba_spec,
+        )
 
 
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders():

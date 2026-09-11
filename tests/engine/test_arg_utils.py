@@ -339,9 +339,11 @@ def test_compilation_config():
     # set to string form of a dict
     args = parser.parse_args(
         [
-            "--compilation-config="
-            '{"mode": 3, "cudagraph_capture_sizes": [1, 2, 4, 8], '
-            '"backend": "inductor"}',
+            (
+                "--compilation-config="
+                '{"mode": 3, "cudagraph_capture_sizes": [1, 2, 4, 8], '
+                '"backend": "inductor"}'
+            ),
         ]
     )
     assert (
@@ -406,12 +408,14 @@ def test_attention_config():
     # set to string form of a dict with all fields
     args = parser.parse_args(
         [
-            "--attention-config="
-            '{"backend": "FLASHINFER", "flash_attn_version": 2, '
-            '"use_prefill_decode_attention": false, '
-            '"flash_attn_max_num_splits_for_cuda_graph": 8, '
-            '"use_trtllm_attention": false, '
-            '"disable_flashinfer_q_quantization": false}',
+            (
+                "--attention-config="
+                '{"backend": "FLASHINFER", "flash_attn_version": 2, '
+                '"use_prefill_decode_attention": false, '
+                '"flash_attn_max_num_splits_for_cuda_graph": 8, '
+                '"use_trtllm_attention": false, '
+                '"disable_flashinfer_q_quantization": false}'
+            ),
         ]
     )
     assert args is not None
@@ -579,6 +583,14 @@ def test_human_readable_other_args():
     assert args.max_num_scheduled_tokens == 2**10 * 4
     args = parser.parse_args(["--max-num-scheduled-tokens", "10.5k"])
     assert args.max_num_scheduled_tokens == 10500
+
+    args = parser.parse_args(["--enable-prefill-token-bucket-schedule"])
+    assert args.enable_prefill_token_bucket_schedule
+
+    args = parser.parse_args(
+        ["--prefill-token-bucket-schedule", "4095:8192,16383:4096,-1:8192"]
+    )
+    assert args.prefill_token_bucket_schedule == "4095:8192,16383:4096,-1:8192"
 
     # Test kv_cache_memory_bytes (existing human-readable arg)
     args = parser.parse_args(["--kv-cache-memory-bytes", "100000"])
