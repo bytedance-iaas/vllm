@@ -45,6 +45,9 @@ ARG BUILD_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
+# Optional apt mirror for Ubuntu-based ByteIAAS CI builds.
+ARG UBUNTU_MIRROR
+
 # OS family of BUILD_BASE_IMAGE. Controls package manager (apt vs dnf) and
 # Python bootstrap. Set to "manylinux" alongside a manylinux build base such
 # as pytorch/manylinux2_28-builder:cuda13.0 to produce wheels with a glibc
@@ -113,6 +116,7 @@ ARG TARGETPLATFORM
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG BUILD_OS
+ARG UBUNTU_MIRROR
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
 ARG SCCACHE_ENDPOINT
@@ -159,7 +163,16 @@ RUN if [ "${BUILD_OS}" = "manylinux" ]; then \
         && dnf clean all \
         && rm -rf /var/cache/dnf; \
     else \
-        apt-get update -y \
+        if [ -n "${UBUNTU_MIRROR}" ]; then \
+            if [ -f /etc/apt/sources.list ]; then \
+                sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
+            fi; \
+            if [ -d /etc/apt/sources.list.d ]; then \
+                find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) \
+                    -exec sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" {} +; \
+            fi; \
+        fi \
+        && apt-get -o Acquire::Retries=5 update -y \
         && apt-get install -y --no-install-recommends \
             ccache \
             software-properties-common \
@@ -670,6 +683,7 @@ ARG NCCL_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
+ARG UBUNTU_MIRROR
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
@@ -680,7 +694,16 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
 # Install Python and system dependencies
-RUN apt-get update -y \
+RUN if [ -n "${UBUNTU_MIRROR}" ]; then \
+        if [ -f /etc/apt/sources.list ]; then \
+            sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" /etc/apt/sources.list; \
+        fi; \
+        if [ -d /etc/apt/sources.list.d ]; then \
+            find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) \
+                -exec sed -i -E "s#https?://(archive|security)[.]ubuntu[.]com/ubuntu#${UBUNTU_MIRROR}#g" {} +; \
+        fi; \
+    fi \
+    && apt-get -o Acquire::Retries=5 update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
         curl \
@@ -1008,11 +1031,14 @@ RUN mv vllm src/vllm
 FROM vllm-base AS vllm-openai-base
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_VERSION=0.1.15
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1070,12 +1096,19 @@ RUN if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         fi; \
     fi
 
+RUN --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
+        uv pip install --system "vllm-router==${VLLM_ROUTER_VERSION}" && \
+        command -v vllm-router && \
+        python3 -m pip show vllm-router >/dev/null; \
+    fi
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-openai:dev}
-LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       org.opencontainers.image.url="${VLLM_BUILD_URL}" \

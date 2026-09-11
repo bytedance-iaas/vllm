@@ -159,6 +159,7 @@ Hel = "Hel"
 wether = "wether"
 iy = "iy"
 indx = "indx"
+byted = "byted"
 # intel cpu features
 tme = "tme"
 dout = "dout"
