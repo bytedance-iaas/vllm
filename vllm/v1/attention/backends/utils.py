@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm.envs as envs
+from vllm.distributed.cp_mapping import (
+    get_cp_local_seq_lens as get_canonical_cp_local_seq_lens,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     get_kv_connector_cache_layout,
 )
@@ -882,6 +885,27 @@ def compute_causal_conv1d_metadata(
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
 
     return nums_dict, batch_ptr, token_chunk_offset_ptr
+
+
+def get_cp_local_seq_lens(
+    seq_lens: torch.Tensor,
+    cp_world_size: int = 1,
+    cp_rank: int | None = None,
+    cp_kv_cache_interleave_size: int = 1,
+) -> torch.Tensor:
+    """Return local sequence lengths for one context-parallel rank.
+
+    This generalizes the existing DCP helper to the combined context-parallel
+    rank space used by DCP and PCP. ``cp_world_size`` is the total number of
+    context-parallel shards and ``cp_rank`` selects one shard. When ``cp_rank``
+    is ``None``, the returned tensor contains every rank's local length.
+    """
+    return get_canonical_cp_local_seq_lens(
+        seq_lens,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+        interleave_size=cp_kv_cache_interleave_size,
+    )
 
 
 def get_dcp_local_seq_lens(
