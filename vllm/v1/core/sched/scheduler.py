@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -3176,6 +3177,26 @@ class Scheduler(SchedulerInterface):
                 continue
             self._free_blocks(req)
 
+    @staticmethod
+    def _has_kv_state_for_replay(
+        request_id: str,
+        replay_boundary: int,
+        group_managers: tuple[Any, ...],
+    ) -> bool:
+        """Check every group's required prefix before rewinding its cursor."""
+        for manager in group_managers:
+            blocks = manager.req_to_blocks.get(request_id, ())
+            if replay_boundary == 0:
+                if any(block.is_null for block in blocks):
+                    return False
+                continue
+            first = max(0, manager.get_num_skipped_tokens(replay_boundary))
+            first //= manager.block_size
+            end = (replay_boundary + manager.block_size - 1) // manager.block_size
+            if end > len(blocks) or any(block.is_null for block in blocks[first:end]):
+                return False
+        return True
+
     def _update_requests_with_invalid_blocks(
         self,
         requests: Iterable[Request],
@@ -3210,12 +3231,14 @@ class Scheduler(SchedulerInterface):
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
         blocks_to_evict: set[int] = set()
+        full_reset_requests: list[Request] = []
         # If a block is invalid and shared by multiple requests in the batch,
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
         for request in requests:
             is_affected = False
+            request_invalid_block_ids: set[int] = set()
             req_id = request.request_id
             req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
             group_block_sizes = self.kv_cache_manager.get_block_sizes()
@@ -3240,6 +3263,7 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     is_affected = True
+                    request_invalid_block_ids.add(block_id)
 
                     if block_id in marked_invalid_block_ids:
                         # This invalid block is shared with a previous request
@@ -3263,6 +3287,15 @@ class Scheduler(SchedulerInterface):
                     )
 
             if recompute_boundary is not None:
+                full_reset = not self._has_kv_state_for_replay(
+                    req_id,
+                    recompute_boundary,
+                    self.kv_cache_manager.coordinator.single_type_managers,
+                )
+                if full_reset:
+                    recompute_boundary = 0
+                    # Reset requests cannot repair shared failed blocks in place.
+                    marked_invalid_block_ids.difference_update(request_invalid_block_ids)
                 request.num_computed_tokens = recompute_boundary
                 total_affected_tokens += (
                     req_num_computed_tokens - request.num_computed_tokens
@@ -3277,6 +3310,15 @@ class Scheduler(SchedulerInterface):
                     ):
                         first_block = recompute_boundary // group_block_size
                         blocks_to_evict.update(req_block_ids[first_block:])
+                    if full_reset and self.recompute_kv_load_failures:
+                        reset_blocks = {
+                            block_id
+                            for ids in req_block_id_groups
+                            for block_id in ids
+                            if block_id != NULL_BLOCK_ID
+                        }
+                        self.kv_cache_manager.evict_blocks(reset_blocks)
+                        full_reset_requests.append(request)
 
             if is_affected:
                 if recompute_boundary is None:
@@ -3292,6 +3334,11 @@ class Scheduler(SchedulerInterface):
 
                 affected_req_ids.add(request.request_id)
 
+        for request in full_reset_requests:
+            self.running.remove(request)
+            self._preempt_request(request, time.monotonic(), drop_stale_output=True)
+
+        blocks_to_evict.discard(NULL_BLOCK_ID)
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
     def _handle_invalid_blocks(

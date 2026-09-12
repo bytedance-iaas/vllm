@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import FinishReason, Request, RequestStatus
 
@@ -50,6 +51,16 @@ def test_hybrid_invalid_block_recovery_uses_group_block_sizes():
         [20, 21, 22, 23, 24, 25, 26, 27],
     )
     scheduler.kv_cache_manager.get_block_sizes.return_value = (256, 64)
+    scheduler.kv_cache_manager.coordinator.single_type_managers = tuple(
+        SimpleNamespace(
+            block_size=size,
+            req_to_blocks={"hybrid": [KVCacheBlock(i) for i in ids]},
+            get_num_skipped_tokens=lambda _: 0,
+        )
+        for size, ids in zip(
+            (256, 64), scheduler.kv_cache_manager.get_block_ids.return_value
+        )
+    )
     request = SimpleNamespace(request_id="hybrid", num_computed_tokens=512)
 
     affected_req_ids, affected_tokens, blocks_to_evict = (
@@ -64,6 +75,121 @@ def test_hybrid_invalid_block_recovery_uses_group_block_sizes():
     assert request.num_computed_tokens == 256
     assert affected_tokens == 256
     assert blocks_to_evict == {11, 24, 25, 26, 27}
+
+
+@pytest.mark.parametrize("async_load", [False, True])
+@pytest.mark.parametrize("pruned", [False, True])
+def test_hybrid_replay_resets_only_when_required_window_is_missing(async_load, pruned):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 64
+    scheduler.recompute_kv_load_failures = True
+    request = SimpleNamespace(request_id="r", num_computed_tokens=1024)
+    scheduler.running = [request]
+    scheduler._preempt_request = Mock()
+    full_blocks = [KVCacheBlock(i + 1) for i in range(16)]
+    window_blocks = [
+        KVCacheBlock(0, is_null=True) if pruned and i < 14 else KVCacheBlock(100 + i)
+        for i in range(16)
+    ]
+    managers = (
+        SimpleNamespace(
+            block_size=64,
+            req_to_blocks={"r": full_blocks},
+            get_num_skipped_tokens=lambda _: 0,
+        ),
+        SimpleNamespace(
+            block_size=64,
+            req_to_blocks={"r": window_blocks},
+            get_num_skipped_tokens=lambda n: max(0, n - 128 + 1),
+        ),
+    )
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.coordinator.single_type_managers = managers
+    scheduler.kv_cache_manager.get_block_ids.return_value = tuple(
+        [b.block_id for b in blocks] for blocks in (full_blocks, window_blocks)
+    )
+    scheduler.kv_cache_manager.get_block_sizes.return_value = (64, 64)
+
+    affected, tokens, evicted = scheduler._update_requests_with_invalid_blocks(
+        [request], {5}, {}, evict_blocks=not async_load
+    )
+
+    assert affected == {"r"}
+    assert request.num_computed_tokens == (0 if pruned else 256)
+    assert tokens == (1024 if pruned else 768)
+    assert 0 not in evicted
+    if pruned and not async_load:
+        scheduler._preempt_request.assert_called_once()
+        assert scheduler._preempt_request.call_args.kwargs["drop_stale_output"]
+        assert request not in scheduler.running
+        scheduler.kv_cache_manager.evict_blocks.assert_called_once()
+    else:
+        scheduler._preempt_request.assert_not_called()
+        scheduler.kv_cache_manager.evict_blocks.assert_not_called()
+        assert request in scheduler.running
+    if async_load:
+        assert evicted == set()
+
+
+@pytest.mark.parametrize(
+    "boundary,first_is_null,expected",
+    [(64, True, False), (64, False, True), (256, False, True), (257, False, False)],
+)
+def test_replay_state_checks_partially_required_blocks(
+    boundary, first_is_null, expected
+):
+    manager = SimpleNamespace(
+        block_size=256,
+        req_to_blocks={
+            "r": [
+                KVCacheBlock(0 if first_is_null else 1, is_null=first_is_null),
+                KVCacheBlock(0, is_null=True),
+            ]
+        },
+        get_num_skipped_tokens=lambda _: 0,
+    )
+    assert Scheduler._has_kv_state_for_replay("r", boundary, (manager,)) is expected
+
+
+def test_full_reset_rechecks_shared_invalid_blocks_for_later_requests():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.recompute_kv_load_failures = True
+    requests = [
+        SimpleNamespace(request_id=f"r{i}", num_computed_tokens=32) for i in range(3)
+    ]
+    scheduler.running = list(requests)
+    scheduler._preempt_request = Mock()
+    first = {
+        r.request_id: [KVCacheBlock(10), KVCacheBlock(11)] for r in requests
+    }
+    second = {
+        "r0": [KVCacheBlock(20), KVCacheBlock(21)],
+        "r1": [KVCacheBlock(22), KVCacheBlock(0, is_null=True)],
+        "r2": [KVCacheBlock(30), KVCacheBlock(31)],
+    }
+    managers = tuple(
+        SimpleNamespace(
+            block_size=16, req_to_blocks=blocks, get_num_skipped_tokens=lambda _: 0
+        )
+        for blocks in (first, second)
+    )
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.coordinator.single_type_managers = managers
+    scheduler.kv_cache_manager.get_block_sizes.return_value = (16, 16)
+    scheduler.kv_cache_manager.get_block_ids.side_effect = lambda rid: tuple(
+        [block.block_id for block in manager.req_to_blocks[rid]]
+        for manager in managers
+    )
+
+    affected, _, _ = scheduler._update_requests_with_invalid_blocks(
+        requests, {11, 22}, {}
+    )
+
+    assert affected == {"r0", "r1", "r2"}
+    assert [request.num_computed_tokens for request in requests] == [16, 0, 16]
+    scheduler._preempt_request.assert_called_once()
+    assert scheduler._preempt_request.call_args.args[0] is requests[1]
 
 
 @pytest.fixture
