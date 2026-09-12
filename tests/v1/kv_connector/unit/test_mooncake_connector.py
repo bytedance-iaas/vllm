@@ -3913,12 +3913,14 @@ def _make_bootstrap_vllm_config(
             data_parallel_rank_local=data_parallel_rank_local,
             data_parallel_index=data_parallel_index,
             nnodes_within_dp=nnodes_within_dp,
+            prefill_context_parallel_size=1,
             master_addr="model-parallel-master",
             data_parallel_master_ip="data-parallel-master",
         )
     )
 
 
+@pytest.mark.parametrize("pcp_rank", [0, 1])
 @pytest.mark.parametrize(
     (
         "tp_rank",
@@ -3952,12 +3954,14 @@ def test_should_launch_bootstrap_server_selects_single_owner(
     data_parallel_rank_local: int,
     data_parallel_index: int,
     expected: bool,
+    pcp_rank: int,
 ):
     vllm_config = _make_bootstrap_vllm_config(
         local_engines_only=local_engines_only,
         data_parallel_rank_local=data_parallel_rank_local,
         data_parallel_index=data_parallel_index,
     )
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
     with (
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
@@ -3968,9 +3972,67 @@ def test_should_launch_bootstrap_server_selects_single_owner(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.get_pp_group"
         ) as mock_pp_group,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pcp_group",
+            return_value=SimpleNamespace(rank_in_group=pcp_rank),
+        ),
     ):
         mock_pp_group.return_value.rank_in_group = pp_rank
-        assert should_launch_bootstrap_server(vllm_config) is expected
+        assert should_launch_bootstrap_server(vllm_config) is (
+            expected and pcp_rank == 0
+        )
+
+
+@pytest.mark.parametrize(
+    "role,dcp", [("kv_consumer", 1), ("kv_both", 1), ("kv_producer", 2)]
+)
+def test_mooncake_rejects_non_replicated_pcp_topologies(role, dcp):
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role, engine_id="p"),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2, decode_context_parallel_size=dcp
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="PCP"):
+        MooncakeConnector(config, KVConnectorRole.SCHEDULER, None)
+
+
+@pytest.mark.parametrize(
+    "role,pcp,expected",
+    [("kv_producer", 2, 8), ("kv_producer", 1, None), ("kv_consumer", 1, None)],
+)
+def test_mooncake_completion_count_uses_canonical_pcp_workers(role, pcp, expected):
+    connector = MooncakeConnector.__new__(MooncakeConnector)
+    connector._kv_transfer_config = SimpleNamespace(kv_role=role)
+    connector._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            world_size=16, prefill_context_parallel_size=pcp
+        )
+    )
+    assert connector.get_finished_count() == expected
+
+
+@pytest.mark.parametrize("pcp_rank", [0, 1])
+def test_only_canonical_pcp_worker_enqueues_send_requests(pcp_rank):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.is_kv_producer = True
+    worker.is_kv_consumer = False
+    worker.pcp_rank = pcp_rank
+    worker.sender_loop = object()
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_to_send["r"] = ("transfer", [[1]])
+
+    def close_scheduled_coroutine(coroutine, loop):
+        assert loop is worker.sender_loop
+        coroutine.close()
+
+    with patch(
+        "asyncio.run_coroutine_threadsafe", side_effect=close_scheduled_coroutine
+    ) as submit:
+        worker.start_load_kv(metadata)
+    assert submit.call_count == (1 if pcp_rank == 0 else 0)
 
 
 @pytest.mark.parametrize(

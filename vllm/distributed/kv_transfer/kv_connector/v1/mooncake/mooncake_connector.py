@@ -1775,6 +1775,17 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.prefill_context_parallel_size > 1:
+            if vllm_config.kv_transfer_config.kv_role != "kv_producer":
+                raise NotImplementedError(
+                    "Mooncake PCP requires producer-only PCP; "
+                    "consumers and kv_both require PCP1."
+                )
+            if parallel_config.decode_context_parallel_size > 1:
+                raise NotImplementedError(
+                    "Mooncake PCP producers require DCP1."
+                )
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
@@ -1859,6 +1870,18 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def get_finished_count(self) -> int | None:
+        parallel_config = self._vllm_config.parallel_config
+        if (
+            self._kv_transfer_config.kv_role == "kv_producer"
+            and parallel_config.prefill_context_parallel_size > 1
+        ):
+            return (
+                parallel_config.world_size
+                // parallel_config.prefill_context_parallel_size
+            )
+        return None
 
     ############################################################
     # Worker Side Methods
@@ -3857,8 +3880,8 @@ class MooncakeConnectorWorker:
             self.block_len_per_layer,
             self.kv_block_len_per_layer,
         )
-        # No need to launch server for D node.
-        if self.is_kv_consumer:
+        # PCP replicas hold complete KV shards; only PCP0 sends them.
+        if self.is_kv_consumer or self.pcp_rank != 0:
             return
 
         ready_event = threading.Event()
@@ -4695,8 +4718,10 @@ class MooncakeConnectorWorker:
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
             )
 
-        if not self.is_kv_consumer and (
-            metadata.reqs_to_send or metadata.reqs_not_processed
+        if (
+            not self.is_kv_consumer
+            and self.pcp_rank == 0
+            and (metadata.reqs_to_send or metadata.reqs_not_processed)
         ):
             asyncio.run_coroutine_threadsafe(
                 self.record_send_reqs(metadata), self.sender_loop
@@ -4936,10 +4961,15 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
-    # Only the TP=0, PP=0 worker of the designated engine should launch it.
+    # Only the TP=0, PP=0, PCP=0 worker of the designated engine launches it.
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    if (
+        parallel_config.prefill_context_parallel_size > 1
+        and get_pcp_group().rank_in_group != 0
+    ):
         return False
 
     # In hybrid or external LB mode,
