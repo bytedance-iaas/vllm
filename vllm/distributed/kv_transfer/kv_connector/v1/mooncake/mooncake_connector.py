@@ -834,7 +834,7 @@ class MooncakeConnectorScheduler:
                 self._reqs_need_recv[request.request_id] = (
                     request,
                     local_block_ids,
-                    True,
+                    num_external_tokens > 0,
                 )
             else:
                 logger.warning(

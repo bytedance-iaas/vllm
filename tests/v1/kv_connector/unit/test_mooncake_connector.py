@@ -37,6 +37,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     MooncakeBootstrapServer,
 )
 from vllm.utils.network_utils import get_open_port
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1362,6 +1364,45 @@ def test_cleanup_only_pull_does_not_complete_freed_request(
     assert pull_failure_worker.finished_recving_reqs == (
         set() if aborted else {request.request_id}
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_external_tokens", [0, 16])
+def test_allocated_pull_only_completes_async_load(
+    pull_failure_worker, num_external_tokens
+):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    scheduler = MooncakeConnectorScheduler(
+        vllm_config, "consumer", _make_test_kv_cache_config()
+    )
+    request = create_request(num_tokens=32, do_remote_prefill=True)
+    request.kv_transfer_params.update(
+        transfer_id="prefix-hit", remote_bootstrap_addr="http://producer:8998"
+    )
+    blocks = KVCacheBlocks(([KVCacheBlock(block_id=10)],))
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+    metadata = scheduler.build_connector_meta(MagicMock())
+    meta = metadata.reqs_to_recv["my-engine-id"][request.request_id]
+    assert meta.local_block_ids == ([[10]] if num_external_tokens else [])
+    assert meta.notify_scheduler is (num_external_tokens > 0)
+    assert request.kv_transfer_params["do_remote_prefill"] is False
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
+    assert not scheduler.build_connector_meta(MagicMock()).reqs_to_recv
+
+    meta.pull_tasks_count = 1
+    pull_failure_worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH, ok_reqs=[request.request_id]
+        ),
+        {request.request_id: meta},
+    )
+    assert pull_failure_worker.finished_recving_reqs == (
+        {request.request_id} if num_external_tokens else set()
+    )
+    assert pull_failure_worker.get_block_ids_with_load_errors() == set()
 
 
 @pytest.mark.asyncio
