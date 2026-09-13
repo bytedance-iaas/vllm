@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import queue
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
     MooncakeXferMetadata,
     MooncakeXferResponse,
@@ -26,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -138,6 +141,15 @@ def test_align_transfer_regions_uses_layer_name_occurrences():
     assert err is None
     assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
     assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+
+@pytest.mark.parametrize("replicated", [False, True])
+@pytest.mark.parametrize("remote_length", [16384, 32768, 65536])
+def test_homogeneous_tp_rejects_different_ring_page_lengths(replicated, remote_length):
+    local = TransferRegion("ring", 0, 0x1000, 32768, 32768)
+    remote = TransferRegion("ring", 0, 0x100000, remote_length, remote_length)
+    error = _validate_asymmetric_region_lengths([local], [remote], 8, 8, replicated)
+    assert (error is None) == (remote_length == 32768)
 
 
 @pytest.mark.asyncio
@@ -800,6 +812,29 @@ def test_resolve_need_send_accounts_for_remote_tp_fanout():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fatal", [False, True])
+async def test_sender_exception_preserves_write_fence_status(fatal):
+    worker = SimpleNamespace(
+        sender_worker_queue=MagicMock(),
+        _xfer_meta_decoder=MagicMock(),
+        _encoder=SimpleNamespace(encode=lambda response: response),
+        _fatal_error="unfenced write" if fatal else None,
+        send_kv_to_decode=AsyncMock(side_effect=RuntimeError("send failed")),
+    )
+    worker.sender_worker_queue.get = AsyncMock(
+        side_effect=[(b"consumer", b"metadata"), asyncio.CancelledError()]
+    )
+    sock = AsyncMock()
+    await MooncakeConnectorWorker._sender_worker(worker, sock)
+    identity, response = sock.send_multipart.call_args.args[0]
+    assert identity == b"consumer"
+    assert response.status == (
+        MooncakeXferResponseStatus.FATAL if fatal else MooncakeXferResponseStatus.ERROR
+    )
+    worker.sender_worker_queue.task_done.assert_called_once()
+
+
+@pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.TransferEngine",
     FakeMooncakeWrapper,
@@ -962,17 +997,28 @@ async def test_kv_producer(monkeypatch):
             send_meta.sent = 0
             send_meta.ready.set()
             xfer_meta.req_blocks["d-req-1"] = (transfer_id, [[20, 21]])
-            # Worker processes the consumer's request
+            xfer_meta.req_blocks["d-pending"] = ("xfer-pending", [[22]])
+            tasks_before = asyncio.all_tasks()
             await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
+            assert not (asyncio.all_tasks() - tasks_before)
             mock_send_blocks.assert_called_once()
             mock_socket.send_multipart.assert_called_once()
             _, sent_payload = mock_socket.send_multipart.call_args[0][0]
             response = prefill_worker._xfer_resp_decoder.decode(sent_payload)
             assert response.err_msg == "Mooncake transfer engine returned 123"
-            assert response.err_reqs == ["d-req-1"]
+            assert response.err_reqs == ["d-req-1", "d-pending"]
+            assert response.status == MooncakeXferResponseStatus.FATAL
+            assert send_meta.sending > 0
+            with pytest.raises(RuntimeError, match="restart the engine"):
+                prefill_worker.get_finished()
+            with pytest.raises(RuntimeError, match="restart the engine"):
+                await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
+            assert mock_send_blocks.call_count == 1
 
         # Clean up
         prefill_worker.sender_loop = origin_sender_loop
+        prefill_worker.shutdown()
+        assert prefill_worker.sender_loop.is_closed()
         prefill_worker.shutdown()
 
 
@@ -1051,6 +1097,183 @@ async def test_kv_consumuer(monkeypatch):
 
         # Clean up
         decode_worker.shutdown()
+
+
+@pytest.fixture
+def pull_failure_worker():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.finished_recving_reqs = set()
+    worker._invalid_block_ids = queue.Queue()
+    worker._fatal_error = None
+    worker.xfer_stats = MagicMock()
+    return worker
+
+
+@pytest.mark.parametrize("notify_scheduler", [True, False])
+def test_failed_pull_waits_for_all_writers(pull_failure_worker, notify_scheduler):
+    worker = pull_failure_worker
+    meta = PullReqMeta(
+        d_req_id="d-failed",
+        transfer_id="xfer-failed",
+        local_block_ids=[[0, 10, 11], [20], [30], [40]],
+        remote_engine_id="producer",
+        remote_bootstrap_addr="http://producer:8998",
+        notify_scheduler=notify_scheduler,
+        pull_tasks_count=2,
+    )
+    pulls = {meta.d_req_id: meta}
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            err_reqs=[meta.d_req_id],
+            err_msg="RDMA failure",
+        ),
+        pulls,
+    )
+    assert worker.finished_recving_reqs == set()
+    assert worker.get_block_ids_with_load_errors() == set()
+    worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH, ok_reqs=[meta.d_req_id]
+        ),
+        pulls,
+    )
+    assert meta.pull_tasks_count == 0
+    assert worker.finished_recving_reqs == (
+        {meta.d_req_id} if notify_scheduler else set()
+    )
+    assert worker.get_block_ids_with_load_errors() == (
+        {10, 11, 20, 30, 40} if notify_scheduler else set()
+    )
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.asyncio
+async def test_missing_bootstrap_engine_finishes_failed_pull(pull_failure_worker):
+    worker = pull_failure_worker
+    worker._remote_agents = {}
+    worker._pending_bootstrap_queries = {}
+    worker._connect_to_prefiller_bootstrap = AsyncMock()
+    meta = PullReqMeta("d", "xfer", [[10], [20]], "producer", "http://producer:8998")
+
+    await worker.handle_new_engine_id("producer", {"d": meta})
+
+    assert worker.finished_recving_reqs == {"d"}
+    assert worker.get_block_ids_with_load_errors() == {10, 20}
+
+
+@pytest.mark.parametrize("aborted", [True, False])
+def test_cleanup_only_pull_does_not_complete_freed_request(
+    pull_failure_worker, aborted
+):
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.is_kv_producer = False
+    scheduler.is_kv_consumer = True
+    scheduler._reqs_need_recv = {}
+    request = SimpleNamespace(
+        request_id="d-cleanup",
+        status=RequestStatus.FINISHED_ABORTED,
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "transfer_id": "cleanup",
+            "remote_engine_id": "producer",
+            "remote_bootstrap_addr": "http://producer:8998",
+        },
+    )
+    if aborted:
+        assert scheduler.request_finished(request, ([],)) == (False, None)
+    else:
+        scheduler._reqs_need_recv[request.request_id] = (request, [], True)
+    metadata = scheduler.build_connector_meta(MagicMock())
+    meta = metadata.reqs_to_recv["producer"][request.request_id]
+    assert meta.notify_scheduler is not aborted
+    meta.pull_tasks_count = 1
+    pull_failure_worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH, ok_reqs=[request.request_id]
+        ),
+        {request.request_id: meta},
+    )
+    assert pull_failure_worker.finished_recving_reqs == (
+        set() if aborted else {request.request_id}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["handshake", "timeout", "incomplete", "unfenced", "duplicate"]
+)
+async def test_receive_failure_only_invalidates_pending_requests(failure):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies() as mocks:
+        connector = MooncakeConnector(
+            vllm_config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        )
+        worker = connector.connector_worker
+        completed = PullReqMeta(
+            "done",
+            "done-xfer",
+            [[10]],
+            "producer",
+            "http://producer:8998",
+            pull_tasks_count=1,
+        )
+        pending = PullReqMeta(
+            "pending",
+            "pending-xfer",
+            [[20], [30]],
+            "producer",
+            "http://producer:8998",
+            pull_tasks_count=1,
+        )
+        success = worker._encoder.encode(
+            MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.CONTINUE, ok_reqs=["done"]
+            )
+        )
+        if failure == "timeout":
+            result = zmq.Again()
+        elif failure in ("unfenced", "duplicate"):
+            result = worker._encoder.encode(
+                MooncakeXferResponse(
+                    status=MooncakeXferResponseStatus.FATAL
+                    if failure == "unfenced"
+                    else MooncakeXferResponseStatus.FINISH,
+                    ok_reqs=["pending", "pending"] if failure == "duplicate" else None,
+                    err_msg="unfenced write",
+                )
+            )
+        else:
+            result = worker._encoder.encode(
+                MooncakeXferResponse(
+                    status=MooncakeXferResponseStatus.ERROR
+                    if failure == "handshake"
+                    else MooncakeXferResponseStatus.FINISH,
+                    err_msg="incompatible regions" if failure == "handshake" else None,
+                )
+            )
+        mocks["mock_socket_object"].recv.side_effect = [success, result]
+
+        await worker.receive_kv_from_single_worker(
+            "tcp://producer:1234", {"done": completed, "pending": pending}
+        )
+
+        if failure in ("timeout", "unfenced", "duplicate"):
+            assert worker.finished_recving_reqs == {"done"}
+            assert worker._invalid_block_ids.empty()
+            assert pending.pull_tasks_count == 1
+            with pytest.raises(RuntimeError, match="restart the engine"):
+                worker.get_finished()
+            with pytest.raises(RuntimeError, match="restart the engine"):
+                connector.get_block_ids_with_load_errors()
+        else:
+            assert worker.finished_recving_reqs == {"done", "pending"}
+            assert connector.get_block_ids_with_load_errors() == {20, 30}
+            assert connector.get_block_ids_with_load_errors() == set()
+        worker.shutdown()
 
 
 @pytest.mark.asyncio
