@@ -7,19 +7,33 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 """
 
 import asyncio
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
+from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
     MooncakeConnectorScheduler,
+    MooncakeConnectorWorker,
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
+)
+from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheLayout,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
 )
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
@@ -436,3 +450,178 @@ def test_request_finished_with_hma_groups():
     assert stored_blocks[0] == fa_blocks
     # SW: clipped to last 9 blocks (sw_size=128, block_size=16 → 8+1=9)
     assert stored_blocks[1] == sw_blocks[-9:]
+
+
+@pytest.fixture(params=[False, True], ids=["plain", "uniform-type"])
+def v41_cache_groups(request):
+    specs = [
+        SlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+        ),
+        MLAAttentionSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            tokens_per_state=2,
+        ),
+        MLAAttentionSpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=144,
+            dtype=torch.uint8,
+            tokens_per_state=2,
+        ),
+        CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1024,
+            head_size_v=0,
+            dtype=torch.float32,
+        ),
+    ]
+    names = [f"model.layers.2.{name}" for name in ("swa", "kv", "indexer", "ring")]
+    groups = [
+        KVCacheGroupSpec(
+            [name],
+            UniformTypeKVCacheSpecs(
+                block_size=spec.block_size, kv_cache_specs={name: spec}
+            )
+            if request.param
+            else spec,
+        )
+        for name, spec in zip(names, specs)
+    ]
+    return KVCacheConfig(
+        num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups
+    ), dict(zip(names, specs))
+
+
+@pytest.mark.cpu_test
+def test_v41_wrapped_swa_clips_without_trimming_ring(v41_cache_groups):
+    config, _ = v41_cache_groups
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_both", block_size=32
+    )
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    scheduler = MooncakeConnectorScheduler(vllm_config, "v41", config)
+    blocks = [list(range(10, 30)), list(range(30, 40)), list(range(40, 50)), [51]]
+    assert scheduler.blocks_per_sw == [5, 0, 0, 0]
+    assert scheduler.get_sw_clipped_blocks(blocks) == [blocks[0][-5:], *blocks[1:]]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("ratio", [1, 2, 4])
+def test_v41_registration_preserves_whole_ring_page(v41_cache_groups, ratio):
+    config, specs = v41_cache_groups
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.engine = MagicMock()
+    worker.engine.batch_register_memory.return_value = 0
+    worker.is_kv_consumer = True
+    worker.use_mla = True
+    worker._layer_specs = specs
+    worker.kv_cache_config = config
+    worker._physical_blocks_per_logical_kv_block = ratio
+    caches = {}
+    expected_lengths = []
+    for name, spec in specs.items():
+        kernel_size = (
+            spec.block_size if isinstance(spec, CircularBufferSpec) else 32 // ratio
+        )
+        raw = torch.zeros(config.num_blocks * spec.page_size_bytes, dtype=torch.int8)
+        caches[name] = dense_kv_cache_views(
+            raw, spec, config.num_blocks, 1, KVCacheLayout.LBNHC, kernel_size
+        )[0]
+        expected_lengths.append(spec.page_size_bytes * kernel_size // spec.block_size)
+
+    worker.register_kv_caches(caches)
+
+    assert worker.registered_group_indices == [0, 1, 2, 3]
+    assert worker.registered_layer_names == list(specs)
+    assert worker.kv_block_len_per_layer == expected_lengths
+    assert worker.block_len_per_layer == expected_lengths
+    registered_ptrs, registered_lengths = (
+        worker.engine.batch_register_memory.call_args.args
+    )
+    assert registered_ptrs == [cache.data_ptr() for cache in caches.values()]
+    assert registered_lengths == [
+        cache.untyped_storage().nbytes() for cache in caches.values()
+    ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ratio", [1, 2, 4])
+@pytest.mark.parametrize("tp_rank", range(8))
+@pytest.mark.parametrize("prompt_len", [1, 2, 3, 31, 32, 33, 127, 128, 129])
+async def test_v41_transfer_keeps_each_state_in_its_own_region(
+    v41_cache_groups, ratio, tp_rank, prompt_len
+):
+    config, specs = v41_cache_groups
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.kv_cache_config = config
+    worker.use_mla = True
+    worker._physical_blocks_per_logical_kv_block = ratio
+    worker.tp_rank = tp_rank
+    worker.tp_size = 8
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=True)
+    num_blocks = cdiv(prompt_len, 32)
+    counts = [min(num_blocks, 5), num_blocks, num_blocks, 1]
+    local_ids = [
+        list(range(start, start + count))
+        for start, count in zip([1, 20, 40, 60], counts)
+    ]
+    remote_ids = [[block_id + 64 for block_id in group] for group in local_ids]
+    local_regions = []
+    remote_regions = []
+    for i, (name, spec) in enumerate(specs.items()):
+        block_len = spec.page_size_bytes // (
+            1 if isinstance(spec, CircularBufferSpec) else ratio
+        )
+        for regions, base in (
+            (local_regions, 0x10000000),
+            (remote_regions, 0x20000000),
+        ):
+            regions.append(
+                TransferRegion(name, 2, base + i * 0x1000000, block_len, block_len, i)
+            )
+    send_meta = SendBlockMeta(
+        p_req_id="p-v41",
+        transfer_id="v41",
+        local_block_ids=local_ids,
+        ready=asyncio.Event(),
+    )
+    metadata = MooncakeXferMetadata(
+        remote_hostname="consumer",
+        remote_port=12345,
+        remote_tp_size=8,
+        remote_tp_rank=tp_rank,
+        req_blocks={"d-v41": ("v41", remote_ids)},
+        kv_caches_base_addr=[r.base_addr for r in remote_regions],
+        block_lens=[r.block_len for r in remote_regions],
+        kv_block_lens=[r.kv_block_len for r in remote_regions],
+    )
+
+    src, dst, lengths, errors, error_message = await worker._build_transfer_params(
+        [("d-v41", send_meta)], metadata, local_regions, remote_regions
+    )
+
+    assert errors == []
+    assert error_message is None
+    assert src == [
+        r.base_addr + ids[0] * spec.page_size_bytes
+        for r, ids, spec in zip(local_regions, local_ids, specs.values())
+    ]
+    assert dst == [
+        r.base_addr + ids[0] * spec.page_size_bytes
+        for r, ids, spec in zip(remote_regions, remote_ids, specs.values())
+    ]
+    assert lengths == [
+        count * spec.page_size_bytes for count, spec in zip(counts, specs.values())
+    ]
