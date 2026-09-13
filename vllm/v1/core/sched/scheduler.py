@@ -2987,18 +2987,41 @@ class Scheduler(SchedulerInterface):
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
         marked_invalid_block_ids: set[int] = set()
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         for request in requests:
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
+            if len(req_block_ids_per_group) > 1:
+                # Hybrid state groups cannot resume from a shared block-index boundary.
+                request_invalid_block_ids = {
+                    block_id
+                    for req_block_ids in req_block_ids_per_group
+                    for block_id in req_block_ids
+                    if block_id != null_block_id and block_id in invalid_block_ids
+                }
+                if request_invalid_block_ids:
+                    marked_invalid_block_ids |= request_invalid_block_ids
+                    total_affected_tokens += req_num_computed_tokens
+                    request.num_computed_tokens = 0
+                    if evict_blocks:
+                        for req_block_ids in req_block_ids_per_group:
+                            blocks_to_evict.update(
+                                block_id
+                                for block_id in req_block_ids
+                                if block_id != null_block_id
+                            )
+                    affected_req_ids.add(req_id)
+                continue
+
+            (req_block_ids,) = req_block_ids_per_group
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
