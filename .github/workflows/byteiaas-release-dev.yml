@@ -115,20 +115,9 @@ jobs:
           fi
           echo "checkout_sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"
 
-  build-wheel:
-    if: github.repository == 'bytedance-iaas/vllm'
-    needs: resolve-source
-    uses: ./.github/workflows/_byteiaas-build-wheel.yml
-    with:
-      checkout_ref: ${{ needs.resolve-source.outputs.checkout_sha }}
-      cuda_version: "13.0.3"
-      artifact_name: vllm-cu130-wheel-dev
-
   build-image:
     if: github.repository == 'bytedance-iaas/vllm'
-    needs:
-      - resolve-source
-      - build-wheel
+    needs: resolve-source
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
       checkout_ref: ${{ needs.resolve-source.outputs.checkout_sha }}
