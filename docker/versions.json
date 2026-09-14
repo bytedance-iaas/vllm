@@ -34,6 +34,9 @@
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
+    "UV_VERSION": {
+      "default": "0.12.6"
+    },
     "PYTORCH_CUDA_INDEX_BASE_URL": {
       "default": "https://download.pytorch.org/whl"
     },
@@ -93,6 +96,15 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
+    },
+    "INSTALL_VLLM_ROUTER": {
+      "default": "false"
+    },
+    "VLLM_ROUTER_VERSION": {
+      "default": "0.1.15"
+    },
+    "VLLM_IMAGE_SOURCE": {
+      "default": "https://github.com/vllm-project/vllm"
     }
   }
 }
