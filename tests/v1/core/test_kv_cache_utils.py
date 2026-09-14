@@ -19,6 +19,7 @@ import vllm.v1.core.kv_cache_utils as kv_cache_utils
 import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     KVTransferConfig,
     ModelConfig,
     SchedulerConfig,
@@ -1532,7 +1533,7 @@ def test_pp_empty_uniform_group_does_not_allocate_remote_layers():
         ],
         {"local": spec},
     )
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     config.cache_config.kv_cache_layout = "BLHNC"
     cache = kv_cache_utils.get_kv_cache_config_from_groups(
         config, groups, spec.page_size_bytes * 4
