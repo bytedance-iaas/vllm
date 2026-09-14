@@ -514,7 +514,7 @@ def test_symm_buffer_cache_separates_architecture_and_dtype_modes(monkeypatch):
     sm90_fp8.get_symm_buffer()
 
     assert calls == [
-        {},
+        {"num_shared_experts": 0},
         {"use_fp8_dispatch": True, "activation": "swiglu"},
         {"use_fp8_dispatch": True, "activation": "swiglu"},
     ]
