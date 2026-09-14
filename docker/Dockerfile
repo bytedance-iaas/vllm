@@ -47,6 +47,10 @@ ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
 # Optional apt mirror for Ubuntu-based ByteIAAS CI builds.
 ARG UBUNTU_MIRROR
+# Optional dnf mirror for AlmaLinux-based manylinux build images.
+ARG ALMALINUX_MIRROR
+# Optional dnf mirror for EPEL packages used by manylinux build images.
+ARG EPEL_MIRROR
 
 # DeepGEMM source defaults. Override all three for builds that require the
 # fork-only SM90 MegaMoE APIs.
@@ -70,6 +74,7 @@ ARG DEADSNAKES_GPGKEY_URL
 #
 # Reference: https://pip.pypa.io/en/stable/installation/#get-pip-py
 ARG GET_PIP_URL="https://bootstrap.pypa.io/get-pip.py"
+ARG UV_VERSION=0.12.6
 
 # PIP supports fetching the packages from custom indexes, allowing third-party
 # to host the packages in private mirrors. The PIP_INDEX_URL and
@@ -109,6 +114,13 @@ ARG INSTALL_RUBIN_PRERELEASE
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG UBUNTU_MIRROR
+ARG ALMALINUX_MIRROR
+ARG EPEL_MIRROR
+ARG PIP_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL
+ARG UV_INDEX_URL=${PIP_INDEX_URL}
+ARG UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ARG UV_VERSION
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
 ARG SCCACHE_ENDPOINT
@@ -138,7 +150,23 @@ ENV VIRTUAL_ENV="/opt/venv"
 
 # Install system dependencies including build tools. The PyTorch manylinux
 # image enables EPEL, which provides ccache.
-RUN dnf install -y --setopt=install_weak_deps=False \
+RUN if [ -n "${ALMALINUX_MIRROR}" ]; then \
+        almalinux_mirror="${ALMALINUX_MIRROR%/}" \
+        && echo "Using AlmaLinux mirror: ${almalinux_mirror}" \
+        && find /etc/yum.repos.d -type f -name "*.repo" -exec sed -i -E \
+            -e "s@^[[:space:]]*(metalink|mirrorlist)=@#\1=@" \
+            -e "s@^[[:space:]]*#?[[:space:]]*baseurl=https?://(repo|vault)[.]almalinux[.]org/almalinux@baseurl=${almalinux_mirror}@" \
+            {} +; \
+    fi \
+    && if [ -n "${EPEL_MIRROR}" ]; then \
+        epel_mirror="${EPEL_MIRROR%/}" \
+        && echo "Using EPEL mirror: ${epel_mirror}" \
+        && find /etc/yum.repos.d -type f -name "epel*.repo" -exec sed -i -E \
+            -e "s@^[[:space:]]*(metalink|mirrorlist)=@#\1=@" \
+            -e "s@^[[:space:]]*#?[[:space:]]*baseurl=https?://[^[:space:]]*/epel/@baseurl=${epel_mirror}/@" \
+            {} +; \
+    fi \
+    && dnf install -y --setopt=install_weak_deps=False \
         ccache \
         git \
         curl \
@@ -172,13 +200,17 @@ ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 # the manylinux image.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
     # doesn't always expose ensurepip via the default venv layout).
     && PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
     && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
+    && MANYLINUX_BIN="$(dirname "${MANYLINUX_PY}")" \
+    && PIP_EXTRA_INDEX_URL= "${MANYLINUX_PY}" -m pip install --no-cache-dir "uv==${UV_VERSION}" \
+    && ln -sf "${MANYLINUX_BIN}/uv" "${UV_INSTALL_DIR}/uv" \
+    && ln -sf "${MANYLINUX_BIN}/uvx" "${UV_INSTALL_DIR}/uvx" \
+    && uv --version \
     && uv venv --seed /opt/venv --python "$MANYLINUX_PY" \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
@@ -238,6 +270,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         printf 'cython<3.3\n' > /tmp/build-constraints.txt \
         && export UV_BUILD_CONSTRAINT=/tmp/build-constraints.txt; \
     fi \
+    && uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
     && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         echo "Installing Rubin prerelease requirements..." \
         && /opt/venv/bin/python3 use_existing_torch.py --prefix \
@@ -254,10 +290,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && echo "Installing other requirements..." \
         && /opt/venv/bin/python3 use_existing_torch.py --prefix \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     else \
         uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     fi
 
 # CUDA 13.4 Rubin images need a compatibility link for the prerelease
@@ -388,7 +426,11 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         echo "Installing build requirements with Rubin prerelease PyTorch..." \
         && python3 use_existing_torch.py --prefix \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt; \
@@ -402,7 +444,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     fi
 
 WORKDIR /workspace
@@ -608,7 +651,11 @@ ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         echo "Installing build requirements with Rubin prerelease PyTorch..." \
         && python3 use_existing_torch.py --prefix \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt; \
@@ -622,7 +669,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     fi
 
 WORKDIR /workspace
@@ -724,19 +772,26 @@ COPY requirements/dev.txt requirements/dev.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing dev requirements plus torch nightly..." \
         && python3 use_existing_torch.py --prefix \
         && cat torch_lib_versions.txt >> requirements/test/cuda.in \
         && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args} \
         && uv pip install --python /opt/venv/bin/python3 $(cat torch_lib_versions.txt | xargs) --pre \
         -r requirements/dev.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     else \
         echo "Installing dev requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     fi
 
 #################### DEV IMAGE ####################
@@ -752,6 +807,9 @@ ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
 ARG UBUNTU_MIRROR
+ARG PIP_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL
+ARG UV_VERSION
 
 # Keep the output image's CUDA metadata aligned with the selected toolkit.
 # This also normalizes prerelease base images with four-component metadata for
@@ -875,7 +933,7 @@ RUN if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
     fi
 
 # Install uv for faster pip installs
-RUN python3 -m pip install uv
+RUN python3 -m pip install "uv==${UV_VERSION}"
 
 # Environment for uv
 # Redirect uv's managed Python and download cache out of /root/ so downstream
@@ -957,6 +1015,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         echo "INSTALL_RUBIN_PRERELEASE=true requires requirements/rubin-prerelease.txt" >&2; \
         exit 1; \
     fi && \
+    uv_extra_index_args="" && \
+    if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi && \
     if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
         sed -i 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' /tmp/requirements-cuda.txt; \
         sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' /tmp/requirements-cuda.txt; \
@@ -976,7 +1038,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     else \
         uv pip install --system \
             -r /tmp/requirements-cuda.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            ${uv_extra_index_args}; \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
@@ -1052,17 +1115,23 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         && echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     else \
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -1078,8 +1147,13 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && uv pip install --system ep_kernels/dist/*.whl --verbose \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
@@ -1126,6 +1200,10 @@ COPY requirements/dev.txt requirements/dev.txt
 COPY use_existing_torch.py use_existing_torch.py
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
+    uv_extra_index_args="" && \
+    if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi && \
     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
     if [ "$CUDA_MAJOR" -ge 12 ]; then \
         if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
@@ -1134,18 +1212,22 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             && cat torch_lib_versions.txt >> requirements/test/cuda.in \
             && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
             --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            ${uv_extra_index_args} \
             && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
             -r requirements/dev.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            ${uv_extra_index_args}; \
         else \
             echo "Installing dev requirements..." \
             && if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
                 echo "Recompiling test requirements for arm64..." \
                 && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
-                --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+                --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+                ${uv_extra_index_args}; \
             fi \
             && uv pip install --system -r requirements/dev.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            ${uv_extra_index_args}; \
         fi \
     fi
 
@@ -1169,17 +1251,23 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         && echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     else \
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}; \
     fi
 
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
@@ -1188,8 +1276,13 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && uv pip install --system ep_kernels/dist/*.whl --verbose \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}
 
 # See the matching comment in the vllm-base stage.
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}

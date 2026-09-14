@@ -53,12 +53,17 @@ jobs:
       HTTP_PROXY: http://100.68.162.211:3128
       HTTPS_PROXY: http://100.68.162.211:3128
       ALL_PROXY: http://100.68.162.211:3128
-      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com,api.launchpad.net,launchpad.net,ppa.launchpad.net,ppa.launchpadcontent.net,keyserver.ubuntu.com
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,mirrors.volces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com,repo.almalinux.org,download.pytorch.org,astral.sh,releases.astral.sh,pypi.org,files.pythonhosted.org,.pythonhosted.org,api.launchpad.net,launchpad.net,ppa.launchpad.net,ppa.launchpadcontent.net,keyserver.ubuntu.com
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
       BYTEIAAS_UBUNTU_MIRROR: http://mirrors.volces.com/ubuntu
+      BYTEIAAS_ALMALINUX_MIRROR: http://mirrors.volces.com/almalinux
+      BYTEIAAS_EPEL_MIRROR: http://mirrors.volces.com/epel
+      BYTEIAAS_GET_PIP_URL: http://mirrors.volces.com/pypa/get-pip.py
+      BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
+      BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
       BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
@@ -311,9 +316,15 @@ jobs:
               --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}"
               -f docker/Dockerfile
               --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}"
-              --build-arg BUILD_BASE_IMAGE="127.0.0.1:5000/nvidia/cuda:${BYTEIAAS_CUDA_VERSION}-devel-ubuntu22.04"
               --build-arg FINAL_BASE_IMAGE="nvidia/cuda:${BYTEIAAS_CUDA_VERSION}-base-ubuntu22.04"
               --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}"
+              --build-arg ALMALINUX_MIRROR="${BYTEIAAS_ALMALINUX_MIRROR}"
+              --build-arg EPEL_MIRROR="${BYTEIAAS_EPEL_MIRROR}"
+              --build-arg GET_PIP_URL="${BYTEIAAS_GET_PIP_URL}"
+              --build-arg PIP_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}"
+              --build-arg PIP_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}"
+              --build-arg UV_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}"
+              --build-arg UV_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}"
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
               --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
