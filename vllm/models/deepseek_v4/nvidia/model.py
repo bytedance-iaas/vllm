@@ -934,12 +934,22 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             and get_ep_group().world_size == 8
         )
 
+    @staticmethod
+    def _get_mega_moe_token_alignment(deep_gemm) -> int | None:
+        for module in (deep_gemm, getattr(deep_gemm, "_C", None)):
+            if module is None:
+                continue
+            get_alignment = getattr(module,
+                                    "get_token_alignment_for_sm90_mega_moe",
+                                    None)
+            if get_alignment is not None:
+                return int(get_alignment())
+        return None
+
     def _get_requested_capacity_buckets(self, deep_gemm) -> tuple[int, ...]:
-        get_alignment = getattr(deep_gemm, "get_token_alignment_for_sm90_mega_moe",
-                                None)
-        if get_alignment is None:
+        alignment = self._get_mega_moe_token_alignment(deep_gemm)
+        if alignment is None:
             return ()
-        alignment = int(get_alignment())
         if alignment != 384:
             return ()
         decode_capacity = self.max_num_tokens

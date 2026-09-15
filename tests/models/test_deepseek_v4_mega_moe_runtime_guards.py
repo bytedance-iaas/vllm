@@ -225,6 +225,49 @@ def test_get_symm_buffer_for_num_tokens_rejects_beyond_batched():
         experts.get_symm_buffer_for_num_tokens(257)
 
 
+def test_get_requested_capacity_buckets_uses_deep_gemm_c_accessor():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 384
+    experts.max_num_batched_tokens = 2048
+    deep_gemm = SimpleNamespace(
+        _C=SimpleNamespace(get_token_alignment_for_sm90_mega_moe=lambda: 384)
+    )
+
+    assert experts._get_requested_capacity_buckets(deep_gemm) == (
+        384,
+        768,
+        2048,
+    )
+
+
+def test_get_requested_capacity_buckets_prefers_top_level_accessor():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 384
+    experts.max_num_batched_tokens = 2048
+    deep_gemm = SimpleNamespace(
+        get_token_alignment_for_sm90_mega_moe=lambda: 384,
+        _C=SimpleNamespace(
+            get_token_alignment_for_sm90_mega_moe=lambda: pytest.fail(
+                "top-level accessor should win when available"
+            )
+        ),
+    )
+
+    assert experts._get_requested_capacity_buckets(deep_gemm) == (
+        384,
+        768,
+        2048,
+    )
+
+
+def test_get_requested_capacity_buckets_stays_disabled_without_accessor():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts.max_num_tokens = 384
+    experts.max_num_batched_tokens = 2048
+
+    assert experts._get_requested_capacity_buckets(SimpleNamespace()) == ()
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "expected_bucket"),
     [
