@@ -120,6 +120,8 @@ def test_resolve_mega_moe_decode_capacity_accounts_for_sequence_parallel():
 
 def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = False
+    experts._capacity_buffers = None
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
     calls = []
@@ -139,6 +141,8 @@ def test_get_symm_buffer_for_num_tokens_uses_cached_full_capacity_buffer(
     monkeypatch,
 ):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = False
+    experts._capacity_buffers = None
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
     calls = []
@@ -158,6 +162,8 @@ def test_get_symm_buffer_for_num_tokens_rounds_oversized_to_full_capacity(
     monkeypatch,
 ):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = False
+    experts._capacity_buffers = None
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
     calls = []
@@ -175,6 +181,8 @@ def test_get_symm_buffer_for_num_tokens_rounds_oversized_to_full_capacity(
 
 def test_get_symm_buffer_for_num_tokens_uses_dp_wide_capacity(monkeypatch):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = False
+    experts._capacity_buffers = None
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
     calls = []
@@ -208,11 +216,203 @@ def test_get_max_num_tokens_across_dp_localizes_sequence_parallel():
 
 def test_get_symm_buffer_for_num_tokens_rejects_beyond_batched():
     experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = False
+    experts._capacity_buffers = None
     experts.max_num_tokens = 80
     experts.max_num_batched_tokens = 256
 
     with pytest.raises(ValueError):
         experts.get_symm_buffer_for_num_tokens(257)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_bucket"),
+    [
+        (0, "decode"),
+        (384, "decode"),
+        (385, "mid"),
+        (767, "mid"),
+        (768, "mid"),
+        (769, "full"),
+        (2048, "full"),
+    ],
+)
+def test_get_symm_buffer_for_num_tokens_uses_first_prepared_bucket(
+    monkeypatch, num_tokens, expected_bucket
+):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = True
+    experts.max_num_batched_tokens = 2048
+    experts._capacity_buffers = (
+        (384, "decode"),
+        (768, "mid"),
+        (2048, "full"),
+    )
+    monkeypatch.setattr(
+        experts,
+        "_get_max_num_tokens_across_dp",
+        lambda tokens: tokens,
+    )
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer",
+        lambda *args, **kwargs: pytest.fail(
+            "serving path should not allocate lazily after preparation"
+        ),
+    )
+
+    assert experts.get_symm_buffer_for_num_tokens(num_tokens) == expected_bucket
+
+
+def test_get_symm_buffer_for_num_tokens_requires_prepared_buckets():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = True
+    experts._capacity_buffers = None
+    experts.max_num_batched_tokens = 2048
+    experts.max_num_tokens = 384
+
+    with pytest.raises(RuntimeError, match="not prepared during initialization"):
+        experts.get_symm_buffer_for_num_tokens(1)
+
+
+def test_get_symm_buffer_for_num_tokens_rejects_beyond_batched_with_buckets(
+    monkeypatch,
+):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = True
+    experts._capacity_buffers = (
+        (384, "decode"),
+        (768, "mid"),
+        (2048, "full"),
+    )
+    experts.max_num_batched_tokens = 2048
+    monkeypatch.setattr(
+        experts,
+        "_get_max_num_tokens_across_dp",
+        lambda tokens: tokens,
+    )
+
+    with pytest.raises(ValueError):
+        experts.get_symm_buffer_for_num_tokens(2049)
+
+
+def test_prepare_capacity_buckets_allocates_and_prewarms_in_order(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._capacity_buffers = None
+    experts._use_prepared_capacity_buckets = False
+    experts._transformed_l1_weights = (torch.empty(1), torch.empty(1))
+    calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        experts,
+        "_supports_prepared_capacity_buckets",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        experts,
+        "_get_requested_capacity_buckets",
+        lambda deep_gemm: (384, 768, 2048),
+    )
+
+    buffers = {
+        384: SimpleNamespace(num_max_tokens_per_rank=384),
+        768: SimpleNamespace(num_max_tokens_per_rank=768),
+        2048: SimpleNamespace(num_max_tokens_per_rank=2304),
+    }
+
+    def fake_get_symm_buffer(max_num_tokens=None, *, cache=True):
+        assert cache is True
+        calls.append(("alloc", max_num_tokens))
+        return buffers[max_num_tokens]
+
+    monkeypatch.setattr(experts, "get_symm_buffer", fake_get_symm_buffer)
+    monkeypatch.setattr(
+        experts,
+        "_prewarm_capacity_bucket",
+        lambda requested_capacity, symm_buffer, **kwargs: calls.append(
+            ("warm", requested_capacity)
+        ),
+    )
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: SimpleNamespace(),
+    )
+
+    experts.prepare_capacity_buckets(activation_clamp=7.5)
+
+    assert calls == [
+        ("alloc", 384),
+        ("alloc", 768),
+        ("alloc", 2048),
+        ("warm", 384),
+        ("warm", 768),
+        ("warm", 2048),
+    ]
+    assert experts._capacity_buffers == (
+        (384, buffers[384]),
+        (768, buffers[768]),
+        (2048, buffers[2048]),
+    )
+    assert experts._use_prepared_capacity_buckets is True
+
+
+def test_prepare_capacity_buckets_is_idempotent(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_prepared_capacity_buckets = False
+    prepared = ((384, object()), (768, object()), (2048, object()))
+    experts._capacity_buffers = prepared
+    monkeypatch.setattr(
+        experts,
+        "_supports_prepared_capacity_buckets",
+        lambda: pytest.fail("should not re-check once prepared"),
+    )
+
+    experts.prepare_capacity_buckets(activation_clamp=None)
+
+    assert experts._capacity_buffers is prepared
+
+
+def test_prepare_capacity_buckets_stays_disabled_when_physical_caps_mismatch(
+    monkeypatch,
+):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._capacity_buffers = None
+    experts._use_prepared_capacity_buckets = False
+    experts._transformed_l1_weights = (torch.empty(1), torch.empty(1))
+
+    monkeypatch.setattr(
+        experts,
+        "_supports_prepared_capacity_buckets",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        experts,
+        "_get_requested_capacity_buckets",
+        lambda deep_gemm: (384, 768, 2048),
+    )
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer",
+        lambda max_num_tokens=None, *, cache=True: SimpleNamespace(
+            num_max_tokens_per_rank=max_num_tokens
+        ),
+    )
+    monkeypatch.setattr(
+        experts,
+        "_prewarm_capacity_bucket",
+        lambda *args, **kwargs: pytest.fail("should not prewarm mismatched buckets"),
+    )
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: SimpleNamespace(),
+    )
+
+    experts.prepare_capacity_buckets(activation_clamp=None)
+
+    assert experts._capacity_buffers is None
+    assert experts._use_prepared_capacity_buckets is False
 
 
 def test_fp8_loader_params_have_expected_shapes_and_dtypes():

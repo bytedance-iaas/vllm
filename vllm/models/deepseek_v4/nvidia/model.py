@@ -190,6 +190,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     _symm_buffer_cache: dict[
         tuple[int, int, int, int, int, int, int, int, str], object
     ] = {}
+    _capacity_warmup_done: set[tuple[int, float | None, bool]] = set()
 
     def __init__(
         self,
@@ -231,6 +232,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self._use_sm90_mega_moe = False
         self._use_sm90_fp4_mega_moe = False
         self._use_sm90_fp8_mega_moe = False
+        self._use_prepared_capacity_buckets = False
+        self._capacity_buffers: tuple[tuple[int, object], ...] | None = None
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -888,6 +891,139 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
 
+    def _supports_prepared_capacity_buckets(self) -> bool:
+        return (
+            self._use_sm90_fp4_mega_moe
+            and self.sequence_parallel_size == 1
+            and self.top_k == 5
+            and self.max_num_tokens == 384
+            and self.max_num_batched_tokens == 2048
+            and get_tensor_model_parallel_world_size() == 1
+            and get_pp_group().world_size == 1
+            and get_ep_group().world_size == 8
+        )
+
+    def _get_requested_capacity_buckets(self, deep_gemm) -> tuple[int, ...]:
+        get_alignment = getattr(deep_gemm, "get_token_alignment_for_sm90_mega_moe",
+                                None)
+        if get_alignment is None:
+            return ()
+        alignment = int(get_alignment())
+        if alignment != 384:
+            return ()
+        decode_capacity = self.max_num_tokens
+        full_capacity = self.max_num_batched_tokens
+        intermediate_capacity = cdiv(decode_capacity + 1, alignment) * alignment
+        requests = sorted(
+            {
+                decode_capacity,
+                full_capacity,
+                intermediate_capacity,
+            }
+        )
+        return tuple(
+            request
+            for request in requests
+            if decode_capacity <= request <= full_capacity
+        )
+
+    def _get_capacity_bucket_warmup_key(
+        self,
+        symm_buffer,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool,
+    ) -> tuple[int, float | None, bool]:
+        return (id(symm_buffer), activation_clamp, fast_math)
+
+    def _prewarm_capacity_bucket(
+        self,
+        requested_capacity: int,
+        symm_buffer,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool,
+    ) -> None:
+        warmup_key = self._get_capacity_bucket_warmup_key(
+            symm_buffer,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+        )
+        if warmup_key in self._capacity_warmup_done:
+            return
+
+        device = self._transformed_l1_weights[0].device
+        hidden_states = torch.zeros(
+            requested_capacity,
+            self.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        topk_weights = torch.zeros(
+            requested_capacity,
+            self.top_k,
+            dtype=torch.float32,
+            device=device,
+        )
+        topk_ids = torch.full(
+            (requested_capacity, self.top_k),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        y = torch.empty_like(hidden_states)
+        for num_tokens in range(requested_capacity + 1):
+            self._run_mega_moe_sm90(
+                hidden_states[:num_tokens],
+                topk_weights[:num_tokens],
+                topk_ids[:num_tokens],
+                y[:num_tokens],
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+                symm_buffer=symm_buffer,
+            )
+        torch.cuda.synchronize(device)
+        self._capacity_warmup_done.add(warmup_key)
+
+    def prepare_capacity_buckets(
+        self,
+        *,
+        activation_clamp: float | None,
+        fast_math: bool = True,
+    ) -> None:
+        if self._capacity_buffers is not None:
+            return
+
+        self._use_prepared_capacity_buckets = False
+        if not self._supports_prepared_capacity_buckets():
+            return
+
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        requested_capacities = self._get_requested_capacity_buckets(deep_gemm)
+        if requested_capacities != (384, 768, 2048):
+            return
+
+        capacity_buffers: list[tuple[int, object]] = []
+        physical_capacities: list[int] = []
+        for requested_capacity in requested_capacities:
+            symm_buffer = self.get_symm_buffer(requested_capacity)
+            capacity_buffers.append((requested_capacity, symm_buffer))
+            physical_capacities.append(int(symm_buffer.num_max_tokens_per_rank))
+        if tuple(physical_capacities) != (384, 768, 2304):
+            return
+
+        for requested_capacity, symm_buffer in capacity_buffers:
+            self._prewarm_capacity_bucket(
+                requested_capacity,
+                symm_buffer,
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+        self._capacity_buffers = tuple(capacity_buffers)
+        self._use_prepared_capacity_buckets = True
+
     def get_symm_buffer_for_num_tokens(self, num_tokens: int):
         max_num_tokens_across_dp = self._get_max_num_tokens_across_dp(num_tokens)
         if max_num_tokens_across_dp > self.max_num_batched_tokens:
@@ -896,6 +1032,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 f"{max_num_tokens_across_dp} tokens across DP ranks, but "
                 "max_num_batched_tokens is "
                 f"{self.max_num_batched_tokens}."
+            )
+        if self._use_prepared_capacity_buckets:
+            if self._capacity_buffers is None:
+                raise RuntimeError(
+                    "DeepSeek V4 MegaMoE capacity buckets were not prepared "
+                    "during initialization."
+                )
+            for max_supported_tokens, symm_buffer in self._capacity_buffers:
+                if max_num_tokens_across_dp <= max_supported_tokens:
+                    return symm_buffer
+            raise AssertionError(
+                "Prepared MegaMoE capacity buckets do not cover the DP-wide "
+                f"token count {max_num_tokens_across_dp}."
             )
         if max_num_tokens_across_dp <= self.max_num_tokens:
             return self.get_symm_buffer()
@@ -1139,11 +1288,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         *,
         activation_clamp: float | None,
         fast_math: bool,
+        symm_buffer=None,
     ) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
-        symm_buffer = self.get_symm_buffer_for_num_tokens(hidden_states.shape[0])
+        if symm_buffer is None:
+            symm_buffer = self.get_symm_buffer_for_num_tokens(hidden_states.shape[0])
         # SM90 staging fills the full symmetric buffer (padded topk rows get
         # -1 / 0.0). routed_scaling_factor is already folded into topk_weights
         # by fused_topk_bias upstream, so pass 1.0 here to avoid double-apply.
@@ -1543,6 +1694,12 @@ class DeepseekV4MoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             self.experts.finalize_weights(self.shared_experts)
+            activation_clamp = (
+                float(self.swiglu_limit) if self.swiglu_limit is not None else None
+            )
+            self.experts.prepare_capacity_buckets(
+                activation_clamp=activation_clamp
+            )
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
