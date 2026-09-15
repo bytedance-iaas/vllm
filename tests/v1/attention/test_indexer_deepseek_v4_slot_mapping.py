@@ -11,6 +11,8 @@ from vllm.models.deepseek_v4.sparse_mla import DeepseekV4SparseMLABackend
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend as DeepseekV41SparseMLABackend,
 )
+from vllm.models.deepseek_v41.sparse_mla import dsv41_storage_block_size
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.compressor_utils import (
     CompressedSlotMappingKernel,
@@ -157,16 +159,35 @@ def test_indexer_shares_uncompressed_block_size_with_deepseek_v4_mla():
     )
 
 
-def test_indexer_preserves_deepseek_v41_mla_block_size():
-    """V4.1 retains its smaller pages independently of V4's C4 indexer."""
-    block_size = DeepseekV41SparseMLABackend.get_supported_kernel_block_sizes()[0]
-    assert isinstance(block_size, int)
-    assert (
-        select_common_block_size(
-            block_size, [DeepseekV41SparseMLABackend, DeepseekV41IndexerBackend]
-        )
-        == block_size
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_indexer_uses_64_state_pages_for_deepseek_v41_sm90(monkeypatch, compress_ratio):
+    """V4.1's mixed compression ratios use legal Hopper DeepGEMM pages."""
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: family == 90
     )
+
+    manager_block_size = DeepseekV41SparseMLABackend.get_preferred_block_size(16)
+    kernel_block_size = select_common_block_size(
+        manager_block_size,
+        [DeepseekV41SparseMLABackend, DeepseekV41IndexerBackend],
+    )
+    storage_block_size = dsv41_storage_block_size(compress_ratio)
+    spec = MLAAttentionSpec(
+        block_size=manager_block_size,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=compress_ratio,
+        storage_block_size=storage_block_size,
+    )
+
+    assert manager_block_size == 128
+    assert kernel_block_size == 64
+    assert storage_block_size == 64 * compress_ratio
+    assert spec.copy_with_new_block_size(storage_block_size).num_states == 64
+    assert compute_layer_kv_cache_shape_bytes(
+        spec, num_blocks=2, kernel_block_size=storage_block_size
+    )[:3] == (2 * (2 // compress_ratio), 1, 64)
 
 
 def test_indexer_warmup_normalizes_zero_compress_ratios():

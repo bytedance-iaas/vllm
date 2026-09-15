@@ -39,6 +39,15 @@ _V41_LAYER_TYPES: dict[int, str] = {
     2: _LAYER_TYPE_C2A,
 }
 
+_SM90_PAGED_MQA_STATES = 64
+
+
+def dsv41_storage_block_size(compress_ratio: int) -> int | None:
+    """Return the logical token span of one SM90 compressed-KV page."""
+    if current_platform.is_device_capability_family(90):
+        return _SM90_PAGED_MQA_STATES * compress_ratio
+    return None
+
 
 def deepseek_v41_layer_type(compress_ratio: int) -> str:
     layer_type = _V41_LAYER_TYPES.get(compress_ratio)
@@ -88,6 +97,15 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [64 if current_platform.is_device_capability_family(90) else 128]
+
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        if current_platform.is_device_capability_family(90):
+            # V4.1 has both ratio-1 and ratio-2 compressed caches. A 128-token
+            # manager block lets each use the 64-state pages required by the
+            # Hopper DeepGEMM paged-MQA kernel.
+            return 128
+        return super().get_preferred_block_size(default_block_size)
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
