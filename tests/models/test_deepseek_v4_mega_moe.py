@@ -22,6 +22,9 @@ from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import (
     prepare_megamoe_inputs_sm90,
 )
 from vllm.models.deepseek_v41.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
+from vllm.models.deepseek_v41.nvidia.model import (
+    DeepseekV4Model as DeepseekV41Model,
+)
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE as DeepseekV41MoE
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
@@ -30,6 +33,23 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="DeepSeek V4 MegaMoE requires CUDA",
 )
+
+
+def test_deepseek_v41_pp_intermediate_tensors_include_input_ids():
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    model.hc_mult = 4
+    model.config = SimpleNamespace(hidden_size=16)
+
+    tensors = model.make_empty_intermediate_tensors(
+        batch_size=8,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+    )
+
+    assert tensors["hidden_states"].shape == (8, 4, 16)
+    assert tensors["pre_mix"].shape == (8, 4)
+    assert tensors["input_ids"].shape == (8,)
+    assert tensors["input_ids"].dtype == torch.int64
 
 
 @pytest.fixture
