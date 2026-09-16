@@ -467,6 +467,27 @@ class TestDensePacking:
             list(g2),
         ]
 
+    def test_block_outer_stride_aligns_native_indexer_pages(self):
+        spec = MLAAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            tokens_per_state=1,
+            alignment=576,
+            kernel_page_rows=64,
+        )
+        groups = [KVCacheGroupSpec(["indexer"], spec)]
+        config = get_kv_cache_config_from_groups(
+            _mock_vllm_config("BLHNC"), groups, MEMORY
+        )
+        (tensor,) = config.kv_cache_tensors
+        native_page_bytes = 64 * spec.state_content_size_bytes
+
+        assert tensor.block_stride % native_page_bytes == 0
+        assert config.num_blocks == MEMORY // tensor.block_stride
+        assert tensor.size == config.num_blocks * tensor.block_stride
+
     def test_layers_within_a_group_are_dense(self):
         groups, _, _ = _mixed_page_groups()
         pages = _pages(groups)
