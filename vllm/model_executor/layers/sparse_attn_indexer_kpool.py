@@ -30,7 +30,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
-    kpool_page_geometry,
+    kpool_flat_page_view,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -237,24 +237,6 @@ def _gather_workspace_shapes(
     )
 
 
-def _kpool_flat_page_view(
-    kv_cache: torch.Tensor, page_rows: int | None
-) -> torch.Tensor:
-    """View manager blocks as native, stride-aware DeepGEMM pages."""
-    if kv_cache.ndim != 3:
-        return kv_cache
-    num_blocks, num_states, row = kv_cache.shape
-    page_states, pages_per_block, stride_pages = kpool_page_geometry(
-        num_states, kv_cache.stride(0) * kv_cache.element_size(), row, page_rows
-    )
-    if pages_per_block == 1:
-        return kv_cache
-    assert kv_cache.stride(1) == row and kv_cache.stride(2) == 1, kv_cache.stride()
-    page_bytes = page_states * row
-    num_pages = (num_blocks - 1) * stride_pages + pages_per_block
-    return kv_cache.as_strided((num_pages, page_states, row), (page_bytes, row, 1))
-
-
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -352,7 +334,7 @@ def sparse_attn_indexer_kpool(
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     # Metadata expresses slot IDs and block tables in native DeepGEMM pages.
     # Re-page the physical cache view before any read or write consumes them.
-    kv_cache = _kpool_flat_page_view(kv_cache, attn_metadata_narrowed.kernel_page_rows)
+    kv_cache = kpool_flat_page_view(kv_cache, attn_metadata_narrowed.kernel_page_rows)
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0

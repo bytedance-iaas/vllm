@@ -288,6 +288,22 @@ def kpool_page_geometry(
     return page_rows, pages_per_block, block_stride_bytes // page_bytes
 
 
+def kpool_flat_page_view(kv_cache: torch.Tensor, page_rows: int | None) -> torch.Tensor:
+    """View manager blocks as native, stride-aware DeepGEMM pages."""
+    if kv_cache.ndim != 3:
+        return kv_cache
+    num_blocks, num_states, row = kv_cache.shape
+    page_states, pages_per_block, stride_pages = kpool_page_geometry(
+        num_states, kv_cache.stride(0) * kv_cache.element_size(), row, page_rows
+    )
+    if pages_per_block == 1:
+        return kv_cache
+    assert kv_cache.stride(1) == row and kv_cache.stride(2) == 1, kv_cache.stride()
+    page_bytes = page_states * row
+    num_pages = (num_blocks - 1) * stride_pages + pages_per_block
+    return kv_cache.as_strided((num_pages, page_states, row), (page_bytes, row, 1))
+
+
 @dataclass(frozen=True)
 class PCPGlobalChunkPlan:
     """PCP packing for one indexer prefill chunk under PCP + DCP."""

@@ -62,6 +62,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV41IndexerBackend,
     dsa_indexer_uses_fp4,
     get_max_prefill_buffer_size,
+    kpool_flat_page_view,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (
@@ -1148,13 +1149,16 @@ class DeepseekV4Indexer(nn.Module):
         # non-boundary tokens hold garbage latent and are skipped by the
         # store kernel.
         k_pre, _ = self.wk(latent)
+        indexer_cache = kpool_flat_page_view(
+            self.k_cache.kv_cache, indexer_metadata.kernel_page_rows
+        )
         indexer_k_norm_rope_store(
             k_pre,
             positions,
             rotary_emb.cos_sin_cache,
             self.k_norm.weight,
             self.k_norm.variance_epsilon,
-            self.k_cache.kv_cache,
+            indexer_cache,
             indexer_metadata.slot_mapping,
             self.compress_ratio,
             self.use_fp4_kv,

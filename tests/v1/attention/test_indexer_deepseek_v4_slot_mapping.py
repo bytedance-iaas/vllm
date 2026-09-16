@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     DeepseekV32IndexerMetadataBuilder,
     DeepseekV41IndexerBackend,
+    kpool_flat_page_view,
     kpool_page_geometry,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -203,11 +204,6 @@ def test_indexer_uses_64_state_pages_for_deepseek_v41_sm90(monkeypatch, compress
 
 def test_indexer_repaging_preserves_padded_manager_block_stride():
     """The ratio-1 page view must skip alignment padding between blocks."""
-    import vllm.models.glm5next.nvidia.attention  # noqa: F401
-    from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
-        _kpool_flat_page_view,
-    )
-
     spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
@@ -232,7 +228,7 @@ def test_indexer_repaging_preserves_padded_manager_block_stride():
         1
     )
 
-    pages = _kpool_flat_page_view(cache, spec.kernel_page_rows)
+    pages = kpool_flat_page_view(cache, spec.kernel_page_rows)
 
     stride_pages = block_stride // page_bytes
     assert pages.shape == ((3 - 1) * stride_pages + 2, 64, 132)
