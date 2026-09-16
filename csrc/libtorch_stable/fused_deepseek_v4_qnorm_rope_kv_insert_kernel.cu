@@ -1057,7 +1057,7 @@ void fused_deepseek_v4_kv_rope_insert(
     vllm::deepseek_v4_fused_ops::launchFusedDeepseekV4Templated<scalar_t, 0, false>(
         nullptr, nullptr, input, cache, slots, positions, cos_sin, 0.0f,
         num_tokens, num_tokens, 0, static_cast<int>(cache_block_size),
-        static_cast<int>(k_cache.stride(0)), stream);
+        static_cast<int>(k_cache.stride(0)), false, stream);
   } else if (fp8) {
     vllm::deepseek_v4_fused_ops::launchFullCacheKernel<scalar_t, false, true>(
         nullptr, nullptr, 0, 0, input, cache, slots, positions, cos_sin,
