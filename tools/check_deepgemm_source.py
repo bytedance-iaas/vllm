@@ -3,6 +3,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Statically validate DeepGEMM's DeepSeek V4 SM90 MegaMoE contract."""
 
+from __future__ import annotations
+
 import argparse
 import ast
 import re

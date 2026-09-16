@@ -2,9 +2,9 @@ include(FetchContent)
 
 # Keep these defaults in sync with tools/install_deepgemm.sh and
 # docker/Dockerfile.
-set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
+set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/wangyicong52/DeepGEMM.git")
 set(_DEEPGEMM_UPSTREAM_COMMIT
-  "ad1f1726aa540a76c1d26d6a120effb8de21eaa4")
+  "c7cef8dbec78b8043833521d7599dc7f03b69df0")
 
 # If DEEPGEMM_SRC_DIR is set, DeepGEMM is built from that directory
 # instead of downloading.
@@ -21,7 +21,7 @@ set(DEEPGEMM_GIT_REPOSITORY "" CACHE STRING
   "Override DeepGEMM git repository (requires DEEPGEMM_GIT_COMMIT)")
 set(DEEPGEMM_GIT_COMMIT "" CACHE STRING
   "Override DeepGEMM exact 40-character git commit")
-set(DEEPGEMM_REQUIRE_SM90_MEGA_MOE OFF CACHE BOOL
+set(DEEPGEMM_REQUIRE_SM90_MEGA_MOE ON CACHE BOOL
   "Require DeepGEMM's SM90 MegaMoE source API contract")
 foreach(_deepgemm_env_var IN ITEMS
     DEEPGEMM_GIT_REPOSITORY
@@ -135,7 +135,7 @@ else()
       BINARY_DIR "${_deepgemm_bin}"
       GIT_REPOSITORY "${_deepgemm_git_repo}"
       GIT_TAG "${_deepgemm_git_commit}"
-      GIT_SUBMODULES "third-party/cutlass" "third-party/deep_jit"
+      GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
       GIT_PROGRESS TRUE
     )
   endif()
@@ -234,15 +234,15 @@ if(DEEPGEMM_ARCHS)
   message(STATUS "DeepGEMM _C will be built for: ${_dg_pythons}")
 
   # add_custom_command does no implicit header scanning; glob explicitly so
-  # header-only edits in DeepGEMM/cutlass/deep_jit re-trigger the rebuild.
+  # header-only edits in DeepGEMM/cutlass/fmt re-trigger the rebuild.
   file(GLOB_RECURSE _dg_headers
     "${deepgemm_SOURCE_DIR}/csrc/*.h"
     "${deepgemm_SOURCE_DIR}/csrc/*.hpp"
     "${deepgemm_SOURCE_DIR}/deep_gemm/include/*.h"
     "${deepgemm_SOURCE_DIR}/deep_gemm/include/*.hpp"
     "${deepgemm_SOURCE_DIR}/deep_gemm/include/*.cuh"
-    "${deepgemm_SOURCE_DIR}/third-party/deep_jit/include/*.h"
-    "${deepgemm_SOURCE_DIR}/third-party/deep_jit/include/*.hpp")
+    "${deepgemm_SOURCE_DIR}/third-party/fmt/include/*.h"
+    "${deepgemm_SOURCE_DIR}/third-party/fmt/include/*.hpp")
 
   set(_dg_markers)
   set(_dg_seen_soabis)

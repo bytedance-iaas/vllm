@@ -7,11 +7,10 @@ set -e
 # Default values
 # Keep these defaults in sync with cmake/external_projects/deepgemm.cmake and
 # docker/Dockerfile.
-DEEPGEMM_GIT_REPO="${DEEPGEMM_GIT_REPOSITORY:-https://github.com/vllm-project/DeepGEMM.git}"
-# NOTE: This targets the vLLM fork's dev branch tip, which carries the sm120
-# and sm90 paged-MQA ports plus the SwiGLU alpha/beta and SiTU Mega MoE
-# activations.
-DEEPGEMM_GIT_REF="${DEEPGEMM_GIT_COMMIT:-ad1f1726aa540a76c1d26d6a120effb8de21eaa4}"
+DEEPGEMM_GIT_REPO="${DEEPGEMM_GIT_REPOSITORY:-https://github.com/wangyicong52/DeepGEMM.git}"
+# NOTE: This targets wyc/vllm-mega-moe, which carries the SM90 MegaMoE APIs
+# needed by DeepSeek-V4.1 Flash plus the paged-MQA indexer APIs used by vLLM.
+DEEPGEMM_GIT_REF="${DEEPGEMM_GIT_COMMIT:-c7cef8dbec78b8043833521d7599dc7f03b69df0}"
 WHEEL_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -117,7 +116,7 @@ if [ "$ACTUAL_COMMIT" != "$DEEPGEMM_GIT_REF" ]; then
 fi
 git submodule update --init --recursive --depth=1
 
-case "${DEEPGEMM_REQUIRE_SM90_MEGA_MOE:-0}" in
+case "${DEEPGEMM_REQUIRE_SM90_MEGA_MOE:-1}" in
     1|ON|on|TRUE|true|YES|yes)
         python3 "$SCRIPT_DIR/check_deepgemm_source.py" "$PWD"
         ;;
