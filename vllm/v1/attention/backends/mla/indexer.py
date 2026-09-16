@@ -39,6 +39,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.mla.sparse_utils import request_row_bounds
 from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
@@ -1105,6 +1106,59 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.global_decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = 0
         return self.global_decode_seq_lens_buffer[:num_decode_tokens]
 
+    def _prepare_paged_mqa_metadata_seq_lens(
+        self,
+        seq_lens: torch.Tensor,
+        dummy_decode_mask: torch.Tensor | None,
+        num_decode_tokens: int,
+        seq_lens_is_buffer_view: bool,
+    ) -> torch.Tensor:
+        """Keep paged-MQA metadata inputs valid and capture-stable.
+
+        FULL CUDA-graph capture uses synthetic short requests. V4/V4.1 cache
+        compression can map those positive request lengths to zero, which the
+        DeepGEMM metadata kernel does not accept. Capture metadata is never used
+        for real KV bounds, so give every captured row the smallest valid
+        length. During normal execution, only graph-padding rows are rewritten;
+        a real short request that legitimately compresses to zero stays zero.
+        """
+        if not seq_lens_is_buffer_view:
+            self.decode_seq_lens_buffer[:num_decode_tokens].copy_(seq_lens)
+            seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
+
+        if dummy_decode_mask is None:
+            seq_lens.fill_(1)
+        else:
+            seq_lens.masked_fill_(dummy_decode_mask, 1)
+        return seq_lens
+
+    @staticmethod
+    def _paged_mqa_dummy_decode_mask(
+        slot_mapping: torch.Tensor,
+        seq_lens: torch.Tensor,
+        for_cudagraph_capture: bool,
+    ) -> torch.Tensor | None:
+        """Identify dummy token rows before indexer-cache compression.
+
+        FULL capture uses the dedicated builder path and all rows are dummy.
+        Breakable PIECEWISE capture deliberately uses the normal builder path,
+        but its token-aligned slot mapping is padded with PAD_SLOT_ID. Runtime
+        rows with a real KV slot must remain distinguishable from short requests
+        whose compressed indexer context is legitimately zero.
+        """
+        if for_cudagraph_capture:
+            return None
+        return (slot_mapping[: seq_lens.numel()] == PAD_SLOT_ID).view_as(seq_lens)
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> DeepseekV32IndexerMetadata:
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            for_cudagraph_capture=True,
+        )
+
     def _split_pcp_dcp_prefill_chunks(
         self,
         row_req_idx: np.ndarray,
@@ -1209,6 +1263,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        *,
+        for_cudagraph_capture: bool = False,
     ) -> DeepseekV32IndexerMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
@@ -1466,6 +1522,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                 )
 
+            dummy_decode_mask = self._paged_mqa_dummy_decode_mask(
+                slot_mapping,
+                seq_lens,
+                for_cudagraph_capture,
+            )
+
             _, pages_per_block, _ = self._page_geometry()
             if pages_per_block > 1:
                 _, paged = self._indexer_page_table(block_table)
@@ -1495,14 +1557,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # compressed tokens. Convert uncompressed seq_lens to compressed.
             if self.compress_ratio > 1:
                 if seq_lens_is_buffer_view:
-                    seq_lens //= self.compress_ratio
+                    if for_cudagraph_capture:
+                        seq_lens.fill_(1)
+                    else:
+                        seq_lens //= self.compress_ratio
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
-                    self.expanded_seq_lens_buffer[:num_decodes] = (
-                        seq_lens // self.compress_ratio
-                    )
-                    self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
+                    if for_cudagraph_capture:
+                        self.expanded_seq_lens_buffer[:num_decode_tokens] = 1
+                    else:
+                        self.expanded_seq_lens_buffer[:num_decodes] = (
+                            seq_lens // self.compress_ratio
+                        )
+                        self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+
+            seq_lens = self._prepare_paged_mqa_metadata_seq_lens(
+                seq_lens=seq_lens,
+                dummy_decode_mask=dummy_decode_mask,
+                num_decode_tokens=num_decode_tokens,
+                seq_lens_is_buffer_view=seq_lens_is_buffer_view,
+            )
 
             # Non-MTP: deep_gemm paged MQA logits requires 2D context_lens
             # (csrc/apis/attention.hpp). Unsqueeze to (B, 1) so downstream

@@ -90,6 +90,10 @@ def inv_rope_bf16_o_proj(
         and wo_a_weight.shape[0] // o_lora_rank == wo_a_groups
     ):
         grouped_weight = wo_a_weight.reshape(wo_a_groups, o_lora_rank, wo_a_input_size)
+        if wo_a_groups == 1:
+            return torch.nn.functional.linear(
+                wo_a_input.squeeze(1), grouped_weight.squeeze(0)
+            ).unsqueeze(1)
         return torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
 
     return maybe_unpack_linear_output(wo_a(wo_a_input))

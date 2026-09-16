@@ -165,6 +165,30 @@ def test_inv_rope_bf16_o_proj_reshapes_flat_grouped_weight():
     torch.testing.assert_close(out, expected)
 
 
+def test_inv_rope_bf16_o_proj_single_group_avoids_batched_einsum(monkeypatch):
+    o = torch.randn(40, 1, 4, dtype=torch.bfloat16)
+    weight = FakeSingleGroupWoA()
+
+    def fail_if_einsum_is_used(*args, **kwargs):
+        raise AssertionError("single-group projection must not use batched einsum")
+
+    monkeypatch.setattr(torch, "einsum", fail_if_einsum_is_used)
+    out = inv_rope_bf16_o_proj(
+        o,
+        torch.zeros(40, dtype=torch.long),
+        torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        weight,
+        n_groups=1,
+        heads_per_group=1,
+        nope_dim=2,
+        rope_dim=2,
+        o_lora_rank=2,
+    )
+
+    expected = torch.nn.functional.linear(o, weight.weight)
+    torch.testing.assert_close(out, expected)
+
+
 class FakeWoB(nn.Module):
     def __init__(self):
         super().__init__()

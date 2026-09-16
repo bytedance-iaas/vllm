@@ -338,6 +338,136 @@ def test_ratio2_indexer_page_table_remains_manager_block_table():
     assert pages is block_table
 
 
+def _make_paged_mqa_seq_lens_builder(capacity: int = 8):
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.decode_seq_lens_buffer = torch.zeros(capacity, dtype=torch.int32)
+    return builder
+
+
+def test_indexer_cudagraph_builder_selects_capture_metadata_path(monkeypatch):
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    common = object()
+    calls = []
+
+    def fake_build(*, common_prefix_len, common_attn_metadata, for_cudagraph_capture):
+        calls.append((common_prefix_len, common_attn_metadata, for_cudagraph_capture))
+        return "metadata"
+
+    monkeypatch.setattr(builder, "build", fake_build)
+
+    assert builder.build_for_cudagraph_capture(common) == "metadata"
+    assert calls == [(0, common, True)]
+
+
+def test_paged_mqa_dummy_mask_distinguishes_full_and_piecewise_capture():
+    slot_mapping = torch.tensor([-1, 7, -1, 9], dtype=torch.int64)
+
+    assert (
+        DeepseekV32IndexerMetadataBuilder._paged_mqa_dummy_decode_mask(
+            slot_mapping,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+            for_cudagraph_capture=True,
+        )
+        is None
+    )
+    torch.testing.assert_close(
+        DeepseekV32IndexerMetadataBuilder._paged_mqa_dummy_decode_mask(
+            slot_mapping,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+            for_cudagraph_capture=False,
+        ),
+        torch.tensor([True, False, True, False]),
+    )
+
+
+def test_paged_mqa_piecewise_padding_keeps_real_compressed_zero():
+    builder = _make_paged_mqa_seq_lens_builder()
+    source = torch.tensor([0, 0, 2, 5], dtype=torch.int32)
+    slot_mapping = torch.tensor([-1, 7, 8, 9], dtype=torch.int64)
+    padding = builder._paged_mqa_dummy_decode_mask(
+        slot_mapping,
+        seq_lens=source,
+        for_cudagraph_capture=False,
+    )
+
+    result = builder._prepare_paged_mqa_metadata_seq_lens(
+        seq_lens=source,
+        dummy_decode_mask=padding,
+        num_decode_tokens=source.numel(),
+        seq_lens_is_buffer_view=False,
+    )
+
+    torch.testing.assert_close(result, torch.tensor([1, 0, 2, 5], dtype=torch.int32))
+
+
+def test_paged_mqa_dummy_mask_preserves_native_spec_decode_shape():
+    seq_lens = torch.zeros((2, 3), dtype=torch.int32)
+    slot_mapping = torch.tensor([-1, 4, 5, -1, -1, 8], dtype=torch.int64)
+
+    mask = DeepseekV32IndexerMetadataBuilder._paged_mqa_dummy_decode_mask(
+        slot_mapping,
+        seq_lens=seq_lens,
+        for_cudagraph_capture=False,
+    )
+
+    assert mask is not None
+    assert mask.shape == seq_lens.shape
+    torch.testing.assert_close(
+        mask,
+        torch.tensor([[True, False, False], [True, True, False]]),
+    )
+
+
+def test_paged_mqa_capture_seq_lens_are_positive_and_buffer_stable():
+    builder = _make_paged_mqa_seq_lens_builder()
+    source = torch.tensor([0, 3, 0, 7], dtype=torch.int32)
+
+    result = builder._prepare_paged_mqa_metadata_seq_lens(
+        seq_lens=source,
+        dummy_decode_mask=None,
+        num_decode_tokens=source.numel(),
+        seq_lens_is_buffer_view=False,
+    )
+
+    assert result.data_ptr() == builder.decode_seq_lens_buffer.data_ptr()
+    torch.testing.assert_close(result, torch.ones_like(source))
+    torch.testing.assert_close(source, torch.tensor([0, 3, 0, 7], dtype=torch.int32))
+
+
+def test_paged_mqa_runtime_seq_lens_only_rewrite_padding_rows():
+    builder = _make_paged_mqa_seq_lens_builder()
+    source = torch.tensor([0, 0, 2, 5], dtype=torch.int32)
+    padding = torch.tensor([True, False, False, False])
+
+    result = builder._prepare_paged_mqa_metadata_seq_lens(
+        seq_lens=source,
+        dummy_decode_mask=padding,
+        num_decode_tokens=source.numel(),
+        seq_lens_is_buffer_view=False,
+    )
+
+    # The first zero is graph padding; the second is a real short request that
+    # legitimately has zero compressed indexer states.
+    torch.testing.assert_close(result, torch.tensor([1, 0, 2, 5], dtype=torch.int32))
+    torch.testing.assert_close(source, torch.tensor([0, 0, 2, 5], dtype=torch.int32))
+
+
+def test_paged_mqa_capture_reuses_existing_buffer_view():
+    builder = _make_paged_mqa_seq_lens_builder()
+    source = builder.decode_seq_lens_buffer[:4]
+    source.copy_(torch.tensor([0, 3, 0, 7], dtype=torch.int32))
+
+    result = builder._prepare_paged_mqa_metadata_seq_lens(
+        seq_lens=source,
+        dummy_decode_mask=None,
+        num_decode_tokens=source.numel(),
+        seq_lens_is_buffer_view=True,
+    )
+
+    assert result.data_ptr() == source.data_ptr()
+    torch.testing.assert_close(result, torch.ones_like(source))
+
+
 def test_indexer_warmup_normalizes_zero_compress_ratios():
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
