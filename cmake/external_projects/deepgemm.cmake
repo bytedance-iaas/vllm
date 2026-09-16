@@ -2,9 +2,9 @@ include(FetchContent)
 
 # Keep these defaults in sync with tools/install_deepgemm.sh and
 # docker/Dockerfile.
-set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
+set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/wangyicong52/DeepGEMM.git")
 set(_DEEPGEMM_UPSTREAM_COMMIT
-  "ad1f1726aa540a76c1d26d6a120effb8de21eaa4")
+  "f30757f9fa7523c365a27aedb723c322e4f37408")
 
 # If DEEPGEMM_SRC_DIR is set, DeepGEMM is built from that directory
 # instead of downloading.
@@ -21,7 +21,7 @@ set(DEEPGEMM_GIT_REPOSITORY "" CACHE STRING
   "Override DeepGEMM git repository (requires DEEPGEMM_GIT_COMMIT)")
 set(DEEPGEMM_GIT_COMMIT "" CACHE STRING
   "Override DeepGEMM exact 40-character git commit")
-set(DEEPGEMM_REQUIRE_SM90_MEGA_MOE OFF CACHE BOOL
+set(DEEPGEMM_REQUIRE_SM90_MEGA_MOE ON CACHE BOOL
   "Require DeepGEMM's SM90 MegaMoE source API contract")
 foreach(_deepgemm_env_var IN ITEMS
     DEEPGEMM_GIT_REPOSITORY
