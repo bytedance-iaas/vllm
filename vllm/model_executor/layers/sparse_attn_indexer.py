@@ -43,6 +43,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+    kpool_flat_page_view,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
@@ -318,6 +319,17 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def indexer_kv_cache_as_quant_view(
+    kv_cache: torch.Tensor,
+    head_dim: int,
+    use_fp4_cache: bool,
+    kernel_page_rows: int | None,
+) -> torch.Tensor:
+    """Match the cache view to the metadata builder's native page ids."""
+    kv_cache = kpool_flat_page_view(kv_cache, kernel_page_rows)
+    return kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -413,6 +425,15 @@ def sparse_attn_indexer(
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+    # The metadata builder expands manager-block ids into native DeepGEMM page
+    # ids. Present the cache with the matching page geometry before either the
+    # generic write path or the paged decode read consumes those ids.
+    kv_cache = indexer_kv_cache_as_quant_view(
+        kv_cache,
+        head_dim,
+        use_fp4_cache,
+        attn_metadata_narrowed.kernel_page_rows,
+    )
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
@@ -641,7 +662,6 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
-        kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if num_decode_tokens == 0:
             padded_q_quant_decode_tokens = q_quant[:1].reshape(1, 1, *q_quant.shape[1:])

@@ -7,6 +7,9 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import create_vllm_config
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    indexer_kv_cache_as_quant_view,
+)
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4SparseMLABackend
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend as DeepseekV41SparseMLABackend,
@@ -236,6 +239,23 @@ def test_indexer_repaging_preserves_padded_manager_block_stride():
         for page in range(2):
             torch.testing.assert_close(
                 pages[block * stride_pages + page],
+                cache[block, page * 64 : (page + 1) * 64],
+            )
+
+
+def test_sparse_indexer_quant_view_uses_native_page_rows():
+    raw = torch.arange(3 * 5 * 64 * 132, dtype=torch.int32).to(torch.uint8)
+    cache = raw.as_strided((3, 128, 132), (5 * 64 * 132, 132, 1))
+
+    quant_view = indexer_kv_cache_as_quant_view(
+        cache, head_dim=128, use_fp4_cache=False, kernel_page_rows=64
+    )
+
+    assert quant_view.shape == (12, 64, 1, 132)
+    for block in range(3):
+        for page in range(2):
+            torch.testing.assert_close(
+                quant_view[block * 5 + page, :, 0],
                 cache[block, page * 64 : (page + 1) * 64],
             )
 
