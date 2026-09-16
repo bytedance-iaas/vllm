@@ -85,26 +85,34 @@ def test_mtp_style_drafter_is_left_alone_under_pp(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "method,pp_size,is_last_rank,expected",
+    "method,pp_size,is_last_rank,prefill_only,expected",
     [
-        ("eagle", 2, True, True),
-        ("eagle3", 2, True, True),
-        ("dflash", 2, True, True),
-        ("dspark", 2, True, True),
-        ("eagle3", 1, True, False),
-        ("eagle3", 2, False, False),
-        ("mtp", 2, True, False),
-        (None, 2, True, False),
+        ("eagle", 2, True, False, True),
+        ("eagle3", 2, True, False, True),
+        ("dflash", 2, True, False, True),
+        ("dspark", 2, True, False, True),
+        ("dspark", 2, True, True, False),
+        ("eagle3", 1, True, False, False),
+        ("eagle3", 2, False, False, False),
+        ("mtp", 2, True, False, False),
+        (None, 2, True, False, False),
     ],
 )
 def test_target_embedding_provisioning(
-    monkeypatch, method, pp_size, is_last_rank, expected
+    monkeypatch, method, pp_size, is_last_rank, prefill_only, expected
 ):
     monkeypatch.setattr(
         "vllm.distributed.parallel_state.get_pp_group",
         _fake_pp(pp_size, is_last_rank),
         raising=True,
     )
-    speculative_config = None if method is None else SimpleNamespace(method=method)
+    speculative_config = (
+        None
+        if method is None
+        else SimpleNamespace(
+            method=method,
+            is_dspark_prefill_only=lambda: prefill_only,
+        )
+    )
     config = SimpleNamespace(speculative_config=speculative_config)
     assert spec_decode_needs_target_embed(config) is expected

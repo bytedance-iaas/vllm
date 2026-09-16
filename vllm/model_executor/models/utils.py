@@ -848,6 +848,11 @@ def spec_decode_needs_target_embed(vllm_config: VllmConfig) -> bool:
         "dspark",
     ):
         return False
+    if (
+        speculative_config.method == "dspark"
+        and speculative_config.is_dspark_prefill_only()
+    ):
+        return False
     pp = get_pp_group()
     return pp.world_size > 1 and pp.is_last_rank
 
