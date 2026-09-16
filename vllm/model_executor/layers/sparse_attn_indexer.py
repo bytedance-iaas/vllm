@@ -319,15 +319,11 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-def indexer_kv_cache_as_quant_view(
-    kv_cache: torch.Tensor,
-    head_dim: int,
-    use_fp4_cache: bool,
-    kernel_page_rows: int | None,
+def indexer_kv_cache_page_view(
+    kv_cache: torch.Tensor, kernel_page_rows: int | None
 ) -> torch.Tensor:
-    """Match the cache view to the metadata builder's native page ids."""
-    kv_cache = kpool_flat_page_view(kv_cache, kernel_page_rows)
-    return kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
+    """Match the 3D cache view to the metadata builder's native page ids."""
+    return kpool_flat_page_view(kv_cache, kernel_page_rows)
 
 
 @eager_break_during_capture
@@ -428,11 +424,8 @@ def sparse_attn_indexer(
     # The metadata builder expands manager-block ids into native DeepGEMM page
     # ids. Present the cache with the matching page geometry before either the
     # generic write path or the paged decode read consumes those ids.
-    kv_cache = indexer_kv_cache_as_quant_view(
-        kv_cache,
-        head_dim,
-        use_fp4_cache,
-        attn_metadata_narrowed.kernel_page_rows,
+    kv_cache = indexer_kv_cache_page_view(
+        kv_cache, attn_metadata_narrowed.kernel_page_rows
     )
     slot_mapping = attn_metadata_narrowed.slot_mapping
     has_decode = attn_metadata_narrowed.num_decodes > 0
@@ -662,6 +655,7 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
+        kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if num_decode_tokens == 0:
             padded_q_quant_decode_tokens = q_quant[:1].reshape(1, 1, *q_quant.shape[1:])
