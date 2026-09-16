@@ -303,45 +303,27 @@ class DFlashSpeculator(DraftModelSpeculator):
         return None
 
     @torch.inference_mode()
-    def propose(
+    def materialize_context_kv(
         self,
         input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        # [num_tokens, hidden_size]
         last_hidden_states: torch.Tensor,
-        # num_layers x [num_tokens, hidden_size]
         aux_hidden_states: list[torch.Tensor] | None,
-        # [num_reqs]
         num_sampled: torch.Tensor,
-        # [num_reqs]
         num_rejected: torch.Tensor,
-        # [max_num_reqs]
         last_sampled: torch.Tensor,
-        # [max_num_reqs]
         next_prefill_tokens: torch.Tensor,
-        # [max_num_reqs]
         temperature: torch.Tensor,
-        # [max_num_reqs]
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
-        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
-        is_profile: bool = False,
-    ) -> torch.Tensor:
+    ) -> None:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
-        num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
-        # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
-        # number of rejected tokens, we maintain the size of input_ids and
-        # hidden_states the same as the target model's. This means, we pad each
-        # request's query length to include any rejected positions.
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)
@@ -358,28 +340,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
-            # DFlash processes all speculative tokens in one forward pass,
-            # so the real token count is num_query_tokens.
-            self._prepare_eplb_forward(num_query_tokens)
-            self._generate_draft(
-                num_reqs,
-                num_query_tokens,
-                attn_metadata=None,
-                slot_mappings=None,
-                num_tokens_across_dp=None,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            )
-            return self.draft_tokens[:num_reqs]
+            return
 
         if self.pcp_manager is not None and not dummy_run:
             self.block_tables.gather_block_tables(
                 input_batch.idx_mapping, num_reqs_padded=num_reqs
             )
 
-        # The query slot mapping is written into the shared BlockTables slot_mappings.
-        # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(
                 self.input_buffers,
@@ -442,6 +410,64 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.model.precompute_and_store_context_kv(
             context_hidden, context_positions, context_slots
         )
+
+    @torch.inference_mode()
+    def propose(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        # [num_tokens, hidden_size]
+        last_hidden_states: torch.Tensor,
+        # num_layers x [num_tokens, hidden_size]
+        aux_hidden_states: list[torch.Tensor] | None,
+        # [num_reqs]
+        num_sampled: torch.Tensor,
+        # [num_reqs]
+        num_rejected: torch.Tensor,
+        # [max_num_reqs]
+        last_sampled: torch.Tensor,
+        # [max_num_reqs]
+        next_prefill_tokens: torch.Tensor,
+        # [max_num_reqs]
+        temperature: torch.Tensor,
+        # [max_num_reqs]
+        seeds: torch.Tensor,
+        dp_sync: DPSyncState | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
+    ) -> torch.Tensor:
+        num_reqs = input_batch.num_reqs
+        num_query_tokens = num_reqs * self.num_query_per_req
+        self.materialize_context_kv(
+            input_batch,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+        )
+
+        if dummy_run and skip_attn_for_dummy_run:
+            # Memory profiling path: block tables / KV cache are not initialized.
+            self._prepare_eplb_forward(num_query_tokens)
+            self._generate_draft(
+                num_reqs,
+                num_query_tokens,
+                attn_metadata=None,
+                slot_mappings=None,
+                # The target's DP counts describe a different token shape.
+                num_tokens_across_dp=None,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+            return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)

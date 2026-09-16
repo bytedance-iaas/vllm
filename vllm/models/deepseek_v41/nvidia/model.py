@@ -57,6 +57,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -557,6 +558,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -620,7 +623,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -718,8 +721,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
 
         spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
+        needs_mtp_hidden_states = (
+            spec_config is not None
+            and (spec_config.use_eagle() or spec_config.uses_draft_model())
+            and not spec_config.is_dspark_prefill_only()
         )
         if get_pp_group().is_last_rank and needs_mtp_hidden_states:
             self._mtp_hidden_buffer = torch.empty(
@@ -856,6 +861,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
             range(self.start_layer, self.decoder_replay_start),
@@ -899,7 +905,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                {
+                    "hidden_states": hidden_states,
+                    "pre_mix": pre_mix,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
 
         # MTP needs full HC states; otherwise collapse and normalize locally
@@ -920,6 +930,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
