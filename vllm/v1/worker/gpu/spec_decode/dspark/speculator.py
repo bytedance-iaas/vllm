@@ -86,6 +86,11 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_model_config.hf_config, "dspark_draft_topk", None
         )
 
+        self.enable_adaptive_verification = (
+            self.speculative_config.enable_adaptive_verification
+            and not self.speculative_config.is_dspark_prefill_only()
+        )
+        self.use_acceptance_estimator = self.enable_adaptive_verification
         self.use_confidence_head: bool = False
 
     def load_draft_model(
@@ -112,7 +117,7 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         self.use_confidence_head = (
             self.enable_adaptive_verification
-            and model.model.confidence_head is not None
+            and getattr(model.model, "confidence_head", None) is not None
         )
         if self.use_confidence_head:
             # The acceptance estimator is not needed when a trained confidence head

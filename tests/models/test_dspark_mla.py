@@ -335,3 +335,126 @@ def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     assert torch.equal(calls[1][1], stacked_output.view(2, 3, 4)[:, 2] + 2)
     assert calls[0][3] is slot_mappings[0]
     assert calls[1][3] is slot_mappings[2]
+
+
+@pytest.mark.cpu_test
+def test_v41_dspark_prefill_only_builds_context_kv_modules(monkeypatch):
+    from vllm.models.deepseek_v41.nvidia import dspark
+
+    class DummyModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class DummyAttention(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.fused_wqa_wkv = DummyModule()
+            self.kv_norm = DummyModule()
+            self.rotary_emb = DummyModule()
+            self.swa_cache_layer = DummyModule()
+            self.unused_projection = DummyModule()
+            self.q_lora_rank = 4
+            self.n_local_heads = 2
+            self.head_dim = 8
+            self.padded_heads = 4
+            self.eps = 1e-6
+            self.kv_mxfp8 = True
+
+    def fail_full_model(*args, **kwargs):
+        raise AssertionError("prefill-only DSpark must not build decode modules")
+
+    config = SimpleNamespace(
+        hidden_size=16,
+        hc_mult=4,
+        hc_eps=1e-6,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=40,
+        dspark_target_layer_ids=[37, 38, 39],
+        num_nextn_predict_layers=3,
+        index_topk=2048,
+    )
+    speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(hf_config=config),
+        is_dspark_prefill_only=lambda: True,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        quant_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+
+    monkeypatch.setattr(dspark, "_use_sequence_parallel", lambda _: False)
+    monkeypatch.setattr(dspark, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(dspark, "ReplicatedLinear", DummyModule)
+    monkeypatch.setattr(dspark, "RMSNorm", DummyModule)
+    monkeypatch.setattr(dspark, "_select_dsv4_attn_cls", lambda _: DummyAttention)
+    monkeypatch.setattr(dspark, "VocabParallelEmbedding", fail_full_model)
+    monkeypatch.setattr(dspark, "DeepseekV4DecoderLayer", fail_full_model)
+    monkeypatch.setattr(dspark, "DSparkMarkovHead", fail_full_model)
+
+    model = dspark.DSparkDeepseekV4Model(vllm_config=vllm_config, prefix="model")
+
+    assert model.context_kv_only
+    assert len(model.layers) == 3
+    assert not hasattr(model, "embed_tokens")
+    assert not hasattr(model, "norm")
+    for layer in model.layers:
+        assert set(dict(layer.attn.named_children())) == {
+            "fused_wqa_wkv",
+            "kv_norm",
+            "rotary_emb",
+            "swa_cache_layer",
+        }
+
+
+@pytest.mark.cpu_test
+def test_v41_dspark_prefill_only_loads_only_context_weights():
+    from vllm.models.deepseek_v41.nvidia import dspark
+
+    loaded_calls = []
+
+    def parameter(name):
+        value = nn.Parameter(torch.empty(1), requires_grad=False)
+
+        def load_weight(param, weight, *args):
+            loaded_calls.append((name, args))
+            param.copy_(weight)
+
+        value.weight_loader = load_weight
+        return value
+
+    params = {
+        "model.main_proj.weight_scale": parameter("main_proj"),
+        "model.main_norm.weight": parameter("main_norm"),
+        "model.layers.0.attn.fused_wqa_wkv.weight": parameter("fused_wqa_wkv"),
+        "model.layers.0.attn.kv_norm.weight": parameter("kv_norm"),
+    }
+    draft = SimpleNamespace(
+        linear_scale_name="weight_scale",
+        model=SimpleNamespace(context_kv_only=True),
+        named_parameters=lambda: params.items(),
+    )
+    draft._remap_dspark_name = lambda name: (
+        dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
+    )
+    weights = [
+        ("mtp.0.main_proj.scale", torch.ones(1)),
+        ("mtp.0.main_norm.weight", torch.ones(1)),
+        ("mtp.0.attn.wq_a.weight", torch.ones(1)),
+        ("mtp.0.attn.wkv.weight", torch.ones(1)),
+        ("mtp.0.attn.kv_norm.weight", torch.ones(1)),
+        ("mtp.0.ffn.shared_experts.w1.weight", torch.ones(1)),
+        ("mtp.2.markov_head.embed.weight", torch.ones(1)),
+    ]
+
+    loaded = dspark.DSparkDeepseekV4ForCausalLM._load_context_kv_weights(draft, weights)
+
+    assert loaded == set(params)
+    assert loaded_calls == [
+        ("main_proj", ()),
+        ("main_norm", ()),
+        ("fused_wqa_wkv", (0,)),
+        ("fused_wqa_wkv", (1,)),
+        ("kv_norm", ()),
+    ]
