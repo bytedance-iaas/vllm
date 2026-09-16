@@ -11,7 +11,6 @@ from vllm.models.deepseek_v4.sparse_mla import DeepseekV4SparseMLABackend
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend as DeepseekV41SparseMLABackend,
 )
-from vllm.models.deepseek_v41.sparse_mla import dsv41_storage_block_size
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.compressor_utils import (
@@ -22,13 +21,22 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     DeepseekV32IndexerMetadataBuilder,
     DeepseekV41IndexerBackend,
+    kpool_page_geometry,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     ConvertReqIndexToGlobalIndexKernel,
 )
+from vllm.v1.core.kv_cache_utils import (
+    _get_kv_cache_bytes_per_block,
+)
 from vllm.v1.kv_cache_interface import (
+    KVCacheGroupSpec,
+    KVCacheLayout,
+    KVCacheTensor,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
     compute_layer_kv_cache_shape_bytes,
+    create_kv_cache_views,
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.utils import select_common_block_size
@@ -161,7 +169,7 @@ def test_indexer_shares_uncompressed_block_size_with_deepseek_v4_mla():
 
 @pytest.mark.parametrize("compress_ratio", [1, 2])
 def test_indexer_uses_64_state_pages_for_deepseek_v41_sm90(monkeypatch, compress_ratio):
-    """V4.1's mixed compression ratios use legal Hopper DeepGEMM pages."""
+    """V4.1 keeps one manager block and re-pages only when necessary."""
     monkeypatch.setattr(
         current_platform, "is_device_capability_family", lambda family: family == 90
     )
@@ -171,23 +179,146 @@ def test_indexer_uses_64_state_pages_for_deepseek_v41_sm90(monkeypatch, compress
         manager_block_size,
         [DeepseekV41SparseMLABackend, DeepseekV41IndexerBackend],
     )
-    storage_block_size = dsv41_storage_block_size(compress_ratio)
     spec = MLAAttentionSpec(
         block_size=manager_block_size,
         num_kv_heads=1,
         head_size=132,
         dtype=torch.uint8,
         tokens_per_state=compress_ratio,
-        storage_block_size=storage_block_size,
+        alignment=576,
+        kernel_page_rows=64,
     )
 
     assert manager_block_size == 128
-    assert kernel_block_size == 64
-    assert storage_block_size == 64 * compress_ratio
-    assert spec.copy_with_new_block_size(storage_block_size).num_states == 64
-    assert compute_layer_kv_cache_shape_bytes(
-        spec, num_blocks=2, kernel_block_size=storage_block_size
-    )[:3] == (2 * (2 // compress_ratio), 1, 64)
+    assert kernel_block_size == 128
+    assert compute_layer_kv_cache_shape_bytes(spec, num_blocks=2)[:3] == (
+        2,
+        1,
+        128 // compress_ratio,
+    )
+    assert kpool_page_geometry(
+        spec.num_states, None, spec.state_content_size_bytes, spec.kernel_page_rows
+    )[:2] == (64, 2 // compress_ratio)
+
+
+def test_indexer_repaging_preserves_padded_manager_block_stride():
+    """The ratio-1 page view must skip alignment padding between blocks."""
+    import vllm.models.glm5next.nvidia.attention  # noqa: F401
+    from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
+        _kpool_flat_page_view,
+    )
+
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        alignment=576,
+        kernel_page_rows=64,
+    )
+    page_bytes = 64 * spec.state_content_size_bytes
+    block_stride = 5 * page_bytes
+    raw = torch.arange(2 * block_stride + spec.page_size_bytes, dtype=torch.int32).to(
+        torch.uint8
+    )
+    tensor = KVCacheTensor(
+        size=raw.numel(),
+        layers=["indexer"],
+        layer_stride=spec.page_size_bytes,
+        block_stride=block_stride,
+    )
+    cache = create_kv_cache_views(raw, spec, 3, KVCacheLayout.BLHNC, tensor)[0].squeeze(
+        1
+    )
+
+    pages = _kpool_flat_page_view(cache, spec.kernel_page_rows)
+
+    stride_pages = block_stride // page_bytes
+    assert pages.shape == ((3 - 1) * stride_pages + 2, 64, 132)
+    for block in range(3):
+        for page in range(2):
+            torch.testing.assert_close(
+                pages[block * stride_pages + page],
+                cache[block, page * 64 : (page + 1) * 64],
+            )
+
+
+def test_indexer_native_page_alignment_applies_to_packed_block_stride():
+    ratio1 = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        alignment=576,
+        kernel_page_rows=64,
+    )
+    ratio2 = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        alignment=576,
+        kernel_page_rows=64,
+    )
+    specs = {"ratio1": ratio1, "ratio2": ratio2}
+    groups = [
+        KVCacheGroupSpec(
+            list(specs),
+            UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs),
+        )
+    ]
+
+    dense = ratio1.page_size_bytes + ratio2.page_size_bytes
+    packed = _get_kv_cache_bytes_per_block(groups, KVCacheLayout.BLHNC)
+
+    native_page_bytes = 64 * ratio1.state_content_size_bytes
+    assert packed >= dense
+    assert packed % native_page_bytes == 0
+
+
+def test_indexer_page_table_matches_packed_page_addresses():
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        kernel_page_rows=64,
+    )
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.kv_cache_spec = spec
+    builder.block_stride_bytes = 5 * 64 * 132
+    builder.arange_buffer = torch.arange(8, dtype=torch.int32)
+    block_table = torch.tensor([[3, 7]], dtype=torch.int32)
+
+    page_states, pages = builder._indexer_page_table(block_table)
+
+    assert page_states == 64
+    assert pages.tolist() == [[15, 16, 35, 36]]
+
+
+def test_ratio2_indexer_page_table_remains_manager_block_table():
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        kernel_page_rows=64,
+    )
+    builder = object.__new__(DeepseekV32IndexerMetadataBuilder)
+    builder.kv_cache_spec = spec
+    builder.block_stride_bytes = 5 * 64 * 132
+    builder.arange_buffer = torch.arange(8, dtype=torch.int32)
+    block_table = torch.tensor([[3, 7]], dtype=torch.int32)
+
+    page_states, pages = builder._indexer_page_table(block_table)
+
+    assert page_states == 64
+    assert pages is block_table
 
 
 def test_indexer_warmup_normalizes_zero_compress_ratios():

@@ -37,6 +37,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
+    group_block_stride_bytes,
 )
 
 
@@ -392,6 +393,38 @@ def test_allocate_compressed_mla_cache(
     )
 
     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
+
+
+def test_allocate_compressed_mla_cache_keeps_padded_manager_blocks():
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=1,
+        alignment=576,
+        kernel_page_rows=64,
+    )
+    num_blocks = 4
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=num_blocks * spec.page_size_bytes,
+                layers=["layer.0"],
+                layer_stride=num_blocks * spec.page_size_bytes,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer.0"], spec)],
+    )
+
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBHNC, [128])
+
+    cache = caches["layer.0"]
+    assert cache.shape == (num_blocks, 1, 128, 132)
+    assert cache.stride(0) == spec.page_size_bytes
+    assert group_block_stride_bytes(config, 0) == spec.page_size_bytes
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))

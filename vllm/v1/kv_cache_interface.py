@@ -653,6 +653,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     is_index_group_leader: bool = False
     storage_block_size: int | None = None
     """Token width used to view storage when it differs from the kernel block."""
+    kernel_page_rows: int | None = None
+    """Rows per native page when a backend re-pages a manager block."""
     # Group capability enabled when any member flattens a non-causal query block
     # into decode rows. Runtime metadata still selects causal vs. non-causal mode.
     non_causal_multi_token_decode: bool = False
@@ -674,6 +676,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_role_set = {spec.cache_role for spec in specs}
         index_group_leader_set = {spec.is_index_group_leader for spec in specs}
         storage_block_size_set = set(spec.storage_block_size for spec in specs)
+        kernel_page_rows_set = set(spec.kernel_page_rows for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
@@ -681,10 +684,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             and len(cache_role_set) == 1
             and len(index_group_leader_set) == 1
             and len(storage_block_size_set) == 1
+            and len(kernel_page_rows_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, cache role, "
-            "index-sharing role, and storage block size."
+            "index-sharing role, storage block size, and kernel page size."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -701,6 +705,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_role=cache_role_set.pop(),
             is_index_group_leader=index_group_leader_set.pop(),
             storage_block_size=storage_block_size_set.pop(),
+            kernel_page_rows=kernel_page_rows_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),

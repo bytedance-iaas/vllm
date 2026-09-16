@@ -21,6 +21,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
+    PAGED_MQA_PAGE_SIZES,
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
     native_next_n_supported,
@@ -261,7 +262,30 @@ class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64 if current_platform.is_device_capability_family(90) else 128]
+        # Re-page Hopper's 128-state ratio-1 manager block in the indexer
+        # instead of asking the worker to split every cache in this group.
+        return [128]
+
+
+def kpool_page_geometry(
+    num_states: int,
+    block_stride_bytes: int | None,
+    state_bytes: int,
+    page_rows: int | None = None,
+) -> tuple[int, int, int]:
+    """Return native page rows, pages per block, and physical page stride."""
+    if page_rows is None:
+        return num_states, 1, 1
+    if num_states <= page_rows:
+        return num_states, 1, 1
+    assert page_rows in PAGED_MQA_PAGE_SIZES
+    assert num_states % page_rows == 0, (num_states, page_rows)
+    pages_per_block = num_states // page_rows
+    if block_stride_bytes is None:
+        return page_rows, pages_per_block, pages_per_block
+    page_bytes = page_rows * state_bytes
+    assert block_stride_bytes % page_bytes == 0, (block_stride_bytes, page_bytes)
+    return page_rows, pages_per_block, block_stride_bytes // page_bytes
 
 
 @dataclass(frozen=True)
@@ -604,6 +628,7 @@ class DeepseekV32IndexerMetadata:
     num_decode_tokens: int
     num_prefills: int
     num_prefill_tokens: int
+    kernel_page_rows: int | None = None
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
@@ -690,6 +715,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            kernel_page_rows=getattr(self.kv_cache_spec, "kernel_page_rows", None),
         )
 
 
@@ -862,15 +888,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 f"(compress_ratio={self.compress_ratio})."
             )
 
-        # Pre-allocate buffers for CUDA graph compatibility when
-        if self.compress_ratio > 1:
-            # compress_ratio > 1 (DeepseekV4)
-            # Compressed slot mapping output buffer
+        # Pre-allocate buffers for compressed caches and native-page re-mapping.
+        if self.compress_ratio > 1 or self._page_geometry()[1] > 1:
             self.compressed_slot_mapping_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
                 dtype=torch.int64,
                 device=self.device,
             )
+        if self.compress_ratio > 1:
             # Buffer for compressed seq_lens in decode path
             self.expanded_seq_lens_buffer = torch.zeros(
                 (scheduler_config.max_num_batched_tokens,),
@@ -879,6 +904,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         self.indexer_decode_block_table_buffer: torch.Tensor | None = None
         self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+    def _page_geometry(self) -> tuple[int, int, int]:
+        spec = self.kv_cache_spec
+        assert isinstance(spec, MLAAttentionSpec)
+        return kpool_page_geometry(
+            spec.num_states,
+            self.block_stride_bytes,
+            spec.state_content_size_bytes,
+            spec.kernel_page_rows,
+        )
+
+    def _indexer_page_table(
+        self, block_table: torch.Tensor
+    ) -> tuple[int, torch.Tensor]:
+        page_states, pages_per_block, stride_pages = self._page_geometry()
+        if pages_per_block == 1:
+            return page_states, block_table
+        rows = block_table.shape[0]
+        offsets = self.arange_buffer[:pages_per_block]
+        paged = block_table[:, :, None] * stride_pages + offsets
+        return page_states, paged.reshape(rows, -1)
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1171,15 +1217,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_slot_mapping = slot_mapping
         compressed_seq_lens = seq_lens
         indexer_block_table = block_table
-        if self.compress_ratio > 1:
-            kernel_block_size = self.kernel_block_size
-            if (
-                kernel_block_size is not None
-                and self.kv_cache_spec.block_size != kernel_block_size
-                and self.kv_cache_spec.block_size % kernel_block_size == 0
-            ):
-                factor = self.kv_cache_spec.block_size // kernel_block_size
-                indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+        page_states = self.kv_cache_spec.num_states
+        _, pages_per_block, _ = self._page_geometry()
+        if self.compress_ratio > 1 or pages_per_block > 1:
+            page_states, indexer_block_table = self._indexer_page_table(block_table)
             padded_num_tokens = num_tokens
             if self.pcp_world_size > 1:
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
@@ -1188,7 +1229,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 query_start_loc,
                 seq_lens,
                 indexer_block_table,
-                self.kv_cache_spec.num_states,
+                page_states,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -1409,26 +1450,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                 )
 
-            if self.compress_ratio > 1:
-                kernel_block_size = self.kernel_block_size
-                if (
-                    kernel_block_size is not None
-                    and self.kv_cache_spec.block_size != kernel_block_size
-                    and self.kv_cache_spec.block_size % kernel_block_size == 0
-                ):
-                    factor = self.kv_cache_spec.block_size // kernel_block_size
-                    compressed = block_table[:, ::factor] // factor
-                    rows, cols = compressed.shape
-                    if self.indexer_decode_block_table_buffer is None:
-                        self.indexer_decode_block_table_buffer = torch.zeros(
-                            (self._max_num_batched_tokens, cols),
-                            dtype=torch.int32,
-                            device=self.device,
-                        )
-                    self.indexer_decode_block_table_buffer[:rows, :cols].copy_(
-                        compressed
+            _, pages_per_block, _ = self._page_geometry()
+            if pages_per_block > 1:
+                _, paged = self._indexer_page_table(block_table)
+                rows, cols = paged.shape
+                if self.indexer_decode_block_table_buffer is None:
+                    self.indexer_decode_block_table_buffer = torch.zeros(
+                        (self._max_num_batched_tokens, cols),
+                        dtype=torch.int32,
+                        device=self.device,
                     )
-                    block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
+                self.indexer_decode_block_table_buffer[:rows, :cols].copy_(paged)
+                block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
 
             # Flattening always returns a buffer view, including single-token
             # batches. Keep its address stable across varlen graph replays.
@@ -1466,7 +1499,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if current_platform.is_cuda() and has_deep_gemm():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
-                    self.kv_cache_spec.num_states,
+                    self._page_geometry()[0],
                     self.num_sms,
                     indices=decode_indices,
                 )
@@ -1494,6 +1527,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            kernel_page_rows=getattr(self.kv_cache_spec, "kernel_page_rows", None),
             prefill=prefill_metadata,
             decode=decode_metadata,
         )

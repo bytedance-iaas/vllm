@@ -603,9 +603,13 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         self.vllm_config = vllm_config
         self.device = device
         self.kernel_block_size: int | None = None
+        self.block_stride_bytes: int | None = None
 
     def set_kernel_block_size(self, kernel_block_size: int) -> None:
         self.kernel_block_size = kernel_block_size
+
+    def set_block_stride_bytes(self, block_stride_bytes: int) -> None:
+        self.block_stride_bytes = block_stride_bytes
 
     @classmethod
     def get_cudagraph_support(
