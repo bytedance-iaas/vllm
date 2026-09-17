@@ -65,7 +65,7 @@ jobs:
       BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
-      BYTEIAAS_DEEPGEMM_GIT_COMMIT: babdbf01ceacc407531b71920600e4a349d7e205
+      BYTEIAAS_DEEPGEMM_GIT_COMMIT: c17c2e1f76458526950254fe7cca0680ba955891
       BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
       BYTEIAAS_TAG_MODE: ${{ inputs.tag_mode }}
