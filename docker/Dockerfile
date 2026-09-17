@@ -56,7 +56,7 @@ ARG EPEL_MIRROR
 # DeepSeek-V4.1 Flash so vLLM vendors one DeepGEMM build for both indexer and
 # MegaMoE paths.
 ARG DEEPGEMM_GIT_REPOSITORY=https://github.com/wangyicong52/DeepGEMM.git
-ARG DEEPGEMM_GIT_COMMIT=c7cef8dbec78b8043833521d7599dc7f03b69df0
+ARG DEEPGEMM_GIT_COMMIT=c17c2e1f76458526950254fe7cca0680ba955891
 ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
