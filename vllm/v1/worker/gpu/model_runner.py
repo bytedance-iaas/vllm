@@ -1932,7 +1932,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
