@@ -205,6 +205,7 @@ class DeepseekV4FP8Config(Fp8Config):
             return ModelOptLinearMethod(
                 QuantSpec(weight=kMxfp8Static, activation=kMxfp8Dynamic),
                 CkptCtx(scale_block_size=(rows, cols)),
+                prefix=prefix,
             )
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
