@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -106,6 +107,7 @@ from vllm.model_executor.utils import (
     replace_parameter,
     set_weight_attrs,
 )
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -117,6 +119,18 @@ logger = init_logger(__name__)
 # Qwen3.8-Flash-Next checkpoints used ``FP8_BLOCK_SCALES`` for the same tensor
 # layout, so retain it as a checkpoint-compatibility alias.
 _BLOCK_FP8_MOE_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+_DSV41_WQ_B_HUMMING_M = frozenset((48, 56))
+
+
+def _is_dsv41_target_wq_b(prefix: str) -> bool:
+    parts = prefix.split(".")
+    return (
+        len(parts) == 6
+        and parts[:3] == ["language_model", "model", "layers"]
+        and parts[3].isdigit()
+        and 0 <= int(parts[3]) < 40
+        and parts[4:] == ["attn", "wq_b"]
+    )
 
 # Single source of truth for the ModelOpt linear algos.
 #
@@ -2461,10 +2475,12 @@ class ModelOptLinearMethod(LinearMethodBase):
         spec: QuantSpec,
         ctx: CkptCtx,
         format_scheme=None,
+        prefix: str = "",
     ) -> None:
         self.spec = spec
         self.ctx = ctx
         self.fmt = format_scheme or FormatScheme()
+        self.prefix = prefix
         self.wkey = SCHEME_FOR[spec.weight]
         self.akey = None if spec.activation is None else SCHEME_FOR[spec.activation]
         # Only the fp8/mxfp8 kernels read input_dtype; nvfp4 ignores it. During
@@ -2483,6 +2499,14 @@ class ModelOptLinearMethod(LinearMethodBase):
         # so the front-end marlin poke stays dormant here — same as the old
         # NVFP4 methods.
         self.kernel: Any = None
+        self._humming_wq_b_candidate = (
+            os.getenv("VLLM_DSV41_DECODE_WQ_B_HUMMING", "0") == "1"
+            and spec.weight == kMxfp8Static
+            and spec.activation == kMxfp8Dynamic
+            and _is_dsv41_target_wq_b(prefix)
+        )
+        self._humming_wq_b_kernel: Any = None
+        self._humming_wq_b_layer: torch.nn.Module | None = None
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -2525,7 +2549,43 @@ class ModelOptLinearMethod(LinearMethodBase):
             rt,
             weight_shape=self.fmt.kernel_weight_shape(layer),
         )
+        if self._humming_wq_b_candidate:
+            self._humming_wq_b_candidate = (
+                input_size_per_partition == 1280
+                and sum(output_partition_sizes) == 32768
+                and getattr(layer, "tp_size", None) == 1
+                and not layer.has_bias
+                and current_platform.is_device_capability_family(90)
+            )
         expose_input_quant_key(layer, self.kernel)
+
+    def _prepare_humming_wq_b(self, layer: torch.nn.Module) -> None:
+        from vllm.model_executor.kernels.linear.mxfp8 import (
+            Mxfp8LinearLayerConfig,
+        )
+        from vllm.model_executor.kernels.linear.mxfp8.humming import (
+            HummingMxfp8LinearKernel,
+        )
+
+        humming_layer = torch.nn.Module()
+        humming_layer.register_parameter(
+            "weight", Parameter(layer.weight.detach().clone(), requires_grad=False)
+        )
+        humming_layer.register_parameter(
+            "weight_scale",
+            Parameter(layer.weight_scale.detach().clone(), requires_grad=False),
+        )
+        humming_layer.input_size_per_partition = layer.input_size_per_partition
+        humming_layer.output_size_per_partition = layer.output_size_per_partition
+        humming_layer.output_partition_sizes = list(layer.output_partition_sizes)
+        humming_layer.params_dtype = layer.params_dtype
+        humming_layer.has_bias = False
+
+        humming_kernel = HummingMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+        humming_kernel.process_weights_after_loading(humming_layer)
+        self._humming_wq_b_layer = humming_layer
+        self._humming_wq_b_kernel = humming_kernel
+        logger.info("Prepared Decode wq_b Humming layout for %s", self.prefix)
 
     def process_weights_after_loading(self, layer) -> None:
         if is_weights_pre_processed():
@@ -2562,14 +2622,28 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         if self.spec.weight == kMxfp8Static and getattr(layer, "is_bmm", False):
             self.kernel = init_mxfp8_linear_kernel(bmm_batch_size=layer.bmm_batch_size)
+        if self._humming_wq_b_candidate:
+            self._prepare_humming_wq_b(layer)
         self.kernel.process_weights_after_loading(layer)
 
     def apply(self, layer, x, bias=None):
+        def apply_kernel(lyr, inp, b):
+            m = inp.numel() // inp.shape[-1]
+            if (
+                self._humming_wq_b_kernel is not None
+                and m in _DSV41_WQ_B_HUMMING_M
+            ):
+                assert self._humming_wq_b_layer is not None
+                return self._humming_wq_b_kernel.apply_weights(
+                    layer=self._humming_wq_b_layer, x=inp, bias=b
+                )
+            return self.kernel.apply_weights(layer=lyr, x=inp, bias=b)
+
         return self.fmt.apply(
             layer,
             x,
             bias,
-            lambda lyr, inp, b: self.kernel.apply_weights(layer=lyr, x=inp, bias=b),
+            apply_kernel,
         )
 
 
