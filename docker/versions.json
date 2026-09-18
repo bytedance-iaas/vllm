@@ -14,13 +14,13 @@
       "default": "2.30.7"
     },
     "BUILD_BASE_IMAGE": {
-      "default": "nvidia/cuda:13.0.3-devel-ubuntu22.04"
+      "default": "pytorch/manylinux2_28-builder:cuda13.0-78e737ad29420ffc4800e677c51e2a852caf8359"
     },
     "FINAL_BASE_IMAGE": {
       "default": "nvidia/cuda:13.0.3-base-ubuntu22.04"
     },
     "BUILD_OS": {
-      "default": "ubuntu"
+      "default": "manylinux"
     },
     "DEEPGEMM_GIT_REPOSITORY": {
       "default": "https://github.com/vllm-project/DeepGEMM.git"
@@ -33,6 +33,9 @@
     },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
+    },
+    "UV_VERSION": {
+      "default": "0.12.6"
     },
     "PYTORCH_CUDA_INDEX_BASE_URL": {
       "default": "https://download.pytorch.org/whl"
@@ -99,6 +102,15 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
+    },
+    "INSTALL_VLLM_ROUTER": {
+      "default": "false"
+    },
+    "VLLM_ROUTER_VERSION": {
+      "default": "0.1.15"
+    },
+    "VLLM_IMAGE_SOURCE": {
+      "default": "https://github.com/vllm-project/vllm"
     }
   }
 }
