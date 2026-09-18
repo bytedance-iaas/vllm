@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_DECODE_BYTES: int = 268_435_456
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
     VLLM_MAX_EMBED_DECODE_BYTES: int = 2_147_483_648
+    VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_MAX_IMAGE_PIXELS: int = 178_956_970
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
@@ -1032,6 +1033,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # embedding at hidden_size 4096.
     "VLLM_MAX_EMBED_DECODE_BYTES": lambda: int(
         os.getenv("VLLM_MAX_EMBED_DECODE_BYTES", "2147483648")
+    ),
+    # Token threshold for the TP-sharded DeepSeek-V4.1 Engram WKV path.
+    # Zero keeps the replicated path.
+    "VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS", "0")
     ),
     # Maximum number of worker threads used for STT preprocessing. The default
     # intentionally caps at 2 because that performed best in profiling.
