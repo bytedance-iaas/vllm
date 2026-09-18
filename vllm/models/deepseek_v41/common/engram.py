@@ -40,6 +40,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -917,6 +918,9 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         self.use_sequence_parallel = use_sequence_parallel
+        self.token_shard_min_tokens = max(
+            0, envs.VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS
+        )
 
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
@@ -1001,10 +1005,52 @@ class Engram(nn.Module):
         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
         the gate so those positions pass through untouched."""
-        kv = self.wkv(self.embed(hash_ids).flatten(-2))
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
-        if self.use_sequence_parallel:
+        embeddings = self.embed(hash_ids).flatten(-2)
+        gather_token_shards = (
+            not self.use_sequence_parallel
+            and getattr(self, "token_shard_min_tokens", 0) > 0
+            and num_kv_tokens >= self.token_shard_min_tokens
+            and get_tensor_model_parallel_world_size() > 1
+        )
+        full_num_tokens = num_kv_tokens
+        if gather_token_shards:
+            assert hidden_states.shape[0] == num_kv_tokens
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            shard_size = (num_kv_tokens + tp_size - 1) // tp_size
+            start = min(tp_rank * shard_size, num_kv_tokens)
+            valid = min(shard_size, num_kv_tokens - start)
+
+            if valid == shard_size:
+                embeddings = embeddings[start : start + valid]
+                hidden_states = hidden_states[start : start + valid]
+                if token_mask is not None:
+                    token_mask = token_mask[start : start + valid]
+            else:
+                local_embeddings = embeddings.new_zeros(
+                    (shard_size, embeddings.shape[1])
+                )
+                local_hidden_states = hidden_states.new_zeros(
+                    (shard_size, *hidden_states.shape[1:])
+                )
+                if valid:
+                    local_embeddings[:valid].copy_(
+                        embeddings[start : start + valid]
+                    )
+                    local_hidden_states[:valid].copy_(
+                        hidden_states[start : start + valid]
+                    )
+                embeddings = local_embeddings
+                hidden_states = local_hidden_states
+                if token_mask is not None:
+                    local_mask = token_mask.new_zeros(shard_size)
+                    if valid:
+                        local_mask[:valid].copy_(token_mask[start : start + valid])
+                    token_mask = local_mask
+            num_kv_tokens = valid
+        elif self.use_sequence_parallel:
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
             shard_size = (num_kv_tokens + tp_size - 1) // tp_size
@@ -1014,43 +1060,53 @@ class Engram(nn.Module):
             if token_mask is not None:
                 token_mask = token_mask[start : start + num_kv_tokens]
 
+        kv = self.wkv(embeddings)
         num_tokens, hc_mult, dim = hidden_states.shape
         assert hc_mult == self.hc_mult and dim == self.dim
         assert kv.ndim == 2 and kv.shape[1] == (hc_mult + 1) * dim
-        output = torch.empty_like(hidden_states)
+        output = (
+            torch.zeros_like(hidden_states)
+            if gather_token_shards and num_kv_tokens < num_tokens
+            else torch.empty_like(hidden_states)
+        )
         if num_tokens == 0:
             return output
 
         block_size = triton.next_power_of_2(dim)
         num_warps = 8 if block_size >= 2048 else 4
         mask = token_mask if token_mask is not None else hidden_states
-        _fused_engram_post_wkv_kernel[(num_tokens * hc_mult,)](
-            hidden_states,
-            kv,
-            self.q_weight,
-            self.k_weight,
-            mask,
-            output,
-            num_kv_tokens,
-            hidden_states.stride(0),
-            hidden_states.stride(1),
-            hidden_states.stride(2),
-            kv.stride(0),
-            kv.stride(1),
-            self.q_weight.stride(0),
-            self.q_weight.stride(1),
-            self.k_weight.stride(0),
-            self.k_weight.stride(1),
-            token_mask.stride(0) if token_mask is not None else 0,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            self.eps,
-            self.clamp_value,
-            DIM=dim,
-            HC_MULT=hc_mult,
-            BLOCK_SIZE=block_size,
-            HAS_MASK=token_mask is not None,
-            num_warps=num_warps,
-        )
+        launch_tokens = num_kv_tokens if gather_token_shards else num_tokens
+        if launch_tokens:
+            _fused_engram_post_wkv_kernel[(launch_tokens * hc_mult,)](
+                hidden_states,
+                kv,
+                self.q_weight,
+                self.k_weight,
+                mask,
+                output,
+                num_kv_tokens,
+                hidden_states.stride(0),
+                hidden_states.stride(1),
+                hidden_states.stride(2),
+                kv.stride(0),
+                kv.stride(1),
+                self.q_weight.stride(0),
+                self.q_weight.stride(1),
+                self.k_weight.stride(0),
+                self.k_weight.stride(1),
+                token_mask.stride(0) if token_mask is not None else 0,
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                self.eps,
+                self.clamp_value,
+                DIM=dim,
+                HC_MULT=hc_mult,
+                BLOCK_SIZE=block_size,
+                HAS_MASK=token_mask is not None,
+                num_warps=num_warps,
+            )
+        if gather_token_shards:
+            output = tensor_model_parallel_all_gather(output, dim=0)
+            output = output[:full_num_tokens]
         return output
