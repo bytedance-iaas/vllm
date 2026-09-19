@@ -66,6 +66,8 @@ jobs:
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: e6f5699a870c60ff94d17f83b779b2cedd967017
+      BYTEIAAS_TOKENIZERS_GIT_REPOSITORY: https://github.com/wangyicong52/tokenizers.git
+      BYTEIAAS_TOKENIZERS_GIT_REF: vllm
       BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
       BYTEIAAS_TAG_MODE: ${{ inputs.tag_mode }}
@@ -258,6 +260,17 @@ jobs:
           build_commit="$(git rev-parse HEAD)"
           build_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           image_source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          tokenizers_commit="$(
+            git ls-remote --exit-code --heads \
+              "${BYTEIAAS_TOKENIZERS_GIT_REPOSITORY}" \
+              "refs/heads/${BYTEIAAS_TOKENIZERS_GIT_REF}" |
+              awk 'NR == 1 {print $1}'
+          )"
+          if ! [[ "${tokenizers_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid tokenizers commit: ${tokenizers_commit}"
+            exit 1
+          fi
+          echo "Building tokenizers ${BYTEIAAS_TOKENIZERS_GIT_REF}@${tokenizers_commit}"
 
           mkdir -p "${cache_root}"
 
@@ -329,6 +342,9 @@ jobs:
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
               --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
+              --build-arg TOKENIZERS_GIT_REPOSITORY="${BYTEIAAS_TOKENIZERS_GIT_REPOSITORY}"
+              --build-arg TOKENIZERS_GIT_REF="${BYTEIAAS_TOKENIZERS_GIT_REF}"
+              --build-arg TOKENIZERS_GIT_COMMIT="${tokenizers_commit}"
               --build-arg INSTALL_KV_CONNECTORS=true
               --build-arg INSTALL_VLLM_ROUTER=true
               --build-arg VLLM_ROUTER_VERSION="${BYTEIAAS_VLLM_ROUTER_VERSION}"

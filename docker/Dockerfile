@@ -60,6 +60,13 @@ ARG DEEPGEMM_GIT_REPOSITORY=https://github.com/vllm-project/DeepGEMM.git
 ARG DEEPGEMM_GIT_COMMIT=e21c821f39a2056d68067a466c64ddc942200106
 ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE=OFF
 
+# Patched Hugging Face tokenizers source used by vLLM's long-prefix
+# detokenization offload. Keep the branch for maintainability and the commit
+# for reproducible builds.
+ARG TOKENIZERS_GIT_REPOSITORY=https://github.com/wangyicong52/tokenizers.git
+ARG TOKENIZERS_GIT_REF=vllm
+ARG TOKENIZERS_GIT_COMMIT=441393c720fbd27a4faea02b7af18ebe08a65a01
+
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
 # installation of the GPG key of the PPA, as done by add-apt-repository, so we
@@ -408,6 +415,41 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         sccache --show-stats; \
     fi
 #################### RUST BUILD IMAGE ####################
+
+#################### TOKENIZERS BUILD IMAGE ####################
+FROM rust-build AS tokenizers-build
+ARG TOKENIZERS_GIT_REPOSITORY
+ARG TOKENIZERS_GIT_REF
+ARG TOKENIZERS_GIT_COMMIT
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --python /opt/venv/bin/python3 "maturin>=1.0,<2.0"
+
+WORKDIR /tmp/tokenizers-src
+RUN set -eux; \
+    test -n "${TOKENIZERS_GIT_REPOSITORY}"; \
+    test -n "${TOKENIZERS_GIT_REF}"; \
+    test "${#TOKENIZERS_GIT_COMMIT}" -eq 40; \
+    case "${TOKENIZERS_GIT_COMMIT}" in *[!0-9a-f]*) exit 1;; esac; \
+    git init .; \
+    git remote add origin "${TOKENIZERS_GIT_REPOSITORY}"; \
+    git fetch --no-tags --depth 1 origin "${TOKENIZERS_GIT_REF}"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "${TOKENIZERS_GIT_COMMIT}"
+
+WORKDIR /tmp/tokenizers-src/bindings/python
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    set -eux; \
+    . /root/.cargo/env; \
+    maturin build --release --locked --compatibility manylinux_2_28 \
+        --interpreter /opt/venv/bin/python3 \
+        --out /tmp/tokenizers-dist; \
+    set -- /tmp/tokenizers-dist/*.whl; \
+    test "$#" -eq 1; \
+    test -f "$1"; \
+    sha256sum "$1" > /tmp/tokenizers-dist/wheels.sha256
+#################### TOKENIZERS BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
@@ -1185,6 +1227,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 -m pip show vllm-router >/dev/null; \
     fi
 
+# Install the source-built tokenizers wheel after all runtime dependencies so
+# dependency resolution cannot replace it with the public 0.23.2 wheel.
+ARG TOKENIZERS_GIT_COMMIT
+COPY --from=tokenizers-build /tmp/tokenizers-dist/wheels.sha256 \
+    /tmp/tokenizers-wheels.sha256
+RUN --mount=type=bind,from=tokenizers-build,src=/tmp/tokenizers-dist,target=/tmp/tokenizers-dist \
+    --mount=type=cache,target=/opt/uv/cache \
+    sha256sum --check --strict /tmp/tokenizers-wheels.sha256 && \
+    set -- /tmp/tokenizers-dist/*.whl && \
+    test "$#" -eq 1 && \
+    test -f "$1" && \
+    uv pip install --system --force-reinstall --no-deps "$1" && \
+    TOKENIZERS_EXPECTED_COMMIT="${TOKENIZERS_GIT_COMMIT}" python3 -c \
+        'import os; from importlib.metadata import distribution; from tokenizers.decoders import DecodeStream; stream = DecodeStream(ids=[0]); assert stream.prefill_pending is True; source = distribution("vllm").locate_file("vllm/v1/engine/detokenizer.py").read_text(); assert "def needs_async_update(" in source; print("patched tokenizers verified for {}".format(os.environ["TOKENIZERS_EXPECTED_COMMIT"]))'
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
@@ -1197,7 +1254,8 @@ LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
-      ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
+      ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
+      ai.vllm.tokenizers.commit="${TOKENIZERS_GIT_COMMIT}"
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
