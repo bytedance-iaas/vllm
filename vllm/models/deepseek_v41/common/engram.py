@@ -41,16 +41,22 @@ import torch
 from torch import nn
 
 from vllm import envs
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
+)
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
@@ -921,6 +927,12 @@ class Engram(nn.Module):
         self.token_shard_min_tokens = max(
             0, envs.VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS
         )
+        self.token_exchange = (
+            envs.VLLM_DSV41_ENGRAM_TOKEN_EXCHANGE
+            and current_platform.is_cuda()
+            and get_current_vllm_config().compilation_config.cudagraph_mode
+            == CUDAGraphMode.NONE
+        )
 
         # Named ``embed_tokens`` so the checkpoint's ``engram.embed.weight``
         # survives the mapper's ``embed.weight`` -> ``embed_tokens.weight``
@@ -974,11 +986,59 @@ class Engram(nn.Module):
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         return self.staged_rows[:num_tokens]
 
-    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
+    @torch.compiler.disable
+    def _can_exchange_tokens(self, num_tokens: int) -> bool:
+        from vllm.v1.attention.backends.mla.sparse_swa import (
+            DeepseekSparseSWAMetadata,
+        )
+
+        if not is_forward_context_available():
+            return False
+        context = get_forward_context()
+        if (
+            context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            or torch.cuda.is_current_stream_capturing()
+            or context.ubatch_slices is not None
+            or not isinstance(context.attn_metadata, dict)
+        ):
+            return False
+        for metadata in context.attn_metadata.values():
+            if isinstance(metadata, DeepseekSparseSWAMetadata):
+                return (
+                    metadata.num_decode_tokens == 0
+                    and metadata.num_prefill_tokens == num_tokens
+                )
+        return False
+
+    @torch.compiler.disable
+    def _exchange_token_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        group = get_tp_group()
+        tp_size = group.world_size
+        assert torch.distributed.get_rank(group.device_group) == group.rank_in_group
+        assert torch.distributed.get_world_size(group.device_group) == tp_size
+        num_tokens, local_heads, dim = rows.shape
+        chunk = (num_tokens + tp_size - 1) // tp_size
+        if num_tokens != chunk * tp_size:
+            padded = rows.new_zeros((chunk * tp_size, local_heads, dim))
+            padded[:num_tokens].copy_(rows)
+            rows = padded
+        received = torch.empty_like(rows)
+        torch.distributed.all_to_all_single(
+            received, rows, group=group.device_group, async_op=False
+        )
+        out = rows.new_empty((chunk, self.embed_tokens.n_hash_cols, dim))
+        _engram_select_rows(received, out, chunk, 0, local_heads * dim)
+        return out
+
+    def embed(
+        self, hash_ids: torch.Tensor, *, shard_tokens: bool = False
+    ) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""
         rows = self._ready_rows(hash_ids.shape[0])
         if self.embed_tokens.tp_size == 1:
             return rows[:, : self.embed_tokens.n_hash_cols]
+        if shard_tokens:
+            return self._exchange_token_rows(rows)
         if self.use_sequence_parallel:
             tp_size = self.embed_tokens.tp_size
             num_tokens, local_heads, dim = rows.shape
@@ -1007,13 +1067,18 @@ class Engram(nn.Module):
         the gate so those positions pass through untouched."""
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
-        embeddings = self.embed(hash_ids).flatten(-2)
         gather_token_shards = (
             not self.use_sequence_parallel
             and getattr(self, "token_shard_min_tokens", 0) > 0
             and num_kv_tokens >= self.token_shard_min_tokens
             and get_tensor_model_parallel_world_size() > 1
         )
+        exchange_tokens = (
+            gather_token_shards
+            and getattr(self, "token_exchange", False)
+            and self._can_exchange_tokens(num_kv_tokens)
+        )
+        embeddings = self.embed(hash_ids, shard_tokens=exchange_tokens).flatten(-2)
         full_num_tokens = num_kv_tokens
         if gather_token_shards:
             assert hidden_states.shape[0] == num_kv_tokens
@@ -1024,25 +1089,28 @@ class Engram(nn.Module):
             valid = min(shard_size, num_kv_tokens - start)
 
             if valid == shard_size:
-                embeddings = embeddings[start : start + valid]
+                if not exchange_tokens:
+                    embeddings = embeddings[start : start + valid]
                 hidden_states = hidden_states[start : start + valid]
                 if token_mask is not None:
                     token_mask = token_mask[start : start + valid]
             else:
-                local_embeddings = embeddings.new_zeros(
-                    (shard_size, embeddings.shape[1])
-                )
+                if not exchange_tokens:
+                    local_embeddings = embeddings.new_zeros(
+                        (shard_size, embeddings.shape[1])
+                    )
+                    if valid:
+                        local_embeddings[:valid].copy_(
+                            embeddings[start : start + valid]
+                        )
+                    embeddings = local_embeddings
                 local_hidden_states = hidden_states.new_zeros(
                     (shard_size, *hidden_states.shape[1:])
                 )
                 if valid:
-                    local_embeddings[:valid].copy_(
-                        embeddings[start : start + valid]
-                    )
                     local_hidden_states[:valid].copy_(
                         hidden_states[start : start + valid]
                     )
-                embeddings = local_embeddings
                 hidden_states = local_hidden_states
                 if token_mask is not None:
                     local_mask = token_mask.new_zeros(shard_size)
