@@ -90,9 +90,9 @@ add_custom_target(_vllm_fa4_cutedsl_C)
 # Install flash_attn/cute directory (needed for FA4).
 # When using a local source dir (VLLM_FLASH_ATTN_SRC_DIR), create a symlink
 # so edits to cute-dsl Python files take effect immediately without rebuilding.
-# Otherwise, copy files and transform flash_attn.cute imports to
-# vllm.vllm_flash_attn.cute to match our package structure.
-if(VLLM_FLASH_ATTN_SRC_DIR)
+# A distributable build can set VLLM_FLASH_ATTN_COPY_CUTEDSL to copy and rewrite
+# the local sources instead, avoiding a wheel that contains an external symlink.
+if(VLLM_FLASH_ATTN_SRC_DIR AND NOT VLLM_FLASH_ATTN_COPY_CUTEDSL)
   install(CODE "
     set(LINK_TARGET \"${vllm-flash-attn_SOURCE_DIR}/flash_attn/cute\")
     set(LINK_NAME \"\${CMAKE_INSTALL_PREFIX}/vllm/vllm_flash_attn/cute\")

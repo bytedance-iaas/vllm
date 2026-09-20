@@ -80,3 +80,17 @@ endif()
     )
 
     subprocess.run([_get_cmake_bin(), "-P", script], check=True)
+
+
+def test_local_flash_attn_can_be_copied_for_distributable_builds():
+    source = (
+        Path(__file__).parents[1]
+        / "cmake"
+        / "external_projects"
+        / "vllm_flash_attn.cmake"
+    ).read_text()
+
+    assert "VLLM_FLASH_ATTN_SRC_DIR AND NOT VLLM_FLASH_ATTN_COPY_CUTEDSL" in source
+    assert "string(REPLACE" in source
+    assert "flash_attn.cute" in source
+    assert "vllm.vllm_flash_attn.cute" in source
