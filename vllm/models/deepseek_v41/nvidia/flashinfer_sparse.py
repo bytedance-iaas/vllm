@@ -241,8 +241,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return _pad_to_supported_q_heads(num_heads)
 
-    def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        o = attn_out[:, : self.n_local_heads, :]
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -620,8 +619,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return _pad_to_supported_q_heads(num_heads)
 
-    def _o_proj(self, attn_out: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        o = attn_out[:, : self.n_local_heads, :]
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
             o,
             positions,
