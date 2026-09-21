@@ -459,7 +459,6 @@ def test_v41_mxfp8_cache_round_trip():
     error = (out[0].float() - k.float()).abs()
     assert (error <= tolerance.repeat_interleave(32, dim=-1)).all()
 
-
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 @pytest.mark.parametrize("compress_ratio", [1, 2])
 @pytest.mark.parametrize("store_fp8", [False, True])
