@@ -213,6 +213,7 @@ def test_replay_metadata_matches_full_batch_rows():
     assert torch.equal(swa.token_to_req_indices, swa_full.token_to_req_indices[rows])
     assert torch.equal(swa.decode_swa_indices, swa_full.decode_swa_indices)
     assert torch.equal(swa.decode_swa_lens, swa_full.decode_swa_lens)
+    assert torch.equal(swa.replay_start, batch.replay_start)
     # Prefill rows are indexed past the decode token in both layouts.
     prefill_rows = rows[1:] - 1
     lens, lens_full = swa.prefill_swa_lens, swa_full.prefill_swa_lens[prefill_rows]

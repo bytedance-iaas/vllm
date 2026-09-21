@@ -132,6 +132,7 @@ def _is_dsv41_target_wq_b(prefix: str) -> bool:
         and parts[4:] == ["attn", "wq_b"]
     )
 
+
 # Single source of truth for the ModelOpt linear algos.
 #
 # Each entry is (owning config's name, mixed-precision sub-config attribute).
@@ -2636,10 +2637,7 @@ class ModelOptLinearMethod(LinearMethodBase):
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
-            if (
-                self._humming_wq_b_kernel is not None
-                and m in _DSV41_WQ_B_HUMMING_M
-            ):
+            if self._humming_wq_b_kernel is not None and m in _DSV41_WQ_B_HUMMING_M:
                 assert self._humming_wq_b_layer is not None
                 return self._humming_wq_b_kernel.apply_weights(
                     layer=self._humming_wq_b_layer, x=inp, bias=b

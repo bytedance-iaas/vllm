@@ -34,7 +34,6 @@ def test_kimi_mega_moe_remains_sm100_only(monkeypatch):
 
 def test_kimi_mega_moe_fails_closed_without_situ_deepgemm(monkeypatch):
     class FakeDeepGemm:
-
         @staticmethod
         def get_symm_buffer_for_mega_moe(
             group,

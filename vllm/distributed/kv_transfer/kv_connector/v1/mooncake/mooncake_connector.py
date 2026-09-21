@@ -1024,7 +1024,6 @@ class MooncakeConnectorWorker:
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
-        self.failed_recving_reqs: set[ReqId] = set()
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
             # Background threads for sending kvcaches to D.
@@ -1831,11 +1830,6 @@ class MooncakeConnectorWorker:
         finished_recving_reqs = self.finished_recving_reqs
         self.finished_recving_reqs = set()
         return finished_recving_reqs
-
-    async def fetch_failed_recving_reqs(self) -> set[ReqId]:
-        failed_recving_reqs = self.failed_recving_reqs
-        self.failed_recving_reqs = set()
-        return failed_recving_reqs
 
     async def fetch_finished_sending_reqs(self) -> set[ReqId]:
         finished_sending_reqs = self.finished_sending_reqs

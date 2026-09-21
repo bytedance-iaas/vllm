@@ -156,8 +156,7 @@ def test_rejects_missing_sm90_buffer_binding(
     binding = tmp_path / "csrc" / "apis" / "sm90_mega.hpp"
     binding.write_text(
         binding.read_text().replace(
-            f'm.def("{binding_name}",\n'
-            f"      &{binding_name});\n",
+            f'm.def("{binding_name}",\n      &{binding_name});\n',
             f'// m.def("{binding_name}", &{binding_name});\n',
         )
     )
@@ -217,8 +216,7 @@ def test_rejects_unreachable_sm90_buffer_api_use(tmp_path: Path) -> None:
     mega_path = tmp_path / "deep_gemm" / "mega" / "__init__.py"
     mega_path.write_text(
         mega_path.read_text().replace(
-            "        self.buffer_size_fn = "
-            "_C.get_symm_buffer_size_for_sm90_mega_moe\n",
+            "        self.buffer_size_fn = _C.get_symm_buffer_size_for_sm90_mega_moe\n",
             "        return\n"
             "        self.buffer_size_fn = "
             "_C.get_symm_buffer_size_for_sm90_mega_moe\n",
@@ -238,8 +236,7 @@ def test_rejects_sm90_buffer_api_use_in_constant_false_branch(
     mega_path = tmp_path / "deep_gemm" / "mega" / "__init__.py"
     mega_path.write_text(
         mega_path.read_text().replace(
-            "        self.buffer_size_fn = "
-            "_C.get_symm_buffer_size_for_sm90_mega_moe\n",
+            "        self.buffer_size_fn = _C.get_symm_buffer_size_for_sm90_mega_moe\n",
             "        if False:\n"
             "            self.buffer_size_fn = "
             "_C.get_symm_buffer_size_for_sm90_mega_moe\n",

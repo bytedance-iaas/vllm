@@ -85,7 +85,12 @@ class ReplayBatchBuilder:
     def trims(self, common: Any) -> bool:
         return bool((self.query_lens(common) > self.window).any())
 
-    def build(self, common: Any, num_batch_tokens: int) -> ReplayInputBatch:
+    def build(
+        self,
+        common: Any,
+        num_batch_tokens: int,
+        encoder_replay_start: torch.Tensor | None = None,
+    ) -> ReplayInputBatch:
         num_reqs = common.num_reqs
         query_start_loc = common.query_start_loc_cpu[: num_reqs + 1].numpy()
         lens = self.query_lens(common)
@@ -115,8 +120,8 @@ class ReplayBatchBuilder:
         replay_start = self._window_start.copy_to_uva(
             np.where(trimmed, seq_lens - self.window, 0)
         )
-        if common.replay_start is not None:
-            replay_start = torch.maximum(replay_start, common.replay_start[:num_reqs])
+        if encoder_replay_start is not None:
+            replay_start = torch.maximum(replay_start, encoder_replay_start[:num_reqs])
 
         return ReplayInputBatch(
             rows=rows,
@@ -168,7 +173,9 @@ class ReplayMetadataBuilder:
             full = attn_metadata[prefix]
             if full.builder not in built:
                 built[full.builder] = self._builder_for(full).build(
-                    0, self._compact(full, batch, num_padded, prefix)
+                    0,
+                    self._compact(full, batch, num_padded, prefix),
+                    replay_start=batch.replay_start,
                 )
             replay[prefix] = built[full.builder]
         compressed = attn_metadata[self.compressed_prefix]
@@ -203,7 +210,6 @@ class ReplayMetadataBuilder:
             num_actual_tokens=batch.num_tokens,
             max_query_len=batch.max_query_len,
             slot_mapping=slot_mapping[:num_padded],
-            replay_start=batch.replay_start,
             positions=batch.positions,
         )
 
@@ -369,8 +375,12 @@ class DecoderReplayLayers:
         hidden_states = states[0]
         assert hidden_states is not None
         forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        full_swa = attn_metadata[self.metadata.swa_prefixes[0]]
         batch = self.batch_builder.build(
-            self.metadata.common(forward_context.attn_metadata), hidden_states.shape[0]
+            full_swa.common,
+            hidden_states.shape[0],
+            full_swa.replay_start,
         )
         replay_outputs = self._run_replay(batch, states)
         if outputs is None:

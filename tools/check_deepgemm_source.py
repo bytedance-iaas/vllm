@@ -81,9 +81,7 @@ C_API_USES = {
     ("function", "get_symm_buffer_for_mega_moe"): {
         "get_token_alignment_for_sm90_mega_moe"
     },
-    ("method", "SymmBuffer", "__init__"): {
-        "get_symm_buffer_size_for_sm90_mega_moe"
-    },
+    ("method", "SymmBuffer", "__init__"): {"get_symm_buffer_size_for_sm90_mega_moe"},
 }
 
 
@@ -145,9 +143,7 @@ def _reachable_c_api_uses(
                     else_names, else_terminates = collect(statement.orelse)
                     branch_names = body_names | else_names
                     terminates = (
-                        bool(statement.orelse)
-                        and body_terminates
-                        and else_terminates
+                        bool(statement.orelse) and body_terminates and else_terminates
                     )
                 names.update(branch_names)
                 if terminates:
@@ -207,9 +203,7 @@ def _accepts_call(
         max(num_positional - len(arguments.posonlyargs), 0),
         len(arguments.args),
     )
-    bound_regular_names = {
-        arg.arg for arg in arguments.args[:num_bound_regular]
-    }
+    bound_regular_names = {arg.arg for arg in arguments.args[:num_bound_regular]}
     if bound_regular_names & keyword_names:
         return False
 
@@ -338,8 +332,7 @@ def check_source(source_dir: Path) -> list[str]:
                 continue
             if re.search(rf"&(?:\w+::)*{re.escape(symbol_name)}\b", statement) is None:
                 errors.append(
-                    f"{path}: C++ binding {api_name} does not reference "
-                    f"{symbol_name}"
+                    f"{path}: C++ binding {api_name} does not reference {symbol_name}"
                 )
             if required_call is not None:
                 parameter_names = tuple(

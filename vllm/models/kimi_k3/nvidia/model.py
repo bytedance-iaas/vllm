@@ -373,9 +373,7 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
     ) -> None:
         api = getattr(deep_gemm, api_name, None)
         if api is None:
-            raise NotImplementedError(
-                f"Kimi K3 MegaMoE requires DeepGEMM.{api_name}."
-            )
+            raise NotImplementedError(f"Kimi K3 MegaMoE requires DeepGEMM.{api_name}.")
         try:
             signature = inspect.signature(api)
         except (TypeError, ValueError) as exc:
@@ -393,10 +391,7 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
 
     def _check_runtime_supported(self) -> None:
         device = self.w13_weight.device
-        if (
-            device.type != "cuda"
-            or torch.cuda.get_device_capability(device)[0] != 10
-        ):
+        if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] != 10:
             raise NotImplementedError("Kimi K3 MegaMoE requires SM100 GPUs.")
         super()._check_runtime_supported()
         from vllm.utils.deep_gemm import _import_deep_gemm

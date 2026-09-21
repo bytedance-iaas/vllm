@@ -62,7 +62,7 @@ def _block_scores_kernel(
         reduced = tl.reduce(values, 1, _max_with_nan)
         reduced = tl.where((end_raw > start) & (blocks == pin), float("inf"), reduced)
         tl.store(scores + row * nblocks + blocks, reduced, blocks < row_blocks)
-    if tl.program_id(1) == 0:
+    if tl.program_id(1) == 0:  # noqa: SIM102
         if (end_raw > start) & (pin >= row_blocks) & (pin < nblocks):
             tl.store(scores + row * nblocks + pin, float("inf"))
 
@@ -157,7 +157,9 @@ def _mask_candidates_kernel(
     end = tl.minimum(end, width)
     edge = tl.load(flags + row * (nblocks + 1) + nblocks)
     offsets = tl.arange(0, TILE)
-    for tile in range(tl.program_id(1), tl.cdiv(tl.maximum(end - start, 0), TILE), ROW_PROGRAMS):
+    for tile in range(
+        tl.program_id(1), tl.cdiv(tl.maximum(end - start, 0), TILE), ROW_PROGRAMS
+    ):
         cols = start + tile * TILE + offsets
         valid = cols < end
         block = (cols - start) // BLOCK_SIZE

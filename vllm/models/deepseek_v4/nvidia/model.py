@@ -308,15 +308,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self._use_sm90_fp8_mega_moe = False
         self._use_prepared_capacity_buckets = False
         self._capacity_buffers: tuple[tuple[int, object], ...] | None = None
-        self._mega_moe_num_sms = _read_nonnegative_int_env(
-            "VLLM_DSV4_MEGAMOE_NUM_SMS"
-        )
+        self._mega_moe_num_sms = _read_nonnegative_int_env("VLLM_DSV4_MEGAMOE_NUM_SMS")
         self._telemetry_max_samples = _read_nonnegative_int_env(
             "VLLM_DSV4_MEGAMOE_TELEMETRY_SAMPLES"
         )
-        self._telemetry_layer = os.environ.get(
-            "VLLM_DSV4_MEGAMOE_TELEMETRY_LAYER", ""
-        )
+        self._telemetry_layer = os.environ.get("VLLM_DSV4_MEGAMOE_TELEMETRY_LAYER", "")
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -391,9 +387,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "VLLM_DSV4_MEGAMOE_NUM_SMS must be an even integer in "
                 f"[2, {max_num_sms}], got {num_sms}."
             )
-        if num_sms and "num_sms" not in signature(
-            deep_gemm.fp8_fp4_mega_moe
-        ).parameters:
+        if (
+            num_sms
+            and "num_sms" not in signature(deep_gemm.fp8_fp4_mega_moe).parameters
+        ):
             raise RuntimeError(
                 "VLLM_DSV4_MEGAMOE_NUM_SMS requires a DeepGEMM build whose "
                 "fp8_fp4_mega_moe API exposes num_sms."
@@ -512,9 +509,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         routed_ids = topk_ids.reshape(-1)
         routed_ids = routed_ids[routed_ids >= 0]
-        local_histogram = torch.bincount(
-            routed_ids, minlength=self.num_experts
-        ).to(torch.int64)
+        local_histogram = torch.bincount(routed_ids, minlength=self.num_experts).to(
+            torch.int64
+        )
         all_histograms = torch.empty(
             ep_group.world_size * self.num_experts,
             dtype=torch.int64,
@@ -1144,9 +1141,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         for module in (deep_gemm, getattr(deep_gemm, "_C", None)):
             if module is None:
                 continue
-            get_alignment = getattr(module,
-                                    "get_token_alignment_for_sm90_mega_moe",
-                                    None)
+            get_alignment = getattr(
+                module, "get_token_alignment_for_sm90_mega_moe", None
+            )
             if get_alignment is not None:
                 return int(get_alignment())
         return None
@@ -1565,9 +1562,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             start_event.record()
         if self._use_sm90_fp4_mega_moe:
             num_sms_kwargs = (
-                {"num_sms": self._mega_moe_num_sms}
-                if self._mega_moe_num_sms
-                else {}
+                {"num_sms": self._mega_moe_num_sms} if self._mega_moe_num_sms else {}
             )
             deep_gemm.fp8_fp4_mega_moe(
                 y,
@@ -2013,9 +2008,7 @@ class DeepseekV4MoE(nn.Module):
             activation_clamp = (
                 float(self.swiglu_limit) if self.swiglu_limit is not None else None
             )
-            self.experts.prepare_capacity_buckets(
-                activation_clamp=activation_clamp
-            )
+            self.experts.prepare_capacity_buckets(activation_clamp=activation_clamp)
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
