@@ -437,7 +437,7 @@ RUN set -eux; \
     case "${TOKENIZERS_GIT_COMMIT}" in *[!0-9a-f]*) exit 1;; esac; \
     git init .; \
     git remote add origin "${TOKENIZERS_GIT_REPOSITORY}"; \
-    git fetch --no-tags --depth 1 origin "${TOKENIZERS_GIT_REF}"; \
+    git fetch --no-tags --depth 1 origin "${TOKENIZERS_GIT_COMMIT}"; \
     git checkout --detach FETCH_HEAD; \
     test "$(git rev-parse HEAD)" = "${TOKENIZERS_GIT_COMMIT}"
 

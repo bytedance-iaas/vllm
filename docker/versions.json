@@ -31,6 +31,15 @@
     "DEEPGEMM_REQUIRE_SM90_MEGA_MOE": {
       "default": "ON"
     },
+    "TOKENIZERS_GIT_REPOSITORY": {
+      "default": "https://github.com/wangyicong52/tokenizers.git"
+    },
+    "TOKENIZERS_GIT_REF": {
+      "default": "vllm"
+    },
+    "TOKENIZERS_GIT_COMMIT": {
+      "default": "441393c720fbd27a4faea02b7af18ebe08a65a01"
+    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
