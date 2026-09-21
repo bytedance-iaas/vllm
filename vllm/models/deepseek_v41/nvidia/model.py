@@ -19,7 +19,6 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import (
     get_forward_context,
@@ -94,11 +93,10 @@ from ..common.engram import EngramLayout, NgramHashState
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from ..common.pipeline import get_sharing_dependencies, validate_local_sharing
 from .engram import Engram, gather_engram_hashes
+from .ops.mega_mhc import mhc_shifted_post_pre
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
     mhc_pre_delayed_overlap,
-    mhc_shifted_post_pre,
-    supports_mhc_all_reduce,
     supports_mhc_overlap,
 )
 
@@ -114,7 +112,6 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         vllm_config: VllmConfig,
         prefix: str = "",
         use_sequence_parallel: bool = False,
-        reduce_results: bool = True,
     ):
         config = vllm_config.model_config.hf_config
         n_routed_experts = config.n_routed_experts
@@ -133,7 +130,6 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
             n_routed_experts=n_routed_experts,
             n_activated_experts=n_activated_experts,
             num_hash_layers=0,
-            reduce_results=reduce_results,
             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
         )
 
@@ -208,14 +204,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
         mhc_stream: torch.cuda.Stream | None = None,
-        fuse_mhc_all_reduce: bool = False,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
         self.mhc_stream = mhc_stream
-        self.fuse_mhc_all_reduce = fuse_mhc_all_reduce
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.engram: Engram | None = None
@@ -239,13 +233,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             aux_stream_list=aux_stream_list,
             candidate_block_buffer=candidate_block_buffer,
         )
-        if self.use_sequence_parallel or fuse_mhc_all_reduce:
+        if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
         self.ffn = DeepseekV4MoE(
             vllm_config,
             prefix=f"{prefix}.ffn",
             use_sequence_parallel=self.use_sequence_parallel,
-            reduce_results=not fuse_mhc_all_reduce,
         )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -450,8 +443,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             # and this block's pre, on the full hc stream, so the mix
             # coefficients see the injected stream. The injection also keeps
             # the post out of the pre-norm GEMM's fused prologue.
-            if self.fuse_mhc_all_reduce:
-                x = tensor_model_parallel_all_reduce(x)
             previous_post = mhc_post_tilelang(x, residual, post_mix, res_mix)
             if capture_previous_aux:
                 previous_aux = previous_post.mean(dim=1)
@@ -495,7 +486,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.attn_norm.variance_epsilon,
                 capture_aux=capture_previous_aux,
                 stream=mhc_stream,
-                reduce_results=self.fuse_mhc_all_reduce,
             )
             if capture_previous_aux:
                 previous_aux = aux
@@ -526,7 +516,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
             stream=mhc_stream,
-            reduce_results=self.fuse_mhc_all_reduce,
         )
         x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
@@ -570,7 +559,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=self.attn_norm.variance_epsilon,
             capture_aux=False,
             stream=mhc_stream,
-            reduce_results=self.fuse_mhc_all_reduce,
         )
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
@@ -624,9 +612,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
         # Keep mHC independent of the streams used inside attention.
         mhc_stream = torch.cuda.Stream() if supports_mhc_overlap(vllm_config) else None
-        self.fuse_mhc_all_reduce = mhc_stream is not None and supports_mhc_all_reduce(
-            vllm_config
-        )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -672,7 +657,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
                 mhc_stream=mhc_stream,
-                fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1034,8 +1018,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         full_num_tokens: int,
     ) -> torch.Tensor:
         # The last layer has no successor to fold its post into.
-        if self.fuse_mhc_all_reduce:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = hidden_states.mean(dim=1)

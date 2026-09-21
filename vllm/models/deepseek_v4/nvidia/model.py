@@ -1652,7 +1652,6 @@ class DeepseekV4MoE(nn.Module):
         use_sequence_parallel: bool = False,
         *,
         num_hash_layers: int,
-        reduce_results: bool = True,
         n_routed_experts: int | None = None,
         n_activated_experts: int | None = None,
         image_sentinel_lo: int = IMAGE_SENTINEL_BASE_ID,
@@ -1664,7 +1663,6 @@ class DeepseekV4MoE(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
         self.use_sequence_parallel = use_sequence_parallel
-        self.reduce_results = reduce_results
         moe_backend = vllm_config.kernel_config.moe_backend
         validate_fi_moe_ep_config(vllm_config)
         self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
@@ -1876,7 +1874,6 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_end = self.experts_end_idx
 
         self.experts = FusedMoEFactory(
-            reduce_results=self.reduce_results,
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=self.n_routed_experts,
