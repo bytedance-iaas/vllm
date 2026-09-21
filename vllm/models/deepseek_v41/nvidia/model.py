@@ -64,9 +64,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MoE as DeepseekV4MoEBase,
 )
 from vllm.models.deepseek_v4.nvidia.model import (
-    MegaGateRoutingMetadata,
     make_deepseek_v4_expert_params_mapping,
-    prepare_mega_gate_routing_metadata,
 )
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
@@ -346,7 +344,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_mask: torch.Tensor | None = None,
         *,
         capture_previous_aux: bool = False,
-        mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -478,7 +475,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
         )
-        x = self.ffn(x, input_ids, mega_gate_metadata)
+        x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
     def write_global_cache(
@@ -801,16 +798,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
 
-        mega_gate_metadata = None
-        if self.use_mega_moe:
-            mega_gate_metadata = prepare_mega_gate_routing_metadata(
-                input_ids,
-                has_hash_routing=False,
-                image_sentinel_base_id=IMAGE_SENTINEL_BASE_ID
-                if getattr(self.config, "vision_n_layers", 0) > 0
-                else None,
-            )
-
         residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = None
         if not get_pp_group().is_first_rank:
@@ -834,7 +821,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer,
             engram_hashes,
             engram_mask,
-            mega_gate_metadata,
         )
         if self.encoder_only_prefill:
             assert self.encoder_only_boundary_layer is not None
@@ -918,20 +904,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         aux_hidden_by_layer: dict[int, torch.Tensor],
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
-        mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
         full_num_tokens = positions.shape[0]
-        if self.use_mega_moe and mega_gate_metadata is None:
-            assert input_ids is not None
-            mega_gate_metadata = prepare_mega_gate_routing_metadata(
-                input_ids,
-                has_hash_routing=False,
-                image_sentinel_base_id=IMAGE_SENTINEL_BASE_ID
-                if getattr(self.config, "vision_n_layers", 0) > 0
-                else None,
-            )
         for idx in layer_ids:
             hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = (
                 self.layers[idx](
@@ -945,7 +921,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     engram_hashes,
                     engram_mask,
                     capture_previous_aux=idx in self.aux_hidden_state_layers,
-                    mega_gate_metadata=mega_gate_metadata,
                 )
             )
             if previous_aux is not None:

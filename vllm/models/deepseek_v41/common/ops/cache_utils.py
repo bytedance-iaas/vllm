@@ -584,11 +584,7 @@ def dequantize_and_gather_k_cache_triton(
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
     if k_cache.shape[-1] == V41_NVFP4_BYTES_PER_TOKEN:
-        # Keep short gathers unchanged; cap total workers for multi-request chunks.
-        num_workers = min(
-            max(128, 2048 // max(1, num_reqs)), max(128, out.shape[1] - offset)
-        )
-        _dequantize_and_gather_k_nvfp4_kernel[(num_reqs, num_workers)](
+        _dequantize_and_gather_k_nvfp4_kernel[(num_reqs, NUM_WORKERS)](
             out,
             out.stride(0),
             out.stride(1),
