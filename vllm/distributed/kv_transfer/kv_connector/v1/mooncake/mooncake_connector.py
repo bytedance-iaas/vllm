@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import fcntl
+import hashlib
 import logging
+import os
 import queue
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
@@ -976,6 +978,75 @@ class MooncakeConnectorWorker:
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
+        self.max_concurrent_large_requests = int(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "max_concurrent_large_requests", 0
+            )
+        )
+        self.large_request_threshold_tokens = int(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "large_request_threshold_tokens", 0
+            )
+        )
+        self.node_large_request_slots = int(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "node_large_request_slots", 0
+            )
+        )
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        self.node_large_request_slot_dir = extra_config.get(
+            "node_large_request_slot_dir", "/dev/shm"
+        )
+        self.node_large_request_slot_namespace = extra_config.get(
+            "node_large_request_slot_namespace", engine_id
+        )
+        if self.max_concurrent_large_requests < 0:
+            raise ValueError(
+                "max_concurrent_large_requests must be non-negative, got "
+                f"{self.max_concurrent_large_requests}"
+            )
+        if self.large_request_threshold_tokens < 0:
+            raise ValueError("large_request_threshold_tokens must be non-negative")
+        if self.node_large_request_slots < 0:
+            raise ValueError(
+                "node_large_request_slots must be non-negative, got "
+                f"{self.node_large_request_slots}"
+            )
+        if not isinstance(self.node_large_request_slot_namespace, str) or not (
+            self.node_large_request_slot_namespace
+        ):
+            raise ValueError(
+                "node_large_request_slot_namespace must be a non-empty string"
+            )
+        self._large_request_semaphore: asyncio.Semaphore | None = (
+            asyncio.Semaphore(self.max_concurrent_large_requests)
+            if self.max_concurrent_large_requests > 0
+            and self.large_request_threshold_tokens > 0
+            else None
+        )
+        if self._large_request_semaphore is not None:
+            logger.info(
+                "Mooncake limiting requests >= %d tokens to %d concurrent send(s)",
+                self.large_request_threshold_tokens,
+                self.max_concurrent_large_requests,
+            )
+        if self.node_large_request_slots and self._large_request_semaphore is None:
+            raise ValueError(
+                "node_large_request_slots requires positive "
+                "max_concurrent_large_requests and "
+                "large_request_threshold_tokens"
+            )
+        self._node_large_request_slot_paths = self._get_node_large_request_slot_paths(
+            self.node_large_request_slot_dir,
+            self.node_large_request_slot_namespace,
+            self.node_large_request_slots,
+        )
+        if self._node_large_request_slot_paths:
+            logger.info(
+                "Mooncake limiting long requests to %d shared node slot(s) under %s",
+                self.node_large_request_slots,
+                self.node_large_request_slot_dir,
+            )
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
@@ -1226,7 +1297,16 @@ class MooncakeConnectorWorker:
                 identity, metadata_bytes = await self.sender_worker_queue.get()
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
-                    await self.send_kv_to_decode(identity, sock, metadata)
+                    if self._is_large_request_meta(metadata):
+                        assert self._large_request_semaphore is not None
+                        async with self._large_request_semaphore:
+                            slot_fd = await self._acquire_node_large_request_slot()
+                            try:
+                                await self.send_kv_to_decode(identity, sock, metadata)
+                            finally:
+                                self._release_node_large_request_slot(slot_fd)
+                    else:
+                        await self.send_kv_to_decode(identity, sock, metadata)
                 except Exception as e:
                     logger.error("Error processing Mooncake xfer request: %s", e)
                     error_response = MooncakeXferResponse(
@@ -1246,6 +1326,56 @@ class MooncakeConnectorWorker:
                 break
             except Exception as e:
                 logger.error("Error in _sender_worker: %s", e)
+
+    def _is_large_request_meta(self, meta: MooncakeXferMetadata) -> bool:
+        """Return whether a pull covers a long-context request."""
+        if self._large_request_semaphore is None:
+            return False
+        max_blocks = max(
+            (
+                len(block_ids)
+                for _, request_groups in meta.req_blocks.values()
+                for block_ids in request_groups
+            ),
+            default=0,
+        )
+        return max_blocks * self.block_size >= self.large_request_threshold_tokens
+
+    @staticmethod
+    def _get_node_large_request_slot_paths(
+        slot_dir: str, namespace: str, num_slots: int
+    ) -> list[str]:
+        namespace_hash = hashlib.sha256(namespace.encode()).hexdigest()[:16]
+        return [
+            os.path.join(
+                slot_dir,
+                f"vllm-mooncake-large-request-{namespace_hash}-slot-{slot}",
+            )
+            for slot in range(num_slots)
+        ]
+
+    async def _acquire_node_large_request_slot(self) -> int | None:
+        """Acquire one advisory node-wide slot without blocking the event loop."""
+        if not self._node_large_request_slot_paths:
+            return None
+        while True:
+            for slot_path in self._node_large_request_slot_paths:
+                fd = os.open(slot_path, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError:
+                    os.close(fd)
+            await asyncio.sleep(0.001)
+
+    @staticmethod
+    def _release_node_large_request_slot(slot_fd: int | None) -> None:
+        if slot_fd is None:
+            return
+        try:
+            fcntl.flock(slot_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(slot_fd)
 
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata

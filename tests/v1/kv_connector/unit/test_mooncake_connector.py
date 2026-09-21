@@ -1673,6 +1673,46 @@ def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
         assert worker.registered_layer_indices == [0, 1]
 
 
+def test_large_request_gate_uses_largest_kv_group_block_count():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._large_request_semaphore = object()
+    worker.large_request_threshold_tokens = 32768
+    worker.block_size = 256
+
+    long_meta = SimpleNamespace(req_blocks={"request": ("transfer", [[0] * 256])})
+    short_meta = SimpleNamespace(req_blocks={"request": ("transfer", [[0] * 14])})
+
+    assert worker._is_large_request_meta(long_meta)
+    assert not worker._is_large_request_meta(short_meta)
+
+
+@pytest.mark.asyncio
+async def test_node_large_request_slots_are_mutually_exclusive(tmp_path):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker._node_large_request_slot_paths = (
+        MooncakeConnectorWorker._get_node_large_request_slot_paths(
+            str(tmp_path), "engine-a", 1
+        )
+    )
+    assert worker._node_large_request_slot_paths != (
+        MooncakeConnectorWorker._get_node_large_request_slot_paths(
+            str(tmp_path), "engine-b", 1
+        )
+    )
+
+    first_slot = await worker._acquire_node_large_request_slot()
+    assert first_slot is not None
+
+    waiting_for_slot = asyncio.create_task(worker._acquire_node_large_request_slot())
+    await asyncio.sleep(0.01)
+    assert not waiting_for_slot.done()
+
+    worker._release_node_large_request_slot(first_slot)
+    second_slot = await asyncio.wait_for(waiting_for_slot, timeout=1)
+    assert second_slot is not None
+    worker._release_node_large_request_slot(second_slot)
+
+
 @pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
