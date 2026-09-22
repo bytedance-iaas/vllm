@@ -16,12 +16,16 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    get_input_quant_key,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
@@ -45,7 +49,11 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -276,6 +284,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
         self.layer_id = layer_id
+        self.token_shard_min_tokens = 0
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
@@ -918,6 +927,39 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert qr_scale is None, "ROCm-only path"
         return self.wq_b(qr)
 
+    @cached_property
+    def _input_projection_is_token_local(self) -> bool:
+        # Resolve after weight loading, when the effective quantizer is known.
+        from vllm.model_executor.layers.quantization.humming import HummingLinearMethod
+        from vllm.model_executor.layers.quantization.utils.humming import (
+            input_schema_to_quant_key,
+        )
+
+        linear = self.fused_wqa_wkv
+        method = linear.quant_method
+        if isinstance(method, UnquantizedLinearMethod):
+            return True
+        if isinstance(method, HummingLinearMethod):
+            key = input_schema_to_quant_key(method.input_schema, linear.params_dtype)
+            if key is None:
+                return True  # Unquantized Humming activations.
+        else:
+            key = (
+                get_input_quant_key(linear)
+                or getattr(method, "activation_quant_key", None)
+                or getattr(method, "akey", None)
+            )
+        supported = key is not None and all(
+            scale is None or scale.static or scale.group_shape.row == 1
+            for scale in (key.scale, key.scale2)
+        )
+        if not supported:
+            logger.warning_once(
+                "DeepSeek V4.1 attention token sharding requires token-local "
+                "activation quantization; keeping the replicated projection."
+            )
+        return supported
+
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
     ) -> tuple[
@@ -928,6 +970,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
             aux_streams = aux_streams[:2]
+
+        num_tokens = hidden_states.shape[0]
+        shard_tokens = (
+            self.token_shard_min_tokens > 0
+            and num_tokens >= self.token_shard_min_tokens
+            and get_tensor_model_parallel_world_size() > 1
+            and self._input_projection_is_token_local
+        )
+        projection_input = hidden_states
+        if shard_tokens:
+            tp_size = get_tensor_model_parallel_world_size()
+            chunk = (num_tokens + tp_size - 1) // tp_size
+            start = get_tensor_model_parallel_rank() * chunk
+            projection_input = hidden_states[start : start + chunk]
+            if projection_input.shape[0] < chunk:
+                projection_input = F.pad(
+                    projection_input, (0, 0, 0, chunk - projection_input.shape[0])
+                )
 
         # fused_wqa_wkv (heaviest) on default; the two lighter input GEMMs on
         # aux streams 0/1 when their owning module exists. ln_events[0] is the
@@ -950,7 +1010,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_fns[1] = indexer_weights_proj
 
         qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
-            lambda: self._fused_wqa_wkv_gemm(hidden_states),
+            lambda: self._fused_wqa_wkv_gemm(projection_input),
             aux_fns,
             self.ln_events[0],
             self.ln_events[1:3],
@@ -959,6 +1019,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
         )
 
+        if shard_tokens:
+            qr_kv = tensor_model_parallel_all_gather(qr_kv, dim=0)[:num_tokens]
         return qr_kv, kv_score, indexer_weights
 
     def _compressor_kv_score(self, hidden_states: torch.Tensor) -> torch.Tensor:

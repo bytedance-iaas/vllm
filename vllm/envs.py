@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
     VLLM_MAX_EMBED_DECODE_BYTES: int = 2_147_483_648
     VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS: int = 0
+    VLLM_DSV41_ATTN_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_ENGRAM_TOKEN_EXCHANGE: bool = False
     VLLM_MAX_IMAGE_PIXELS: int = 178_956_970
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
@@ -1039,6 +1040,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Zero keeps the replicated path.
     "VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS", "0")
+    ),
+    # Shard the replicated attention input GEMM by token without model-wide SP.
+    # Zero disables sharding; the threshold uses this layer's padded batch size.
+    "VLLM_DSV41_ATTN_TOKEN_SHARD_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV41_ATTN_TOKEN_SHARD_MIN_TOKENS", "0")
     ),
     # Exchange heads directly to token owners in the eager TP-sharded path.
     "VLLM_DSV41_ENGRAM_TOKEN_EXCHANGE": lambda: bool(
