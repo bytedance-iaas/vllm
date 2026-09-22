@@ -4,7 +4,7 @@ include(FetchContent)
 # docker/Dockerfile.
 set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/wangyicong52/DeepGEMM.git")
 set(_DEEPGEMM_UPSTREAM_COMMIT
-  "f49711cda4a6a4449ce5df92f425f20b4577dfa7")
+  "d194b2c3f600cebeab6fa4b83146523ee6ccac0c")
 
 # If DEEPGEMM_SRC_DIR is set, DeepGEMM is built from that directory
 # instead of downloading.

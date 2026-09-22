@@ -10,7 +10,7 @@ set -e
 DEEPGEMM_GIT_REPO="${DEEPGEMM_GIT_REPOSITORY:-https://github.com/wangyicong52/DeepGEMM.git}"
 # NOTE: This targets wyc/vllm-mega-moe, which carries the SM90 MegaMoE APIs
 # needed by DeepSeek-V4.1 Flash plus the paged-MQA indexer APIs used by vLLM.
-DEEPGEMM_GIT_REF="${DEEPGEMM_GIT_COMMIT:-f49711cda4a6a4449ce5df92f425f20b4577dfa7}"
+DEEPGEMM_GIT_REF="${DEEPGEMM_GIT_COMMIT:-d194b2c3f600cebeab6fa4b83146523ee6ccac0c}"
 WHEEL_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

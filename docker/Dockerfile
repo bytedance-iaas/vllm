@@ -56,7 +56,7 @@ ARG EPEL_MIRROR
 # DeepSeek-V4.1 Flash so vLLM vendors one DeepGEMM build for both indexer and
 # MegaMoE paths.
 ARG DEEPGEMM_GIT_REPOSITORY=https://github.com/wangyicong52/DeepGEMM.git
-ARG DEEPGEMM_GIT_COMMIT=f49711cda4a6a4449ce5df92f425f20b4577dfa7
+ARG DEEPGEMM_GIT_COMMIT=d194b2c3f600cebeab6fa4b83146523ee6ccac0c
 ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
 
 # Patched Hugging Face tokenizers source used by vLLM's long-prefix

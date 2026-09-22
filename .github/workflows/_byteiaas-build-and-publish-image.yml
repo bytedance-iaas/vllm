@@ -65,7 +65,7 @@ jobs:
       BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
-      BYTEIAAS_DEEPGEMM_GIT_COMMIT: f49711cda4a6a4449ce5df92f425f20b4577dfa7
+      BYTEIAAS_DEEPGEMM_GIT_COMMIT: d194b2c3f600cebeab6fa4b83146523ee6ccac0c
       BYTEIAAS_TOKENIZERS_GIT_REPOSITORY: https://github.com/wangyicong52/tokenizers.git
       BYTEIAAS_TOKENIZERS_GIT_REF: vllm
       BYTEIAAS_TOKENIZERS_GIT_COMMIT: 441393c720fbd27a4faea02b7af18ebe08a65a01

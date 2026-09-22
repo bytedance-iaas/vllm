@@ -26,7 +26,7 @@
       "default": "https://github.com/wangyicong52/DeepGEMM.git"
     },
     "DEEPGEMM_GIT_COMMIT": {
-      "default": "f49711cda4a6a4449ce5df92f425f20b4577dfa7"
+      "default": "d194b2c3f600cebeab6fa4b83146523ee6ccac0c"
     },
     "DEEPGEMM_REQUIRE_SM90_MEGA_MOE": {
       "default": "ON"
