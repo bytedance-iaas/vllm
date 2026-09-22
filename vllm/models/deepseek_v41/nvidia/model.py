@@ -198,6 +198,30 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _attention_token_shard_min_tokens(vllm_config: VllmConfig) -> int:
+    threshold = max(0, envs.VLLM_DSV41_ATTN_TOKEN_SHARD_MIN_TOKENS)
+    if threshold == 0:
+        return 0
+    parallel = vllm_config.parallel_config
+    if (
+        not current_platform.is_cuda()
+        or parallel.tensor_parallel_size == 1
+        or _use_sequence_parallel(vllm_config)
+        or parallel.prefill_context_parallel_size > 1
+        or parallel.decode_context_parallel_size > 1
+        or parallel.use_ubatching
+        or vllm_config.lora_config is not None
+        or vllm_config.speculative_config is not None
+        or envs.VLLM_BATCH_INVARIANT
+    ):
+        logger.warning_once(
+            "DeepSeek V4.1 attention token sharding is disabled for this "
+            "parallelism or execution configuration."
+        )
+        return 0
+    return threshold
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -241,6 +265,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if self.use_sequence_parallel or fuse_mhc_all_reduce:
             self.attn.wo_b.reduce_results = False
+        self.attn.token_shard_min_tokens = _attention_token_shard_min_tokens(
+            vllm_config
+        )
         self.ffn = DeepseekV4MoE(
             vllm_config,
             prefix=f"{prefix}.ffn",
