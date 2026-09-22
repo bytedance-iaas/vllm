@@ -18,12 +18,14 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 
 def _prepare_dflash_inputs_to_capture(
     num_reqs: int,
     num_tokens: int,
+    model_state: ModelState,
     input_buffers: InputBuffers,
     block_tables: BlockTables,
     attn_groups: list[list[AttentionGroup]],
@@ -66,7 +68,9 @@ def _prepare_dflash_inputs_to_capture(
             kv_cache_config=kv_cache_config,
             for_cudagraph_capture=True,
             causal=causal,
-            replay_start=input_batch.replay_start,
+            model_specific_attn_metadata=(
+                model_state.get_cudagraph_capture_attn_metadata(num_reqs)
+            ),
         )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 
@@ -78,6 +82,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
     def capture(
         self,
         forward_fn: Callable,
+        model_state: ModelState,
         input_buffers: InputBuffers,
         block_tables: BlockTables,
         attn_groups: list[list[AttentionGroup]],
@@ -100,6 +105,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
             attn_state = _prepare_dflash_inputs_to_capture(
                 num_reqs,
                 num_tokens,
+                model_state,
                 input_buffers,
                 block_tables,
                 attn_groups,

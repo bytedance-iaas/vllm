@@ -154,6 +154,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
+            self.model_state,
             self.input_buffers,
             self.block_tables,
             self.attn_groups,
