@@ -890,7 +890,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         layer_stop = self.decoder_replay_start
         if self.encoder_only_prefill:
             assert self.encoder_only_boundary_layer is not None
-            layer_stop = self.encoder_only_boundary_layer
+            layer_stop = min(self.end_layer, self.encoder_only_boundary_layer)
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
             range(self.start_layer, layer_stop),
             hidden_states,
@@ -911,6 +911,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert post_mix is not None
             assert res_mix is not None
             assert pre_mix is not None
+            if self.end_layer <= self.encoder_only_boundary_layer:
+                hidden_states = self._collapse(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    aux_hidden_by_layer,
+                    full_num_tokens,
+                )
+                return IntermediateTensors(
+                    {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                )
             layer = self.layers[self.encoder_only_boundary_layer]
             assert isinstance(layer, DeepseekV4DecoderLayer)
             return layer.write_global_cache(

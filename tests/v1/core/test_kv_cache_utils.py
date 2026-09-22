@@ -438,6 +438,72 @@ def test_dsv41_encoder_only_profile_transfers_global_groups_only():
 
 
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("cut", [8, 14])
+def test_dsv41_encoder_only_profile_projects_prefill_pp_groups(monkeypatch, cut):
+    """Projected worker caches retain scheduler IDs for every global source."""
+    sources = (2, 8, 14, 20)
+    config = VllmConfig(model_config=ModelConfig(max_model_len=128))
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        dsv41_encoder_only_prefill=True,
+    )
+    config.cache_config.kv_cache_layout = "BLNHC"
+    config.parallel_config.pipeline_parallel_size = 2
+    config.model_config.hf_text_config.num_hidden_layers = 40
+    config.model_config.hf_text_config.kv_source_layer_ids = sources
+    config.model_config.hf_text_config.index_source_layer_ids = sources
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", f"{cut},{40 - cut}")
+    specs: dict[str, KVCacheSpec] = {}
+    global_names = set()
+    for layer in sources:
+        for suffix, head_size in (("", 576), (".indexer.k_cache", 132)):
+            name = f"model.layers.{layer}.attn{suffix}"
+            global_names.add(name)
+            specs[name] = MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=head_size,
+                dtype=torch.uint8,
+                tokens_per_state=1 if layer == 20 else 2,
+                model_version="deepseek_v4",
+            )
+    for layer in range(40):
+        specs[f"model.layers.{layer}.swa"] = SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+            bounded_replay=True,
+            model_version="deepseek_v4",
+        )
+
+    worker_specs = [
+        {
+            name: spec
+            for name, spec in specs.items()
+            if start <= int(name.split(".")[2]) < end
+        }
+        for start, end in ((0, cut), (cut, 40))
+    ]
+    workers = get_kv_cache_configs(config, worker_specs, [64 * 1024**2] * 2)
+    scheduler = generate_scheduler_kv_cache_config(
+        workers, merge_pp_transfer_groups=True
+    )
+    assert set(scheduler.transfer_group_index_by_layer) == global_names
+    for worker, worker_spec in zip(workers, worker_specs):
+        assert set(worker.transfer_group_index_by_layer) == global_names & set(
+            worker_spec
+        )
+        for group_id in worker.transfer_group_ids:
+            assert group_id in scheduler.transfer_group_ids
+            assert set(worker.kv_cache_groups[group_id].layer_names) <= set(
+                scheduler.kv_cache_groups[group_id].layer_names
+            )
+
+
+@pytest.mark.skip_global_cleanup
 def test_dsv41_encoder_only_profile_rejects_missing_or_mixed_global_state():
     global_name = "model.layers.20.attn"
     index_name = "model.layers.20.attn.indexer.k_cache"
@@ -2554,6 +2620,41 @@ def test_generate_scheduler_kv_cache_config():
         kv_cache_tensors=[],
         kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
     )
+
+
+def test_dsv41_prefill_pp_scheduler_preserves_later_stage_transfer_group():
+    ratio2 = new_kv_cache_spec()
+    ratio1 = new_kv_cache_spec(head_size=128)
+    first_stage = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["model.layers.2.attn"], ratio2),
+            KVCacheGroupSpec([], ratio1, enable_kv_transfer=False),
+        ],
+    )
+    last_stage = KVCacheConfig(
+        num_blocks=10,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["model.layers.14.attn"], ratio2),
+            KVCacheGroupSpec(["model.layers.20.attn"], ratio1),
+        ],
+    )
+    assert first_stage.transfer_group_ids == (0,)
+
+    scheduler_config = generate_scheduler_kv_cache_config(
+        [first_stage, last_stage], merge_pp_transfer_groups=True
+    )
+
+    assert scheduler_config.transfer_group_ids == (0, 1)
+    assert scheduler_config.kv_cache_groups[0].layer_names == [
+        "model.layers.2.attn",
+        "model.layers.14.attn",
+    ]
+    assert scheduler_config.kv_cache_groups[1].layer_names == ["model.layers.20.attn"]
+    assert first_stage.transfer_group_ids == (0,)
+    assert last_stage.transfer_group_ids == (0, 1)
 
 
 def _glm5_like_kv_cache_spec(

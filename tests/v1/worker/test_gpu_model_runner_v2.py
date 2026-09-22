@@ -74,6 +74,56 @@ def test_cache_only_runner_waits_for_kv_writes_before_output(monkeypatch):
     assert events == [("record", main_stream), ("synchronize", None)]
 
 
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_cache_only_prefill_pp_first_rank_skips_sample_broadcast(monkeypatch):
+    events = []
+
+    class FakeEvent:
+        def __init__(self, blocking=False):
+            assert blocking
+
+        def record(self, stream):
+            events.append("record")
+
+        def synchronize(self):
+            events.append("synchronize")
+
+    monkeypatch.setattr(torch, "Event", FakeEvent)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    input_batch = SimpleNamespace(
+        req_ids=["req"], idx_mapping=torch.tensor([0], dtype=torch.int32)
+    )
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=input_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        dp_sync=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        routed_experts=None,
+        cudagraph_stats=None,
+    )
+    runner.is_last_pp_rank = False
+    runner.is_dsv41_encoder_only_prefill = True
+    runner.pp_handler = SimpleNamespace(receive=MagicMock())
+    runner.postprocess_num_computed_tokens = MagicMock()
+    runner.model_state = SimpleNamespace(postprocess_state=MagicMock())
+    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(return_value=None))
+    runner.main_stream = object()
+    runner.eplb = SimpleNamespace(step=MagicMock())
+
+    output = runner.sample_tokens(None)
+
+    assert isinstance(output, AsyncCacheOnlyOutput)
+    runner.pp_handler.receive.assert_not_called()
+    assert events == ["record"]
+    output.get_output()
+    assert events == ["record", "synchronize"]
+
+
 def test_prepare_padding_mask_marks_sequence_parallel_padding():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.input_buffers = SimpleNamespace(is_padding=torch.empty(8, dtype=torch.bool))

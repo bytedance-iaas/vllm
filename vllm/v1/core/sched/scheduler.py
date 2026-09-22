@@ -2087,7 +2087,12 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request status.
             if self.is_dsv41_encoder_only_prefill:
                 assert not new_token_ids
-                if request.num_computed_tokens >= request.num_prompt_tokens:
+                # PP can schedule the final chunk before earlier outputs arrive.
+                if (
+                    not output_is_stale
+                    and request.num_in_flight_tokens == 0
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                ):
                     request.status = RequestStatus.FINISHED_STOPPED
                     stopped = True
             elif new_token_ids:

@@ -2087,6 +2087,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         self.execute_model_state = None
 
+        if self.is_dsv41_encoder_only_prefill:
+            self.postprocess_num_computed_tokens(input_batch)
+            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            if not self.is_last_pp_rank:
+                output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+                output = ModelRunnerOutput.with_ec_conn_output(
+                    output, ec_connector_output
+                )
+            else:
+                output = ModelRunnerOutput(
+                    req_ids=input_batch.req_ids,
+                    req_id_to_index={
+                        req_id: i for i, req_id in enumerate(input_batch.req_ids)
+                    },
+                    sampled_token_ids=[[] for _ in input_batch.req_ids],
+                    kv_connector_output=kv_connector_output,
+                    ec_connector_output=ec_connector_output,
+                    cudagraph_stats=cudagraph_stats,
+                )
+            return AsyncCacheOnlyOutput(output, self.main_stream)
+
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
@@ -2106,22 +2128,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
-
-        if self.is_dsv41_encoder_only_prefill:
-            self.postprocess_num_computed_tokens(input_batch)
-            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
-            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            output = ModelRunnerOutput(
-                req_ids=input_batch.req_ids,
-                req_id_to_index={
-                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
-                },
-                sampled_token_ids=[[] for _ in input_batch.req_ids],
-                kv_connector_output=kv_connector_output,
-                ec_connector_output=ec_connector_output,
-                cudagraph_stats=cudagraph_stats,
-            )
-            return AsyncCacheOnlyOutput(output, self.main_stream)
 
         # Last rank: sample tokens
         draft_hidden_states = hidden_states

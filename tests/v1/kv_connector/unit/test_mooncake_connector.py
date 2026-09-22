@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     MooncakeBootstrapServer,
 )
 from vllm.utils.network_utils import get_open_port
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -361,6 +362,35 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
         assert src_ptrs == expected_by_pp_rank[pp_rank]["src_ptrs"]
         assert dst_ptrs == expected_by_pp_rank[pp_rank]["dst_ptrs"]
         assert lengths == [2 * block_len, 2 * block_len]
+
+    remapped_local = [
+        TransferRegion("model.layers.14.attn", 14, 0x5000, block_len, block_len, 0)
+    ]
+    remapped_remote = [
+        TransferRegion("model.layers.14.attn", 14, 0xE000, block_len, block_len, 1)
+    ]
+    aligned_local, aligned_remote, err = _align_transfer_regions(
+        remapped_local, remapped_remote, allow_group_remap=True
+    )
+    assert err is None
+    xfer_meta.req_blocks["d-req-pp"] = (transfer_id, [[30, 31], [20, 21]])
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-req-pp", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=aligned_local,
+        remote_regions=aligned_remote,
+        allow_group_remap=True,
+    )
+    assert (err_reqs, err_msg) == ([], None)
+    assert src_ptrs == [0x5000 + 10 * block_len]
+    assert dst_ptrs == [0xE000 + 20 * block_len]
+    assert lengths == [2 * block_len]
 
 
 @pytest.mark.asyncio
@@ -771,6 +801,8 @@ def test_encoder_only_cache_ready_triggers_mooncake_transfer():
 
     assert delay_free
     assert connector._reqs_need_send[request.request_id][1] == [[10, 11]]
+    metadata = connector.build_connector_meta(SchedulerOutput.make_empty())
+    assert metadata.scheduler_transfer_group_ids == (0,)
 
     connector._reqs_need_send.clear()
     request.num_computed_tokens -= 1
@@ -787,6 +819,35 @@ def test_encoder_only_cache_ready_triggers_mooncake_transfer():
 
 @pytest.mark.cpu_test
 @pytest.mark.skip_global_cleanup
+@pytest.mark.asyncio
+async def test_encoder_only_prefill_pp_worker_projects_scheduler_block_groups():
+    metadata = MooncakeConnectorMetadata()
+    metadata.scheduler_transfer_group_ids = (0, 1)
+    metadata.reqs_to_send["p-req"] = ("xfer", [[10, 11], [20, 21]])
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.vllm_config = SimpleNamespace(is_dsv41_encoder_only_prefill=True)
+    worker.pp_size = 2
+    spec = _make_test_kv_cache_config().kv_cache_groups[0].kv_cache_spec
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["model.layers.2.attn"], spec),
+            KVCacheGroupSpec([], spec, enable_kv_transfer=False),
+        ],
+    )
+    send_meta = SendBlockMeta("p-req", "xfer", [], asyncio.Event())
+    worker.reqs_need_send = {"xfer": send_meta}
+
+    await worker.record_send_reqs(metadata)
+
+    assert send_meta.local_block_ids == [[10, 11]]
+    assert send_meta.ready.is_set()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
 def test_encoder_only_mooncake_rejects_extra_consumer_cache_regions():
     main = TransferRegion("model.layers.20.attn", 20, 0, 512, 512)
     indexer = TransferRegion("model.layers.20.attn.indexer.k_cache", 20, 0, 132, 132)
@@ -795,6 +856,45 @@ def test_encoder_only_mooncake_rejects_extra_consumer_cache_regions():
     assert _validate_dsv41_cache_only_regions([main, indexer], [main, indexer]) is None
     assert (
         _validate_dsv41_cache_only_regions([main, indexer], [main, indexer, swa])
+        is not None
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_encoder_only_mooncake_accepts_prefill_pp_region_subset():
+    first = TransferRegion("model.layers.2.attn", 2, 0, 512, 512)
+    last = TransferRegion("model.layers.20.attn", 20, 0, 512, 512)
+    required = {".layers.2.attn", ".layers.20.attn"}
+
+    assert (
+        _validate_dsv41_cache_only_regions(
+            [first],
+            [first, last],
+            allow_producer_subset=True,
+            required_consumer_suffixes=required,
+        )
+        is None
+    )
+    assert (
+        _validate_dsv41_cache_only_regions(
+            [last], [first, last], allow_producer_subset=True
+        )
+        is None
+    )
+    assert (
+        _validate_dsv41_cache_only_regions(
+            [first, last], [first], allow_producer_subset=True
+        )
+        is not None
+    )
+    assert (
+        _validate_dsv41_cache_only_regions(
+            [first],
+            [first, last, TransferRegion("model.layers.1.swa", 1, 0, 512, 512)],
+            allow_producer_subset=True,
+            required_consumer_suffixes=required,
+        )
         is not None
     )
 
