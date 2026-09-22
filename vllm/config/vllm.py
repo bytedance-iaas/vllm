@@ -2860,8 +2860,28 @@ class VllmConfig:
             )
         if not self.use_v2_model_runner:
             raise ValueError("dsv41_encoder_only_prefill requires model runner V2.")
-        if self.parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("dsv41_encoder_only_prefill requires PP=1.")
+        dsv41_encoder_only_boundary_layer(model_config.hf_text_config)
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size != 1:
+            from vllm.distributed.utils import get_pp_indices
+
+            sources = tuple(model_config.hf_text_config.kv_source_layer_ids)
+            if kv_config.kv_role != "kv_producer" or pp_size != 2:
+                raise ValueError(
+                    "dsv41_encoder_only_prefill supports PP=2 only on the "
+                    "kv_producer; the consumer requires PP=1."
+                )
+            if self.parallel_config.distributed_executor_backend != "mp":
+                raise ValueError(
+                    "dsv41_encoder_only_prefill PP=2 requires the multiprocessing "
+                    "executor (--distributed-executor-backend mp)."
+                )
+            _, cut = get_pp_indices(40, 0, pp_size)
+            if cut not in sources[1:-1]:
+                raise ValueError(
+                    "dsv41_encoder_only_prefill PP cut must start a local "
+                    "sharing group before L20 (for example 8,32 or 14,26)."
+                )
         if self.parallel_config.prefill_context_parallel_size != 1:
             raise ValueError(
                 "dsv41_encoder_only_prefill does not support prefill context "
@@ -2888,7 +2908,6 @@ class VllmConfig:
                 "dsv41_encoder_only_prefill currently requires the validated "
                 "128-token target window."
             )
-        dsv41_encoder_only_boundary_layer(model_config.hf_text_config)
         if kv_config.kv_role == "kv_producer" and self.speculative_config is not None:
             raise ValueError(
                 "The dsv41_encoder_only_prefill producer must not configure a "

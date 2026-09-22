@@ -21,6 +21,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
         "architecture": "DeepseekV41ForCausalLM",
         "use_v2": True,
         "pp": 1,
+        "executor": "mp",
         "pcp": 1,
         "ubatching": False,
         "async_scheduling": False,
@@ -54,6 +55,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
             use_v2_model_runner=values["use_v2"],
             parallel_config=SimpleNamespace(
                 pipeline_parallel_size=values["pp"],
+                distributed_executor_backend=values["executor"],
                 prefill_context_parallel_size=values["pcp"],
                 use_ubatching=values["ubatching"],
             ),
@@ -70,6 +72,49 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
 @pytest.mark.skip_global_cleanup
 def test_dsv41_encoder_only_handoff_accepts_initial_boundary(role):
     VllmConfig._verify_dsv41_encoder_only_handoff(_dsv41_handoff_config(role=role))
+
+
+@pytest.mark.parametrize("partition", ["8,32", "14,26"])
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_accepts_aligned_prefill_pp(monkeypatch, partition):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    VllmConfig._verify_dsv41_encoder_only_handoff(_dsv41_handoff_config(pp=2))
+
+
+@pytest.mark.parametrize("partition", ["10,30", "12,28", "20,20"])
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_rejects_unsafe_pp_cut(monkeypatch, partition):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    with pytest.raises(ValueError, match="PP cut must start a local sharing group"):
+        VllmConfig._verify_dsv41_encoder_only_handoff(_dsv41_handoff_config(pp=2))
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_rejects_incomplete_partition(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,10")
+    with pytest.raises(ValueError, match="does not match num_hidden_layers"):
+        VllmConfig._verify_dsv41_encoder_only_handoff(_dsv41_handoff_config(pp=2))
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_keeps_consumer_at_pp1(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "14,26")
+    with pytest.raises(ValueError, match="consumer requires PP=1"):
+        VllmConfig._verify_dsv41_encoder_only_handoff(
+            _dsv41_handoff_config(role="kv_consumer", pp=2)
+        )
+
+
+@pytest.mark.parametrize("executor", ["ray", "external_launcher"])
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_prefill_pp_requires_all_rank_completion(
+    monkeypatch, executor
+):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "8,32")
+    with pytest.raises(ValueError, match="requires the multiprocessing executor"):
+        VllmConfig._verify_dsv41_encoder_only_handoff(
+            _dsv41_handoff_config(pp=2, executor=executor)
+        )
 
 
 @pytest.mark.skip_global_cleanup
@@ -95,7 +140,7 @@ def test_dsv41_encoder_only_handoff_separates_producer_compile_hash():
         ({"role": "kv_both"}, "dedicated kv_producer or kv_consumer"),
         ({"architecture": "LlamaForCausalLM"}, "DeepseekV41ForCausalLM only"),
         ({"use_v2": False}, "requires model runner V2"),
-        ({"pp": 2}, "requires PP=1"),
+        ({"pp": 2}, "PP cut must start a local sharing group"),
         ({"pcp": 2}, "does not support prefill context parallelism"),
         ({"ubatching": True}, "does not support DBO or microbatching"),
         ({"async_scheduling": True}, "requires --no-async-scheduling"),

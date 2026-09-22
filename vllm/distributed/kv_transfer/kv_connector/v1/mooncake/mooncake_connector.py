@@ -312,6 +312,7 @@ def _align_transfer_regions(
     remote_regions: list[TransferRegion],
     *,
     allow_partial_layers: bool = False,
+    allow_group_remap: bool = False,
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
     """Align KV transfer regions by registered layer-name occurrence.
 
@@ -364,7 +365,10 @@ def _align_transfer_regions(
                     f"{remote_region.layer_index}."
                 ),
             )
-        if local_region.group_index != remote_region.group_index:
+        if (
+            not allow_group_remap
+            and local_region.group_index != remote_region.group_index
+        ):
             return (
                 [],
                 [],
@@ -384,15 +388,41 @@ def _align_transfer_regions(
 def _validate_dsv41_cache_only_regions(
     producer_regions: list[TransferRegion],
     consumer_regions: list[TransferRegion],
+    *,
+    allow_producer_subset: bool = False,
+    required_consumer_suffixes: set[str] | None = None,
 ) -> str | None:
-    """Require both Mooncake roles to register the same global cache layers."""
+    """Require a P stage's global regions to be present on the consumer."""
     producer_layers = Counter(
         (region.layer_name, region.layer_index) for region in producer_regions
     )
     consumer_layers = Counter(
         (region.layer_name, region.layer_index) for region in consumer_regions
     )
-    if producer_layers != consumer_layers:
+    if required_consumer_suffixes is not None:
+        seen_suffixes = {
+            suffix
+            for region in consumer_regions
+            for suffix in required_consumer_suffixes
+            if region.layer_name.endswith(suffix)
+        }
+        if seen_suffixes != required_consumer_suffixes or any(
+            not any(
+                region.layer_name.endswith(suffix)
+                for suffix in required_consumer_suffixes
+            )
+            for region in consumer_regions
+        ):
+            return (
+                "DeepSeek-V4.1 cache-only Mooncake consumer must register "
+                "only the complete global Main-KV/Indexer-K regions."
+            )
+    regions_match = (
+        producer_layers <= consumer_layers
+        if allow_producer_subset
+        else producer_layers == consumer_layers
+    )
+    if not producer_layers or not regions_match:
         return (
             "DeepSeek-V4.1 cache-only Mooncake handoff requires matching "
             "Main-KV/Indexer-K regions on producer and consumer."
@@ -482,6 +512,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.scheduler_transfer_group_ids: tuple[int, ...] = ()
 
     def add_new_req(
         self,
@@ -878,6 +909,8 @@ class MooncakeConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
+        if self.is_dsv41_encoder_only_prefill and self.is_kv_producer:
+            meta.scheduler_transfer_group_ids = self.kv_cache_config.transfer_group_ids
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
@@ -1312,9 +1345,23 @@ class MooncakeConnectorWorker:
             meta.registered_layer_indices,
             meta.registered_group_indices,
         )
+        cache_only_prefill_pp = (
+            self.vllm_config.is_dsv41_encoder_only_prefill
+            and self.pp_size == 2
+            and meta.remote_pp_size == 1
+        )
         if self.vllm_config.is_dsv41_encoder_only_prefill:
+            hf_config = self.vllm_config.model_config.hf_text_config
+            required_suffixes = {
+                f".layers.{layer_id}.attn{suffix}"
+                for layer_id in hf_config.kv_source_layer_ids
+                for suffix in ("", ".indexer.k_cache")
+            }
             profile_error = _validate_dsv41_cache_only_regions(
-                local_regions, remote_regions
+                local_regions,
+                remote_regions,
+                allow_producer_subset=cache_only_prefill_pp,
+                required_consumer_suffixes=required_suffixes,
             )
             if profile_error is not None:
                 response = MooncakeXferResponse(
@@ -1329,6 +1376,7 @@ class MooncakeConnectorWorker:
             allow_partial_layers=(
                 meta.remote_pp_size > 1 and meta.remote_pp_size != self.pp_size
             ),
+            allow_group_remap=cache_only_prefill_pp,
         )
         if align_err is not None:
             response = MooncakeXferResponse(
@@ -1439,6 +1487,7 @@ class MooncakeConnectorWorker:
                 meta,
                 local_regions,
                 remote_regions,
+                allow_group_remap=cache_only_prefill_pp,
             )
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
@@ -1543,6 +1592,8 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        *,
+        allow_group_remap: bool = False,
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
         src_ptrs = []
         dst_ptrs = []
@@ -1559,17 +1610,54 @@ class MooncakeConnectorWorker:
             ):
                 continue
 
-            if len(send_meta.local_block_ids) != len(remote_block_ids_per_group):
+            local_group_count = len(send_meta.local_block_ids)
+            remote_group_count = len(remote_block_ids_per_group)
+            if not allow_group_remap and local_group_count != remote_group_count:
                 logger.error(
                     "req %s: KV group count mismatch: local=%d, remote=%d",
                     d_req_id,
-                    len(send_meta.local_block_ids),
-                    len(remote_block_ids_per_group),
+                    local_group_count,
+                    remote_group_count,
                 )
                 err_reqs.append(d_req_id)
                 if err_msg is None:
                     err_msg = "KV group count mismatch"
                 continue
+
+            if allow_group_remap:
+                group_mapping: dict[int, int] = {}
+                mapping_error = len(local_regions) != len(
+                    remote_regions
+                ) or local_group_count != len(self.kv_cache_config.transfer_groups)
+                for local_region, remote_region in zip(local_regions, remote_regions):
+                    local_index = local_region.group_index
+                    remote_index = remote_region.group_index
+                    if (
+                        local_index < 0
+                        or remote_index < 0
+                        or local_index >= local_group_count
+                        or remote_index >= remote_group_count
+                        or group_mapping.get(local_index, remote_index) != remote_index
+                    ):
+                        mapping_error = True
+                        break
+                    group_mapping[local_index] = remote_index
+                if (
+                    mapping_error
+                    or not group_mapping
+                    or len(group_mapping) != local_group_count
+                    or len(set(group_mapping.values())) != local_group_count
+                ):
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = "KV group mapping mismatch"
+                    continue
+                group_pairs = [
+                    (local_index, group_mapping[local_index])
+                    for local_index in range(local_group_count)
+                ]
+            else:
+                group_pairs = [(i, i) for i in range(local_group_count)]
 
             # Keep KV-cache group identity. Hybrid/HMA groups can carry
             # different semantics (e.g. full-attention KV pages vs GDN/Mamba
@@ -1579,9 +1667,9 @@ class MooncakeConnectorWorker:
             remote_block_ids_by_group: list[list[int]] = []
             has_block_error = False
             group_specs = self.kv_cache_config.transfer_groups
-            for group_index, (local_group, remote_group) in enumerate(
-                zip(send_meta.local_block_ids, remote_block_ids_per_group)
-            ):
+            for group_index, remote_group_index in group_pairs:
+                local_group = send_meta.local_block_ids[group_index]
+                remote_group = remote_block_ids_per_group[remote_group_index]
                 is_mamba_group = isinstance(
                     group_specs[group_index].kv_cache_spec,
                     MambaSpec,
@@ -1637,10 +1725,10 @@ class MooncakeConnectorWorker:
             )
 
             for local_region, remote_region in zip(local_regions, remote_regions):
-                assert local_region.group_index == remote_region.group_index, (
-                    "Aligned Mooncake transfer regions must belong to the same "
-                    "KV group."
-                )
+                assert (
+                    group_pairs[local_region.group_index][1]
+                    == remote_region.group_index
+                ), "Aligned Mooncake transfer regions must belong to the same KV group."
                 group_index = local_region.group_index
                 assert group_index < len(local_block_ids_by_group), (
                     "Transfer region references a missing KV group."
@@ -2195,7 +2283,19 @@ class MooncakeConnectorWorker:
                 # Already gone through request_finished()
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
-                send_meta.local_block_ids = block_ids
+                if self.vllm_config.is_dsv41_encoder_only_prefill and self.pp_size == 2:
+                    scheduler_groups = metadata.scheduler_transfer_group_ids
+                    if len(block_ids) != len(scheduler_groups):
+                        raise ValueError(
+                            "DeepSeek-V4.1 Prefill PP Mooncake scheduler block "
+                            "groups do not match its transfer-group metadata."
+                        )
+                    send_meta.local_block_ids = [
+                        block_ids[scheduler_groups.index(group_id)]
+                        for group_id in self.kv_cache_config.transfer_group_ids
+                    ]
+                else:
+                    send_meta.local_block_ids = block_ids
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )

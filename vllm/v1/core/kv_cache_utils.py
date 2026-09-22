@@ -2383,6 +2383,8 @@ def get_kv_cache_groups(
 
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
+    *,
+    merge_pp_transfer_groups: bool = False,
 ) -> KVCacheConfig:
     """Generate the KV cache configuration for the scheduler."""
     assert all(
@@ -2395,6 +2397,33 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    if merge_pp_transfer_groups:
+        for group_index, group in enumerate(cfg.kv_cache_groups):
+            worker_groups = [
+                worker.kv_cache_groups[group_index] for worker in kv_cache_configs
+            ]
+            group.layer_names = list(
+                dict.fromkeys(
+                    layer_name
+                    for worker_group in worker_groups
+                    for layer_name in worker_group.layer_names
+                )
+            )
+            group.enable_kv_transfer = any(
+                worker_group.enable_kv_transfer for worker_group in worker_groups
+            )
+            if not group.layer_names:
+                raise ValueError(
+                    "DeepSeek-V4.1 Prefill PP cache group has no owner on any stage."
+                )
+        for property_name in (
+            "transfer_group_ids",
+            "transfer_groups",
+            "transfer_group_index_by_layer",
+            "prefix_cacheable_group_ids",
+            "prefix_cacheable_groups",
+        ):
+            cfg.__dict__.pop(property_name, None)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2766,6 +2795,13 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    if vllm_config.uses_dsv41_encoder_only_handoff:
+        hf_config = vllm_config.model_config.hf_text_config
+        _apply_dsv41_encoder_only_transfer_profile(
+            global_kv_cache_groups,
+            hf_config.kv_source_layer_ids,
+            hf_config.index_source_layer_ids,
+        )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
@@ -2775,11 +2811,15 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
     if vllm_config.uses_dsv41_encoder_only_handoff:
-        hf_config = vllm_config.model_config.hf_text_config
-        for groups in projected_groups_per_worker:
+        for groups, worker_spec in zip(projected_groups_per_worker, kv_cache_specs):
+            local_sources = tuple(
+                source
+                for source in hf_config.kv_source_layer_ids
+                if any(name.endswith(f".layers.{source}.attn") for name in worker_spec)
+            )
             _apply_dsv41_encoder_only_transfer_profile(
                 groups,
-                hf_config.kv_source_layer_ids,
+                local_sources,
                 hf_config.index_source_layer_ids,
             )
 
