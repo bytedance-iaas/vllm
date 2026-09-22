@@ -878,9 +878,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert qr_scale is None, "ROCm-only path"
         return self.wq_b(qr)
 
-    @cached_property
-    def _input_projection_is_token_local(self) -> bool:
+    def _input_projection_uses_token_local_quantization(self) -> bool:
         # Resolve after weight loading, when the effective quantizer is known.
+        cached = self.__dict__.get("_input_projection_token_local")
+        if cached is not None:
+            return cached
+
         from vllm.model_executor.layers.quantization.humming import HummingLinearMethod
         from vllm.model_executor.layers.quantization.utils.humming import (
             input_schema_to_quant_key,
@@ -889,10 +892,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         linear = self.fused_wqa_wkv
         method = linear.quant_method
         if isinstance(method, UnquantizedLinearMethod):
+            self._input_projection_token_local = True
             return True
         if isinstance(method, HummingLinearMethod):
             key = input_schema_to_quant_key(method.input_schema, linear.param_dtype)
             if key is None:
+                self._input_projection_token_local = True
                 return True  # Unquantized Humming activations.
         else:
             key = (
@@ -909,6 +914,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "DeepSeek V4.1 attention token sharding requires token-local "
                 "activation quantization; keeping the replicated projection."
             )
+        self._input_projection_token_local = supported
         return supported
 
     def _run_parallel_input_projections(
@@ -927,7 +933,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.token_shard_min_tokens > 0
             and num_tokens >= self.token_shard_min_tokens
             and get_tensor_model_parallel_world_size() > 1
-            and self._input_projection_is_token_local
+            and self._input_projection_uses_token_local_quantization()
         )
         projection_input = hidden_states
         if shard_tokens:
