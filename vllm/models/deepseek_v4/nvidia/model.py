@@ -1669,6 +1669,9 @@ class DeepseekV4MoE(nn.Module):
         validate_fi_moe_ep_config(vllm_config)
         self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
         self.use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend)
+        self.use_fused_mega_gate = (
+            self.use_mega_moe and current_platform.is_device_capability_family(100)
+        )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -1918,7 +1921,7 @@ class DeepseekV4MoE(nn.Module):
         org_shape = hidden_states.shape
         # Small local padded batches favor GateLinear; 128-expert gates cross earlier.
         gate_threshold = 1 if self.gate.weight.shape[0] == 128 else 16
-        if hidden_states.shape[0] <= gate_threshold:
+        if hidden_states.shape[0] <= gate_threshold or not self.use_fused_mega_gate:
             router_logits, _ = self.gate(hidden_states)
             topk_weights, topk_ids = fused_topk_bias(
                 hidden_states=hidden_states,
