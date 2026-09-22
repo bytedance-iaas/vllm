@@ -270,6 +270,12 @@ class DeepseekV41ModelState(DefaultModelState):
             model_inputs["lookback_token_ids"] = self.lookback_token_ids
         return model_inputs
 
+    def get_cudagraph_capture_attn_metadata(
+        self, num_reqs: int
+    ) -> ModelSpecificAttnMetadata:
+        replay_start = self._replay_start[:num_reqs].zero_()
+        return ReplayAttnMetadata(replay_start)
+
     def prepare_attn(
         self,
         input_batch: InputBatch,

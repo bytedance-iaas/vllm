@@ -139,6 +139,12 @@ class ModelState(ABC):
         """
         return AttentionCGSupport.ALWAYS, None
 
+    def get_cudagraph_capture_attn_metadata(
+        self, num_reqs: int
+    ) -> ModelSpecificAttnMetadata | None:
+        """Return persistent model-specific metadata for CUDA graph capture."""
+        return None
+
     def preprocess_state(
         self,
         input_batch: InputBatch,
