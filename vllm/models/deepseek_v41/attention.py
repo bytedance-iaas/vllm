@@ -940,7 +940,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if isinstance(method, UnquantizedLinearMethod):
             return True
         if isinstance(method, HummingLinearMethod):
-            key = input_schema_to_quant_key(method.input_schema, linear.params_dtype)
+            key = input_schema_to_quant_key(method.input_schema, linear.param_dtype)
             if key is None:
                 return True  # Unquantized Humming activations.
         else:
