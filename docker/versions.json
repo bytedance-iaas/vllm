@@ -22,8 +22,29 @@
     "FINAL_BASE_IMAGE": {
       "default": "nvidia/cuda:13.0.3-base-ubuntu24.04"
     },
+    "DEEPGEMM_GIT_REPOSITORY": {
+      "default": "https://github.com/wangyicong52/DeepGEMM.git"
+    },
+    "DEEPGEMM_GIT_COMMIT": {
+      "default": "eb84b71a746958a162e9d889f1f7b1a49f077033"
+    },
+    "DEEPGEMM_REQUIRE_SM90_MEGA_MOE": {
+      "default": "ON"
+    },
+    "TOKENIZERS_GIT_REPOSITORY": {
+      "default": "https://github.com/wangyicong52/tokenizers.git"
+    },
+    "TOKENIZERS_GIT_REF": {
+      "default": "vllm"
+    },
+    "TOKENIZERS_GIT_COMMIT": {
+      "default": "441393c720fbd27a4faea02b7af18ebe08a65a01"
+    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
+    },
+    "UV_VERSION": {
+      "default": "0.12.6"
     },
     "PYTORCH_CUDA_INDEX_BASE_URL": {
       "default": "https://download.pytorch.org/whl"
@@ -84,6 +105,15 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
+    },
+    "INSTALL_VLLM_ROUTER": {
+      "default": "false"
+    },
+    "VLLM_ROUTER_VERSION": {
+      "default": "0.1.15"
+    },
+    "VLLM_IMAGE_SOURCE": {
+      "default": "https://github.com/vllm-project/vllm"
     }
   }
 }
