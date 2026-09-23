@@ -432,6 +432,9 @@ class PullReqMeta:
     local_block_ids: list[list[int]]
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
+    # True only when the scheduler parked this request in
+    # WAITING_FOR_REMOTE_KVS and expects a finished_recving signal.
+    awaiting_kvs: bool = True
     # Set expire time to avoid infinitely sending requests.
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
@@ -467,6 +470,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        awaiting_kvs: bool = True,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -477,6 +481,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                awaiting_kvs=awaiting_kvs,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -678,7 +683,7 @@ class MooncakeConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]]]] = {}
+        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]], bool]] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -824,8 +829,13 @@ class MooncakeConnectorScheduler:
                     else ()
                 )
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                awaiting_kvs = num_external_tokens > 0
                 # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                    awaiting_kvs,
+                )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -851,12 +861,13 @@ class MooncakeConnectorScheduler:
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
-            for req_id, (req, block_ids) in self._reqs_need_recv.items():
+            for req_id, (req, block_ids, awaiting_kvs) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    awaiting_kvs=awaiting_kvs,
                 )
             self._reqs_need_recv.clear()
 
@@ -902,7 +913,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], False)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -911,7 +922,10 @@ class MooncakeConnectorScheduler:
 
         assert not self.is_kv_consumer
 
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
@@ -1983,14 +1997,15 @@ class MooncakeConnectorWorker:
             failed.append(req_id)
             self.xfer_stats.record_failed_recv()
 
+            if not pull_meta.awaiting_kvs:
+                continue
+
             invalid = {b for group in pull_meta.local_block_ids for b in group}
             if not invalid:
-                # A pull with no local blocks only asks P to release its blocks
-                # for a request that never reached the scheduler (see
-                # AsyncLLM.notify_kv_transfer_request_rejected, which submits an
-                # abort_immediately request just to run request_finished). No D
-                # request is waiting on a load, and reporting one here would trip
-                # the scheduler's `assert req_id in self.requests`.
+                # Nothing to invalidate. If the scheduler is waiting, there is
+                # no block-level recovery target, so fail by request id.
+                self._failed_recv_reqs.put(pull_meta.d_req_id)
+                self.finished_recving_reqs.add(pull_meta.d_req_id)
                 continue
             if self._is_hma_required:
                 self._failed_recv_reqs.put(pull_meta.d_req_id)
@@ -2024,7 +2039,7 @@ class MooncakeConnectorWorker:
                 continue
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
-            if pull_meta.pull_tasks_count == 0:
+            if pull_meta.pull_tasks_count == 0 and pull_meta.awaiting_kvs:
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
 
         if ok_reqs:
