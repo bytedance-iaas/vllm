@@ -420,7 +420,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def _log_runtime_fingerprint(self, deep_gemm, device: torch.device) -> None:
         module_name = deep_gemm.__name__
-        log_key = (torch.cuda.current_device(), module_name, self._mega_moe_num_sms)
+        log_key = (
+            torch.accelerator.current_device_index(),
+            module_name,
+            self._mega_moe_num_sms,
+        )
         if log_key in self._runtime_fingerprint_logged:
             return
 
@@ -473,7 +477,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             return False
         device_index = device.index
         if device_index is None:
-            device_index = torch.cuda.current_device()
+            device_index = torch.accelerator.current_device_index()
         count = self._telemetry_sample_counts.get(device_index, 0)
         if count >= self._telemetry_max_samples:
             return False
@@ -736,6 +740,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "to be multiples of 128."
             )
         deep_gemm = _import_deepseek_v4_mega_moe_deep_gemm()
+        required: tuple[str, ...]
         if self._use_sm90_mega_moe:
             required = ("get_symm_buffer_for_mega_moe",)
             if self._use_sm90_fp4_mega_moe:
@@ -1195,6 +1200,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if warmup_key in self._capacity_warmup_done:
             return
 
+        assert self._transformed_l1_weights is not None
         device = self._transformed_l1_weights[0].device
         hidden_states = torch.zeros(
             requested_capacity,
@@ -1225,7 +1231,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 fast_math=fast_math,
                 symm_buffer=symm_buffer,
             )
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         self._capacity_warmup_done.add(warmup_key)
 
     def prepare_capacity_buckets(

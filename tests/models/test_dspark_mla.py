@@ -243,6 +243,7 @@ def test_v41_dspark_loads_linear_scales(
         model=SimpleNamespace(
             layers=[SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))],
             confidence_head=None,
+            context_kv_only=False,
         ),
         named_parameters=lambda: [(runtime_name, param)],
         process_weights_after_loading=lambda: None,
@@ -380,6 +381,7 @@ def test_v41_dspark_prefill_only_builds_context_kv_modules(monkeypatch):
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config,
         quant_config=None,
+        kernel_config=SimpleNamespace(moe_backend="CUTLASS"),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
@@ -392,6 +394,7 @@ def test_v41_dspark_prefill_only_builds_context_kv_modules(monkeypatch):
     monkeypatch.setattr(dspark, "VocabParallelEmbedding", fail_full_model)
     monkeypatch.setattr(dspark, "DeepseekV4DecoderLayer", fail_full_model)
     monkeypatch.setattr(dspark, "DSparkMarkovHead", fail_full_model)
+    monkeypatch.setattr(dspark, "maybe_init_gemm_rs", fail_full_model)
 
     model = dspark.DSparkDeepseekV4Model(vllm_config=vllm_config, prefix="model")
 

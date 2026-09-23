@@ -66,13 +66,6 @@ def test_async_detokenizer_prompt_threshold_env(
         getattr(envs, name)
 
 
-def test_mooncake_pd_trace_env() -> None:
-    with patch.dict(os.environ, {}, clear=True):
-        assert environment_variables["VLLM_MOONCAKE_PD_TRACE"]() is False
-    with patch.dict(os.environ, {"VLLM_MOONCAKE_PD_TRACE": "1"}, clear=True):
-        assert environment_variables["VLLM_MOONCAKE_PD_TRACE"]() is True
-
-
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

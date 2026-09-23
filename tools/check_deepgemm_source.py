@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import argparse
 import ast
-import re
 import sys
 from pathlib import Path
+
+import regex as re
 
 PUBLIC_APIS = {
     "fp8_fp4_mega_moe",

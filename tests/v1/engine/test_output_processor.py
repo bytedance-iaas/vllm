@@ -11,6 +11,9 @@ from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import TokenizersBackend
 
 from tests.v1.engine.utils import (
     NUM_PROMPT_LOGPROBS_UNDER_TEST,
@@ -234,15 +237,28 @@ def test_remote_prefill_cached_tokens_override(do_remote_prefill: bool):
         assert request_output.num_cached_tokens == len(prompt_tokens) - 1
 
 
+@pytest.fixture
+def async_output_test_vectors():
+    tokenizer = TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel({"hello": 0, "world": 1, "!": 2})),
+    )
+    return SimpleNamespace(
+        tokenizer=tokenizer,
+        prompt_tokens=[[0, 1]],
+        prompt_strings=["hello world"],
+        generation_tokens=[[2]],
+    )
+
+
 def test_fast_detokenizer_async_update_eligibility(
-    dummy_test_vectors,
+    async_output_test_vectors,
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("VLLM_V1_DETOKENIZER_ASYNC_MIN_PROMPT_TOKENS", "0")
     request = EngineCoreRequest(
         request_id="request",
         external_req_id="external",
-        prompt_token_ids=dummy_test_vectors.prompt_tokens[0],
+        prompt_token_ids=async_output_test_vectors.prompt_tokens[0],
         mm_features=None,
         arrival_time=0,
         lora_request=None,
@@ -252,15 +268,15 @@ def test_fast_detokenizer_async_update_eligibility(
         pooling_params=None,
     )
     output_processor = OutputProcessor(
-        dummy_test_vectors.tokenizer,
+        async_output_test_vectors.tokenizer,
         log_stats=False,
     )
-    output_processor.add_request(request, dummy_test_vectors.prompt_strings[0])
+    output_processor.add_request(request, async_output_test_vectors.prompt_strings[0])
     detokenizer = output_processor.request_states[request.request_id].detokenizer
     assert isinstance(detokenizer, FastIncrementalDetokenizer)
     detokenizer.stream = SimpleNamespace(prefill_pending=True)
 
-    token_id = dummy_test_vectors.generation_tokens[0][0]
+    token_id = async_output_test_vectors.generation_tokens[0][0]
     assert not detokenizer.needs_async_update([], stop_terminated=False)
     assert not detokenizer.needs_async_update([token_id], stop_terminated=True)
     assert detokenizer.needs_async_update([token_id], stop_terminated=False)
@@ -287,7 +303,7 @@ def test_fast_detokenizer_async_update_eligibility(
     ],
 )
 def test_fast_detokenizer_async_prompt_threshold(
-    dummy_test_vectors,
+    async_output_test_vectors,
     monkeypatch: pytest.MonkeyPatch,
     threshold: str | None,
     prompt_len: int,
@@ -299,7 +315,7 @@ def test_fast_detokenizer_async_prompt_threshold(
     else:
         monkeypatch.setenv(env_name, threshold)
 
-    base_tokens = dummy_test_vectors.prompt_tokens[0]
+    base_tokens = async_output_test_vectors.prompt_tokens[0]
     repeats = (prompt_len + len(base_tokens) - 1) // len(base_tokens)
     prompt_token_ids = (base_tokens * repeats)[:prompt_len]
     request = EngineCoreRequest(
@@ -315,12 +331,12 @@ def test_fast_detokenizer_async_prompt_threshold(
         pooling_params=None,
     )
     detokenizer = FastIncrementalDetokenizer(
-        dummy_test_vectors.tokenizer,
+        async_output_test_vectors.tokenizer,
         request,
     )
     detokenizer.stream = SimpleNamespace(prefill_pending=True)
 
-    token_id = dummy_test_vectors.generation_tokens[0][0]
+    token_id = async_output_test_vectors.generation_tokens[0][0]
     assert detokenizer.needs_async_update([token_id], stop_terminated=False) is expected
 
 
@@ -356,11 +372,11 @@ class _BlockingFirstUpdateDetokenizer(IncrementalDetokenizer):
         return "x"
 
 
-def _make_async_output_test_state(dummy_test_vectors):
+def _make_async_output_test_state(async_output_test_vectors):
     request = EngineCoreRequest(
         request_id="request",
         external_req_id="external",
-        prompt_token_ids=dummy_test_vectors.prompt_tokens[0],
+        prompt_token_ids=async_output_test_vectors.prompt_tokens[0],
         mm_features=None,
         arrival_time=0,
         lora_request=None,
@@ -370,7 +386,7 @@ def _make_async_output_test_state(dummy_test_vectors):
         pooling_params=None,
     )
     output_processor = OutputProcessor(
-        dummy_test_vectors.tokenizer,
+        async_output_test_vectors.tokenizer,
         log_stats=False,
     )
     queue = RequestOutputCollector(
@@ -378,17 +394,17 @@ def _make_async_output_test_state(dummy_test_vectors):
         request_id=request.request_id,
     )
     output_processor.add_request(request, None, queue=queue)
-    token_id = dummy_test_vectors.generation_tokens[0][0]
+    token_id = async_output_test_vectors.generation_tokens[0][0]
     output = EngineCoreOutput(request_id=request.request_id, new_token_ids=[token_id])
     return output_processor, request, queue, output
 
 
 @pytest.mark.asyncio
 async def test_async_first_detokenizer_update_keeps_loop_responsive(
-    dummy_test_vectors,
+    async_output_test_vectors,
 ):
     output_processor, request, queue, output = _make_async_output_test_state(
-        dummy_test_vectors
+        async_output_test_vectors
     )
     started = threading.Event()
     release = threading.Event()
@@ -407,9 +423,7 @@ async def test_async_first_detokenizer_update_keeps_loop_responsive(
         task = asyncio.create_task(
             output_processor.process_outputs_async([output], executor=executor)
         )
-        async with asyncio.timeout(2):
-            while not started.is_set():
-                await asyncio.sleep(0)
+        assert await asyncio.to_thread(started.wait, 2)
         assert not task.done()
         await asyncio.sleep(0)
         release.set()
@@ -431,10 +445,10 @@ async def test_async_first_detokenizer_update_keeps_loop_responsive(
 
 @pytest.mark.asyncio
 async def test_async_detokenizer_result_does_not_replace_aborted_request(
-    dummy_test_vectors,
+    async_output_test_vectors,
 ):
     output_processor, request, queue, output = _make_async_output_test_state(
-        dummy_test_vectors
+        async_output_test_vectors
     )
     started = threading.Event()
     release = threading.Event()
@@ -445,9 +459,7 @@ async def test_async_detokenizer_result_does_not_replace_aborted_request(
         task = asyncio.create_task(
             output_processor.process_outputs_async([output], executor=executor)
         )
-        async with asyncio.timeout(2):
-            while not started.is_set():
-                await asyncio.sleep(0)
+        assert await asyncio.to_thread(started.wait, 2)
 
         assert output_processor.abort_requests([request.request_id], internal=True) == [
             request.request_id

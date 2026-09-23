@@ -460,34 +460,38 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
         self.w2_weight = None
         self.w2_weight_scale = None
 
-    def get_symm_buffer(self):
+    def get_symm_buffer(self, max_num_tokens: int | None = None, *, cache: bool = True):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
+        max_num_tokens = (
+            self.max_num_tokens if max_num_tokens is None else max_num_tokens
+        )
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
         key = (
             id(group),
             device,
             self.num_experts,
-            self.max_num_tokens,
+            max_num_tokens,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
             self.activation,
         )
-        symm_buffer = self._kimi_symm_buffer_cache.get(key)
+        symm_buffer = self._kimi_symm_buffer_cache.get(key) if cache else None
         if symm_buffer is None:
             symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
                 self.num_experts,
-                self.max_num_tokens,
+                max_num_tokens,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
                 activation=self.activation,
             )
-            self._kimi_symm_buffer_cache[key] = symm_buffer
+            if cache:
+                self._kimi_symm_buffer_cache[key] = symm_buffer
         return symm_buffer
 
     def forward(

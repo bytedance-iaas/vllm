@@ -18,6 +18,12 @@ def test_prefill_pp_keeps_input_ids_for_second_stage_engram():
     assert requires_raw_input_tokens(DeepseekV41ForCausalLM)
 
 
+def test_encoder_only_prefill_does_not_prepare_decoder_replay():
+    """A cache-only producer has no decoder SWA cache for replay metadata."""
+    model = SimpleNamespace(encoder_only_prefill=True)
+    assert not dsv41_model.DeepseekV4Model._decoder_replay_supported(model, None, 20)
+
+
 def test_official_index_sources_do_not_move_encoder_only_boundary(monkeypatch):
     """Later indexers share L20 K; they must not move the producer cut."""
 

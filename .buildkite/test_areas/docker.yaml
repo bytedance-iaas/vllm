@@ -13,8 +13,14 @@ steps:
     - docker/Dockerfile.cpu
     - docker/docker-bake.hcl
     - tests/tools/test_docker_build_metadata_args.py
+    - cmake/external_projects/deepgemm.cmake
+    - tools/check_deepgemm_checkout.py
+    - tools/check_deepgemm_source.py
+    - tests/tools/test_check_deepgemm_checkout.py
+    - tests/tools/test_check_deepgemm_source.py
   commands:
     - pytest -v -s tools/test_docker_build_metadata_args.py
+    - pytest -v -s tools/test_check_deepgemm_checkout.py tools/test_check_deepgemm_source.py
   mirror:
     amd:
       label: ":amd: (MI250) Docker Build Metadata"

@@ -344,6 +344,7 @@ def test_get_symm_buffer_for_num_tokens_rejects_beyond_batched_with_buckets(
 
 def test_prepare_capacity_buckets_allocates_and_prewarms_in_order(monkeypatch):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._mega_moe_num_sms = 0
     experts._capacity_buffers = None
     experts._use_prepared_capacity_buckets = False
     experts._transformed_l1_weights = (torch.empty(1), torch.empty(1))
@@ -806,7 +807,7 @@ def test_symm_buffer_cache_separates_architecture_and_dtype_modes(monkeypatch):
     sm90_fp8.get_symm_buffer()
 
     assert calls == [
-        {},
+        {"num_shared_experts": 0},
         {"use_fp8_dispatch": True, "activation": "swiglu"},
         {"use_fp8_dispatch": True, "activation": "swiglu"},
     ]

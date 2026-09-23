@@ -220,6 +220,8 @@ def maybe_init_gemm_rs(vllm_config: VllmConfig, use_sequence_parallel: bool) -> 
         return False
     logger.info_once("To disable DeepSeek-V4.1 GEMM-RS, set VLLM_ENABLE_GEMM_RS=0.")
     return True
+
+
 def _attention_token_shard_min_tokens(vllm_config: VllmConfig) -> int:
     threshold = max(0, envs.VLLM_DSV41_ATTN_TOKEN_SHARD_MIN_TOKENS)
     if threshold == 0:
@@ -1193,6 +1195,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
         """Whether this rank may trim the layers after ``cut``; warns when not."""
+        if self.encoder_only_prefill:
+            return False
         parallel_config = vllm_config.parallel_config
         spec_config = vllm_config.speculative_config
         draft_config = spec_config.draft_model_config if spec_config else None
