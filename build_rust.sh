@@ -15,7 +15,14 @@ TOOLCHAIN=$(grep '^channel' "$REPO_ROOT/rust-toolchain.toml" | sed 's/.*= *"\(.*
 # Ensure rustup and the required toolchain are available.
 if ! command -v rustup &>/dev/null; then
     echo "rustup not found, installing..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+    rustup_installer=$(mktemp)
+    trap 'rm -f "$rustup_installer"' EXIT
+    curl --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
+        --connect-timeout 20 --proto '=https' --tlsv1.2 -sSf \
+        -o "$rustup_installer" https://sh.rustup.rs
+    sh "$rustup_installer" -y --default-toolchain none
+    rm -f "$rustup_installer"
+    trap - EXIT
     source "$HOME/.cargo/env"
 fi
 
