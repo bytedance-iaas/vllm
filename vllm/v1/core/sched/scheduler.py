@@ -288,8 +288,13 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
-            self.use_eagle = speculative_config.use_eagle()
-            self.use_eagle_block_drop = speculative_config.use_eagle_block_drop()
+            self.use_eagle = (
+                speculative_config.use_eagle()
+                and not speculative_config.is_dspark_prefill_only()
+            )
+            self.use_eagle_block_drop = (
+                self.use_eagle and speculative_config.use_eagle_block_drop()
+            )
             if self.use_eagle and not self.use_eagle_block_drop:
                 logger.warning(
                     "EAGLE trailing prefix-cache block dropping is disabled. "
@@ -3066,9 +3071,15 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
-            else:
-                assert RequestStatus.is_finished(req.status)
+            elif RequestStatus.is_finished(req.status):
                 self._free_blocks(self.requests[req_id])
+            else:
+                logger.warning(
+                    "Ignoring finished_recving for request %s in state %s. "
+                    "The request is live, so freeing its blocks would corrupt it.",
+                    req_id,
+                    req.status.name,
+                )
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
