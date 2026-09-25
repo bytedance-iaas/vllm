@@ -72,6 +72,7 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
             partial_param_re=_PARTIAL_PARAM_RE,
             value_end_re=_PARAM_VALUE_END_RE,
         ),
+        arg_structural_chars=None,
     )
 
 
