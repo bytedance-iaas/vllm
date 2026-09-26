@@ -243,6 +243,7 @@ def test_v41_dspark_loads_linear_scales(
         model=SimpleNamespace(
             layers=[SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))],
             confidence_head=None,
+            context_wkv_proj=None,
         ),
         named_parameters=lambda: [(runtime_name, param)],
         process_weights_after_loading=lambda: None,
@@ -323,6 +324,110 @@ def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     )
 
     dsv4_dspark.DSparkDeepseekV4Model.precompute_and_store_context_kv(
+        model,
+        torch.zeros(2, 5),
+        torch.tensor([7, 8]),
+        slot_mappings,
+    )
+
+    assert projection.calls == 1
+    assert len(calls) == 2
+    assert torch.equal(calls[0][1], stacked_output.view(2, 3, 4)[:, 0])
+    assert torch.equal(calls[1][1], stacked_output.view(2, 3, 4)[:, 2] + 2)
+    assert calls[0][3] is slot_mappings[0]
+    assert calls[1][3] is slot_mappings[2]
+
+
+@pytest.mark.cpu_test
+def test_v41_stacked_context_wkv_loads_each_layer_shard(monkeypatch):
+    from vllm.models.deepseek_v41.nvidia import dspark
+
+    loaded_calls = []
+
+    def parameter(name):
+        value = nn.Parameter(torch.empty(1), requires_grad=False)
+
+        def load_weight(param, weight, *args):
+            loaded_calls.append((name, args))
+            param.copy_(weight)
+
+        value.weight_loader = load_weight
+        return value
+
+    params = {
+        "model.context_wkv_proj.weight": parameter("context_wkv_proj"),
+        "model.layers.0.attn.fused_wqa_wkv.weight": parameter("fused_wqa_wkv"),
+    }
+    draft = SimpleNamespace(
+        config=SimpleNamespace(num_attention_heads=4, n_routed_experts=1),
+        quant_config=SimpleNamespace(weight_block_size=[32, 32]),
+        linear_scale_name="weight_scale",
+        pad_shared_expert=False,
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))],
+            confidence_head=None,
+            context_wkv_proj=object(),
+            context_kv_only=False,
+        ),
+        named_parameters=lambda: params.items(),
+        process_weights_after_loading=lambda: None,
+    )
+    draft._remap_dspark_name = lambda name: (
+        dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
+    )
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        dspark, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
+    )
+
+    loaded = dspark.DSparkDeepseekV4ForCausalLM.load_weights(
+        draft, [("mtp.0.attn.wkv.weight", torch.ones(1))]
+    )
+
+    assert loaded == set(params)
+    assert loaded_calls == [
+        ("context_wkv_proj", (0,)),
+        ("fused_wqa_wkv", (1,)),
+    ]
+
+
+def test_v41_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
+    from vllm.models.deepseek_v41.nvidia import dspark
+
+    calls = []
+    stacked_output = torch.arange(24, dtype=torch.float32).view(2, 12)
+
+    class StackedProjection:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, main_x):
+            self.calls += 1
+            assert main_x.shape == (2, 5)
+            return stacked_output
+
+    projection = StackedProjection()
+    layers = [
+        SimpleNamespace(attn=SimpleNamespace(kv_norm=lambda kv, offset=i: kv + offset))
+        for i in range(3)
+    ]
+    model = SimpleNamespace(
+        config=SimpleNamespace(head_dim=4),
+        context_wkv_proj=projection,
+        layers=layers,
+        num_dspark_layers=3,
+    )
+    slot_mappings = [torch.tensor([0, 1]), None, torch.tensor([4, 5])]
+    monkeypatch.setattr(
+        dspark,
+        "_insert_context_kv",
+        lambda attn, kv, positions, slots: calls.append(
+            (attn, kv.clone(), positions, slots)
+        ),
+    )
+
+    dspark.DSparkDeepseekV4Model.precompute_and_store_context_kv(
         model,
         torch.zeros(2, 5),
         torch.tensor([7, 8]),
