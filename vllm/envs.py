@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_DSV41_ENGRAM_TOKEN_EXCHANGE: bool = False
     VLLM_DSV41_STACK_CONTEXT_WKV: bool = False
     VLLM_DSV41_VALIDATE_STACK_CONTEXT_WKV: bool = False
+    VLLM_DSV41_FP8_CANDIDATE_COMPACT_TAIL: bool = False
     VLLM_MAX_IMAGE_PIXELS: int = 178_956_970
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
@@ -1058,6 +1059,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSV41_VALIDATE_STACK_CONTEXT_WKV": lambda: bool(
         int(os.getenv("VLLM_DSV41_VALIDATE_STACK_CONTEXT_WKV", "0"))
+    ),
+    "VLLM_DSV41_FP8_CANDIDATE_COMPACT_TAIL": lambda: bool(
+        int(os.getenv("VLLM_DSV41_FP8_CANDIDATE_COMPACT_TAIL", "0"))
     ),
     # Maximum number of worker threads used for STT preprocessing. The default
     # intentionally caps at 2 because that performed best in profiling.

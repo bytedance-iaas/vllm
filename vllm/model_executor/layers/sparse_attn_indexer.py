@@ -18,6 +18,12 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
 )
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    gather_candidate_logits as _gather_candidate_logits,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    remap_candidate_topk as _remap_candidate_topk,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
 from vllm.model_executor.layers.indexer_topk import (
@@ -52,6 +58,10 @@ logger = init_logger(__name__)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+# FULL CUDA graphs do not key on the effective context length, so gate only on
+# the measured cooperative-top-k CS=2 row range. Other shapes stay dense.
+_FP8_CANDIDATE_COMPACT_MIN_ROWS = 34
+_FP8_CANDIDATE_COMPACT_MAX_ROWS = 64
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -344,6 +354,9 @@ def sparse_attn_indexer(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    candidate_compact_logits: torch.Tensor | None = None,
+    candidate_compact_indices: torch.Tensor | None = None,
+    candidate_compact_ends: torch.Tensor | None = None,
     topk_backend: str = "auto",
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
@@ -359,6 +372,16 @@ def sparse_attn_indexer(
             "v4.1 two-level candidate filtering is not supported with DCP."
         )
         assert candidate_block_size > 0
+
+    compact_buffers = (
+        candidate_compact_logits,
+        candidate_compact_indices,
+        candidate_compact_ends,
+    )
+    if any(buffer is not None for buffer in compact_buffers):
+        assert all(buffer is not None for buffer in compact_buffers)
+        assert candidate_blocks is not None and not candidate_write
+        assert not use_fp4_cache, "compact candidate tail only supports FP8"
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
@@ -409,6 +432,9 @@ def sparse_attn_indexer(
             candidate_blocks=candidate_blocks,
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
+            candidate_compact_logits=candidate_compact_logits,
+            candidate_compact_indices=candidate_compact_indices,
+            candidate_compact_ends=candidate_compact_ends,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -735,6 +761,8 @@ def sparse_attn_indexer(
                 indices=decode_metadata.indices,
             )
         num_rows = logits.shape[0]
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        compact_candidate_tail = False
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
@@ -754,6 +782,31 @@ def sparse_attn_indexer(
                     decode_candidates,
                     row_repeat,
                 )
+            elif (
+                candidate_compact_logits is not None
+                and _FP8_CANDIDATE_COMPACT_MIN_ROWS
+                <= num_rows
+                <= _FP8_CANDIDATE_COMPACT_MAX_ROWS
+                and topk_backend in ("auto", "cooperative")
+            ):
+                assert candidate_compact_indices is not None
+                assert candidate_compact_ends is not None
+                assert num_rows <= candidate_compact_logits.shape[0]
+                assert num_rows <= candidate_compact_indices.shape[0]
+                assert num_rows <= candidate_compact_ends.shape[0]
+                compact_logits = candidate_compact_logits[:num_rows]
+                compact_indices = candidate_compact_indices[:num_rows, :topk_tokens]
+                compact_ends = candidate_compact_ends[:num_rows]
+                _gather_candidate_logits(
+                    logits,
+                    vis,
+                    decode_candidates,
+                    candidate_block_size,
+                    compact_logits,
+                    compact_ends,
+                    row_repeat,
+                )
+                compact_candidate_tail = True
             else:
                 _apply_candidate_mask(
                     logits,
@@ -763,18 +816,36 @@ def sparse_attn_indexer(
                     candidate_block_size,
                     row_repeat,
                 )
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
-            logits,
-            seq_lens,
-            next_n,
-            topk_indices,
-            topk_tokens,
-            attn_metadata_narrowed.max_seq_len,
-        )
+        if compact_candidate_tail:
+            get_indexer_topk(topk_backend)(
+                compact_logits,
+                compact_ends,
+                1,
+                compact_indices,
+                topk_tokens,
+                compact_logits.shape[1],
+            )
+            _remap_candidate_topk(
+                compact_indices,
+                decode_candidates,
+                vis,
+                candidate_block_size,
+                topk_indices,
+                logits.shape[1],
+                row_repeat,
+            )
+        else:
+            get_indexer_topk(topk_backend)(
+                logits,
+                seq_lens,
+                next_n,
+                topk_indices,
+                topk_tokens,
+                attn_metadata_narrowed.max_seq_len,
+            )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
@@ -826,6 +897,9 @@ def sparse_attn_indexer_fake(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    candidate_compact_logits: torch.Tensor | None = None,
+    candidate_compact_indices: torch.Tensor | None = None,
+    candidate_compact_ends: torch.Tensor | None = None,
     topk_backend: str = "auto",
 ) -> torch.Tensor:
     return topk_indices_buffer
@@ -834,7 +908,13 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=["topk_indices_buffer", "candidate_blocks"],
+    mutates_args=[
+        "topk_indices_buffer",
+        "candidate_blocks",
+        "candidate_compact_logits",
+        "candidate_compact_indices",
+        "candidate_compact_ends",
+    ],
     fake_impl=sparse_attn_indexer_fake,
     dispatch_key=current_platform.dispatch_key,
 )
@@ -869,6 +949,9 @@ class SparseAttnIndexer(CustomOp):
         candidate_blocks: torch.Tensor | None = None,
         candidate_block_size: int = 0,
         candidate_write: bool = False,
+        candidate_compact_logits: torch.Tensor | None = None,
+        candidate_compact_indices: torch.Tensor | None = None,
+        candidate_compact_ends: torch.Tensor | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -887,6 +970,9 @@ class SparseAttnIndexer(CustomOp):
         self.candidate_blocks = candidate_blocks
         self.candidate_block_size = candidate_block_size
         self.candidate_write = candidate_write
+        self.candidate_compact_logits = candidate_compact_logits
+        self.candidate_compact_indices = candidate_compact_indices
+        self.candidate_compact_ends = candidate_compact_ends
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
@@ -1003,6 +1089,9 @@ class SparseAttnIndexer(CustomOp):
             candidate_blocks=self.candidate_blocks,
             candidate_block_size=self.candidate_block_size,
             candidate_write=self.candidate_write,
+            candidate_compact_logits=self.candidate_compact_logits,
+            candidate_compact_indices=self.candidate_compact_indices,
+            candidate_compact_ends=self.candidate_compact_ends,
             topk_backend=self.topk_backend,
         )
 

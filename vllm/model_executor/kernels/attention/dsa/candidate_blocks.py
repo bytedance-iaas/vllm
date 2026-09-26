@@ -172,6 +172,184 @@ def _mask_candidates_kernel(
         )
 
 
+@triton.jit(do_not_specialize=["width"])
+def _gather_candidate_logits_kernel(
+    logits,
+    candidates,
+    row_ends,
+    compact_logits,
+    compact_ends,
+    logits_stride_row,
+    logits_stride_col,
+    candidate_stride_row,
+    candidate_stride_col,
+    compact_stride_row,
+    compact_stride_col,
+    row_end_stride,
+    width,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    COMPACT_WIDTH: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    candidate_col = cols // BLOCK_SIZE
+    block = tl.load(
+        candidates + row * candidate_stride_row + candidate_col * candidate_stride_col,
+        candidate_col < NUM_CANDIDATES,
+        other=-1,
+    ).to(tl.int64)
+    offset = cols % BLOCK_SIZE
+    pos = block * BLOCK_SIZE + offset
+    end = tl.load(row_ends + row // ROW_REPEAT * row_end_stride)
+
+    # Match apply_candidate_mask's packed-width clamp: a candidate beyond
+    # `width` keeps the final packed column exactly once.
+    edge = (block >= 0) & (block * BLOCK_SIZE >= width)
+    mapped_pos = tl.where(edge, width - 1, pos)
+    valid = (cols < COMPACT_WIDTH) & (block >= 0)
+    valid &= ((pos < end) & (pos < width)) | (edge & (offset == 0) & (end >= width))
+    values = tl.load(
+        logits + row * logits_stride_row + mapped_pos * logits_stride_col,
+        valid,
+        other=-float("inf"),
+    )
+    tl.store(
+        compact_logits + row * compact_stride_row + cols * compact_stride_col,
+        values,
+        cols < COMPACT_WIDTH,
+    )
+    if tl.program_id(1) == 0:
+        tl.store(compact_ends + row, COMPACT_WIDTH)
+
+
+@triton.jit(do_not_specialize=["width"])
+def _remap_candidate_topk_kernel(
+    compact_indices,
+    candidates,
+    row_ends,
+    output,
+    compact_index_stride_row,
+    compact_index_stride_col,
+    candidate_stride_row,
+    candidate_stride_col,
+    output_stride_row,
+    output_stride_col,
+    row_end_stride,
+    width,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    TOPK: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+    PADDED_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, PADDED_TOPK)
+    compact_col = tl.load(
+        compact_indices
+        + row * compact_index_stride_row
+        + cols * compact_index_stride_col,
+        cols < TOPK,
+        other=-1,
+    ).to(tl.int64)
+    valid_col = (compact_col >= 0) & (compact_col < NUM_CANDIDATES * BLOCK_SIZE)
+    safe_col = tl.where(valid_col, compact_col, 0)
+    block = tl.load(
+        candidates
+        + row * candidate_stride_row
+        + (safe_col // BLOCK_SIZE) * candidate_stride_col
+    ).to(tl.int64)
+    offset = safe_col % BLOCK_SIZE
+    pos = block * BLOCK_SIZE + offset
+    end = tl.load(row_ends + row // ROW_REPEAT * row_end_stride)
+    edge = (block >= 0) & (block * BLOCK_SIZE >= width)
+    mapped_pos = tl.where(edge, width - 1, pos)
+    valid = valid_col & (block >= 0)
+    valid &= ((pos < end) & (pos < width)) | (edge & (offset == 0) & (end >= width))
+    tl.store(
+        output + row * output_stride_row + cols * output_stride_col,
+        tl.where(valid, mapped_pos, -1),
+        cols < TOPK,
+    )
+
+
+def gather_candidate_logits(
+    logits: torch.Tensor,
+    row_ends: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    block_size: int,
+    compact_logits: torch.Tensor,
+    compact_ends: torch.Tensor,
+    row_repeat: int = 1,
+) -> None:
+    """Gather candidate-token logits into a fixed contiguous row prefix."""
+    assert logits.is_cuda
+    rows, width = logits.shape
+    num_candidates = candidate_blocks.shape[1]
+    compact_width = num_candidates * block_size
+    assert candidate_blocks.shape[0] >= rows
+    assert compact_logits.shape[0] >= rows
+    assert compact_logits.shape[1] == compact_width
+    assert compact_ends.shape[0] >= rows
+    assert compact_logits.dtype == logits.dtype == torch.float32
+    assert compact_ends.dtype == candidate_blocks.dtype == torch.int32
+    if not rows:
+        return
+    _gather_candidate_logits_kernel[(rows, triton.cdiv(compact_width, 256))](
+        logits,
+        candidate_blocks,
+        row_ends,
+        compact_logits,
+        compact_ends,
+        *logits.stride(),
+        *candidate_blocks.stride(),
+        *compact_logits.stride(),
+        row_ends.stride(0),
+        width,
+        BLOCK_SIZE=block_size,
+        NUM_CANDIDATES=num_candidates,
+        COMPACT_WIDTH=compact_width,
+        ROW_REPEAT=row_repeat,
+        TILE=256,
+    )
+
+
+def remap_candidate_topk(
+    compact_indices: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    row_ends: torch.Tensor,
+    block_size: int,
+    output: torch.Tensor,
+    logits_width: int,
+    row_repeat: int = 1,
+) -> None:
+    """Remap compact top-k columns to request-local compressed positions."""
+    rows, topk = compact_indices.shape
+    assert compact_indices.dtype == candidate_blocks.dtype == torch.int32
+    assert output.dtype == torch.int32 and output.shape == compact_indices.shape
+    assert candidate_blocks.shape[0] >= rows
+    if not rows:
+        return
+    _remap_candidate_topk_kernel[(rows,)](
+        compact_indices,
+        candidate_blocks,
+        row_ends,
+        output,
+        *compact_indices.stride(),
+        *candidate_blocks.stride(),
+        *output.stride(),
+        row_ends.stride(0),
+        logits_width,
+        BLOCK_SIZE=block_size,
+        NUM_CANDIDATES=candidate_blocks.shape[1],
+        TOPK=topk,
+        ROW_REPEAT=row_repeat,
+        PADDED_TOPK=triton.next_power_of_2(topk),
+    )
+
+
 def select_candidate_blocks(
     logits: torch.Tensor,
     row_ks: torch.Tensor | None,

@@ -87,6 +87,9 @@ from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.mla.index_group import (
+    get_sparse_mla_index_group_max_rows,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
@@ -230,6 +233,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        candidate_compact_logits_buffer: torch.Tensor | None = None,
+        candidate_compact_indices_buffer: torch.Tensor | None = None,
+        candidate_compact_ends_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
@@ -262,6 +268,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
             candidate_block_buffer=candidate_block_buffer,
+            candidate_compact_logits_buffer=candidate_compact_logits_buffer,
+            candidate_compact_indices_buffer=candidate_compact_indices_buffer,
+            candidate_compact_ends_buffer=candidate_compact_ends_buffer,
         )
         if self.use_sequence_parallel or fuse_mhc_all_reduce:
             self.attn.wo_b.reduce_results = False
@@ -677,6 +686,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
+        self.candidate_compact_logits_buffer = None
+        self.candidate_compact_indices_buffer = None
+        self.candidate_compact_ends_buffer = None
+        if envs.VLLM_DSV41_FP8_CANDIDATE_COMPACT_TAIL:
+            if self.candidate_block_buffer is None:
+                raise ValueError(
+                    "VLLM_DSV41_FP8_CANDIDATE_COMPACT_TAIL requires the "
+                    "DeepSeek V4.1 two-level candidate configuration."
+                )
+            compact_width = candidate_topk_blocks * config.candidate_block_size
+            max_rows = min(64, get_sparse_mla_index_group_max_rows(vllm_config))
+            self.candidate_compact_logits_buffer = torch.empty(
+                max_rows,
+                compact_width,
+                dtype=torch.float32,
+            )
+            self.candidate_compact_indices_buffer = torch.empty(
+                max_rows,
+                config.index_topk,
+                dtype=torch.int32,
+            )
+            self.candidate_compact_ends_buffer = torch.empty(
+                max_rows,
+                dtype=torch.int32,
+            )
+            logger.info(
+                "Enabled FP8 candidate compact tail with scratch [%d, %d].",
+                max_rows,
+                compact_width,
+            )
+
         if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -697,6 +737,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
+                candidate_compact_logits_buffer=(self.candidate_compact_logits_buffer),
+                candidate_compact_indices_buffer=(
+                    self.candidate_compact_indices_buffer
+                ),
+                candidate_compact_ends_buffer=self.candidate_compact_ends_buffer,
                 engram_layout=self.engram_layout,
                 mhc_stream=mhc_stream,
                 fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
