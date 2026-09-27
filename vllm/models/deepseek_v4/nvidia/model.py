@@ -1728,6 +1728,12 @@ direct_register_custom_op(
 
 
 class DeepseekV4MoE(nn.Module):
+    _shared_overlap_num_sms = frozenset((72, 76))
+
+    @classmethod
+    def _supports_shared_overlap_num_sms(cls, num_sms: int) -> bool:
+        return num_sms in cls._shared_overlap_num_sms
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1881,7 +1887,9 @@ class DeepseekV4MoE(nn.Module):
             and self.ep_size == 8
             and current_platform.is_device_capability_family(90)
             and os.environ.get("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
-            and self.experts._target_mega_moe_num_sms == 72
+            and self._supports_shared_overlap_num_sms(
+                self.experts._target_mega_moe_num_sms
+            )
         )
         self._shared_overlap_stream = (
             aux_stream() if self._shared_overlap_enabled else None
@@ -1894,7 +1902,8 @@ class DeepseekV4MoE(nn.Module):
         if self._shared_overlap_enabled:
             logger.info_once(
                 "DeepSeek V4 target routed/shared overlap enabled: "
-                "target_num_sms=72 EP8 TP1 M=(48,56,64)."
+                "target_num_sms=%d EP8 TP1 M=(48,56,64).",
+                self.experts._target_mega_moe_num_sms,
             )
 
     def _init_mega_moe_experts(
@@ -2098,7 +2107,9 @@ class DeepseekV4MoE(nn.Module):
         use_shared_overlap = (
             getattr(self, "_shared_overlap_enabled", False)
             and has_serial_shared_experts
-            and self.experts._get_mega_moe_num_sms(hidden_states.shape[0]) == 72
+            and self._supports_shared_overlap_num_sms(
+                self.experts._get_mega_moe_num_sms(hidden_states.shape[0])
+            )
         )
         if use_shared_overlap:
             assert self.shared_experts is not None
