@@ -120,6 +120,10 @@ logger = init_logger(__name__)
 # layout, so retain it as a checkpoint-compatibility alias.
 _BLOCK_FP8_MOE_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 _DSV41_WQ_B_HUMMING_M = frozenset((48, 56))
+_DSV41_M96_BF16_ATTN_PROJECTIONS = {
+    "attn.wq_b": (32768, 1280),
+    "attn.wo_b": (5120, 8192),
+}
 
 
 def _is_dsv41_target_wq_b(prefix: str) -> bool:
@@ -131,6 +135,18 @@ def _is_dsv41_target_wq_b(prefix: str) -> bool:
         and 0 <= int(parts[3]) < 40
         and parts[4:] == ["attn", "wq_b"]
     )
+
+
+def _get_dsv41_m96_bf16_shape(prefix: str) -> tuple[int, int] | None:
+    parts = prefix.split(".")
+    if (
+        len(parts) == 6
+        and parts[:3] == ["language_model", "model", "layers"]
+        and parts[3].isdigit()
+        and 0 <= int(parts[3]) < 40
+    ):
+        return _DSV41_M96_BF16_ATTN_PROJECTIONS.get(".".join(parts[4:]))
+    return None
 
 
 # Single source of truth for the ModelOpt linear algos.
@@ -2504,6 +2520,12 @@ class ModelOptLinearMethod(LinearMethodBase):
         )
         self._humming_wq_b_kernel: Any = None
         self._humming_wq_b_layer: torch.nn.Module | None = None
+        self._m96_bf16_shape = (
+            _get_dsv41_m96_bf16_shape(prefix)
+            if os.getenv("VLLM_DSV41_M96_BF16_ATTN_PROJECTIONS", "0") == "1"
+            else None
+        )
+        self._m96_bf16_weight: torch.Tensor | None = None
         self._dense_mxfp8: Any = None
 
     @property
@@ -2561,6 +2583,19 @@ class ModelOptLinearMethod(LinearMethodBase):
                 and getattr(layer, "tp_size", None) == 1
                 and not layer.has_bias
                 and current_platform.is_device_capability_family(90)
+            )
+        if self._m96_bf16_shape is not None:
+            self._m96_bf16_shape = (
+                self._m96_bf16_shape
+                if (
+                    (sum(output_partition_sizes), input_size_per_partition)
+                    == self._m96_bf16_shape
+                    and getattr(layer, "tp_size", None) == 1
+                    and not layer.has_bias
+                    and params_dtype == torch.bfloat16
+                    and current_platform.is_device_capability_family(90)
+                )
+                else None
             )
         expose_input_quant_key(layer, self.kernel)
 
@@ -2633,6 +2668,23 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         if self._humming_wq_b_candidate:
             self._prepare_humming_wq_b(layer)
+        if self._m96_bf16_shape is not None:
+            scale = layer.weight_scale.detach().view(torch.uint8)
+            weight = torch.empty_like(layer.weight, dtype=torch.bfloat16)
+            for start in range(0, weight.shape[0], 256):
+                stop = min(start + 256, weight.shape[0])
+                expanded_scale = (
+                    scale[start:stop]
+                    .view(torch.float8_e8m0fnu)
+                    .float()
+                    .repeat_interleave(32, dim=1)
+                )
+                weight[start:stop].copy_(
+                    (layer.weight[start:stop].float() * expanded_scale).bfloat16()
+                )
+            layer.register_buffer("_dsv41_m96_bf16_weight", weight, persistent=False)
+            self._m96_bf16_weight = weight
+            logger.info("Prepared M96 BF16 projection for %s", self.prefix)
         if (
             os.getenv("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
             and self.spec.weight == kMxfp8Static
@@ -2654,6 +2706,8 @@ class ModelOptLinearMethod(LinearMethodBase):
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
+            if self._m96_bf16_weight is not None and m == 96 and b is None:
+                return torch.matmul(inp, self._m96_bf16_weight.t())
             if (
                 self._dense_mxfp8 is not None
                 and b is None
