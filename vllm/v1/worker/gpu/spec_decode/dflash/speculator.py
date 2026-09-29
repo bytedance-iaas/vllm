@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -78,6 +79,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 "is the bonus token."
             )
         self.sample_from_anchor = False
+        self._dummy_rank_request_clamp = (
+            envs.VLLM_DFLASH_DUMMY_RANK_REQUEST_CLAMP
+        )
+        if self._dummy_rank_request_clamp:
+            logger.info_once("DFlash DP dummy request clamp enabled.")
 
         # Context positions for the K/V precompute. Populated by
         # prepare_dflash_inputs, and processed by the model's
@@ -317,8 +323,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         seeds: torch.Tensor,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
+        num_reqs_override: int | None = None,
     ) -> None:
-        num_reqs = input_batch.num_reqs
+        num_reqs = (
+            input_batch.num_reqs
+            if num_reqs_override is None
+            else num_reqs_override
+        )
+        assert 0 < num_reqs <= input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
@@ -379,6 +391,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                num_reqs_override=num_reqs_override,
             )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
@@ -440,7 +453,23 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
-        num_reqs = input_batch.num_reqs
+        input_num_reqs = input_batch.num_reqs
+        num_reqs = input_num_reqs
+        num_reqs_override = None
+        if (
+            self._dummy_rank_request_clamp
+            and dummy_run
+            and dp_sync is not None
+        ):
+            num_reqs = min(num_reqs, dp_sync.num_reqs_unpadded)
+            assert num_reqs > 0
+            num_reqs_override = num_reqs
+            if num_reqs < input_num_reqs:
+                logger.info_once(
+                    "Clamped DFlash DP dummy requests from %d to %d.",
+                    input_num_reqs,
+                    num_reqs,
+                )
         num_query_tokens = num_reqs * self.num_query_per_req
         self.materialize_context_kv(
             input_batch,
@@ -454,6 +483,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             seeds,
             dummy_run=dummy_run,
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            num_reqs_override=num_reqs_override,
         )
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -767,12 +797,15 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    num_reqs_override: int | None = None,
 ) -> None:
-    num_reqs = input_batch.num_reqs
-    assert num_reqs > 0
+    num_reqs = (
+        input_batch.num_reqs if num_reqs_override is None else num_reqs_override
+    )
+    assert 0 < num_reqs <= input_batch.num_reqs
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
-    max_target_query_len = int(input_batch.num_scheduled_tokens.max())
+    max_target_query_len = int(input_batch.num_scheduled_tokens[:num_reqs].max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
