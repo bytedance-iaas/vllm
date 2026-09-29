@@ -328,13 +328,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // conditionally compiled so impl registration is in source file
   ops.def("fp32_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
 
-  // Pinned cuBLASLt tactic for DeepSeek-V4.1 target wq_b at M96 on H20.
-  // conditionally compiled so impl registration is in source file
-  ops.def("dsv41_m96_wq_b_cublaslt_is_supported(Tensor device_anchor) -> bool");
-  ops.def(
-      "dsv41_m96_wq_b_cublaslt(Tensor! output, Tensor input, Tensor weight, "
-      "Tensor workspace) -> ()");
-
   // reorder weight for AllSpark Ampere W8A16 Fused Gemm kernel
   ops.def(
       "rearrange_kn_weight_as_n32k16_order(Tensor b_qweight, Tensor b_scales, "

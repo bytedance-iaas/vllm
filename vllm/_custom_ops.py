@@ -2388,36 +2388,6 @@ def fp32_router_gemm(
     return output
 
 
-def dsv41_m96_wq_b_cublaslt(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    output_shape = (*hidden_states.shape[:-1], weight.shape[0])
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    output_numel = hidden_states.shape[0] * weight.shape[0]
-    storage = torch.empty(
-        output_numel + 2,
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    output = storage[:-2].view(hidden_states.shape[0], weight.shape[0])
-    workspace = storage[-2:].view(torch.uint8)
-    torch.ops._C.dsv41_m96_wq_b_cublaslt(
-        output,
-        hidden_states,
-        weight,
-        workspace,
-    )
-    return output.view(output_shape)
-
-
-def dsv41_m96_wq_b_cublaslt_is_supported(device_anchor: torch.Tensor) -> bool:
-    try:
-        return bool(torch.ops._C.dsv41_m96_wq_b_cublaslt_is_supported(device_anchor))
-    except (AttributeError, RuntimeError):
-        return False
-
-
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

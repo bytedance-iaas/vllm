@@ -12,7 +12,6 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.quantization import QuantSpec
 from vllm.logger import init_logger
@@ -2521,18 +2520,9 @@ class ModelOptLinearMethod(LinearMethodBase):
         )
         self._humming_wq_b_kernel: Any = None
         self._humming_wq_b_layer: torch.nn.Module | None = None
-        self._m96_bf16_projection_enabled = (
-            os.getenv("VLLM_DSV41_M96_BF16_ATTN_PROJECTIONS", "0") == "1"
-        )
-        self._m96_wq_b_cublaslt_candidate = (
-            os.getenv("VLLM_DSV41_M96_WQ_B_CUBLASLT", "0") == "1"
-            and spec.weight == kMxfp8Static
-            and spec.activation == kMxfp8Dynamic
-            and _is_dsv41_target_wq_b(prefix)
-        )
         self._m96_bf16_shape = (
             _get_dsv41_m96_bf16_shape(prefix)
-            if self._m96_bf16_projection_enabled or self._m96_wq_b_cublaslt_candidate
+            if os.getenv("VLLM_DSV41_M96_BF16_ATTN_PROJECTIONS", "0") == "1"
             else None
         )
         self._m96_bf16_weight: torch.Tensor | None = None
@@ -2607,9 +2597,6 @@ class ModelOptLinearMethod(LinearMethodBase):
                 )
                 else None
             )
-        self._m96_wq_b_cublaslt_candidate = (
-            self._m96_wq_b_cublaslt_candidate and self._m96_bf16_shape is not None
-        )
         expose_input_quant_key(layer, self.kernel)
 
     def _prepare_humming_wq_b(self, layer: torch.nn.Module) -> None:
@@ -2681,18 +2668,6 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         if self._humming_wq_b_candidate:
             self._prepare_humming_wq_b(layer)
-        if self._m96_wq_b_cublaslt_candidate:
-            self._m96_wq_b_cublaslt_candidate = (
-                ops.dsv41_m96_wq_b_cublaslt_is_supported(layer.weight)
-            )
-            if not self._m96_wq_b_cublaslt_candidate:
-                logger.warning(
-                    "Pinned M96 wq_b cuBLASLt tactic is unavailable for %s; "
-                    "falling back to the configured linear backend",
-                    self.prefix,
-                )
-                if not self._m96_bf16_projection_enabled:
-                    self._m96_bf16_shape = None
         if self._m96_bf16_shape is not None:
             scale = layer.weight_scale.detach().view(torch.uint8)
             weight = torch.empty_like(layer.weight, dtype=torch.bfloat16)
@@ -2710,11 +2685,6 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer.register_buffer("_dsv41_m96_bf16_weight", weight, persistent=False)
             self._m96_bf16_weight = weight
             logger.info("Prepared M96 BF16 projection for %s", self.prefix)
-            if self._m96_wq_b_cublaslt_candidate:
-                logger.info(
-                    "Prepared M96 wq_b pinned cuBLASLt tactic for %s",
-                    self.prefix,
-                )
         if (
             os.getenv("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
             and self.spec.weight == kMxfp8Static
@@ -2736,16 +2706,6 @@ class ModelOptLinearMethod(LinearMethodBase):
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
-            if (
-                self._m96_wq_b_cublaslt_candidate
-                and self._m96_bf16_weight is not None
-                and m == 96
-                and b is None
-            ):
-                return ops.dsv41_m96_wq_b_cublaslt(
-                    inp,
-                    self._m96_bf16_weight,
-                )
             if self._m96_bf16_weight is not None and m == 96 and b is None:
                 return torch.matmul(inp, self._m96_bf16_weight.t())
             if (
