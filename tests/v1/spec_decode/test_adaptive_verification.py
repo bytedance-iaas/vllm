@@ -35,6 +35,7 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager._post_dp_refill_enabled = False
     return manager
 
 
@@ -129,6 +130,60 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert draft_budget == 1
     assert valid_drafts == {"low": 2, "high": 2}
     assert num_non_draft_tokens == {"low": 1, "high": 1}
+
+
+def test_post_dp_refill_uses_only_scheduled_drafts():
+    manager = make_manager(np.ones((14, 5), dtype=np.float32), np.ones(128))
+    manager._post_dp_refill_enabled = True
+    drafts = {f"req-{i}": 5 for i in range(14)}
+    non_drafts = {f"req-{i}": 1 for i in range(14)}
+    manager._batch_budget = (drafts, non_drafts, 50)
+
+    num_tokens = manager.maybe_refill_post_dp_budget(
+        local_dispatch_tokens=64,
+        graph_mode=CUDAGraphMode.FULL,
+        graph_num_tokens=96,
+        graph_num_reqs=16,
+        graph_max_query_len=6,
+        dp_eager=False,
+        dp_has_prefill=False,
+        dp_num_reqs_unpadded=16,
+    )
+
+    assert num_tokens == 84
+    assert manager._batch_budget == (drafts, non_drafts, 70)
+
+
+@pytest.mark.parametrize(
+    ("graph_mode", "dp_eager", "dp_has_prefill", "local_tokens"),
+    [
+        (CUDAGraphMode.PIECEWISE, False, False, 3),
+        (CUDAGraphMode.FULL, True, False, 3),
+        (CUDAGraphMode.FULL, False, True, 3),
+        (CUDAGraphMode.FULL, False, False, 4),
+    ],
+)
+def test_post_dp_refill_fails_closed(
+    graph_mode, dp_eager, dp_has_prefill, local_tokens
+):
+    manager = make_manager(np.ones((2, 2), dtype=np.float32), np.ones(16))
+    manager._post_dp_refill_enabled = True
+    budget = ({"low": 2, "high": 2}, {"low": 1, "high": 1}, 1)
+    manager._batch_budget = budget
+
+    num_tokens = manager.maybe_refill_post_dp_budget(
+        local_dispatch_tokens=local_tokens,
+        graph_mode=graph_mode,
+        graph_num_tokens=8,
+        graph_num_reqs=2,
+        graph_max_query_len=3,
+        dp_eager=dp_eager,
+        dp_has_prefill=dp_has_prefill,
+        dp_num_reqs_unpadded=2,
+    )
+
+    assert num_tokens == local_tokens
+    assert manager._batch_budget is budget
 
 
 def test_profiled_batches_seed_cost_curves_via_consumer():
