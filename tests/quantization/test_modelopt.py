@@ -144,6 +144,35 @@ def test_modelopt_mxfp8_preserves_per_row_checkpoint_scales(dist_init, monkeypat
     assert torch.equal(linear.weight_scale, scales)
 
 
+def test_dsv41_humming_w8a8_collapses_expanded_block_scales():
+    from vllm.model_executor.layers.quantization.utils.dsv41_humming_w8a8 import (
+        _collapse_repeated_block_scales,
+    )
+
+    block_scales = torch.arange(40, dtype=torch.uint8).repeat(1024, 1) + 100
+    expanded_scales = block_scales.repeat_interleave(32, dim=0)
+
+    collapsed = _collapse_repeated_block_scales(expanded_scales)
+
+    assert collapsed.dtype == torch.float32
+    assert collapsed.shape == (1024, 40)
+    assert torch.equal(
+        collapsed.to(torch.float8_e8m0fnu).view(torch.uint8), block_scales
+    )
+
+
+def test_dsv41_humming_w8a8_rejects_non_block_scales():
+    from vllm.model_executor.layers.quantization.utils.dsv41_humming_w8a8 import (
+        _collapse_repeated_block_scales,
+    )
+
+    expanded_scales = torch.full((32768, 40), 127, dtype=torch.uint8)
+    expanded_scales[1, 0] = 128
+
+    with pytest.raises(ValueError, match="not constant"):
+        _collapse_repeated_block_scales(expanded_scales)
+
+
 def test_modelopt_mxfp8_pre_processed_weights_follow_kernel(monkeypatch):
     """The weight cache daemon can only serve MXFP8 layers whose kernel needs
     no post-load state beyond the parameters it exports."""

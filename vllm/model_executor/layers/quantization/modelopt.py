@@ -2520,6 +2520,13 @@ class ModelOptLinearMethod(LinearMethodBase):
         )
         self._humming_wq_b_kernel: Any = None
         self._humming_wq_b_layer: torch.nn.Module | None = None
+        self._humming_w8a8_wq_b_candidate = (
+            os.getenv("VLLM_DSV41_DECODE_WQ_B_HUMMING_W8A8", "0") == "1"
+            and spec.weight == kMxfp8Static
+            and spec.activation == kMxfp8Dynamic
+            and _is_dsv41_target_wq_b(prefix)
+        )
+        self._humming_w8a8_wq_b: Any = None
         self._m96_bf16_shape = (
             _get_dsv41_m96_bf16_shape(prefix)
             if os.getenv("VLLM_DSV41_M96_BF16_ATTN_PROJECTIONS", "0") == "1"
@@ -2583,6 +2590,16 @@ class ModelOptLinearMethod(LinearMethodBase):
                 and getattr(layer, "tp_size", None) == 1
                 and not layer.has_bias
                 and current_platform.is_device_capability_family(90)
+            )
+        if self._humming_w8a8_wq_b_candidate:
+            self._humming_w8a8_wq_b_candidate = (
+                input_size_per_partition == 1280
+                and sum(output_partition_sizes) == 32768
+                and getattr(layer, "tp_size", None) == 1
+                and not layer.has_bias
+                and params_dtype == torch.bfloat16
+                and current_platform.is_device_capability_family(90)
+                and "H20" in current_platform.get_device_name().upper()
             )
         if self._m96_bf16_shape is not None:
             self._m96_bf16_shape = (
@@ -2668,6 +2685,13 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         if self._humming_wq_b_candidate:
             self._prepare_humming_wq_b(layer)
+        if self._humming_w8a8_wq_b_candidate:
+            from vllm.model_executor.layers.quantization.utils.dsv41_humming_w8a8 import (  # noqa: E501
+                Dsv41HummingW8A8WqB,
+            )
+
+            self._humming_w8a8_wq_b = Dsv41HummingW8A8WqB.from_layer(layer)
+            logger.info("Prepared Decode M96 WQ_B W8A8 Humming for %s", self.prefix)
         if self._m96_bf16_shape is not None:
             scale = layer.weight_scale.detach().view(torch.uint8)
             weight = torch.empty_like(layer.weight, dtype=torch.bfloat16)
@@ -2706,6 +2730,13 @@ class ModelOptLinearMethod(LinearMethodBase):
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
+            if (
+                self._humming_w8a8_wq_b is not None
+                and m == 96
+                and b is None
+                and self._humming_w8a8_wq_b.supports(inp)
+            ):
+                return self._humming_w8a8_wq_b(inp)
             if self._m96_bf16_weight is not None and m == 96 and b is None:
                 return torch.matmul(inp, self._m96_bf16_weight.t())
             if (
