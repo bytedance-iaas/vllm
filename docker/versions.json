@@ -91,6 +91,9 @@
     "RUN_WHEEL_CHECK": {
       "default": "true"
     },
+    "DSV41_HUMMING_VERSION": {
+      "default": "0.1.12"
+    },
     "FLASHINFER_VERSION": {
       "default": "0.6.18.post1"
     },
