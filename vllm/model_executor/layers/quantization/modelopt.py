@@ -2534,6 +2534,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         )
         self._m96_bf16_weight: torch.Tensor | None = None
         self._dense_mxfp8: Any = None
+        self._humming_dense: Any = None
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -2692,6 +2693,26 @@ class ModelOptLinearMethod(LinearMethodBase):
 
             self._humming_w8a8_wq_b = Dsv41HummingW8A8WqB.from_layer(layer)
             logger.info("Prepared Decode M96 WQ_B W8A8 Humming for %s", self.prefix)
+        if (
+            os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") == "1"
+            and self.spec.weight == kMxfp8Static
+            and self.spec.activation == kMxfp8Dynamic
+            and type(self.fmt) is FormatScheme
+            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+        ):
+            from vllm.model_executor.layers.quantization.utils.dsv41_humming_dense import (  # noqa: E501
+                Dsv41HummingDense,
+            )
+
+            self._humming_dense = Dsv41HummingDense.from_layer(layer)
+            if self._humming_dense is not None:
+                layer.add_module("_humming_dense", self._humming_dense)
+                self._m96_bf16_shape = None
+                logger.info(
+                    "Prepared ordered W8A8 Humming M%d for %s",
+                    self._humming_dense.m,
+                    self.prefix,
+                )
         if self._m96_bf16_shape is not None:
             scale = layer.weight_scale.detach().view(torch.uint8)
             weight = torch.empty_like(layer.weight, dtype=torch.bfloat16)
@@ -2730,6 +2751,12 @@ class ModelOptLinearMethod(LinearMethodBase):
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
+            if (
+                self._humming_dense is not None
+                and b is None
+                and self._humming_dense.supports(inp)
+            ):
+                return self._humming_dense(inp)
             if (
                 self._humming_w8a8_wq_b is not None
                 and m == 96
