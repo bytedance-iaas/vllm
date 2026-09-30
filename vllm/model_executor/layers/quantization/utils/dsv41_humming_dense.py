@@ -21,8 +21,8 @@ _SHAPES = {
     "ffn.shared_experts.down_proj": (5120, 2304),
     "main_proj": (5120, 15360),
 }
-_TARGET_ROWS = (96, 104, 112)
-_DRAFT_ROWS = (80, 88, 96)
+_TARGET_ROWS = (96, 104, 108, 112)
+_DRAFT_ROWS = (80, 88, 90, 96)
 
 
 @triton.jit
