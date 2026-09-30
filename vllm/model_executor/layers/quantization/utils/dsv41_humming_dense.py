@@ -15,8 +15,11 @@ _SHAPES = {
     "attn.wkv": (512, 5120),
     "attn.wq_b": (32768, 1280),
     "attn.wo_b": (5120, 8192),
+    "attn.indexer.wq_b": (4096, 1280),
+    "engram.wkv": (25600, 6144),
     "ffn.shared_experts.gate_up_proj": (4608, 5120),
     "ffn.shared_experts.down_proj": (5120, 2304),
+    "main_proj": (5120, 15360),
 }
 
 
@@ -48,6 +51,8 @@ def quantize_input(x):
 
 
 def _projection(prefix):
+    if prefix == "model.main_proj":
+        return "main_proj", 96
     parts = prefix.split(".")
     if parts[:3] == ["language_model", "model", "layers"]:
         index, suffix, m = parts[3:4], parts[4:], 96
