@@ -1584,16 +1584,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ) // client_count
         self._phase_stagger_width = int(os.getenv(_DP_LB_PHASE_STAGGER_ENV, "0"))
         self._phase_stagger_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._phase_stagger_num_engines = len(self.core_engines)
         self._phase_stagger_state = "disarmed"
-        if self._phase_stagger_width:
-            if self._phase_stagger_width < 0:
-                raise ValueError(f"{_DP_LB_PHASE_STAGGER_ENV} must be non-negative")
+        if self._phase_stagger_width not in (0, 1):
+            raise ValueError(f"{_DP_LB_PHASE_STAGGER_ENV} must be 0 or 1")
+        if self._phase_stagger_width == 1:
             if self.client_count != 1:
                 raise ValueError(f"{_DP_LB_PHASE_STAGGER_ENV} requires one API client")
-            if self._phase_stagger_width >= self._phase_stagger_max_num_seqs:
-                raise ValueError(
-                    f"{_DP_LB_PHASE_STAGGER_ENV} must be smaller than max_num_seqs"
-                )
             logger.info(
                 "DP phase stagger enabled: width=%d, max_num_seqs=%d",
                 self._phase_stagger_width,
@@ -1612,6 +1609,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self._phase_stagger_state = "disarmed"
 
         num_engines = len(inflight_counts)
+        if num_engines != self._phase_stagger_num_engines:
+            self._phase_stagger_num_engines = num_engines
+            self._phase_stagger_state = "done"
+            logger.info("DP phase stagger stopped after DP topology change")
+            return inflight_counts, None
+
         capacity = num_engines * self._phase_stagger_max_num_seqs
         if self._phase_stagger_state != "shifting":
             return inflight_counts, None
@@ -1652,8 +1655,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         counts = tuple(
             self.engine_inflight[engine] for engine in self.core_engines[:num_engines]
         )
-        capacity = num_engines * self._phase_stagger_max_num_seqs
-        if self._phase_stagger_state == "disarmed" and sum(counts) == capacity:
+        balanced = (self._phase_stagger_max_num_seqs,) * num_engines
+        if self._phase_stagger_state == "disarmed" and counts == balanced:
             self._phase_stagger_state = "shifting"
             logger.info("DP phase stagger armed: inflight=%s", counts)
             return
@@ -1765,6 +1768,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
                     self.engine_inflight[engine] -= 1
+            if self._phase_stagger_width and not any(self.engine_inflight.values()):
+                self._phase_stagger_state = "disarmed"
 
     @staticmethod
     async def eep_process_engine_core_notification(
