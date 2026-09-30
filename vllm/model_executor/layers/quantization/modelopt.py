@@ -2514,6 +2514,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         self.kernel: Any = None
         self._humming_wq_b_candidate = (
             os.getenv("VLLM_DSV41_DECODE_WQ_B_HUMMING", "0") == "1"
+            and os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") != "1"
             and spec.weight == kMxfp8Static
             and spec.activation == kMxfp8Dynamic
             and _is_dsv41_target_wq_b(prefix)
@@ -2522,6 +2523,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         self._humming_wq_b_layer: torch.nn.Module | None = None
         self._humming_w8a8_wq_b_candidate = (
             os.getenv("VLLM_DSV41_DECODE_WQ_B_HUMMING_W8A8", "0") == "1"
+            and os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") != "1"
             and spec.weight == kMxfp8Static
             and spec.activation == kMxfp8Dynamic
             and _is_dsv41_target_wq_b(prefix)
