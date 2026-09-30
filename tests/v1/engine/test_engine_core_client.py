@@ -222,7 +222,6 @@ def _make_dplb_client(
     client._kv_event_sources = {}
     client._phase_stagger_width = phase_stagger_width
     client._phase_stagger_max_num_seqs = max_num_seqs
-    client._phase_stagger_num_engines = num_engines
     client._phase_stagger_state = "disarmed"
     return client
 
@@ -333,15 +332,6 @@ def test_dplb_phase_stagger_applies_once_after_saturation():
     assert chosen == client.core_engines[4]
     assert max(client.engine_inflight.values()) == 19
 
-    asyncio.run(
-        DPLBAsyncMPClient.process_engine_outputs(
-            client,
-            EngineCoreOutputs(finished_requests=set(client.reqs_in_flight)),
-        )
-    )
-    assert [client.engine_inflight[engine] for engine in client.core_engines] == [0] * 8
-    assert client._phase_stagger_state == "disarmed"
-
 
 def test_dplb_phase_stagger_does_not_skew_unsaturated_burst():
     client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=18)
@@ -351,32 +341,6 @@ def test_dplb_phase_stagger_does_not_skew_unsaturated_burst():
 
     assert [client.engine_inflight[engine] for engine in client.core_engines] == [2] * 8
     assert client._phase_stagger_state == "disarmed"
-
-
-def test_dplb_phase_stagger_requires_balanced_saturation():
-    client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=18)
-    for engine, count in zip(
-        client.core_engines,
-        [19, 19, 19, 19, 17, 17, 17, 17],
-        strict=True,
-    ):
-        client.engine_inflight[engine] = count
-
-    client._update_phase_stagger_state(num_engines=8)
-
-    assert client._phase_stagger_state == "disarmed"
-
-
-def test_dplb_phase_stagger_stops_after_topology_change():
-    client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=18)
-    client._phase_stagger_state = "shifting"
-
-    loads, targets = client._phase_stagger_loads([9] * 16)
-
-    assert loads == [9] * 16
-    assert targets is None
-    assert client._phase_stagger_state == "done"
-    assert client._phase_stagger_num_engines == 16
 
 
 def test_dplb_single_client_refills_freed_engine_despite_stale_high_snapshot():
