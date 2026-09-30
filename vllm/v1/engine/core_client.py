@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
-import os
 import queue
 import sys
 import uuid
@@ -76,8 +75,6 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
-
-_DP_LB_PHASE_STAGGER_ENV = "VLLM_DP_LB_PHASE_STAGGER"
 
 
 class EngineCoreClient(ABC):
@@ -1582,118 +1579,25 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
-        self._phase_stagger_width = int(os.getenv(_DP_LB_PHASE_STAGGER_ENV, "0"))
-        self._phase_stagger_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._phase_stagger_state = "disarmed"
-        if self._phase_stagger_width:
-            if self._phase_stagger_width < 0:
-                raise ValueError(f"{_DP_LB_PHASE_STAGGER_ENV} must be non-negative")
-            if self.client_count != 1:
-                raise ValueError(f"{_DP_LB_PHASE_STAGGER_ENV} requires one API client")
-            if self._phase_stagger_width >= self._phase_stagger_max_num_seqs:
-                raise ValueError(
-                    f"{_DP_LB_PHASE_STAGGER_ENV} must be smaller than max_num_seqs"
-                )
-            logger.info(
-                "DP phase stagger enabled: width=%d, max_num_seqs=%d",
-                self._phase_stagger_width,
-                self._phase_stagger_max_num_seqs,
-            )
-
-    def _phase_stagger_loads(
-        self, inflight_counts: list[int]
-    ) -> tuple[list[int], tuple[int, ...] | None]:
-        width = self._phase_stagger_width
-        if not width:
-            return inflight_counts, None
-
-        total_inflight = sum(inflight_counts)
-        if total_inflight == 0:
-            self._phase_stagger_state = "disarmed"
-
-        num_engines = len(inflight_counts)
-        capacity = num_engines * self._phase_stagger_max_num_seqs
-        if self._phase_stagger_state != "shifting":
-            return inflight_counts, None
-        if total_inflight >= capacity:
-            # A request arriving while all running slots are still occupied
-            # means offered concurrency exceeds the calibrated phase boundary.
-            self._phase_stagger_state = "done"
-            logger.info(
-                "DP phase stagger skipped above capacity: inflight=%s",
-                inflight_counts,
-            )
-            return inflight_counts, None
-
-        half = num_engines // 2
-        offsets = tuple(
-            width if idx < half else -width if idx >= num_engines - half else 0
-            for idx in range(num_engines)
-        )
-        targets = tuple(self._phase_stagger_max_num_seqs + offset for offset in offsets)
-        # The target cap is a hard bound. Using count-offset as the local load
-        # makes refill routing converge to the target while preserving the
-        # existing snapshot score inside each equal-load candidate set.
-        loads = [
-            count - offset if count < target else sys.maxsize
-            for count, offset, target in zip(
-                inflight_counts, offsets, targets, strict=True
-            )
-        ]
-        if min(loads) == sys.maxsize:
-            self._phase_stagger_state = "done"
-            return inflight_counts, None
-        return loads, targets
-
-    def _update_phase_stagger_state(self, num_engines: int) -> None:
-        if not self._phase_stagger_width:
-            return
-
-        counts = tuple(
-            self.engine_inflight[engine] for engine in self.core_engines[:num_engines]
-        )
-        capacity = num_engines * self._phase_stagger_max_num_seqs
-        if self._phase_stagger_state == "disarmed" and sum(counts) == capacity:
-            self._phase_stagger_state = "shifting"
-            logger.info("DP phase stagger armed: inflight=%s", counts)
-            return
-        if self._phase_stagger_state != "shifting":
-            return
-
-        half = num_engines // 2
-        targets = tuple(
-            self._phase_stagger_max_num_seqs
-            + (
-                self._phase_stagger_width
-                if idx < half
-                else -self._phase_stagger_width
-                if idx >= num_engines - half
-                else 0
-            )
-            for idx in range(num_engines)
-        )
-        if counts == targets:
-            self._phase_stagger_state = "done"
-            logger.info("DP phase stagger applied: inflight=%s", counts)
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
-        uses_load_balancer = False
         if (eng_index := request.data_parallel_rank) is None and (
             eng_index := get_late_interaction_engine_index(
                 request.pooling_params, len(self.core_engines)
             )
         ) is None:
-            uses_load_balancer = True
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
-            inflight_counts = [
-                self.engine_inflight[engine]
-                for engine in self.core_engines[:num_engines]
-            ]
-            routing_loads, phase_targets = self._phase_stagger_loads(inflight_counts)
-            min_inflight = min(routing_loads) if self.client_count == 1 else None
+            min_inflight = (
+                min(
+                    self.engine_inflight[engine]
+                    for engine in self.core_engines[:num_engines]
+                )
+                if self.client_count == 1
+                else None
+            )
             min_score: float = sys.maxsize
             eng_index = 0
             for i in range(num_engines):
@@ -1701,13 +1605,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
                 waiting, running, kv_cache_usage = current_counts[idx]
-                inflight = inflight_counts[idx]
+                inflight = self.engine_inflight[self.core_engines[idx]]
                 # With one API client, the local count is exact and fresher than
                 # coordinator snapshots. Restrict routing to the least-loaded
                 # ranks so a stale-high snapshot cannot hide a newly freed slot.
-                if min_inflight is not None and routing_loads[idx] != min_inflight:
-                    continue
-                if phase_targets is not None and inflight >= phase_targets[idx]:
+                if min_inflight is not None and inflight != min_inflight:
                     continue
                 # Estimate engine load as the greater of the coordinator's
                 # latest (waiting + running) snapshot and this client's own
@@ -1742,8 +1644,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
-        if uses_load_balancer:
-            self._update_phase_stagger_state(len(self.lb_engines))
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
