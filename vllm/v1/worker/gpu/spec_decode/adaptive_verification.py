@@ -101,10 +101,10 @@ def _calibrate_dsv41_c128_budget(
     max_draft_budget: int,
     draft_budget: int,
 ) -> int:
-    if target_rows not in (80, 88, 96, 104, 108, 112):
+    if target_rows not in (80, 88, 96):
         return draft_budget
     if (
-        num_reqs not in (15, 16, 17, 18, 19)
+        num_reqs not in (15, 16, 17)
         or num_non_draft_tokens != num_reqs
         or scheduled_drafts != num_reqs * 5
     ):

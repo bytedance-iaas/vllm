@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Selected-shape H20 block-FP8 projections with ordered Stream-K reductions."""
+"""Fixed-shape H20 block-FP8 projections with ordered Stream-K reductions."""
 
 import math
 
@@ -21,8 +21,6 @@ _SHAPES = {
     "ffn.shared_experts.down_proj": (5120, 2304),
     "main_proj": (5120, 15360),
 }
-_TARGET_ROWS = (96, 104, 108, 112)
-_DRAFT_ROWS = (80, 88, 89, 90, 96)
 
 
 @triton.jit
@@ -54,13 +52,13 @@ def quantize_input(x):
 
 def _projection(prefix):
     if prefix == "model.main_proj":
-        return "main_proj", _TARGET_ROWS
+        return "main_proj", 96
     parts = prefix.split(".")
     if parts[:3] == ["language_model", "model", "layers"]:
-        index, suffix, rows = parts[3:4], parts[4:], _TARGET_ROWS
+        index, suffix, m = parts[3:4], parts[4:], 96
         allowed = range(40)
     elif parts[:2] == ["model", "layers"]:
-        index, suffix, rows = parts[2:3], parts[3:], _DRAFT_ROWS
+        index, suffix, m = parts[2:3], parts[3:], 80
         allowed = range(40, 43)
     else:
         return None
@@ -69,11 +67,11 @@ def _projection(prefix):
     name = ".".join(suffix)
     if name not in _SHAPES:
         return None
-    if rows == _TARGET_ROWS and name in ("attn.wq_a", "attn.wkv"):
+    if m == 96 and name in ("attn.wq_a", "attn.wkv"):
         return None
-    if rows == _DRAFT_ROWS and name == "attn.fused_wqa_wkv":
+    if m == 80 and name == "attn.fused_wqa_wkv":
         return None
-    return name, rows
+    return name, m
 
 
 def _max_stream_slices(m, n, k, tuning):
@@ -112,7 +110,7 @@ class Dsv41HummingDense(torch.nn.Module):
             or layer.params_dtype != torch.bfloat16
         ):
             return None
-        name, rows = projection
+        name, m = projection
         n, k = _SHAPES[name]
         weight = layer.weight.detach()
         scale = layer.weight_scale.detach().view(torch.uint8)
@@ -130,9 +128,9 @@ class Dsv41HummingDense(torch.nn.Module):
         if not torch.equal(grouped, first.expand_as(grouped)):
             return None
         block_scale = first[:, 0, :].contiguous().view(torch.float8_e8m0fnu).float()
-        return cls(weight, block_scale, name, rows)
+        return cls(weight, block_scale, name, m)
 
-    def __init__(self, weight, block_scale, projection, rows):
+    def __init__(self, weight, block_scale, projection, m):
         super().__init__()
         import humming
         from humming.layer import HummingLayer
@@ -140,8 +138,7 @@ class Dsv41HummingDense(torch.nn.Module):
 
         if humming.__version__.split("+")[0] != "0.1.12":
             raise RuntimeError("DSv4.1 ordered W8A8 requires humming-kernels 0.1.12")
-        self.rows = tuple(rows)
-        self.m = self.rows[0]
+        self.m = m
         self.n, self.k = weight.shape
         with torch.device(weight.device):
             packed = HummingLayer(
@@ -165,38 +162,34 @@ class Dsv41HummingDense(torch.nn.Module):
         self.layer_config = packed.humming_config
         for name in ("weight", "weight_scale", "locks"):
             self.register_buffer(name, getattr(packed, name).detach(), persistent=False)
-        self.tuning_configs = {}
-        for m in self.rows:
-            tuning = dict(get_heuristics_config(self.layer_config, shape_m=m))
-            tuning["use_tma_c"] = False
-            grid_caps = {
-                "attn.fused_wqa_wkv": 56,
-                "attn.wq_a": 40,
-                "attn.wkv": 16,
-            }
-            if projection in grid_caps:
-                tuning["num_sms"] = grid_caps[projection]
-            if projection == "attn.wq_b":
-                tuning.update(
-                    num_sms=64,
-                    use_tma=True,
-                    use_warp_spec=True,
-                    use_mbarrier=True,
-                    num_stages=3,
-                )
-            # With at most three slices, the non-TMA epilogue serializes BF16 adds.
-            if _max_stream_slices(m, self.n, self.k, tuning) > 3:
-                raise RuntimeError("DSv4.1 Humming launch would use unordered atomics")
-            self.tuning_configs[m] = tuning
-        self.tuning_config = self.tuning_configs[self.m]
+        tuning = dict(get_heuristics_config(self.layer_config, shape_m=m))
+        tuning["use_tma_c"] = False
+        grid_caps = {
+            "attn.fused_wqa_wkv": 56,
+            "attn.wq_a": 40,
+            "attn.wkv": 16,
+        }
+        if projection in grid_caps:
+            tuning["num_sms"] = grid_caps[projection]
+        if projection == "attn.wq_b":
+            tuning.update(
+                num_sms=64,
+                use_tma=True,
+                use_warp_spec=True,
+                use_mbarrier=True,
+                num_stages=3,
+            )
+        # With at most three slices, the non-TMA epilogue serializes BF16 adds.
+        if _max_stream_slices(m, self.n, self.k, tuning) > 3:
+            raise RuntimeError("DSv4.1 Humming launch would use unordered atomics")
+        self.tuning_config = tuning
 
     def supports(self, x):
-        m = x.numel() // x.shape[-1]
         return (
             x.dtype == torch.bfloat16
             and x.is_contiguous()
             and x.shape[-1] == self.k
-            and m in self.tuning_configs
+            and x.numel() == self.m * self.k
         )
 
     def forward(self, x):
@@ -204,8 +197,7 @@ class Dsv41HummingDense(torch.nn.Module):
 
         if not self.supports(x):
             raise ValueError("Unsupported DSv4.1 Humming projection input")
-        m = x.numel() // x.shape[-1]
-        q, scale = quantize_input(x.view(m, self.k))
+        q, scale = quantize_input(x.view(self.m, self.k))
         output = humming_forward(
             self.layer_config,
             inputs=q,
@@ -214,6 +206,6 @@ class Dsv41HummingDense(torch.nn.Module):
             weight_scale=self.weight_scale,
             locks=self.locks,
             compute_config={"gemm_type": "dense", "use_batch_invariant": False},
-            tuning_config=self.tuning_configs[m],
+            tuning_config=self.tuning_config,
         )
         return output.view(*x.shape[:-1], self.n)

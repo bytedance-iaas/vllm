@@ -206,12 +206,7 @@ def _make_pooling_request(
     )
 
 
-def _make_dplb_client(
-    num_engines: int = 3,
-    client_count: int = 1,
-    phase_stagger_width: int = 0,
-    max_num_seqs: int = 19,
-) -> DPLBAsyncMPClient:
+def _make_dplb_client(num_engines: int = 3, client_count: int = 1) -> DPLBAsyncMPClient:
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = client_count
     client.reqs_in_flight = {}
@@ -220,11 +215,6 @@ def _make_dplb_client(
     client.lb_engines = [[0, 0, 0.0] for _ in range(num_engines)]
     client.eng_start_index = 0
     client._kv_event_sources = {}
-    client._phase_stagger_width = phase_stagger_width
-    client._phase_stagger_max_num_seqs = max_num_seqs
-    client._phase_stagger_base_num_seqs = max_num_seqs - phase_stagger_width
-    client._phase_stagger_num_engines = num_engines
-    client._phase_stagger_state = "disarmed"
     return client
 
 
@@ -271,123 +261,6 @@ def test_dplb_burst_round_robins_despite_snapshot_rebinds():
         client.get_core_engine_for_request(make_request(SamplingParams(max_tokens=1)))
 
     assert sorted(client.engine_inflight.values()) == [2, 2, 2, 2]
-
-
-def test_dplb_phase_stagger_persists_after_saturation():
-    client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=19)
-    initial_requests = [make_request(SamplingParams(max_tokens=1)) for _ in range(144)]
-
-    for request in initial_requests:
-        client.get_core_engine_for_request(request)
-
-    assert [client.engine_inflight[engine] for engine in client.core_engines] == [
-        18
-    ] * 8
-    assert client._phase_stagger_state == "shifting"
-
-    finished = {
-        next(
-            request.request_id
-            for request in initial_requests
-            if client.reqs_in_flight[request.request_id]
-            == client.core_engines[eng_index]
-        )
-        for eng_index in range(4, 8)
-    }
-    asyncio.run(
-        DPLBAsyncMPClient.process_engine_outputs(
-            client, EngineCoreOutputs(finished_requests=finished)
-        )
-    )
-
-    replacements = [make_request(SamplingParams(max_tokens=1)) for _ in range(4)]
-    for request in replacements:
-        client.get_core_engine_for_request(request)
-
-    assert [client.engine_inflight[engine] for engine in client.core_engines] == [
-        19,
-        19,
-        19,
-        19,
-        17,
-        17,
-        17,
-        17,
-    ]
-    assert client._phase_stagger_state == "steady"
-
-    high_request = next(
-        request
-        for request in initial_requests
-        if client.reqs_in_flight.get(request.request_id) == client.core_engines[0]
-    )
-    asyncio.run(
-        DPLBAsyncMPClient.process_engine_outputs(
-            client,
-            EngineCoreOutputs(finished_requests={high_request.request_id}),
-        )
-    )
-    chosen = client.get_core_engine_for_request(
-        make_request(SamplingParams(max_tokens=1))
-    )
-
-    assert chosen == client.core_engines[0]
-    assert [client.engine_inflight[engine] for engine in client.core_engines] == [
-        19,
-        19,
-        19,
-        19,
-        17,
-        17,
-        17,
-        17,
-    ]
-    assert max(client.engine_inflight.values()) == 19
-
-    asyncio.run(
-        DPLBAsyncMPClient.process_engine_outputs(
-            client,
-            EngineCoreOutputs(finished_requests=set(client.reqs_in_flight)),
-        )
-    )
-    assert [client.engine_inflight[engine] for engine in client.core_engines] == [0] * 8
-    assert client._phase_stagger_state == "disarmed"
-
-
-def test_dplb_phase_stagger_does_not_skew_unsaturated_burst():
-    client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=19)
-
-    for _ in range(16):
-        client.get_core_engine_for_request(make_request(SamplingParams(max_tokens=1)))
-
-    assert [client.engine_inflight[engine] for engine in client.core_engines] == [2] * 8
-    assert client._phase_stagger_state == "disarmed"
-
-
-def test_dplb_phase_stagger_requires_balanced_saturation():
-    client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=19)
-    for engine, count in zip(
-        client.core_engines,
-        [19, 19, 19, 19, 17, 17, 17, 17],
-        strict=True,
-    ):
-        client.engine_inflight[engine] = count
-
-    client._update_phase_stagger_state(num_engines=8)
-
-    assert client._phase_stagger_state == "disarmed"
-
-
-def test_dplb_phase_stagger_stops_after_topology_change():
-    client = _make_dplb_client(num_engines=8, phase_stagger_width=1, max_num_seqs=19)
-    client._phase_stagger_state = "shifting"
-
-    loads, targets = client._phase_stagger_loads([9] * 16)
-
-    assert loads == [9] * 16
-    assert targets is None
-    assert client._phase_stagger_state == "done"
-    assert client._phase_stagger_num_engines == 16
 
 
 def test_dplb_single_client_refills_freed_engine_despite_stale_high_snapshot():
