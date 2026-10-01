@@ -8,7 +8,10 @@ import pytest
 import torch
 
 import vllm.models.deepseek_v41.attention as attention_module
+import vllm.models.deepseek_v41.sparse_mla as sparse_mla_module
 from vllm.forward_context import get_forward_context, set_forward_context
+
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 @dataclass
@@ -79,6 +82,32 @@ def test_attention_cp_plan_splits_each_request_on_aligned_blocks(
         *range(300, 428),
         *range(256, 300),
     ]
+
+
+def test_attention_cp_plan_rotates_short_requests_across_ranks():
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=8,
+        query_start_loc_cpu=torch.arange(9, dtype=torch.int32) * 64,
+        prefill_seq_lens_cpu=torch.full((8,), 64, dtype=torch.int32),
+    )
+
+    plans = [
+        attention_module.AttentionCPPlan.build(
+            metadata,
+            cp_rank=rank,
+            cp_size=8,
+            alignment=64,
+            device=torch.device("cpu"),
+        )
+        for rank in range(8)
+    ]
+
+    assert [plan.num_local_tokens for plan in plans] == [64] * 8
+    assert [plan.output_gather_sizes for plan in plans] == [[64] * 8] * 8
+    all_indices = torch.cat([plan.token_indices for plan in plans]).sort().values
+    torch.testing.assert_close(all_indices, torch.arange(512))
 
 
 def test_attention_cp_plan_restores_original_packed_order(monkeypatch):
@@ -364,3 +393,74 @@ def test_attention_cp_uses_local_q_and_full_kv_kernel_modes(monkeypatch):
 
     assert output.shape == (2, 64, 512)
     assert calls == [("q", (2, 16, 512), 0), ("kv", (4, 512), 4)]
+
+
+def test_attention_cp_keeps_short_prompt_tails_on_prefill_path(monkeypatch):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(attention_context_parallel_size=2),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(compress_ratios=[0, 1, 2])
+        ),
+    )
+
+    def initialize_base(builder, *args, **kwargs):
+        builder.vllm_config = config
+        builder.decode_threshold = 1
+
+    monkeypatch.setattr(
+        sparse_mla_module.DeepseekSparseSWAMetadataBuilder,
+        "__init__",
+        initialize_base,
+    )
+
+    builder = sparse_mla_module.DeepseekV41SparseSWAMetadataBuilder()
+
+    assert builder.decode_threshold == 0
+
+
+def test_cp1_keeps_opaque_quantized_query_path():
+    class OpaqueQuery:
+        pass
+
+    query = OpaqueQuery()
+    observed: dict[str, object] = {}
+
+    def project(local_qr, qr_scale):
+        observed["query"] = local_qr
+        return torch.empty(4, 1, 2)
+
+    def insert(q, kv, q_positions, kv_positions, metadata, *, split_q):
+        observed["split_q"] = split_q
+        return q
+
+    def sparse_and_attn(*args):
+        observed["attention_q"] = args[4]
+
+    layer = SimpleNamespace(
+        indexer=None,
+        compressor=None,
+        aux_stream_list=None,
+        n_local_heads=1,
+        head_dim=2,
+        _wq_b_proj=project,
+        _fused_qnorm_rope_kv_insert=insert,
+        _sparse_indexer_and_attn=sparse_and_attn,
+    )
+    positions = torch.arange(4, dtype=torch.int64)
+
+    with set_forward_context({}, make_forward_context_config()):
+        attention_module.DeepseekV4Attention._prepare_and_attn(
+            layer,
+            hidden_states=torch.empty(4, 1),
+            qr=query,
+            kv=torch.empty(4, 2),
+            qr_scale=torch.empty(1),
+            kv_score=torch.empty(4, 1),
+            indexer_weights=torch.empty(4, 1),
+            positions=positions,
+            attn_out=torch.empty(4, 1, 2),
+            cp_plan=None,
+        )
+
+    assert observed["query"] is query
+    assert observed["split_q"] is False

@@ -4,11 +4,14 @@
 import pytest
 import torch
 
+import vllm.model_executor.parameter as parameter_module
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed.parallel_state import (
     _get_attention_parallel_group_ranks,
 )
 from vllm.model_executor.layers.linear import RowParallelLinear
+
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 def test_attention_context_parallel_default_preserves_world_size():
@@ -103,6 +106,17 @@ def test_attention_parallel_groups_preserve_outer_dimensions():
 
 
 def test_row_parallel_linear_uses_override_group(monkeypatch):
+    monkeypatch.setattr(
+        parameter_module,
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        parameter_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+
     class FakeGroup:
         rank_in_group = 1
         world_size = 2

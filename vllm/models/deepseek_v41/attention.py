@@ -171,13 +171,15 @@ class AttentionCPPlan:
 
         rank_indices: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
         local_lens: list[int] = []
+        rank_offset = 0
         for req_idx in range(num_reqs):
             query_len = int(global_query_lens[req_idx].item())
             num_blocks = (query_len + alignment - 1) // alignment
             global_query_start = int(query_start_loc_cpu[req_idx].item())
             for rank in range(cp_size):
-                start_block = (num_blocks * rank + cp_size - 1) // cp_size
-                end_block = (num_blocks * (rank + 1) + cp_size - 1) // cp_size
+                partition = (rank - rank_offset) % cp_size
+                start_block = (num_blocks * partition + cp_size - 1) // cp_size
+                end_block = (num_blocks * (partition + 1) + cp_size - 1) // cp_size
                 local_start = min(start_block * alignment, query_len)
                 local_end = min(end_block * alignment, query_len)
                 global_start = global_query_start + local_start
@@ -188,6 +190,7 @@ class AttentionCPPlan:
                     )
                 if rank == cp_rank:
                     local_lens.append(global_end - global_start)
+            rank_offset = (rank_offset + num_blocks) % cp_size
 
         indices_cpu_by_rank = [
             torch.cat(indices) if indices else torch.empty(0, dtype=torch.int64)
@@ -245,26 +248,6 @@ class AttentionCPPlan:
 class AttentionCPPlanCacheEntry:
     signature: tuple[Any, ...]
     plan: AttentionCPPlan
-
-
-class _AttentionColumnParallelLinear(ColumnParallelLinear):
-    """Column-parallel linear sharded over the attention TP group."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        group = get_attn_tp_group()
-        super().__init__(
-            *args,
-            tp_rank=group.rank_in_group,
-            tp_size=group.world_size,
-            **kwargs,
-        )
-
-
-class _AttentionRowParallelLinear(RowParallelLinear):
-    """Row-parallel linear reduced over the attention TP group."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, tp_group=get_attn_tp_group(), **kwargs)
 
 
 def get_attention_tp_head_range(num_heads: int) -> tuple[int, int]:
@@ -479,13 +462,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         tp_size = get_tensor_model_parallel_world_size()
         self.attn_cp_size = vllm_config.parallel_config.attention_context_parallel_size
         self.attn_tp_size = tp_size // self.attn_cp_size
-        column_parallel_cls = (
-            _AttentionColumnParallelLinear
-            if self.attn_cp_size > 1
-            else ColumnParallelLinear
-        )
-        row_parallel_cls = (
-            _AttentionRowParallelLinear if self.attn_cp_size > 1 else RowParallelLinear
+        attn_tp_group = get_attn_tp_group() if self.attn_cp_size > 1 else None
+        attn_tp_kwargs = (
+            {
+                "tp_rank": attn_tp_group.rank_in_group,
+                "tp_size": attn_tp_group.world_size,
+            }
+            if attn_tp_group is not None
+            else {}
         )
         layer_id = extract_layer_index(prefix)
         self.layer_id = layer_id
@@ -583,36 +567,39 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             disable_tp=True,  # fused ReplicatedLinear
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = column_parallel_cls(
+        self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
             bias=False,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wq_b",
+            **attn_tp_kwargs,
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = column_parallel_cls(
+        self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_a",
+            **attn_tp_kwargs,
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
         self._o_proj_block_size = (
             32 if getattr(self.wo_a, "weight_block_size", None) == [1, 32] else 128
         )
-        self.wo_b = row_parallel_cls(
+        self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_b",
+            tp_group=attn_tp_group,
         )
 
         # Initialize rotary embedding before the indexer/compressor consume it.
@@ -875,6 +862,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         cp_plan = self._build_attention_cp_plan(hidden_states.device)
+        if (
+            cp_plan is not None
+            and cp_plan.gathered_token_indices.numel() != hidden_states.shape[0]
+        ):
+            raise NotImplementedError(
+                "Attention context parallelism does not support padded token rows."
+            )
         num_output_tokens = (
             cp_plan.num_local_tokens if cp_plan is not None else hidden_states.shape[0]
         )
@@ -1102,7 +1096,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 assert isinstance(qr, torch.Tensor)
                 local_qr = qr.index_select(0, cp_plan.token_indices)
                 q_positions = positions.index_select(0, cp_plan.token_indices)
-            if local_qr.shape[0] == 0:
+            if cp_plan is not None and local_qr.shape[0] == 0:
                 q = kv.new_empty((0, self.n_local_heads, self.head_dim))
             else:
                 q = self._wq_b_proj(local_qr, qr_scale).view(

@@ -60,6 +60,17 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if (
+            getattr(
+                self.vllm_config.parallel_config,
+                "attention_context_parallel_size",
+                1,
+            )
+            > 1
+        ):
+            # Encoder-only producers can still emit one-token prompt tails.
+            # Keep every row on the Prefill path so the CP query plan owns it.
+            self.decode_threshold = 0
         compress_ratios = getattr(
             self.vllm_config.model_config.hf_config, "compress_ratios", None
         ) or [0]

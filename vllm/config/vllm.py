@@ -2899,6 +2899,18 @@ class VllmConfig:
             raise NotImplementedError(
                 "Attention context parallelism does not support pipeline parallelism."
             )
+        if self.parallel_config.data_parallel_size != 1:
+            raise NotImplementedError(
+                "Attention context parallelism does not support data parallelism."
+            )
+        if (
+            self.parallel_config.enable_expert_parallel
+            or self.parallel_config.use_sequence_parallel_moe
+        ):
+            raise NotImplementedError(
+                "Attention context parallelism does not support expert or "
+                "sequence parallelism."
+            )
         if self.parallel_config.enable_elastic_ep:
             raise NotImplementedError(
                 "Attention context parallelism does not support elastic expert "
