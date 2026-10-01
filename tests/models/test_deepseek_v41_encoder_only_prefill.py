@@ -6,10 +6,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.nvidia import model as dsv41_model
+from vllm.models.deepseek_v41.nvidia.vl_model import DeepseekV41ForCausalLM
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
+
+def test_prefill_pp_keeps_input_ids_for_second_stage_engram():
+    assert requires_raw_input_tokens(DeepseekV41ForCausalLM)
 
 
 def test_official_index_sources_do_not_move_encoder_only_boundary(monkeypatch):
@@ -107,6 +113,49 @@ def test_encoder_only_prefill_stops_at_global_cache_boundary(monkeypatch):
     assert sum(layer.full_calls for layer in layers) == 20
     assert sum(layer.cache_calls for layer in layers) == 1
     assert all(layer.full_calls == 0 for layer in layers[20:])
+
+
+@pytest.mark.parametrize("cut", [8, 14])
+def test_encoder_only_prefill_pp_hands_off_before_shared_source(monkeypatch, cut):
+    """Both stages match the single-stage L20 cache-writer input."""
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
+    monkeypatch.setattr(dsv41_model, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(dsv41_model, "mhc_post_tilelang", lambda x, *_: x)
+    layers = [_RecordingLayer() for _ in range(40)]
+    model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.embed_tokens = _Embedding()
+    model.layers = torch.nn.ModuleList(layers)
+    model.start_layer = 0
+    model.end_layer = cut
+    model.decoder_replay_start = cut
+    model.fuse_mhc_all_reduce = False
+    model.use_mega_moe = False
+    model.engram_hash = None
+    model.engram_dp_shared_memory = False
+    model.use_sequence_parallel = False
+    model.aux_hidden_state_layers = set()
+    model.encoder_only_prefill = True
+    model.encoder_only_boundary_layer = 20
+
+    input_ids = torch.tensor([2, 3])
+    intermediate = model(input_ids, torch.arange(2), None)
+    assert isinstance(intermediate, dsv41_model.IntermediateTensors)
+    assert sum(layer.full_calls for layer in layers) == cut
+    assert sum(layer.cache_calls for layer in layers) == 0
+
+    pp_group.is_first_rank = False
+    pp_group.is_last_rank = True
+    model.start_layer = cut
+    model.end_layer = 40
+    model.decoder_replay_start = 21
+    output = model(input_ids, torch.arange(2), intermediate)
+
+    expected = model.embed_input_ids(input_ids) + 20
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(layers[20].global_cache, expected)
+    assert sum(layer.full_calls for layer in layers) == 20
+    assert sum(layer.cache_calls for layer in layers) == 1
 
 
 def test_global_cache_writer_publishes_same_latent_to_main_and_indexer():
