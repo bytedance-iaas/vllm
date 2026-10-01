@@ -1591,15 +1591,11 @@ class MooncakeConnectorWorker:
                 try:
                     ret_value = await self.sender_loop.run_in_executor(
                         self._sender_executor,
-                        self._send_blocks_traced,
+                        self._send_blocks,
                         remote_session,
                         src_ptrs,
                         dst_ptrs,
                         lengths,
-                        rdma_started,
-                        "|".join(
-                            send_meta.transfer_id for _, send_meta in ok_ready_reqs
-                        ),
                     )
                 finally:
                     rdma_ms = (time.perf_counter() - rdma_started) * 1000
@@ -1964,47 +1960,6 @@ class MooncakeConnectorWorker:
                 sum(lengths),
             )
         return ret_value
-
-    def _send_blocks_traced(
-        self,
-        remote_session: str,
-        src_ptrs: list[int],
-        dst_ptrs: list[int],
-        lengths: list[int],
-        submitted_at: float,
-        transfer_ids: str,
-    ) -> int:
-        started_at = time.perf_counter()
-        if self.trace_sender_timing:
-            logger.info(
-                "Mooncake sender trace event=rdma_worker_start elapsed_ms=%.3f "
-                "dp_rank=%s tp_rank=%s pp_rank=%s executor_wait_ms=%.3f "
-                "thread=%s transfer_ids=%s",
-                (started_at - self._sender_trace_epoch) * 1000,
-                self.dp_rank,
-                self.tp_rank,
-                self.pp_rank,
-                (started_at - submitted_at) * 1000,
-                threading.current_thread().name,
-                transfer_ids,
-            )
-        try:
-            return self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
-        finally:
-            finished_at = time.perf_counter()
-            if self.trace_sender_timing:
-                logger.info(
-                    "Mooncake sender trace event=rdma_worker_end elapsed_ms=%.3f "
-                    "dp_rank=%s tp_rank=%s pp_rank=%s duration_ms=%.3f "
-                    "thread=%s transfer_ids=%s",
-                    (finished_at - self._sender_trace_epoch) * 1000,
-                    self.dp_rank,
-                    self.tp_rank,
-                    self.pp_rank,
-                    (finished_at - started_at) * 1000,
-                    threading.current_thread().name,
-                    transfer_ids,
-                )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
