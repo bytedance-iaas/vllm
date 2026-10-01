@@ -6,6 +6,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -47,6 +48,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed import (
+    get_attn_cp_group,
     get_attn_tp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -81,6 +83,168 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+_ATTENTION_CP_PLAN_CACHE_KEY = (
+    "vllm.models.deepseek_v41.attention:attention_cp_plan_cache_entry"
+)
+_ATTENTION_CP_PURE_PREFILL_ONLY_ERROR = (
+    "Attention context parallelism currently supports pure prefill batches only."
+)
+
+
+def _raise_for_attention_cp_decode_metadata(
+    swa_metadata: "DeepseekSparseSWAMetadata",
+) -> None:
+    if swa_metadata.num_decodes != 0 or swa_metadata.num_decode_tokens != 0:
+        raise NotImplementedError(_ATTENTION_CP_PURE_PREFILL_ONLY_ERROR)
+
+
+def _attention_cp_plan_tensor_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+    return (
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+    )
+
+
+def _attention_cp_plan_cache_signature(
+    swa_metadata: "DeepseekSparseSWAMetadata",
+    *,
+    cp_rank: int,
+    cp_size: int,
+    alignment: int,
+    device: torch.device,
+) -> tuple[Any, ...]:
+    query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+    seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+    assert query_start_loc_cpu is not None
+    assert seq_lens_cpu is not None
+
+    return (
+        cp_rank,
+        cp_size,
+        alignment,
+        device.type,
+        device.index,
+        swa_metadata.num_decodes,
+        swa_metadata.num_decode_tokens,
+        swa_metadata.num_prefills,
+        _attention_cp_plan_tensor_signature(query_start_loc_cpu),
+        _attention_cp_plan_tensor_signature(seq_lens_cpu),
+    )
+
+
+@dataclass
+class AttentionCPPlan:
+    token_indices: torch.Tensor
+    output_gather_sizes: list[int]
+    gathered_token_indices: torch.Tensor
+    local_query_start_loc_cpu: torch.Tensor
+
+    @property
+    def num_local_tokens(self) -> int:
+        return int(self.local_query_start_loc_cpu[-1].item())
+
+    @classmethod
+    def build(
+        cls,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        *,
+        cp_rank: int,
+        cp_size: int,
+        alignment: int,
+        device: torch.device,
+    ) -> "AttentionCPPlan":
+        _raise_for_attention_cp_decode_metadata(swa_metadata)
+        if alignment <= 0:
+            raise ValueError(f"alignment must be positive, got {alignment}")
+        if cp_size <= 0 or not 0 <= cp_rank < cp_size:
+            raise ValueError(f"Invalid attention CP rank/size: {cp_rank}/{cp_size}")
+
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        assert query_start_loc_cpu is not None
+        num_reqs = swa_metadata.num_prefills
+        query_start_loc_cpu = query_start_loc_cpu[: num_reqs + 1].to(torch.int64)
+        global_query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+
+        rank_indices: list[list[torch.Tensor]] = [[] for _ in range(cp_size)]
+        local_lens: list[int] = []
+        for req_idx in range(num_reqs):
+            query_len = int(global_query_lens[req_idx].item())
+            num_blocks = (query_len + alignment - 1) // alignment
+            global_query_start = int(query_start_loc_cpu[req_idx].item())
+            for rank in range(cp_size):
+                start_block = (num_blocks * rank + cp_size - 1) // cp_size
+                end_block = (num_blocks * (rank + 1) + cp_size - 1) // cp_size
+                local_start = min(start_block * alignment, query_len)
+                local_end = min(end_block * alignment, query_len)
+                global_start = global_query_start + local_start
+                global_end = global_query_start + local_end
+                if global_end > global_start:
+                    rank_indices[rank].append(
+                        torch.arange(global_start, global_end, dtype=torch.int64)
+                    )
+                if rank == cp_rank:
+                    local_lens.append(global_end - global_start)
+
+        indices_cpu_by_rank = [
+            torch.cat(indices) if indices else torch.empty(0, dtype=torch.int64)
+            for indices in rank_indices
+        ]
+        output_gather_sizes = [int(indices.numel()) for indices in indices_cpu_by_rank]
+        num_global_tokens = int(query_start_loc_cpu[-1].item())
+        if sum(output_gather_sizes) != num_global_tokens:
+            raise RuntimeError(
+                "Attention CP output plan does not cover all query tokens: "
+                f"{output_gather_sizes=} {num_global_tokens=}"
+            )
+        local_query_lens_cpu = torch.tensor(local_lens, dtype=torch.int32)
+        local_query_start_loc_cpu = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(local_query_lens_cpu, dim=0),
+            )
+        )
+        return cls(
+            token_indices=indices_cpu_by_rank[cp_rank].to(device=device),
+            output_gather_sizes=output_gather_sizes,
+            gathered_token_indices=torch.cat(indices_cpu_by_rank).to(device=device),
+            local_query_start_loc_cpu=local_query_start_loc_cpu,
+        )
+
+    def restore_output(
+        self,
+        local_output: torch.Tensor,
+        num_global_tokens: int,
+    ) -> torch.Tensor:
+        if local_output.shape[0] != self.num_local_tokens:
+            raise ValueError(
+                "Local attention output token count does not match the CP plan: "
+                f"{local_output.shape[0]} != {self.num_local_tokens}"
+            )
+        if self.gathered_token_indices.numel() != num_global_tokens:
+            raise ValueError(
+                "Global attention output token count does not match the CP plan: "
+                f"{num_global_tokens} != {self.gathered_token_indices.numel()}"
+            )
+
+        gathered_output = get_attn_cp_group().all_gatherv(
+            local_output,
+            dim=0,
+            sizes=self.output_gather_sizes,
+        )
+        output = local_output.new_empty((num_global_tokens, local_output.shape[-1]))
+        if num_global_tokens > 0:
+            output.index_copy_(0, self.gathered_token_indices, gathered_output)
+        return output
+
+
+@dataclass(frozen=True)
+class AttentionCPPlanCacheEntry:
+    signature: tuple[Any, ...]
+    plan: AttentionCPPlan
 
 
 class _AttentionColumnParallelLinear(ColumnParallelLinear):
@@ -555,6 +719,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self.attn_cp_alignment = cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
 
         # Resolve the kv-cache dtype from this backend's block format. The same
@@ -709,10 +874,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        cp_plan = self._build_attention_cp_plan(hidden_states.device)
+        num_output_tokens = (
+            cp_plan.num_local_tokens if cp_plan is not None else hidden_states.shape[0]
+        )
         # The eager attention region writes into a caller-owned buffer
         # (breakable_cudagraph needs in-place outputs); its shape and how it is
         # projected afterwards follow the interface contract above.
-        attn_out = self._alloc_attn_out(hidden_states.shape[0], hidden_states)
+        attn_out = self._alloc_attn_out(num_output_tokens, hidden_states)
 
         # Keep the attention input preparation in the captured graph. Only the
         # sparse indexer and MLA attention run in the eager break below.
@@ -730,8 +899,65 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_weights,
             positions,
             attn_out,
+            cp_plan,
         )
-        return self._o_proj(attn_out, positions)
+        if cp_plan is None:
+            return self._o_proj(attn_out, positions)
+        if cp_plan.num_local_tokens == 0:
+            local_output = hidden_states.new_empty((0, self.hidden_size))
+        else:
+            local_positions = positions.index_select(0, cp_plan.token_indices)
+            local_output = self._o_proj(attn_out, local_positions)
+        return cp_plan.restore_output(local_output, hidden_states.shape[0])
+
+    def _build_attention_cp_plan(self, device: torch.device) -> AttentionCPPlan | None:
+        if self.attn_cp_size == 1:
+            return None
+
+        forward_context = get_forward_context()
+        if forward_context.is_profile:
+            return None
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            raise NotImplementedError(
+                "Attention context parallelism requires a single attention "
+                "metadata dictionary."
+            )
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+        _raise_for_attention_cp_decode_metadata(swa_metadata)
+
+        cp_group = get_attn_cp_group()
+        cache_signature = _attention_cp_plan_cache_signature(
+            swa_metadata,
+            cp_rank=cp_group.rank_in_group,
+            cp_size=cp_group.world_size,
+            alignment=self.attn_cp_alignment,
+            device=device,
+        )
+        cache_entry = forward_context.additional_kwargs.get(
+            _ATTENTION_CP_PLAN_CACHE_KEY
+        )
+        if (
+            isinstance(cache_entry, AttentionCPPlanCacheEntry)
+            and cache_entry.signature == cache_signature
+        ):
+            return cache_entry.plan
+
+        cp_plan = AttentionCPPlan.build(
+            swa_metadata,
+            cp_rank=cp_group.rank_in_group,
+            cp_size=cp_group.world_size,
+            alignment=self.attn_cp_alignment,
+            device=device,
+        )
+        forward_context.additional_kwargs[_ATTENTION_CP_PLAN_CACHE_KEY] = (
+            AttentionCPPlanCacheEntry(signature=cache_signature, plan=cp_plan)
+        )
+        return cp_plan
 
     def write_global_cache(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -775,6 +1001,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             can_fuse_query_quant,
         )
 
+        if self.attn_cp_size > 1:
+            return False
         linears = [self.wq_b]
         if self.indexer is not None:
             linears.append(self.indexer.wq_b)
@@ -822,6 +1050,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         attn_out: "torch.Tensor | QuantizedActivation",
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         """Wide eager region: the whole of ``_prepare_and_attn`` runs eagerly.
 
@@ -837,6 +1066,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer_weights,
             positions,
             attn_out,
+            cp_plan,
         )
 
     def _prepare_and_attn(
@@ -849,6 +1079,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         attn_out: "torch.Tensor | QuantizedActivation",
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         """Attention input preparation followed by the sparse indexer and MLA.
 
@@ -864,10 +1095,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_streams = self.aux_stream_list
 
         def project_query_and_cache_kv() -> torch.Tensor:
-            q = self._wq_b_proj(qr, qr_scale).view(
-                -1, self.n_local_heads, self.head_dim
+            if cp_plan is None:
+                local_qr = qr
+                q_positions = positions
+            else:
+                assert isinstance(qr, torch.Tensor)
+                local_qr = qr.index_select(0, cp_plan.token_indices)
+                q_positions = positions.index_select(0, cp_plan.token_indices)
+            if local_qr.shape[0] == 0:
+                q = kv.new_empty((0, self.n_local_heads, self.head_dim))
+            else:
+                q = self._wq_b_proj(local_qr, qr_scale).view(
+                    -1, self.n_local_heads, self.head_dim
+                )
+            return self._fused_qnorm_rope_kv_insert(
+                q,
+                kv,
+                q_positions,
+                positions,
+                attn_metadata,
+                split_q=cp_plan is not None,
             )
-            return self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         index_q: torch.Tensor | None = None
         index_q_scale: torch.Tensor | None = None
@@ -1021,17 +1269,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
-        positions: torch.Tensor,
+        q_positions: torch.Tensor,
+        kv_positions: torch.Tensor,
         attn_metadata: (
             dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None
         ),
+        *,
+        split_q: bool,
     ) -> torch.Tensor:
         """Ready ``q`` for the attention kernel and publish this step's KV.
 
-        One launch does both. With ``accepts_unnormed_unroped_query`` the
-        attention kernel norms and rotates Q itself and reads it in its own
-        chunk-interleaved layout, so the Q half of the launch is a zero-pad to
-        ``padded_heads`` -- and nothing at all once the shard is that wide.
+        The default path fuses both operations. Attention CP keeps Q local and
+        publishes full KV with the existing Q-only and KV-only kernel modes.
+        With ``accepts_unnormed_unroped_query`` the attention kernel norms and
+        rotates Q itself and reads it in its own chunk-interleaved layout, so
+        the Q half of the launch is a zero-pad to ``padded_heads`` -- and
+        nothing at all once the shard is that wide.
         """
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
@@ -1058,7 +1311,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         swa_kv_cache = self.swa_cache_layer.kv_cache
         # The fused insert ops require int64 position_ids; the runner's positions
         # buffer is already int64, so no cast is needed.
-        assert positions.dtype == torch.int64
+        assert q_positions.dtype == torch.int64
+        assert kv_positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
 
@@ -1078,12 +1332,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 and self.n_local_heads == self.padded_heads
                 else self.padded_heads
             )
+            if split_q:
+                if q.shape[0] == 0:
+                    q_padded = q.new_empty((0, self.padded_heads, self.head_dim))
+                else:
+                    q_padded = (
+                        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                            q,
+                            kv[: q.shape[0]],
+                            swa_kv_cache_2d,
+                            swa_metadata.slot_mapping[:0],
+                            q_positions,
+                            cos_sin_cache,
+                            pad_to,
+                            self.eps,
+                            swa_metadata.block_size,
+                            False,
+                            self.kv_mxfp8,
+                            True,
+                            False,
+                        )
+                    )
+                torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+                    kv,
+                    swa_kv_cache,
+                    swa_metadata.slot_mapping,
+                    kv_positions,
+                    cos_sin_cache,
+                    swa_metadata.block_size,
+                    None,
+                    self.kv_mxfp8,
+                )
+                return q_padded
             q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
                 swa_metadata.slot_mapping,
-                positions,
+                kv_positions,
                 cos_sin_cache,
                 pad_to,
                 self.eps,
@@ -1095,6 +1381,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
             return q if pad_to == 0 else q_padded
 
+        if split_q:
+            raise NotImplementedError(
+                "Attention context parallelism requires the fp8_ds_mla KV cache."
+            )
         assert not self.accepts_unnormed_unroped_query, (
             "the chunk-interleaved Q layout only pairs with a packed KV record"
         )
@@ -1111,7 +1401,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 kv,
                 swa_kv_cache_3d,
                 swa_metadata.slot_mapping,
-                positions,
+                kv_positions,
                 cos_sin_cache,
                 self.eps,
                 block_size,
@@ -1127,7 +1417,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q_fp8,
             swa_kv_cache_3d,
             swa_metadata.slot_mapping,
-            positions,
+            kv_positions,
             cos_sin_cache,
             self._flashinfer_fp8_kv_scale,
             self._flashinfer_fp8_q_scale_inv,

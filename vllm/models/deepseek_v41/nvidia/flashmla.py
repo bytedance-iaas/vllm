@@ -10,7 +10,7 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
     deep_gemm_fp8_o_proj,
 )
-from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.attention import AttentionCPPlan, DeepseekV4Attention
 from vllm.models.deepseek_v41.common.ops import (
     combine_topk_swa_indices,
     dequantize_and_gather_k_cache,
@@ -154,6 +154,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         num_decodes = swa_metadata.num_decodes
         num_prefills = swa_metadata.num_prefills
         num_decode_tokens = swa_metadata.num_decode_tokens
+        cp_plan = self._build_attention_cp_plan(q.device)
+        if cp_plan is not None and num_decodes > 0:
+            raise NotImplementedError(
+                "Attention context parallelism does not support mixed decode "
+                "and prefill batches."
+            )
 
         if num_prefills > 0:
             self._forward_prefill(
@@ -161,9 +167,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 positions=positions[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
                 swa_k_cache=swa_kv_cache,
-                output=output[num_decode_tokens:],
+                output=output if cp_plan is not None else output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
+                cp_plan=cp_plan,
             )
         if num_decodes > 0:
             self._forward_decode(
@@ -255,6 +262,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         output: torch.Tensor,
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
+        cp_plan: AttentionCPPlan | None,
     ) -> None:
         swa_only = self.compress_ratio == 0
 
@@ -349,12 +357,29 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_N,
                 out=(combined_indices_out, combined_lens_out),
             )
+            if cp_plan is not None:
+                local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
+                local_end = int(cp_plan.local_query_start_loc_cpu[chunk_end].item())
+                if local_start == local_end:
+                    continue
+                global_token_indices = cp_plan.token_indices[local_start:local_end]
+                query_indices = global_token_indices - prefill_token_base
+                chunk_indices = query_indices - query_start
+                q_chunk = q[local_start:local_end]
+                indices_chunk = combined_indices.index_select(0, chunk_indices)
+                lens_chunk = combined_lens.index_select(0, chunk_indices)
+                output_chunk = output[local_start:local_end]
+            else:
+                q_chunk = q[query_start:query_end]
+                indices_chunk = combined_indices
+                lens_chunk = combined_lens
+                output_chunk = output[query_start:query_end]
             flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
+                q=q_chunk,
                 kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
+                indices=indices_chunk.unsqueeze(1),
                 sm_scale=self.scale,
                 attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
+                topk_length=lens_chunk,
+                out=output_chunk,
             )
