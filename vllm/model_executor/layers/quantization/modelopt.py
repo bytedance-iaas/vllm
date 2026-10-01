@@ -2498,6 +2498,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         self.kernel: Any = None
         self._humming_wq_b_candidate = (
             os.getenv("VLLM_DSV41_DECODE_WQ_B_HUMMING", "0") == "1"
+            and os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") != "1"
             and spec.weight == kMxfp8Static
             and spec.activation == kMxfp8Dynamic
             and _is_dsv41_target_wq_b(prefix)
@@ -2505,6 +2506,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         self._humming_wq_b_kernel: Any = None
         self._humming_wq_b_layer: torch.nn.Module | None = None
         self._dense_mxfp8: Any = None
+        self._humming_dense: Any = None
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -2634,6 +2636,25 @@ class ModelOptLinearMethod(LinearMethodBase):
         if self._humming_wq_b_candidate:
             self._prepare_humming_wq_b(layer)
         if (
+            os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") == "1"
+            and self.spec.weight == kMxfp8Static
+            and self.spec.activation == kMxfp8Dynamic
+            and type(self.fmt) is FormatScheme
+            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+        ):
+            from vllm.model_executor.layers.quantization.utils.dsv41_humming_dense import (  # noqa: E501
+                Dsv41HummingDense,
+            )
+
+            self._humming_dense = Dsv41HummingDense.from_layer(layer)
+            if self._humming_dense is not None:
+                layer.add_module("_humming_dense", self._humming_dense)
+                logger.info(
+                    "Prepared ordered W8A8 Humming M%d for %s",
+                    self._humming_dense.m,
+                    self.prefix,
+                )
+        if (
             os.getenv("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
             and self.spec.weight == kMxfp8Static
             and self.spec.activation == kMxfp8Dynamic
@@ -2654,6 +2675,12 @@ class ModelOptLinearMethod(LinearMethodBase):
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
+            if (
+                self._humming_dense is not None
+                and b is None
+                and self._humming_dense.supports(inp)
+            ):
+                return self._humming_dense(inp)
             if (
                 self._dense_mxfp8 is not None
                 and b is None

@@ -235,8 +235,10 @@ class DeepseekV4MLP(nn.Module):
 
     def forward(self, x):
         dense = getattr(self.gate_up_proj.quant_method, "_dense_mxfp8", None)
+        humming = getattr(self.gate_up_proj.quant_method, "_humming_dense", None)
         if (
             dense is not None
+            and (humming is None or not humming.supports(x))
             and dense.supports(x)
             and isinstance(self.act_fn, SiluAndMulWithClamp)
             and self.act_fn.swiglu_limit == 10.0
