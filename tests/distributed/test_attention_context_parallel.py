@@ -8,6 +8,7 @@ from vllm.config.parallel import ParallelConfig
 from vllm.distributed.parallel_state import (
     _get_attention_parallel_group_ranks,
 )
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 
 def test_attention_context_parallel_default_preserves_world_size():
@@ -99,3 +100,38 @@ def test_attention_parallel_groups_preserve_outer_dimensions():
         [12, 14],
         [13, 15],
     ]
+
+
+def test_row_parallel_linear_uses_override_group(monkeypatch):
+    class FakeGroup:
+        rank_in_group = 1
+        world_size = 2
+        called = False
+
+        def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+            self.called = True
+            return tensor + 7
+
+    group = FakeGroup()
+    layer = RowParallelLinear(
+        8,
+        3,
+        bias=False,
+        return_bias=False,
+        tp_group=group,
+    )
+    assert (layer.tp_rank, layer.tp_size, tuple(layer.weight.shape)) == (
+        1,
+        2,
+        (3, 4),
+    )
+    monkeypatch.setattr(
+        layer.quant_method,
+        "apply",
+        lambda layer, x, bias: x.sum(-1, keepdim=True).expand(-1, 3),
+    )
+
+    output = layer(torch.ones(2, 4))
+
+    assert group.called
+    assert torch.equal(output, torch.full((2, 3), 11.0))

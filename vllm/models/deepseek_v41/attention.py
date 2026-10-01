@@ -46,7 +46,10 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_attn_tp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -78,6 +81,38 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+class _AttentionColumnParallelLinear(ColumnParallelLinear):
+    """Column-parallel linear sharded over the attention TP group."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        group = get_attn_tp_group()
+        super().__init__(
+            *args,
+            tp_rank=group.rank_in_group,
+            tp_size=group.world_size,
+            **kwargs,
+        )
+
+
+class _AttentionRowParallelLinear(RowParallelLinear):
+    """Row-parallel linear reduced over the attention TP group."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, tp_group=get_attn_tp_group(), **kwargs)
+
+
+def get_attention_tp_head_range(num_heads: int) -> tuple[int, int]:
+    attn_tp_group = get_attn_tp_group()
+    if num_heads % attn_tp_group.world_size != 0:
+        raise ValueError(
+            f"num_heads={num_heads} must be divisible by attention TP size "
+            f"{attn_tp_group.world_size}."
+        )
+    local_heads = num_heads // attn_tp_group.world_size
+    start = local_heads * attn_tp_group.rank_in_group
+    return start, start + local_heads
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
@@ -278,21 +313,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
+        self.attn_cp_size = vllm_config.parallel_config.attention_context_parallel_size
+        self.attn_tp_size = tp_size // self.attn_cp_size
+        column_parallel_cls = (
+            _AttentionColumnParallelLinear
+            if self.attn_cp_size > 1
+            else ColumnParallelLinear
+        )
+        row_parallel_cls = (
+            _AttentionRowParallelLinear if self.attn_cp_size > 1 else RowParallelLinear
+        )
         layer_id = extract_layer_index(prefix)
         self.layer_id = layer_id
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
-        assert self.n_heads % tp_size == 0
-        self.n_local_heads = self.n_heads // tp_size
+        assert self.n_heads % self.attn_tp_size == 0
+        self.n_local_heads = self.n_heads // self.attn_tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
+        assert self.n_groups % self.attn_tp_size == 0
+        self.n_local_groups = self.n_groups // self.attn_tp_size
         self.window_size = config.sliding_window
         # ---- v4.1 sparse-attention topology ----
         # compress_ratios has one entry per layer (MTP layers included):
@@ -373,7 +419,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             disable_tp=True,  # fused ReplicatedLinear
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(
+        self.wq_b = column_parallel_cls(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
             bias=False,
@@ -383,7 +429,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = ColumnParallelLinear(
+        self.wo_a = column_parallel_cls(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
@@ -396,7 +442,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self._o_proj_block_size = (
             32 if getattr(self.wo_a, "weight_block_size", None) == [1, 32] else 128
         )
-        self.wo_b = RowParallelLinear(
+        self.wo_b = row_parallel_cls(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
             bias=False,
