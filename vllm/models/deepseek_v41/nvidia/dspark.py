@@ -33,7 +33,10 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -50,6 +53,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.platforms import current_platform
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -172,6 +176,34 @@ class DSparkDeepseekV4Model(nn.Module):
                 )
         self.layers = nn.ModuleList(layers)
 
+        self.context_wkv_proj: MergedColumnParallelLinear | None = None
+        self._stacked_context_wkv_validated = False
+        if envs.VLLM_DSV41_STACK_CONTEXT_WKV:
+            supported = (
+                not self.context_kv_only
+                and self.num_dspark_layers == 3
+                and get_tensor_model_parallel_world_size() == 1
+                and current_platform.is_device_capability_family(90)
+            )
+            if supported:
+                self.context_wkv_proj = MergedColumnParallelLinear(
+                    config.hidden_size,
+                    [config.head_dim] * self.num_dspark_layers,
+                    bias=False,
+                    return_bias=False,
+                    quant_config=vllm_config.quant_config,
+                    prefix=maybe_prefix(prefix, "context_wkv_proj"),
+                    disable_tp=True,
+                )
+                logger.info_once(
+                    "Using stacked DSpark context WKV projection on SM90 TP1."
+                )
+            else:
+                logger.warning_once(
+                    "VLLM_DSV41_STACK_CONTEXT_WKV is ignored outside the "
+                    "three-layer SM90 TP1 Decode model."
+                )
+
         if not self.context_kv_only:
             # Heads are not needed when this model only materializes context KV.
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -220,15 +252,46 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
-        for i, layer in enumerate(self.layers):
+        if self.context_wkv_proj is not None:
+            kv_by_layer = (
+                self.context_wkv_proj(main_x)
+                .view(main_x.shape[0], self.num_dspark_layers, self.config.head_dim)
+                .unbind(1)
+            )
+            if (
+                envs.VLLM_DSV41_VALIDATE_STACK_CONTEXT_WKV
+                and not self._stacked_context_wkv_validated
+                and context_slot_mappings is not None
+                and any(mapping is not None for mapping in context_slot_mappings)
+            ):
+                kv_by_layer = tuple(kv.clone() for kv in kv_by_layer)
+                for layer_id, (layer, kv) in enumerate(
+                    zip(self.layers, kv_by_layer, strict=True)
+                ):
+                    reference, _ = layer.attn.fused_wqa_wkv(main_x)
+                    reference = reference[..., layer.attn.q_lora_rank :]
+                    if not torch.equal(kv, reference):
+                        max_diff = (kv.float() - reference.float()).abs().max().item()
+                        raise RuntimeError(
+                            "Stacked DSpark context WKV mismatch at layer "
+                            f"{layer_id}: max_abs={max_diff}"
+                        )
+                self._stacked_context_wkv_validated = True
+                logger.info_once(
+                    "Validated stacked DSpark context WKV bitwise for shape %s.",
+                    tuple(main_x.shape),
+                )
+        else:
+            kv_by_layer = tuple(
+                layer.attn.fused_wqa_wkv(main_x)[0][..., layer.attn.q_lora_rank :]
+                for layer in self.layers
+            )
+
+        for i, (layer, kv) in enumerate(zip(self.layers, kv_by_layer, strict=True)):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
             attn = layer.attn
-            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
-            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
@@ -446,6 +509,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             ("attn.fused_wqa_wkv", "attn.wq_a", 0),
             ("attn.fused_wqa_wkv", "attn.wkv", 1),
         ]
+        context_wkv_shards = (
+            {f"model.layers.{i}.attn.wkv": i for i in range(len(self.model.layers))}
+            if self.model.context_wkv_proj is not None
+            else {}
+        )
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -479,6 +547,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_weight = DeepseekV4Model._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
                 )
+
+            module, _, param_suffix = name.rpartition(".")
+            if (context_shard := context_wkv_shards.get(module)) is not None:
+                context_name = f"model.context_wkv_proj.{param_suffix}"
+                param = params_dict[context_name]
+                param.weight_loader(param, loaded_weight, context_shard)
+                loaded_params.add(context_name)
 
             # E8M0 expert scales: keep raw exponent bytes.
             if ".experts." in name:
