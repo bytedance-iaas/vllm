@@ -1590,6 +1590,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
             num_engines = len(current_counts)
+            min_inflight = (
+                min(
+                    self.engine_inflight[engine]
+                    for engine in self.core_engines[:num_engines]
+                )
+                if self.client_count == 1
+                else None
+            )
             min_score: float = sys.maxsize
             eng_index = 0
             for i in range(num_engines):
@@ -1597,6 +1605,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
                 waiting, running, kv_cache_usage = current_counts[idx]
+                inflight = self.engine_inflight[self.core_engines[idx]]
+                # With one API client, the local count is exact and fresher than
+                # coordinator snapshots. Restrict routing to the least-loaded
+                # ranks so a stale-high snapshot cannot hide a newly freed slot.
+                if min_inflight is not None and inflight != min_inflight:
+                    continue
                 # Estimate engine load as the greater of the coordinator's
                 # latest (waiting + running) snapshot and this client's own
                 # in-flight count (scaled by the number of clients). The
@@ -1604,7 +1618,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # rebind, so a burst spreads round-robin even when snapshots
                 # race with routing decisions; the snapshot raises the score
                 # when other clients or stale requests load the engine.
-                inflight = self.engine_inflight[self.core_engines[idx]]
                 score: float = max(self.client_count * inflight, waiting + running)
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache

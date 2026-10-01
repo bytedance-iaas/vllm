@@ -263,6 +263,46 @@ def test_dplb_burst_round_robins_despite_snapshot_rebinds():
     assert sorted(client.engine_inflight.values()) == [2, 2, 2, 2]
 
 
+def test_dplb_single_client_refills_freed_engine_despite_stale_high_snapshot():
+    """A stale-high snapshot must not hide the rank that just completed."""
+    client = _make_dplb_client(num_engines=4)
+    requests = [make_request(SamplingParams(max_tokens=1)) for _ in range(4)]
+
+    for request in requests:
+        client.get_core_engine_for_request(request)
+    client.lb_engines = [[0, 1, 0.0] for _ in range(4)]
+
+    freed_engine = client.core_engines[2]
+    freed_request = next(
+        request
+        for request in requests
+        if client.reqs_in_flight[request.request_id] == freed_engine
+    )
+    outputs = EngineCoreOutputs(finished_requests={freed_request.request_id})
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1))
+    )
+
+    assert chosen == freed_engine
+    assert sorted(client.engine_inflight.values()) == [1, 1, 1, 1]
+
+
+def test_dplb_single_client_ignores_unpublished_scale_up_engines():
+    """Only engines represented by the current snapshot are routable."""
+    client = _make_dplb_client(num_engines=3)
+    client.lb_engines = [[0, 5, 0.0], [0, 1, 0.0]]
+    client.engine_inflight[client.core_engines[0]] = 5
+    client.engine_inflight[client.core_engines[1]] = 1
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1))
+    )
+
+    assert chosen == client.core_engines[1]
+
+
 @pytest.mark.asyncio
 async def test_dplb_scale_down_routes_after_stale_stats_snapshot():
     """A coordinator snapshot during scale-down must only route to survivors."""
