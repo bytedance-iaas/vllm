@@ -42,6 +42,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_attn_cp_group,
+    get_attn_tp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -517,6 +519,12 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        attn_cp_size = vllm_config.parallel_config.attention_context_parallel_size
+        if attn_cp_size > 1 and vllm_config.kv_transfer_config.kv_role != "kv_producer":
+            raise NotImplementedError(
+                "Mooncake attention context parallelism supports pure "
+                "kv_producer instances only."
+            )
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
@@ -597,6 +605,12 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def get_finished_count(self) -> int | None:
+        if self._kv_transfer_config.kv_role != "kv_producer":
+            return None
+        attn_cp_size = self._vllm_config.parallel_config.attention_context_parallel_size
+        return self._vllm_config.parallel_config.world_size // attn_cp_size
 
     ############################################################
     # Worker Side Methods
@@ -1036,8 +1050,21 @@ class MooncakeConnectorWorker:
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        assert (parallel_config := vllm_config.parallel_config)
+        self.attn_cp_size = parallel_config.attention_context_parallel_size
+        if self.attn_cp_size > 1:
+            attn_tp_group = get_attn_tp_group()
+            self.tp_rank = attn_tp_group.rank_in_group
+            self.tp_size = attn_tp_group.world_size
+            self.attn_cp_rank = get_attn_cp_group().rank_in_group
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.attn_cp_rank = 0
+        self.is_canonical_attn_cp_rank = self.attn_cp_rank == 0
+        self.is_sender_worker = (
+            not self.is_kv_consumer and self.is_canonical_attn_cp_rank
+        )
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -1045,7 +1072,6 @@ class MooncakeConnectorWorker:
         self.registered_group_indices: list[int] = []
         self.seen_base_addresses: list[int] = []
 
-        assert (parallel_config := vllm_config.parallel_config)
         dp_rank = parallel_config.data_parallel_index
         dp_local_rank = parallel_config.data_parallel_rank_local
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
@@ -1057,7 +1083,7 @@ class MooncakeConnectorWorker:
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
         # For kv_both, we will act both prefiller and decoder.
-        if not self.is_kv_consumer:
+        if self.is_sender_worker:
             # Background threads for sending kvcaches to D.
             # Each pool thread must be bound to the correct CUDA device
             # because CUDA device selection is thread-local.
@@ -1175,7 +1201,7 @@ class MooncakeConnectorWorker:
     def shutdown(self):
         """Cleanup background threads on destruction."""
         self.async_zmq_ctx.term()
-        if not self.is_kv_consumer:
+        if self.is_sender_worker:
             self._sender_executor.shutdown(wait=False)
             if self.sender_loop.is_running():
                 self.sender_loop.call_soon_threadsafe(self.sender_loop.stop)
@@ -1189,6 +1215,8 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.join()
 
     async def register_worker_with_bootstrap(self):
+        if not self.is_sender_worker:
+            return
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
         worker_addr = make_zmq_path("tcp", self.hostname, self.side_channel_port)
@@ -1769,6 +1797,9 @@ class MooncakeConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
+        if self.is_kv_producer and not self.is_canonical_attn_cp_rank:
+            self.device_kv_caches = kv_caches
+            return
 
         kv_data_ptrs: list[int] = []
         kv_data_lens: list[int] = []
@@ -1859,8 +1890,8 @@ class MooncakeConnectorWorker:
             self.kv_block_len_per_layer,
         )
 
-        # No need to launch server for D node.
-        if self.is_kv_consumer:
+        # Only canonical attention-CP producer ranks serve Mooncake transfers.
+        if not self.is_sender_worker:
             return
 
         ready_event = threading.Event()
@@ -1915,7 +1946,7 @@ class MooncakeConnectorWorker:
                 self.fetch_finished_recving_reqs(), self.receiver_loop
             )
 
-        if not self.is_kv_consumer:
+        if self.is_sender_worker:
             send_fut = asyncio.run_coroutine_threadsafe(
                 self.fetch_finished_sending_reqs(), self.sender_loop
             )
@@ -2190,6 +2221,8 @@ class MooncakeConnectorWorker:
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+        if not self.is_sender_worker:
+            return
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
@@ -2223,7 +2256,7 @@ class MooncakeConnectorWorker:
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
             )
 
-        if not self.is_kv_consumer and (
+        if self.is_sender_worker and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
             asyncio.run_coroutine_threadsafe(
@@ -2354,10 +2387,15 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
-    # Only the TP=0, PP=0 worker of the designated engine should launch it.
+    # Only the TP=0, PP=0, canonical attention-CP worker should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    if (
+        parallel_config.attention_context_parallel_size > 1
+        and get_attn_cp_group().rank_in_group != 0
+    ):
         return False
 
     # In hybrid or external LB mode,
