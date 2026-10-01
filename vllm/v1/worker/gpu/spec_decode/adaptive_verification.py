@@ -4,7 +4,7 @@
 
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -25,6 +25,19 @@ from vllm.v1.worker.gpu.attn_utils import (
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
+
+
+class _PostDPRefillDecision(NamedTuple):
+    num_reqs: int
+    scheduled_drafts: int
+    scheduled_max_query_len: int
+    non_draft_tokens: int
+    draft_budget: int
+    max_safe_budget: int
+    local_budget_tokens: int
+    new_draft_budget: int
+    reason: str
+
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -178,8 +191,13 @@ class AdaptiveVerificationManager:
         self._copy_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
         self._pending_resets: list[int] = []
         self._stale_idx = 0
+        self._post_dp_refill_enabled = envs.VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
+
+    @property
+    def post_dp_refill_enabled(self) -> bool:
+        return self._post_dp_refill_enabled
 
     def add_request(self, req_idx: int) -> None:
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
@@ -351,6 +369,126 @@ class AdaptiveVerificationManager:
             draft_budget,
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+
+    def _get_post_dp_refill_decision(
+        self,
+        *,
+        local_dispatch_tokens: int,
+        graph_mode: CUDAGraphMode,
+        graph_num_tokens: int,
+        graph_num_reqs: int | None,
+        graph_max_query_len: int | None,
+        dp_eager: bool,
+        dp_has_prefill: bool,
+        dp_num_reqs_unpadded: int,
+    ) -> _PostDPRefillDecision:
+        batch_budget = self._batch_budget
+        assert batch_budget is not None
+        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        num_reqs = len(num_drafts_per_req)
+        scheduled_drafts = sum(num_drafts_per_req.values())
+        scheduled_max_query_len = max(
+            (
+                num_non_draft_tokens_per_req[req_id] + num_drafts
+                for req_id, num_drafts in num_drafts_per_req.items()
+            ),
+            default=0,
+        )
+        non_draft_tokens = sum(num_non_draft_tokens_per_req.values())
+        max_safe_budget = min(
+            scheduled_drafts,
+            max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+        )
+        local_budget_tokens = non_draft_tokens + draft_budget
+        graph_request_capacity = (
+            graph_num_reqs is not None
+            and graph_num_reqs >= num_reqs
+            and graph_num_reqs >= dp_num_reqs_unpadded
+        )
+        graph_query_capacity = (
+            graph_max_query_len is None
+            or graph_max_query_len >= scheduled_max_query_len
+        )
+        new_draft_budget = max(
+            draft_budget,
+            min(
+                scheduled_drafts,
+                max_safe_budget,
+                graph_num_tokens - non_draft_tokens,
+            ),
+        )
+
+        if dp_eager:
+            reason = "eager"
+        elif graph_mode != CUDAGraphMode.FULL:
+            reason = "not_full"
+        elif dp_has_prefill:
+            reason = "prefill"
+        elif local_dispatch_tokens != local_budget_tokens:
+            reason = "dispatch_tokens_changed"
+        elif not graph_request_capacity:
+            reason = "request_cap"
+        elif not graph_query_capacity:
+            reason = "query_cap"
+        elif scheduled_drafts == draft_budget:
+            reason = "no_omitted_drafts"
+        elif max_safe_budget <= draft_budget:
+            reason = "sampler_cap"
+        elif new_draft_budget == draft_budget:
+            reason = "no_graph_capacity"
+        else:
+            reason = "eligible"
+
+        return _PostDPRefillDecision(
+            num_reqs=num_reqs,
+            scheduled_drafts=scheduled_drafts,
+            scheduled_max_query_len=scheduled_max_query_len,
+            non_draft_tokens=non_draft_tokens,
+            draft_budget=draft_budget,
+            max_safe_budget=max_safe_budget,
+            local_budget_tokens=local_budget_tokens,
+            new_draft_budget=new_draft_budget,
+            reason=reason,
+        )
+
+    def maybe_refill_post_dp_budget(
+        self,
+        *,
+        local_dispatch_tokens: int,
+        graph_mode: CUDAGraphMode,
+        graph_num_tokens: int,
+        graph_num_reqs: int | None,
+        graph_max_query_len: int | None,
+        dp_eager: bool,
+        dp_has_prefill: bool,
+        dp_num_reqs_unpadded: int,
+    ) -> int:
+        """Refill only draft rows that fit the already-selected FULL graph."""
+        if not self._post_dp_refill_enabled:
+            return local_dispatch_tokens
+
+        decision = self._get_post_dp_refill_decision(
+            local_dispatch_tokens=local_dispatch_tokens,
+            graph_mode=graph_mode,
+            graph_num_tokens=graph_num_tokens,
+            graph_num_reqs=graph_num_reqs,
+            graph_max_query_len=graph_max_query_len,
+            dp_eager=dp_eager,
+            dp_has_prefill=dp_has_prefill,
+            dp_num_reqs_unpadded=dp_num_reqs_unpadded,
+        )
+        if decision.reason != "eligible":
+            return local_dispatch_tokens
+
+        batch_budget = self._batch_budget
+        assert batch_budget is not None
+        num_drafts_per_req, num_non_draft_tokens_per_req, _ = batch_budget
+        self._batch_budget = (
+            num_drafts_per_req,
+            num_non_draft_tokens_per_req,
+            decision.new_draft_budget,
+        )
+        return decision.non_draft_tokens + decision.new_draft_budget
 
     def compact_batch(
         self,

@@ -21,7 +21,12 @@ import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
+from vllm.v1.worker.gpu.model_runner import (
+    BatchReqState,
+    GPUModelRunner,
+    _apply_post_dp_refill_num_tokens,
+    sort_batch_req_ids,
+)
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 
@@ -112,6 +117,35 @@ def test_adaptive_verification_sizes_only_batches_with_drafts():
     assert state is not None
     assert state.num_tokens == 12
     assert uniform_tok_count is None
+
+
+def test_skipped_post_dp_refill_preserves_pcp_global_batch_count():
+    empty = np.empty(0, dtype=np.int32)
+    batch_state = BatchReqState([], empty, 46, empty, empty, empty, empty, True)
+
+    unchanged_state, local_tokens = _apply_post_dp_refill_num_tokens(
+        batch_state,
+        local_dispatch_tokens=26,
+        refilled_num_tokens=26,
+    )
+    mismatched_state, mismatched_local_tokens = _apply_post_dp_refill_num_tokens(
+        batch_state,
+        local_dispatch_tokens=26,
+        refilled_num_tokens=32,
+    )
+    refilled_state, refilled_local_tokens = _apply_post_dp_refill_num_tokens(
+        batch_state._replace(num_tokens=26),
+        local_dispatch_tokens=26,
+        refilled_num_tokens=32,
+    )
+
+    assert unchanged_state is batch_state
+    assert unchanged_state.num_tokens == 46
+    assert local_tokens == 26
+    assert mismatched_state is batch_state
+    assert mismatched_local_tokens == 26
+    assert refilled_state.num_tokens == 32
+    assert refilled_local_tokens == 32
 
 
 def test_prompt_chunk_of_decode_query_len_is_not_uniform_decode():
