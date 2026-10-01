@@ -2504,6 +2504,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         )
         self._humming_wq_b_kernel: Any = None
         self._humming_wq_b_layer: torch.nn.Module | None = None
+        self._dense_mxfp8: Any = None
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -2632,11 +2633,33 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         if self._humming_wq_b_candidate:
             self._prepare_humming_wq_b(layer)
+        if (
+            os.getenv("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
+            and self.spec.weight == kMxfp8Static
+            and self.spec.activation == kMxfp8Dynamic
+            and type(self.fmt) is FormatScheme
+            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+            and current_platform.is_device_capability_family(90)
+        ):
+            from vllm.model_executor.layers.quantization.utils import (
+                dense_mxfp8_triton,
+            )
+
+            self._dense_mxfp8 = dense_mxfp8_triton.Dsv41DenseMxfp8.from_layer(layer)
+            if self._dense_mxfp8 is not None:
+                layer.add_module("_dense_mxfp8", self._dense_mxfp8)
+                logger.info("Prepared Dense Triton layout for %s", layer.prefix)
         self.kernel.process_weights_after_loading(layer)
 
     def apply(self, layer, x, bias=None):
         def apply_kernel(lyr, inp, b):
             m = inp.numel() // inp.shape[-1]
+            if (
+                self._dense_mxfp8 is not None
+                and b is None
+                and self._dense_mxfp8.supports(inp)
+            ):
+                return self._dense_mxfp8(inp)
             if self._humming_wq_b_kernel is not None and m in _DSV41_WQ_B_HUMMING_M:
                 assert self._humming_wq_b_layer is not None
                 return self._humming_wq_b_kernel.apply_weights(
