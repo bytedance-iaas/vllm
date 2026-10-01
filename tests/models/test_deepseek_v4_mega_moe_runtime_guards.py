@@ -83,6 +83,14 @@ def _make_fp4_experts(
     )
 
 
+@pytest.mark.parametrize(
+    ("num_sms", "expected"),
+    [(70, False), (72, True), (74, False), (76, True), (78, False)],
+)
+def test_shared_overlap_num_sms_guard(num_sms, expected):
+    assert DeepseekV4MoE._supports_shared_overlap_num_sms(num_sms) is expected
+
+
 def test_resolve_mega_moe_decode_capacity_defaults_to_decode_capacity():
     cfg = _make_vllm_config(max_num_batched_tokens=512, max_num_seqs=16)
     assert DeepseekV4MegaMoEExperts._resolve_mega_moe_decode_capacity(cfg) == 16
