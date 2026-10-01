@@ -13,18 +13,42 @@ from pathlib import Path
 
 PUBLIC_APIS = {
     "fp8_fp4_mega_moe",
+    "fp8_fp4_mega_moe_rs",
+    "fp8_fp4_mega_moe_ss",
     "fp8_mega_moe",
     "get_symm_buffer_for_mega_moe",
     "transform_sf_into_required_layout",
     "transform_weights_for_mega_moe_sm90",
     "transform_weights_for_mega_moe_sm90_fp4",
+    "transform_weights_for_mega_moe_sm90_fp4_rs",
+    "transform_weights_for_mega_moe_sm90_fp4_ss",
 }
 MEGA_WRAPPER_CALLS = {
     "fp8_fp4_mega_moe": (
         (
             "DeepSeek V4 SM90 FP4",
             4,
-            frozenset({"recipe", "activation", "activation_clamp", "fast_math"}),
+            frozenset(
+                {"recipe", "activation", "activation_clamp", "fast_math", "num_sms"}
+            ),
+        ),
+    ),
+    "fp8_fp4_mega_moe_ss": (
+        (
+            "DeepSeek V4 SM90 FP4 SS",
+            4,
+            frozenset(
+                {"recipe", "activation", "activation_clamp", "fast_math", "num_sms"}
+            ),
+        ),
+    ),
+    "fp8_fp4_mega_moe_rs": (
+        (
+            "DeepSeek V4 SM90 FP4 RS",
+            4,
+            frozenset(
+                {"recipe", "activation", "activation_clamp", "fast_math", "num_sms"}
+            ),
         ),
     ),
     "fp8_mega_moe": (
@@ -49,7 +73,9 @@ MEGA_WRAPPER_CALLS = {
 REQUIRED_CPP_TOKENS = {
     "csrc/python_api.cpp": {
         '"apis/sm90_mega.hpp"',
+        '"apis/sm90_mega_rs.hpp"',
         "deep_gemm::mega::register_sm90_apis(m)",
+        "deep_gemm::mega::register_sm90_rs_apis(m)",
     },
 }
 CPP_BINDINGS = {
@@ -74,14 +100,24 @@ CPP_BINDINGS = {
             None,
         ),
     },
+    "csrc/apis/sm90_mega_rs.hpp": {
+        "fp8_fp4_mega_moe_sm90_rs": ("fp8_fp4_mega_moe_sm90_rs", None),
+    },
 }
 C_API_USES = {
-    ("function", "fp8_fp4_mega_moe"): {"fp8_fp4_mega_moe_sm90"},
+    ("function", "fp8_fp4_mega_moe_ss"): {"fp8_fp4_mega_moe_sm90"},
+    ("function", "fp8_fp4_mega_moe_rs"): {"fp8_fp4_mega_moe_sm90_rs"},
     ("function", "fp8_mega_moe"): {"fp8_mega_moe"},
     ("function", "get_symm_buffer_for_mega_moe"): {
         "get_token_alignment_for_sm90_mega_moe"
     },
     ("method", "SymmBuffer", "__init__"): {"get_symm_buffer_size_for_sm90_mega_moe"},
+}
+PYTHON_USES = {
+    ("function", "fp8_fp4_mega_moe"): {
+        "fp8_fp4_mega_moe_ss",
+        "fp8_fp4_mega_moe_rs",
+    },
 }
 
 
@@ -154,6 +190,51 @@ def _reachable_c_api_uses(
             if isinstance(statement, (ast.Raise, ast.Return)):
                 return names, True
         return names, False
+
+    return collect(body)[0]
+
+
+def _reachable_python_uses(
+    body: list[ast.stmt],
+) -> set[str]:
+    def names(root: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(root)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+
+    def constant_truth(node: ast.expr) -> bool | None:
+        if isinstance(node, ast.Constant):
+            return bool(node.value)
+        return None
+
+    def collect(statements: list[ast.stmt]) -> tuple[set[str], bool]:
+        found = set()
+        for statement in statements:
+            if isinstance(statement, ast.If):
+                found.update(names(statement.test))
+                truth = constant_truth(statement.test)
+                if truth is not None:
+                    branch_names, terminates = collect(
+                        statement.body if truth else statement.orelse
+                    )
+                else:
+                    body_names, body_terminates = collect(statement.body)
+                    else_names, else_terminates = collect(statement.orelse)
+                    branch_names = body_names | else_names
+                    terminates = (
+                        bool(statement.orelse) and body_terminates and else_terminates
+                    )
+                found.update(branch_names)
+                if terminates:
+                    return found, True
+                continue
+
+            found.update(names(statement))
+            if isinstance(statement, (ast.Raise, ast.Return)):
+                return found, True
+        return found, False
 
     return collect(body)[0]
 
@@ -302,6 +383,16 @@ def check_source(source_dir: Path) -> list[str]:
                 scope_name = ".".join(scope[1:])
                 errors.append(
                     f"{mega_path}: {scope_name} is missing reachable _C APIs: "
+                    f"{', '.join(missing_names)}"
+                )
+        for scope, required_names in PYTHON_USES.items():
+            body = _find_c_api_scope(mega_tree, scope)
+            found_names = _reachable_python_uses(body) if body is not None else set()
+            missing_names = sorted(required_names - found_names)
+            if missing_names:
+                scope_name = ".".join(scope[1:])
+                errors.append(
+                    f"{mega_path}: {scope_name} is missing reachable wrappers: "
                     f"{', '.join(missing_names)}"
                 )
     except ValueError as exc:

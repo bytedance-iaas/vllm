@@ -17,11 +17,15 @@ def _write_source_tree(root: Path) -> None:
 from ._C import transform_sf_into_required_layout
 from .mega import (
     fp8_fp4_mega_moe,
+    fp8_fp4_mega_moe_rs,
+    fp8_fp4_mega_moe_ss,
     fp8_mega_moe,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     transform_weights_for_mega_moe_sm90,
     transform_weights_for_mega_moe_sm90_fp4,
+    transform_weights_for_mega_moe_sm90_fp4_rs,
+    transform_weights_for_mega_moe_sm90_fp4_ss,
 )
 """,
         "deep_gemm/mega/__init__.py": """
@@ -51,6 +55,38 @@ def transform_weights_for_mega_moe_sm90(l1_weights, l2_weights):
 def transform_weights_for_mega_moe_sm90_fp4(l1_weights, l2_weights):
     pass
 
+def transform_weights_for_mega_moe_sm90_fp4_ss(l1_weights, l2_weights):
+    pass
+
+def transform_weights_for_mega_moe_sm90_fp4_rs(l1_weights, l2_weights):
+    pass
+
+def fp8_fp4_mega_moe_ss(
+    y,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    recipe=(1, 1, 32),
+    activation="swiglu",
+    activation_clamp=None,
+    fast_math=True,
+    num_sms=0,
+):
+    return _C.fp8_fp4_mega_moe_sm90
+
+def fp8_fp4_mega_moe_rs(
+    y,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    recipe=(1, 1, 32),
+    activation="swiglu",
+    activation_clamp=None,
+    fast_math=True,
+    num_sms=0,
+):
+    return _C.fp8_fp4_mega_moe_sm90_rs
+
 def fp8_fp4_mega_moe(
     y,
     l1_weights,
@@ -60,8 +96,10 @@ def fp8_fp4_mega_moe(
     activation="swiglu",
     activation_clamp=None,
     fast_math=True,
+    num_sms=0,
 ):
-    return _C.fp8_fp4_mega_moe_sm90, _C.fp8_fp4_mega_moe
+    op = fp8_fp4_mega_moe_rs if _SM90_FP4_USE_RS else fp8_fp4_mega_moe_ss
+    return op(y, l1_weights, l2_weights, sym_buffer)
 
 def fp8_mega_moe(
     y,
@@ -77,7 +115,9 @@ def fp8_mega_moe(
 """,
         "csrc/python_api.cpp": """
 #include "apis/sm90_mega.hpp"
+#include "apis/sm90_mega_rs.hpp"
 deep_gemm::mega::register_sm90_apis(m);
+deep_gemm::mega::register_sm90_rs_apis(m);
 """,
         "csrc/apis/layout.hpp": """
 m.def(
@@ -98,6 +138,9 @@ m.def("get_symm_buffer_size_for_sm90_mega_moe",
       &get_symm_buffer_size_for_sm90_mega_moe);
 m.def("fp8_fp4_mega_moe_sm90", &fp8_fp4_mega_moe_sm90);
 m.def("fp8_mega_moe", &fp8_mega_moe);
+""",
+        "csrc/apis/sm90_mega_rs.hpp": """
+m.def("fp8_fp4_mega_moe_sm90_rs", &fp8_fp4_mega_moe_sm90_rs);
 """,
         "csrc/apis/mega.hpp": "",
     }
@@ -139,6 +182,22 @@ def test_rejects_missing_sm90_fp8_fp4_dispatch_binding(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "fp8_fp4_mega_moe_sm90" in result.stderr
+
+
+def test_rejects_missing_sm90_fp8_fp4_rs_dispatch_binding(tmp_path: Path) -> None:
+    _write_source_tree(tmp_path)
+    binding = tmp_path / "csrc" / "apis" / "sm90_mega_rs.hpp"
+    binding.write_text(
+        binding.read_text().replace(
+            'm.def("fp8_fp4_mega_moe_sm90_rs", &fp8_fp4_mega_moe_sm90_rs);\n',
+            '// m.def("fp8_fp4_mega_moe_sm90_rs", &fp8_fp4_mega_moe_sm90_rs);\n',
+        )
+    )
+
+    result = _run_checker(tmp_path)
+
+    assert result.returncode == 1
+    assert "fp8_fp4_mega_moe_sm90_rs" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -198,17 +257,53 @@ def test_rejects_incompatible_runtime_wrapper_signature(tmp_path: Path) -> None:
     assert "incompatible wrapper signature for fp8_mega_moe" in result.stderr
 
 
-def test_rejects_missing_sm90_fp4_mega_moe_binding_use(tmp_path: Path) -> None:
+def test_rejects_missing_sm90_fp4_ss_backend_use(tmp_path: Path) -> None:
     _write_source_tree(tmp_path)
     mega_path = tmp_path / "deep_gemm" / "mega" / "__init__.py"
     mega_path.write_text(
-        mega_path.read_text().replace("_C.fp8_fp4_mega_moe_sm90, ", "")
+        mega_path.read_text().replace(
+            "    return _C.fp8_fp4_mega_moe_sm90\n",
+            "    return None\n",
+        )
     )
 
     result = _run_checker(tmp_path)
 
     assert result.returncode == 1
-    assert "fp8_fp4_mega_moe is missing reachable _C APIs" in result.stderr
+    assert "fp8_fp4_mega_moe_ss is missing reachable _C APIs" in result.stderr
+
+
+def test_rejects_missing_sm90_fp4_rs_backend_use(tmp_path: Path) -> None:
+    _write_source_tree(tmp_path)
+    mega_path = tmp_path / "deep_gemm" / "mega" / "__init__.py"
+    mega_path.write_text(
+        mega_path.read_text().replace(
+            "    return _C.fp8_fp4_mega_moe_sm90_rs\n",
+            "    return None\n",
+        )
+    )
+
+    result = _run_checker(tmp_path)
+
+    assert result.returncode == 1
+    assert "fp8_fp4_mega_moe_rs is missing reachable _C APIs" in result.stderr
+
+
+def test_rejects_missing_sm90_fp4_public_dispatch(tmp_path: Path) -> None:
+    _write_source_tree(tmp_path)
+    mega_path = tmp_path / "deep_gemm" / "mega" / "__init__.py"
+    mega_path.write_text(
+        mega_path.read_text().replace(
+            "fp8_fp4_mega_moe_rs if _SM90_FP4_USE_RS else fp8_fp4_mega_moe_ss",
+            "fp8_fp4_mega_moe_ss if _SM90_FP4_USE_RS else fp8_fp4_mega_moe_ss",
+        )
+    )
+
+    result = _run_checker(tmp_path)
+
+    assert result.returncode == 1
+    assert "fp8_fp4_mega_moe is missing reachable wrappers" in result.stderr
+    assert "fp8_fp4_mega_moe_rs" in result.stderr
 
 
 def test_rejects_unreachable_sm90_buffer_api_use(tmp_path: Path) -> None:

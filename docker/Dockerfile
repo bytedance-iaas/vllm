@@ -56,7 +56,7 @@ ARG EPEL_MIRROR
 # DeepSeek-V4.1 Flash so vLLM vendors one DeepGEMM build for both indexer and
 # MegaMoE paths.
 ARG DEEPGEMM_GIT_REPOSITORY=https://github.com/wangyicong52/DeepGEMM.git
-ARG DEEPGEMM_GIT_COMMIT=eb84b71a746958a162e9d889f1f7b1a49f077033
+ARG DEEPGEMM_GIT_COMMIT=09f5008a04e4184b6e8e5da7d70c57c38aa91fac
 ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
 
 # Patched Hugging Face tokenizers source used by vLLM's long-prefix
@@ -863,6 +863,7 @@ ARG UBUNTU_MIRROR
 ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_VERSION
+ARG DSV41_HUMMING_VERSION=0.1.12
 
 # Keep the output image's CUDA metadata aligned with the selected toolkit.
 # This also normalizes prerelease base images with four-component metadata for
@@ -1098,6 +1099,24 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             ${uv_extra_index_args}; \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
+
+# Keep the validated DSv4.1 Decode kernels isolated from the global Humming
+# dependency used by Prefill. Decode opts into this path through PYTHONPATH.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    humming_extra=cu13 \
+    && if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
+        humming_extra=cu12; \
+    fi \
+    && uv_extra_index_args="" \
+    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+    fi \
+    && uv pip install \
+        --target "/opt/humming-${DSV41_HUMMING_VERSION}" \
+        --no-deps \
+        "humming-kernels[${humming_extra}]==${DSV41_HUMMING_VERSION}" \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        ${uv_extra_index_args}
 
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
