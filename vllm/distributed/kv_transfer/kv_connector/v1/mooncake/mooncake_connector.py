@@ -8,7 +8,7 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -503,6 +503,8 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    created_at: float = field(default_factory=time.perf_counter)
+    ready_at: float | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -1035,9 +1037,9 @@ class MooncakeConnectorWorker:
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
-        self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
-            "num_workers", 10
-        )
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        self.num_sender_workers = extra_config.get("num_workers", 10)
+        self.trace_sender_timing = extra_config.get("trace_sender_timing", False)
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
@@ -1104,7 +1106,10 @@ class MooncakeConnectorWorker:
                 self.num_sender_workers,
             )
             # An asyncio queue to buffer incoming requests for the sender
-            self.sender_worker_queue = asyncio.Queue[tuple[bytes, bytes]]()
+            self.sender_worker_queue = asyncio.Queue[tuple[bytes, bytes, float]]()
+            self._sender_trace_epoch = time.perf_counter()
+            self._sender_active_tasks = 0
+            self._sender_active_rdma = 0
             self.sender_loop = asyncio.new_event_loop()
             # Background thread for processing new sending requests.
             self._sender_listener_t = threading.Thread(
@@ -1221,6 +1226,25 @@ class MooncakeConnectorWorker:
             self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
             self._mooncake_receiver_t.join()
 
+    def _trace_sender_event(self, event: str, **fields: object) -> None:
+        if not getattr(self, "trace_sender_timing", False):
+            return
+        details = " ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+        logger.info(
+            "Mooncake sender trace event=%s elapsed_ms=%.3f "
+            "dp_rank=%s tp_rank=%s pp_rank=%s queue_depth=%d "
+            "active_tasks=%d active_rdma=%d %s",
+            event,
+            (time.perf_counter() - self._sender_trace_epoch) * 1000,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            self.sender_worker_queue.qsize(),
+            self._sender_active_tasks,
+            self._sender_active_rdma,
+            details,
+        )
+
     async def register_worker_with_bootstrap(self):
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
@@ -1267,8 +1291,8 @@ class MooncakeConnectorWorker:
 
         # Create async worker tasks that process items from the queue
         sender_tasks = [
-            asyncio.create_task(self._sender_worker(sock))
-            for _ in range(self.num_sender_tasks)
+            asyncio.create_task(self._sender_worker(sock, worker_id))
+            for worker_id in range(self.num_sender_tasks)
         ]
 
         ready_event.set()
@@ -1276,7 +1300,14 @@ class MooncakeConnectorWorker:
         try:
             while True:
                 identity, metadata_bytes = await sock.recv_multipart()
-                await self.sender_worker_queue.put((identity, metadata_bytes))
+                queued_at = time.perf_counter()
+                await self.sender_worker_queue.put(
+                    (identity, metadata_bytes, queued_at)
+                )
+                self._trace_sender_event(
+                    "queue_enqueue",
+                    payload_bytes=len(metadata_bytes),
+                )
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake sender thread.")
         except Exception as e:
@@ -1288,12 +1319,27 @@ class MooncakeConnectorWorker:
             await asyncio.gather(*sender_tasks, return_exceptions=True)
             sock.close()
 
-    async def _sender_worker(self, sock: zmq.asyncio.Socket):
+    async def _sender_worker(self, sock: zmq.asyncio.Socket, worker_id: int):
         while True:
             try:
-                identity, metadata_bytes = await self.sender_worker_queue.get()
+                identity, metadata_bytes, queued_at = (
+                    await self.sender_worker_queue.get()
+                )
+                self._sender_active_tasks += 1
+                transfer_ids = ""
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
+                    transfer_ids = "|".join(
+                        transfer_id
+                        for transfer_id, _ in metadata.req_blocks.values()
+                    )
+                    self._trace_sender_event(
+                        "queue_dequeue",
+                        worker_id=worker_id,
+                        queue_wait_ms=f"{(time.perf_counter() - queued_at) * 1000:.3f}",
+                        request_count=len(metadata.req_blocks),
+                        transfer_ids=transfer_ids,
+                    )
                     await self.send_kv_to_decode(identity, sock, metadata)
                 except Exception as e:
                     logger.error("Error processing Mooncake xfer request: %s", e)
@@ -1304,6 +1350,12 @@ class MooncakeConnectorWorker:
                         (identity, self._encoder.encode(error_response))
                     )
                 finally:
+                    self._sender_active_tasks -= 1
+                    self._trace_sender_event(
+                        "worker_idle",
+                        worker_id=worker_id,
+                        transfer_ids=transfer_ids,
+                    )
                     self.sender_worker_queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -1313,6 +1365,7 @@ class MooncakeConnectorWorker:
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
+        call_started = time.perf_counter()
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
@@ -1415,8 +1468,22 @@ class MooncakeConnectorWorker:
                     local_block_ids=[],
                     ready=asyncio.Event(),
                 )
+                self._trace_sender_event(
+                    "placeholder_created",
+                    d_req_id=d_req_id,
+                    transfer_id=transfer_id,
+                )
             send_meta = self.reqs_need_send[transfer_id]
             pending_reqs[d_req_id] = send_meta
+
+        self._trace_sender_event(
+            "batch_wait_start",
+            initial_ready=sum(meta.ready.is_set() for meta in pending_reqs.values()),
+            request_count=len(pending_reqs),
+            transfer_ids="|".join(
+                send_meta.transfer_id for send_meta in pending_reqs.values()
+            ),
+        )
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
@@ -1461,6 +1528,18 @@ class MooncakeConnectorWorker:
             for task in done:
                 d_req_id, send_meta = task.result()
                 del pending_reqs[d_req_id]
+                observed_at = time.perf_counter()
+                self._trace_sender_event(
+                    "request_ready_observed",
+                    d_req_id=d_req_id,
+                    ready_age_ms=(
+                        f"{(observed_at - send_meta.ready_at) * 1000:.3f}"
+                        if send_meta.ready_at is not None
+                        else "unknown"
+                    ),
+                    transfer_id=send_meta.transfer_id,
+                    wait_ms=f"{(observed_at - call_started) * 1000:.3f}",
+                )
                 # Do we still in reqs_need_send (not expired)?
                 if send_meta.transfer_id in self.reqs_need_send:
                     # Mark it sending to avoid expiration.
@@ -1498,14 +1577,37 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
-                    src_ptrs,
-                    dst_ptrs,
-                    lengths,
+                rdma_started = time.perf_counter()
+                self._sender_active_rdma += 1
+                self._trace_sender_event(
+                    "rdma_start",
+                    bytes=sum(lengths),
+                    descriptor_count=len(src_ptrs),
+                    request_count=len(ok_ready_reqs),
+                    transfer_ids="|".join(
+                        send_meta.transfer_id for _, send_meta in ok_ready_reqs
+                    ),
                 )
+                try:
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                    )
+                finally:
+                    rdma_ms = (time.perf_counter() - rdma_started) * 1000
+                    self._sender_active_rdma -= 1
+                    self._trace_sender_event(
+                        "rdma_end",
+                        duration_ms=f"{rdma_ms:.3f}",
+                        request_count=len(ok_ready_reqs),
+                        transfer_ids="|".join(
+                            send_meta.transfer_id for _, send_meta in ok_ready_reqs
+                        ),
+                    )
 
                 if ret_value != 0:
                     transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
@@ -1540,6 +1642,11 @@ class MooncakeConnectorWorker:
                 err_msg=err_msg,
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
+        self._trace_sender_event(
+            "batch_complete",
+            duration_ms=f"{(time.perf_counter() - call_started) * 1000:.3f}",
+            request_count=len(meta.req_blocks),
+        )
 
     def resolve_need_send(
         self,
@@ -2299,7 +2406,15 @@ class MooncakeConnectorWorker:
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
+                send_meta.ready_at = time.perf_counter()
                 send_meta.ready.set()
+                self._trace_sender_event(
+                    "request_ready",
+                    age_ms=f"{(send_meta.ready_at - send_meta.created_at) * 1000:.3f}",
+                    block_count=sum(len(group) for group in block_ids),
+                    p_req_id=p_req_id,
+                    transfer_id=transfer_id,
+                )
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet
@@ -2311,6 +2426,11 @@ class MooncakeConnectorWorker:
                         transfer_id=transfer_id,
                         local_block_ids=[],
                         ready=asyncio.Event(),
+                    )
+                    self._trace_sender_event(
+                        "prefill_registered",
+                        p_req_id=p_req_id,
+                        transfer_id=transfer_id,
                     )
         for transfer_id in metadata.reqs_not_processed:
             send_meta = self.reqs_need_send.pop(transfer_id)
