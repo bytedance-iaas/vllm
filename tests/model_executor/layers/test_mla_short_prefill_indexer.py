@@ -472,6 +472,135 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(("rows", "row_repeat"), [(6, 1), (6, 2), (48, 1), (48, 2)])
+def test_compact_candidate_topk_matches_masked_set_and_replays(rows, row_repeat):
+    """The compact decode tail preserves the selected set across graph replay."""
+    major, _ = torch.cuda.get_device_capability()
+    if major < 9 or major >= 12:
+        pytest.skip("cooperative top-k requires SM90+ and excludes SM12x")
+
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        apply_candidate_mask,
+        gather_candidate_logits,
+        remap_candidate_topk,
+    )
+    from vllm.model_executor.layers.indexer_topk import RADIX_TOPK_WORKSPACE_SIZE
+
+    torch.manual_seed(59)
+    width, num_candidates, block_size, topk = 4100, 128, 8, 512
+    grouped_rows = rows // row_repeat
+    long_ends = torch.linspace(width, 1025, grouped_rows - 2, dtype=torch.int32)
+    ends = torch.cat((long_ends, torch.tensor([100, 0], dtype=torch.int32))).cuda()
+
+    def make_candidates(row_ends):
+        candidate_rows = []
+        for end in row_ends.repeat_interleave(row_repeat).cpu().tolist():
+            nblocks = (end + block_size - 1) // block_size
+            if nblocks <= num_candidates:
+                selected = torch.randperm(nblocks)
+            else:
+                selected = torch.cat(
+                    (
+                        torch.tensor([nblocks - 1]),
+                        torch.randperm(nblocks - 1)[: num_candidates - 1],
+                    )
+                )
+            if selected.numel() < num_candidates:
+                selected = torch.cat(
+                    (
+                        selected,
+                        torch.full((num_candidates - selected.numel(),), -1),
+                    )
+                )
+            candidate_rows.append(selected.to(torch.int32))
+        return torch.stack(candidate_rows).cuda()
+
+    logits = torch.randn(rows, width, device="cuda")
+    candidates = make_candidates(ends)
+    compact_logits = torch.empty(rows, num_candidates * block_size, device="cuda")
+    compact_ends = torch.empty(rows, device="cuda", dtype=torch.int32)
+    compact_indices = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    compact_output = torch.empty_like(compact_indices)
+    dense_output = torch.empty_like(compact_indices)
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, device="cuda", dtype=torch.uint8)
+
+    def run_compact():
+        gather_candidate_logits(
+            logits,
+            ends,
+            candidates,
+            block_size,
+            compact_logits,
+            compact_ends,
+            row_repeat,
+        )
+        torch.ops._C.cooperative_topk(
+            compact_logits,
+            compact_ends,
+            compact_indices,
+            workspace,
+            topk,
+            compact_logits.shape[1],
+        )
+        remap_candidate_topk(
+            compact_indices,
+            candidates,
+            ends,
+            block_size,
+            compact_output,
+            width,
+            row_repeat,
+        )
+
+    def assert_matches_dense():
+        dense_logits = logits.clone()
+        apply_candidate_mask(
+            dense_logits,
+            None,
+            ends,
+            candidates,
+            block_size,
+            row_repeat,
+        )
+        expanded_ends = ends.repeat_interleave(row_repeat)
+        torch.ops._C.cooperative_topk(
+            dense_logits,
+            expanded_ends,
+            dense_output,
+            workspace,
+            topk,
+            width,
+        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(
+            compact_output.sort(dim=1).values,
+            dense_output.sort(dim=1).values,
+            rtol=0,
+            atol=0,
+        )
+        compact_values = logits.gather(1, compact_output.clamp_min(0))
+        dense_values = logits.gather(1, dense_output.clamp_min(0))
+        torch.testing.assert_close(
+            compact_values.sort(dim=1).values,
+            dense_values.sort(dim=1).values,
+            rtol=0,
+            atol=0,
+        )
+
+    run_compact()
+    assert_matches_dense()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_compact()
+
+    logits.normal_()
+    ends.copy_(ends - 7)
+    candidates.copy_(make_candidates(ends))
+    graph.replay()
+    assert_matches_dense()
+
+
 # --- DeepGEMM sparse-MQA indexer path (V4.1 two-level candidate filtering) ---
 
 

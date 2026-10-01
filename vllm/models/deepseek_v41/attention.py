@@ -269,6 +269,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        candidate_compact_logits_buffer: torch.Tensor | None = None,
+        candidate_compact_indices_buffer: torch.Tensor | None = None,
+        candidate_compact_ends_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -476,6 +479,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 ),
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=is_candidate_source,
+                candidate_compact_logits=(
+                    candidate_compact_logits_buffer if uses_candidates else None
+                ),
+                candidate_compact_indices=(
+                    candidate_compact_indices_buffer if uses_candidates else None
+                ),
+                candidate_compact_ends=(
+                    candidate_compact_ends_buffer if uses_candidates else None
+                ),
             )
 
         self._prepare_and_attn_fn = self._prepare_and_attn
@@ -1257,6 +1269,9 @@ class DeepseekV4Indexer(nn.Module):
         candidate_block_buffer: torch.Tensor | None = None,
         candidate_block_size: int = 0,
         candidate_write: bool = False,
+        candidate_compact_logits: torch.Tensor | None = None,
+        candidate_compact_indices: torch.Tensor | None = None,
+        candidate_compact_ends: torch.Tensor | None = None,
     ):
         super().__init__()
         self.vllm_config = vllm_config
@@ -1270,6 +1285,18 @@ class DeepseekV4Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.owns_k = owns_k
         self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
+        compact_buffers = (
+            candidate_compact_logits,
+            candidate_compact_indices,
+            candidate_compact_ends,
+        )
+        if any(buffer is not None for buffer in compact_buffers):
+            if not all(buffer is not None for buffer in compact_buffers):
+                raise ValueError("All candidate compact-tail buffers are required.")
+            if self.use_fp4_kv or candidate_write or compress_ratio != 1:
+                raise ValueError(
+                    "Candidate compact tail requires a ratio-1 FP8 consumer."
+                )
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",
@@ -1360,6 +1387,9 @@ class DeepseekV4Indexer(nn.Module):
                 candidate_blocks=candidate_block_buffer,
                 candidate_block_size=candidate_block_size,
                 candidate_write=candidate_write,
+                candidate_compact_logits=candidate_compact_logits,
+                candidate_compact_indices=candidate_compact_indices,
+                candidate_compact_ends=candidate_compact_ends,
             )
         # The fused Q kernel writes the per-head weights in the dtype the
         # scoring kernels take, so no cast runs per step.
