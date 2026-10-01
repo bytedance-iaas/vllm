@@ -15,7 +15,10 @@ import torch
 import vllm.utils.deep_gemm as deep_gemm_utils
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v4.nvidia import model as dsv4_model
-from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+from vllm.models.deepseek_v4.nvidia.model import (
+    DeepseekV4MegaMoEExperts,
+    DeepseekV4MoE,
+)
 from vllm.utils.torch_utils import _encode_layer_name
 
 
@@ -697,6 +700,52 @@ def test_sm90_finalize_passes_fp4_weights_to_deep_gemm(monkeypatch):
     assert experts._transformed_l1_weights[1].dtype == torch.float32
     assert experts._transformed_l2_weights[0].dtype == torch.int8
     assert experts._transformed_l2_weights[1].dtype == torch.float32
+
+
+def test_sm90_mega_moe_uses_unfused_gate_above_threshold(monkeypatch):
+    calls = []
+
+    class FakeGate(torch.nn.Module):
+        weight = torch.empty(384, 128)
+        tid2eid = None
+        e_score_correction_bias = None
+        bias_vl = None
+
+        def forward(self, hidden_states):
+            calls.append("gate")
+            return torch.empty(hidden_states.shape[0], 384), None
+
+    class FakeExperts(torch.nn.Module):
+        def forward(self, hidden_states, topk_weights, topk_ids, **kwargs):
+            calls.append("experts")
+            return hidden_states.clone()
+
+    def fake_fused_topk_bias(**kwargs):
+        calls.append("topk")
+        num_tokens = kwargs["hidden_states"].shape[0]
+        return torch.ones(num_tokens, 2), torch.zeros(num_tokens, 2, dtype=torch.int64)
+
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    moe.use_mega_moe = True
+    moe.use_fused_mega_gate = False
+    moe.gate = FakeGate()
+    moe.experts = FakeExperts()
+    moe.shared_experts = None
+    moe.scoring_func = "sqrtsoftplus"
+    moe.n_activated_experts = 2
+    moe.renormalize = True
+    moe.hash_indices_dtype = torch.int64
+    moe.routed_scaling_factor = 1.0
+    moe.swiglu_limit = 10.0
+    moe.image_sentinel_lo = 0
+    monkeypatch.setattr(dsv4_model, "fused_topk_bias", fake_fused_topk_bias)
+
+    hidden_states = torch.zeros(17, 128)
+    output = moe(hidden_states)
+
+    assert calls == ["gate", "topk", "experts"]
+    torch.testing.assert_close(output, hidden_states)
 
 
 @pytest.mark.parametrize(
