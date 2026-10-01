@@ -22,7 +22,14 @@ def _config():
 
 
 @pytest.mark.parametrize(
-    "ranges", [[(0, 40)], [(0, 20), (20, 40)], [(0, 8), (8, 14), (14, 20), (20, 40)]]
+    "ranges",
+    [
+        [(0, 40)],
+        [(0, 8), (8, 40)],
+        [(0, 14), (14, 40)],
+        [(0, 20), (20, 40)],
+        [(0, 8), (8, 14), (14, 20), (20, 40)],
+    ],
 )
 def test_group_aligned_pipeline_cuts_keep_all_sources_local(ranges):
     validate_local_sharing(get_sharing_dependencies(_config(), ranges))
@@ -39,6 +46,13 @@ def test_equal_pp4_reports_cross_stage_kv_index_and_candidates():
     }
     assert {("kv", 8, 10), ("index", 28, 30), ("candidate", 20, 32)} <= cross
     with pytest.raises(NotImplementedError, match="source layer 8.*stage 0.*stage 1"):
+        validate_local_sharing(dependencies)
+
+
+@pytest.mark.parametrize("cut", [10, 12])
+def test_prefill_pp_cut_inside_shared_group_fails_closed(cut):
+    dependencies = get_sharing_dependencies(_config(), [(0, cut), (cut, 40)])
+    with pytest.raises(NotImplementedError, match="source layer 8"):
         validate_local_sharing(dependencies)
 
 

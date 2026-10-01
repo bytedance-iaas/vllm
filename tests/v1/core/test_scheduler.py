@@ -3798,6 +3798,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.return_sampling_mask = False
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler.is_dsv41_encoder_only_prefill = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 
@@ -6705,6 +6706,40 @@ def test_dsv41_cache_only_prefill_finishes_without_sampling():
     assert request.num_output_tokens == 0
     assert outputs[0].kv_transfer_params is None
     assert request.request_id in scheduler.requests
+    scheduler.connector.request_finished.assert_called_once()
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsv41_cache_only_prefill_pp_waits_for_last_inflight_chunk():
+    """Scheduling the final chunk does not make its KV safe to transfer."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        pipeline_parallel_size=2,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        kv_role="kv_producer",
+    )
+    scheduler.is_dsv41_encoder_only_prefill = True
+    scheduler.connector.request_finished = Mock(return_value=(True, None))
+    (request,) = create_requests(num_requests=1, num_tokens=32, max_tokens=1)
+    scheduler.add_request(request)
+
+    first_chunk = scheduler.schedule()
+    last_chunk = scheduler.schedule()
+    assert request.num_computed_tokens == request.num_prompt_tokens
+    assert request.num_in_flight_tokens == 32
+
+    scheduler.update_from_output(
+        first_chunk, make_empty_encoder_model_runner_output(first_chunk)
+    )
+    assert request.status == RequestStatus.RUNNING
+    scheduler.connector.request_finished.assert_not_called()
+
+    scheduler.update_from_output(
+        last_chunk, make_empty_encoder_model_runner_output(last_chunk)
+    )
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert request.num_output_tokens == 0
     scheduler.connector.request_finished.assert_called_once()
 
 
