@@ -126,6 +126,68 @@ def test_attention_input_projection_uses_replicated_path_when_disabled():
     torch.testing.assert_close(output, hidden_states + 1)
 
 
+def test_attention_input_projection_accepts_native_humming_mxfp8():
+    from vllm.model_executor.kernels.linear.mxfp8.humming import (
+        HummingMxfp8LinearKernel,
+    )
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8DynamicTensorSym,
+        kMxfp8Dynamic,
+    )
+
+    quant_method = ModelOptLinearMethod.__new__(ModelOptLinearMethod)
+    quant_method.kernel = HummingMxfp8LinearKernel.__new__(
+        HummingMxfp8LinearKernel
+    )
+    layer = SimpleNamespace(
+        fused_wqa_wkv=SimpleNamespace(
+            quant_method=quant_method,
+            params_dtype=torch.bfloat16,
+        )
+    )
+    support_check = vars(attention_module.DeepseekV4Attention)[
+        "_input_projection_quant_supports_token_sharding"
+    ].func
+
+    quant_method.spec = SimpleNamespace(activation=kMxfp8Dynamic)
+    assert support_check(layer)
+
+    quant_method.spec = SimpleNamespace(activation=kFp8DynamicTensorSym)
+    assert not support_check(layer)
+
+
+def test_attention_input_projection_guard_accepts_unpadded_v2_mask(monkeypatch):
+    num_tokens = 2048
+    layer = SimpleNamespace(
+        input_proj_token_shard_enabled=True,
+        input_proj_token_shard_min_tokens=num_tokens,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+        _input_projection_quant_supports_token_sharding=True,
+    )
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=num_tokens,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    with set_forward_context(
+        {"swa": metadata},
+        make_forward_context_config(),
+        is_padding=torch.zeros(num_tokens, dtype=torch.bool),
+    ):
+        assert attention_module.DeepseekV4Attention._can_shard_fused_wqa_wkv(
+            layer, torch.empty(num_tokens, 1)
+        )
+        metadata.num_prefill_tokens -= 1
+        assert not attention_module.DeepseekV4Attention._can_shard_fused_wqa_wkv(
+            layer, torch.empty(num_tokens, 1)
+        )
+
+
 @pytest.mark.parametrize(
     ("cp_rank", "expected_lens", "expected_indices"),
     [

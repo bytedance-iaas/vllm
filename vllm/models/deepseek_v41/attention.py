@@ -1186,19 +1186,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if isinstance(quant_method, UnquantizedLinearMethod):
             return True
 
+        from vllm.model_executor.kernels.linear.mxfp8.humming import (
+            HummingMxfp8LinearKernel,
+        )
         from vllm.model_executor.layers.quantization.humming import (
             HummingLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptLinearMethod,
         )
         from vllm.model_executor.layers.quantization.utils.humming import (
             input_schema_to_quant_key,
         )
 
-        if not isinstance(quant_method, HummingLinearMethod):
+        if isinstance(quant_method, HummingLinearMethod):
+            quant_key = input_schema_to_quant_key(
+                quant_method.input_schema,
+                self.fused_wqa_wkv.params_dtype,
+            )
+        elif isinstance(
+            quant_method, ModelOptLinearMethod
+        ) and isinstance(quant_method.kernel, HummingMxfp8LinearKernel):
+            quant_key = quant_method.spec.activation
+        else:
             return False
-        quant_key = input_schema_to_quant_key(
-            quant_method.input_schema,
-            self.fused_wqa_wkv.params_dtype,
-        )
         if quant_key is None:
             return True
         scales = (quant_key.scale, quant_key.scale2)
@@ -1221,7 +1232,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             forward_context.is_profile
             or forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
             or forward_context.ubatch_slices is not None
-            or forward_context.is_padding is not None
             or torch.cuda.is_current_stream_capturing()
             or not isinstance(forward_context.attn_metadata, dict)
         ):
@@ -1240,6 +1250,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         tp_group = get_tp_group()
+        logger.info_once(
+            "Running TP-sharded DeepSeek V4.1 Attention input projection."
+        )
         num_tokens = hidden_states.shape[0]
         shard_size = (num_tokens + tp_group.world_size - 1) // tp_group.world_size
         start = min(tp_group.rank_in_group * shard_size, num_tokens)
