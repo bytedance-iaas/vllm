@@ -2824,10 +2824,21 @@ class VllmConfig:
                     "executor (--distributed-executor-backend mp)."
                 )
             _, cut = get_pp_indices(40, 0, pp_size)
-            if cut not in sources[1:-1]:
+            index_sources = tuple(model_config.hf_text_config.index_source_layer_ids)
+            compress_ratios = tuple(model_config.hf_text_config.compress_ratios)
+            supports_l8_cache_relay = (
+                cut == 10
+                and self.parallel_config.tensor_parallel_size == 4
+                and self.parallel_config.attention_context_parallel_size == 4
+                and sources == (2, 8, 14, 20)
+                and index_sources == (2, 8, 14, 20, 24, 28, 32, 36)
+                and compress_ratios[8:14] == (2,) * 6
+            )
+            if cut not in sources[1:-1] and not supports_l8_cache_relay:
                 raise ValueError(
                     "dsv41_encoder_only_prefill PP cut must start a local "
-                    "sharing group before L20 (for example 8,32 or 14,26)."
+                    "sharing group before L20, except for the validated TP4/PP2/"
+                    "attention-CP4 10,30 layer-8 cache relay."
                 )
         if self.parallel_config.prefill_context_parallel_size != 1:
             raise ValueError(

@@ -15,6 +15,15 @@ class SharingDependency:
     consumer_stage: int
 
 
+@dataclass(frozen=True)
+class PipelineCacheRelay:
+    source_layer: int
+    receiver_layer: int
+    source_stage: int
+    receiver_stage: int
+    consumer_layers: tuple[int, ...]
+
+
 def get_sharing_dependencies(
     config: Any, stage_ranges: list[tuple[int, int]]
 ) -> tuple[SharingDependency, ...]:
@@ -94,9 +103,84 @@ def get_sharing_dependencies(
     return tuple(dependencies)
 
 
-def validate_local_sharing(dependencies: tuple[SharingDependency, ...]) -> None:
+def get_encoder_only_cache_relay(
+    config: Any,
+    stage_ranges: list[tuple[int, int]],
+    dependencies: tuple[SharingDependency, ...],
+) -> PipelineCacheRelay | None:
+    """Return the one validated cross-stage cache relay supported by Prefill."""
+    cross_stage = tuple(
+        dependency
+        for dependency in dependencies
+        if dependency.source_stage != dependency.consumer_stage
+    )
+    if not cross_stage:
+        return None
+
+    consumer_layers = tuple(range(10, 14))
+    expected = {
+        (kind, 8, consumer, 0, 1)
+        for kind in ("kv", "index")
+        for consumer in consumer_layers
+    }
+    actual = {
+        (
+            dependency.kind,
+            dependency.source_layer,
+            dependency.consumer_layer,
+            dependency.source_stage,
+            dependency.consumer_stage,
+        )
+        for dependency in cross_stage
+    }
+    if (
+        config.num_hidden_layers == 40
+        and stage_ranges == [(0, 10), (10, 40)]
+        and tuple(config.kv_source_layer_ids) == (2, 8, 14, 20)
+        and tuple(config.index_source_layer_ids) == (2, 8, 14, 20, 24, 28, 32, 36)
+        and tuple(config.compress_ratios[8:14]) == (2,) * 6
+        and actual == expected
+    ):
+        return PipelineCacheRelay(
+            source_layer=8,
+            receiver_layer=10,
+            source_stage=0,
+            receiver_stage=1,
+            consumer_layers=consumer_layers,
+        )
+    return None
+
+
+def validate_local_sharing(
+    dependencies: tuple[SharingDependency, ...],
+    relay: PipelineCacheRelay | None = None,
+) -> None:
     """Reject stage cuts that require sharing tensors between pipeline ranks."""
     cross_stage = [d for d in dependencies if d.source_stage != d.consumer_stage]
+    if relay is not None:
+        allowed = {
+            (
+                kind,
+                relay.source_layer,
+                consumer,
+                relay.source_stage,
+                relay.receiver_stage,
+            )
+            for kind in ("kv", "index")
+            for consumer in relay.consumer_layers
+        }
+        cross_stage = [
+            dependency
+            for dependency in cross_stage
+            if (
+                dependency.kind,
+                dependency.source_layer,
+                dependency.consumer_layer,
+                dependency.source_stage,
+                dependency.consumer_stage,
+            )
+            not in allowed
+        ]
     if cross_stage:
         detail = "; ".join(
             f"{d.kind} source layer {d.source_layer} (stage {d.source_stage}) -> "

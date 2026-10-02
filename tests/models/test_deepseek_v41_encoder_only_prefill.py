@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.common.pipeline import PipelineCacheRelay
 from vllm.models.deepseek_v41.nvidia import model as dsv41_model
 from vllm.models.deepseek_v41.nvidia.vl_model import DeepseekV41ForCausalLM
 
@@ -32,7 +33,9 @@ def test_official_index_sources_do_not_move_encoder_only_boundary(monkeypatch):
         dsv41_model, "get_pp_group", lambda: SimpleNamespace(world_size=1)
     )
     monkeypatch.setattr(dsv41_model, "get_sharing_dependencies", lambda *_: ())
-    monkeypatch.setattr(dsv41_model, "validate_local_sharing", lambda _: None)
+    monkeypatch.setattr(
+        dsv41_model, "validate_local_sharing", lambda _, relay=None: None
+    )
     monkeypatch.setattr(dsv41_model.torch.cuda, "Stream", stop_after_topology_check)
     hf_config = SimpleNamespace(
         num_hidden_layers=40,
@@ -187,3 +190,165 @@ def test_global_cache_writer_publishes_same_latent_to_main_and_indexer():
     indexer.insert_cache.assert_called_once_with(
         latent, positions, attention.indexer_rotary_emb
     )
+
+
+def _cache_relay() -> PipelineCacheRelay:
+    return PipelineCacheRelay(
+        source_layer=8,
+        receiver_layer=10,
+        source_stage=0,
+        receiver_stage=1,
+        consumer_layers=(10, 11, 12, 13),
+    )
+
+
+def test_pipeline_cache_relay_allocates_typed_intermediates(monkeypatch):
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=1),
+    )
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_profile=False),
+    )
+    model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.hc_mult = 4
+    model.config = SimpleNamespace(hidden_size=16, index_topk=32)
+    model.pipeline_cache_relay = _cache_relay()
+
+    tensors = model.make_empty_intermediate_tensors(
+        batch_size=7, dtype=torch.bfloat16, device=torch.device("cpu")
+    )
+
+    assert tensors["hidden_states"].shape == (7, 4, 16)
+    assert tensors["pre_mix"].shape == (7, 4)
+    assert tensors["dsv41_relay_l8_main_kv"].shape == (7, 584)
+    assert tensors["dsv41_relay_l8_main_kv"].dtype == torch.uint8
+    assert tensors["dsv41_relay_l8_topk"].shape == (7, 32)
+    assert tensors["dsv41_relay_l8_topk"].dtype == torch.int32
+
+
+def test_pipeline_cache_relay_imports_before_consumers(monkeypatch):
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=1),
+    )
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_profile=False),
+    )
+    model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    layers = [_RecordingLayer() for _ in range(40)]
+    layers[10].attn = SimpleNamespace(import_cross_stage_kv=Mock())
+    model.layers = torch.nn.ModuleList(layers)
+    model.config = SimpleNamespace(index_topk=4)
+    model.pipeline_cache_relay = _cache_relay()
+    model.topk_indices_buffer = torch.empty((8, 4), dtype=torch.int32)
+    positions = torch.arange(3)
+    packed_kv = torch.randint(0, 256, (3, 584), dtype=torch.uint8)
+    topk = torch.arange(12, dtype=torch.int32).view(3, 4)
+    intermediate = dsv41_model.IntermediateTensors(
+        {
+            "dsv41_relay_l8_main_kv": packed_kv,
+            "dsv41_relay_l8_topk": topk,
+        }
+    )
+
+    model._import_pipeline_cache_relay(intermediate, positions)
+
+    layers[10].attn.import_cross_stage_kv.assert_called_once_with(packed_kv, positions)
+    torch.testing.assert_close(model.topk_indices_buffer[:3], topk)
+
+
+def test_pipeline_cache_relay_exports_source_payload(monkeypatch):
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_profile=False),
+    )
+    model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    layers = [_RecordingLayer() for _ in range(40)]
+    packed_kv = torch.randint(0, 256, (3, 584), dtype=torch.uint8)
+    layers[8].attn = SimpleNamespace(export_cross_stage_kv=Mock(return_value=packed_kv))
+    model.layers = torch.nn.ModuleList(layers)
+    model.config = SimpleNamespace(index_topk=4)
+    model.pipeline_cache_relay = _cache_relay()
+    model.topk_indices_buffer = torch.arange(32, dtype=torch.int32).view(8, 4)
+    positions = torch.arange(3)
+
+    payload = model._export_pipeline_cache_relay(positions)
+
+    layers[8].attn.export_cross_stage_kv.assert_called_once_with(positions)
+    assert payload["dsv41_relay_l8_main_kv"] is packed_kv
+    torch.testing.assert_close(
+        payload["dsv41_relay_l8_topk"], model.topk_indices_buffer[:3]
+    )
+
+
+def test_pipeline_cache_relay_import_precedes_layer_10_forward(monkeypatch):
+    events = []
+    pp_group = SimpleNamespace(
+        is_first_rank=False,
+        is_last_rank=True,
+        rank_in_group=1,
+    )
+    monkeypatch.setattr(dsv41_model, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_profile=False),
+    )
+    monkeypatch.setattr(dsv41_model, "mhc_post_tilelang", lambda x, *_: x)
+    model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    layers = [_RecordingLayer() for _ in range(40)]
+    receiver_forward = layers[10].forward
+
+    def ordered_forward(*args, **kwargs):
+        events.append("layer10")
+        return receiver_forward(*args, **kwargs)
+
+    layers[10].forward = ordered_forward
+    layers[10].attn = SimpleNamespace(
+        import_cross_stage_kv=Mock(side_effect=lambda *_: events.append("import"))
+    )
+    model.layers = torch.nn.ModuleList(layers)
+    model.start_layer = 10
+    model.end_layer = 40
+    model.decoder_replay_start = 21
+    model.fuse_mhc_all_reduce = False
+    model.use_mega_moe = False
+    model.engram_hash = None
+    model.engram_dp_shared_memory = False
+    model.use_sequence_parallel = False
+    model.aux_hidden_state_layers = set()
+    model.encoder_only_prefill = True
+    model.encoder_only_boundary_layer = 20
+    model.config = SimpleNamespace(index_topk=4)
+    model.pipeline_cache_relay = _cache_relay()
+    model.topk_indices_buffer = torch.empty((8, 4), dtype=torch.int32)
+    positions = torch.arange(2)
+    intermediate = dsv41_model.IntermediateTensors(
+        {
+            "hidden_states": torch.ones((2, 2)),
+            "pre_mix": torch.ones((2, 2)),
+            "dsv41_relay_l8_main_kv": torch.zeros((2, 584), dtype=torch.uint8),
+            "dsv41_relay_l8_topk": torch.zeros((2, 4), dtype=torch.int32),
+        }
+    )
+
+    model(torch.tensor([2, 3]), positions, intermediate)
+
+    assert events[:2] == ["import", "layer10"]

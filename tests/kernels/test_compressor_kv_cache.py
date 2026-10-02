@@ -330,6 +330,108 @@ def test_v41_fused_save_compress_and_insert(
         torch.testing.assert_close(cache_backing, expected_cache, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_v41_packed_kv_pipeline_relay_round_trip():
+    from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+        gather_packed_kv_cache_rows,
+        rope_quant_insert,
+        scatter_packed_kv_cache_rows,
+    )
+
+    torch.manual_seed(42)
+    device = "cuda"
+    compress_ratio = 2
+    cache_block = 32
+    num_blocks = 6
+    source_stride = cache_block * 584 + 64
+    destination_stride = cache_block * 584 + 128
+    source_backing = torch.zeros(
+        (num_blocks, source_stride), dtype=torch.uint8, device=device
+    )
+    destination_backing = torch.full(
+        (num_blocks, destination_stride), 165, dtype=torch.uint8, device=device
+    )
+    source = source_backing.as_strided(
+        (num_blocks, cache_block, 584), (source_stride, 584, 1)
+    )
+    destination = destination_backing.as_strided(
+        (num_blocks, cache_block, 584), (destination_stride, 584, 1)
+    )
+    positions = torch.tensor(
+        [62, 63, 64, 65, 7, 8, 9, 10], dtype=torch.int64, device=device
+    )
+    req_ids = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32, device=device)
+    source_table = torch.tensor([[2, 0], [1, 4]], dtype=torch.int32, device=device)
+    destination_table = torch.tensor([[5, 3], [4, 0]], dtype=torch.int32, device=device)
+
+    def slots(block_table: torch.Tensor) -> torch.Tensor:
+        result = torch.full_like(positions, -1)
+        for token, (position, request) in enumerate(zip(positions, req_ids)):
+            position_int = int(position.item())
+            if (position_int + 1) % compress_ratio:
+                continue
+            compressed = position_int // compress_ratio
+            block = int(block_table[int(request.item()), compressed // cache_block])
+            result[token] = block * cache_block + compressed % cache_block
+        return result
+
+    latent = torch.randn(positions.numel(), 512, dtype=torch.bfloat16, device=device)
+    angles = torch.randn(32, 32, device=device)
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    rope_quant_insert(
+        latent,
+        positions,
+        cos_sin,
+        source,
+        slots(source_table),
+        compress_ratio,
+    )
+
+    packed = gather_packed_kv_cache_rows(
+        source, positions, req_ids, source_table, compress_ratio
+    )
+    scatter_packed_kv_cache_rows(
+        packed,
+        positions,
+        destination,
+        slots(destination_table),
+        compress_ratio,
+    )
+    round_trip = gather_packed_kv_cache_rows(
+        destination,
+        positions,
+        req_ids,
+        destination_table,
+        compress_ratio,
+    )
+
+    torch.testing.assert_close(round_trip, packed, rtol=0, atol=0)
+    valid = (positions + 1) % compress_ratio == 0
+    assert torch.count_nonzero(packed[~valid]) == 0
+    assert torch.count_nonzero(packed[valid]) > 0
+
+    destination_backing.fill_(165)
+    destination_slots = slots(destination_table)
+    skipped_token = 3
+    skipped_slot = int(destination_slots[skipped_token].item())
+    destination_slots[skipped_token] = -1
+    scatter_packed_kv_cache_rows(
+        packed,
+        positions,
+        destination,
+        destination_slots,
+        compress_ratio,
+    )
+    skipped_page, skipped_row = divmod(skipped_slot, cache_block)
+    value_bytes = destination_backing[
+        skipped_page, skipped_row * 576 : (skipped_row + 1) * 576
+    ]
+    scale_start = cache_block * 576 + skipped_row * 8
+    scale_bytes = destination_backing[skipped_page, scale_start : scale_start + 8]
+    assert torch.all(value_bytes == 165)
+    assert torch.all(scale_bytes == 165)
+
+
 def _rotate_rope_tail(
     latent_row: torch.Tensor, cos_sin_row: torch.Tensor
 ) -> torch.Tensor:

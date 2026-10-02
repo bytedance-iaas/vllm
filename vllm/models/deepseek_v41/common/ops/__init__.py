@@ -27,16 +27,24 @@ from .cache_utils import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
 )
+from .fused_compress_quant_cache import (
+    SM90_PACKED_KV_RECORD_BYTES,
+    gather_packed_kv_cache_rows,
+    scatter_packed_kv_cache_rows,
+)
 from .indexer_k_store import indexer_k_norm_rope_store
 
 __all__ = [
     "MXFP4_BLOCK_SIZE",
+    "SM90_PACKED_KV_RECORD_BYTES",
     "build_flashinfer_mixed_sparse_indices",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
     "dequantize_and_gather_k_cache",
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
+    "gather_packed_kv_cache_rows",
     "indexer_k_norm_rope_store",
     "quantize_and_insert_k_cache",
+    "scatter_packed_kv_cache_rows",
 ]

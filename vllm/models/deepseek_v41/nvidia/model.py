@@ -77,6 +77,7 @@ from vllm.models.deepseek_v41.attention import (
     DeepseekV4Attention,
     get_attention_tp_head_range,
 )
+from vllm.models.deepseek_v41.common.ops import SM90_PACKED_KV_RECORD_BYTES
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
@@ -97,7 +98,12 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import EngramLayout, NgramHashState
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
-from ..common.pipeline import get_sharing_dependencies, validate_local_sharing
+from ..common.pipeline import (
+    PipelineCacheRelay,
+    get_encoder_only_cache_relay,
+    get_sharing_dependencies,
+    validate_local_sharing,
+)
 from .engram import Engram, gather_engram_hashes
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
@@ -111,6 +117,14 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+
+def _relay_kv_key(source_layer: int) -> str:
+    return f"dsv41_relay_l{source_layer}_main_kv"
+
+
+def _relay_topk_key(source_layer: int) -> str:
+    return f"dsv41_relay_l{source_layer}_topk"
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -217,6 +231,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         engram_layout: EngramLayout | None = None,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
+        cross_stage_kv_cache_layer_id: int | None = None,
     ):
         super().__init__()
 
@@ -249,6 +264,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             candidate_compact_logits_buffer=candidate_compact_logits_buffer,
             candidate_compact_indices_buffer=candidate_compact_indices_buffer,
             candidate_compact_ends_buffer=candidate_compact_ends_buffer,
+            cross_stage_kv_cache_layer_id=cross_stage_kv_cache_layer_id,
         )
         if self.use_sequence_parallel or fuse_mhc_all_reduce:
             self.attn.wo_b.reduce_results = False
@@ -606,7 +622,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             get_pp_indices(config.num_hidden_layers, rank, pp_size)
             for rank in range(pp_size)
         ]
-        validate_local_sharing(get_sharing_dependencies(config, stage_ranges))
+        sharing_dependencies = get_sharing_dependencies(config, stage_ranges)
+        self.pipeline_cache_relay: PipelineCacheRelay | None = None
+        if vllm_config.is_dsv41_encoder_only_prefill:
+            self.pipeline_cache_relay = get_encoder_only_cache_relay(
+                config, stage_ranges, sharing_dependencies
+            )
+        validate_local_sharing(sharing_dependencies, self.pipeline_cache_relay)
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
@@ -720,6 +742,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram_layout=self.engram_layout,
                 mhc_stream=mhc_stream,
                 fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
+                cross_stage_kv_cache_layer_id=(
+                    self.pipeline_cache_relay.receiver_layer
+                    if self.pipeline_cache_relay is not None
+                    and extract_layer_index(prefix)
+                    in self.pipeline_cache_relay.consumer_layers
+                    else None
+                ),
             ),
             prefix=f"{prefix}.layers",
         )
@@ -811,20 +840,80 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        relay = getattr(self, "pipeline_cache_relay", None)
+        if relay is not None and get_pp_group().rank_in_group == relay.receiver_stage:
+            tensors[_relay_kv_key(relay.source_layer)] = torch.zeros(
+                (batch_size, SM90_PACKED_KV_RECORD_BYTES),
+                dtype=torch.uint8,
+                device=device,
+            )
+            tensors[_relay_topk_key(relay.source_layer)] = torch.zeros(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
+
+    def _import_pipeline_cache_relay(
+        self,
+        intermediate_tensors: IntermediateTensors,
+        positions: torch.Tensor,
+    ) -> None:
+        relay = getattr(self, "pipeline_cache_relay", None)
+        if relay is None or get_pp_group().rank_in_group != relay.receiver_stage:
+            return
+        if get_forward_context().is_profile:
+            return
+        receiver = self.layers[relay.receiver_layer]
+        assert isinstance(receiver, DeepseekV4DecoderLayer)
+        packed_kv = intermediate_tensors[_relay_kv_key(relay.source_layer)]
+        topk = intermediate_tensors[_relay_topk_key(relay.source_layer)]
+        if topk.shape != (positions.shape[0], self.config.index_topk):
+            raise RuntimeError(
+                "DeepSeek V4.1 cross-stage top-k payload has an invalid shape."
+            )
+        receiver.attn.import_cross_stage_kv(packed_kv, positions)
+        self.topk_indices_buffer[: positions.shape[0]].copy_(topk)
+
+    def _export_pipeline_cache_relay(
+        self,
+        positions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        relay = getattr(self, "pipeline_cache_relay", None)
+        if relay is None or get_pp_group().rank_in_group != relay.source_stage:
+            return {}
+        source = self.layers[relay.source_layer]
+        assert isinstance(source, DeepseekV4DecoderLayer)
+        if get_forward_context().is_profile:
+            packed_kv = torch.zeros(
+                (positions.shape[0], SM90_PACKED_KV_RECORD_BYTES),
+                dtype=torch.uint8,
+                device=positions.device,
+            )
+            topk = torch.zeros(
+                (positions.shape[0], self.config.index_topk),
+                dtype=torch.int32,
+                device=positions.device,
+            )
+        else:
+            packed_kv = source.attn.export_cross_stage_kv(positions)
+            topk = self.topk_indices_buffer[: positions.shape[0]]
+        return {
+            _relay_kv_key(relay.source_layer): packed_kv,
+            _relay_topk_key(relay.source_layer): topk,
+        }
 
     def forward(
         self,
@@ -908,6 +997,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
 
         full_num_tokens = positions.shape[0]
+        if not get_pp_group().is_first_rank:
+            assert intermediate_tensors is not None
+            self._import_pipeline_cache_relay(intermediate_tensors, positions)
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
@@ -968,7 +1060,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     full_num_tokens,
                 )
                 return IntermediateTensors(
-                    {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                    {
+                        "hidden_states": hidden_states,
+                        "pre_mix": pre_mix,
+                        **self._export_pipeline_cache_relay(positions),
+                    }
                 )
             layer = self.layers[self.encoder_only_boundary_layer]
             assert isinstance(layer, DeepseekV4DecoderLayer)
