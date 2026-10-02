@@ -18,8 +18,15 @@ pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 class FakeGroup:
     rank_in_group: int
     world_size: int
+    all_gather_result: torch.Tensor | None = None
+    all_gather_input: torch.Tensor | None = None
     all_gatherv_result: torch.Tensor | None = None
     all_gatherv_sizes: list[int] | None = None
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        assert dim == 0
+        self.all_gather_input = tensor
+        return tensor if self.all_gather_result is None else self.all_gather_result
 
     def all_gatherv(
         self,
@@ -44,6 +51,79 @@ def make_forward_context_config() -> SimpleNamespace:
             is_moe_model=False,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "tp_rank"),
+    [
+        (8, 2),
+        (6, 3),
+        (2, 3),
+    ],
+)
+def test_attention_input_projection_shards_and_restores_token_rows(
+    monkeypatch,
+    num_tokens: int,
+    tp_rank: int,
+):
+    hidden_states = torch.arange(num_tokens * 3, dtype=torch.float32).reshape(
+        num_tokens, 3
+    )
+    tp_size = 4
+    shard_size = (num_tokens + tp_size - 1) // tp_size
+    padded = hidden_states.new_zeros((shard_size * tp_size, 3))
+    padded[:num_tokens].copy_(hidden_states)
+    projected_inputs: list[torch.Tensor] = []
+
+    def project(rows: torch.Tensor) -> tuple[torch.Tensor, None]:
+        projected_inputs.append(rows)
+        return projected(rows), None
+
+    def projected(rows: torch.Tensor) -> torch.Tensor:
+        return torch.cat((rows, rows + 100), dim=1)
+
+    gathered = projected(padded)
+    group = FakeGroup(
+        rank_in_group=tp_rank,
+        world_size=tp_size,
+        all_gather_result=gathered,
+    )
+    monkeypatch.setattr(attention_module, "get_tp_group", lambda: group)
+    layer = SimpleNamespace(fused_wqa_wkv=project)
+
+    output = attention_module.DeepseekV4Attention._fused_wqa_wkv_gemm_token_sharded(
+        layer, hidden_states
+    )
+
+    start = tp_rank * shard_size
+    local_hidden_states = padded[start : start + shard_size]
+    torch.testing.assert_close(projected_inputs[0], local_hidden_states)
+    torch.testing.assert_close(
+        group.all_gather_input,
+        projected(local_hidden_states),
+    )
+    torch.testing.assert_close(output, projected(hidden_states))
+
+
+def test_attention_input_projection_uses_replicated_path_when_disabled():
+    projected_inputs: list[torch.Tensor] = []
+
+    def project(rows: torch.Tensor) -> tuple[torch.Tensor, None]:
+        projected_inputs.append(rows)
+        return rows + 1, None
+
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    layer = SimpleNamespace(
+        fused_wqa_wkv=project,
+        _can_shard_fused_wqa_wkv=lambda _: False,
+    )
+
+    output = attention_module.DeepseekV4Attention._fused_wqa_wkv_gemm(
+        layer, hidden_states
+    )
+
+    assert projected_inputs[0] is hidden_states
+    torch.testing.assert_close(output, hidden_states + 1)
 
 
 @pytest.mark.parametrize(

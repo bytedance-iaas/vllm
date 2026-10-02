@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
@@ -47,12 +48,14 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
     get_attn_cp_group,
     get_attn_tp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -462,6 +465,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         tp_size = get_tensor_model_parallel_world_size()
         self.attn_cp_size = vllm_config.parallel_config.attention_context_parallel_size
         self.attn_tp_size = tp_size // self.attn_cp_size
+        self.input_proj_token_shard_min_tokens = max(
+            0, envs.VLLM_DSV41_ATTN_INPUT_TOKEN_SHARD_MIN_TOKENS
+        )
+        self.input_proj_token_shard_enabled = (
+            self.input_proj_token_shard_min_tokens > 0
+            and current_platform.is_cuda()
+            and vllm_config.is_dsv41_encoder_only_prefill
+            and tp_size == 4
+            and self.attn_cp_size == 4
+            and self.attn_tp_size == 1
+            and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        )
         attn_tp_group = get_attn_tp_group() if self.attn_cp_size > 1 else None
         attn_tp_kwargs = (
             {
@@ -1165,9 +1180,90 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             attn_out,
         )
 
+    @cached_property
+    def _input_projection_quant_supports_token_sharding(self) -> bool:
+        quant_method = self.fused_wqa_wkv.quant_method
+        if isinstance(quant_method, UnquantizedLinearMethod):
+            return True
+
+        from vllm.model_executor.layers.quantization.humming import (
+            HummingLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.utils.humming import (
+            input_schema_to_quant_key,
+        )
+
+        if not isinstance(quant_method, HummingLinearMethod):
+            return False
+        quant_key = input_schema_to_quant_key(
+            quant_method.input_schema,
+            self.fused_wqa_wkv.params_dtype,
+        )
+        if quant_key is None:
+            return True
+        scales = (quant_key.scale, quant_key.scale2)
+        return all(
+            scale is None or scale.static or scale.group_shape.row == 1
+            for scale in scales
+        )
+
+    def _can_shard_fused_wqa_wkv(self, hidden_states: torch.Tensor) -> bool:
+        if (
+            not self.input_proj_token_shard_enabled
+            or hidden_states.ndim != 2
+            or hidden_states.shape[0] < self.input_proj_token_shard_min_tokens
+            or not is_forward_context_available()
+        ):
+            return False
+
+        forward_context = get_forward_context()
+        if (
+            forward_context.is_profile
+            or forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            or forward_context.ubatch_slices is not None
+            or forward_context.is_padding is not None
+            or torch.cuda.is_current_stream_capturing()
+            or not isinstance(forward_context.attn_metadata, dict)
+        ):
+            return False
+        swa_metadata = forward_context.attn_metadata.get(self.swa_cache_layer.prefix)
+        if (
+            swa_metadata is None
+            or swa_metadata.num_decodes != 0
+            or swa_metadata.num_decode_tokens != 0
+            or swa_metadata.num_prefill_tokens != hidden_states.shape[0]
+        ):
+            return False
+        return self._input_projection_quant_supports_token_sharding
+
+    def _fused_wqa_wkv_gemm_token_sharded(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        tp_group = get_tp_group()
+        num_tokens = hidden_states.shape[0]
+        shard_size = (num_tokens + tp_group.world_size - 1) // tp_group.world_size
+        start = min(tp_group.rank_in_group * shard_size, num_tokens)
+        valid = min(shard_size, num_tokens - start)
+        if valid == shard_size:
+            local_hidden_states = hidden_states[start : start + valid].contiguous()
+        else:
+            local_hidden_states = hidden_states.new_zeros(
+                (shard_size, hidden_states.shape[1])
+            )
+            if valid:
+                local_hidden_states[:valid].copy_(
+                    hidden_states[start : start + valid]
+                )
+
+        local_qr_kv, _ = self.fused_wqa_wkv(local_hidden_states)
+        qr_kv = tp_group.all_gather(local_qr_kv, dim=0)
+        return qr_kv[:num_tokens]
+
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Override point: the ROCm layer preshuffles this weight in place, so
         # it cannot go through fused_wqa_wkv directly.
+        if self._can_shard_fused_wqa_wkv(hidden_states):
+            return self._fused_wqa_wkv_gemm_token_sharded(hidden_states)
         # MergedColumnParallelLinear returns (output, bias); bias is None.
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         return qr_kv
