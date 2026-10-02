@@ -870,6 +870,7 @@ async def test_encoder_only_prefill_pp_worker_projects_scheduler_block_groups():
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.shutdown = MagicMock()
     worker.vllm_config = SimpleNamespace(is_dsv41_encoder_only_prefill=True)
+    worker.is_sender_worker = True
     worker.pp_size = 2
     spec = _make_test_kv_cache_config().kv_cache_groups[0].kv_cache_spec
     worker.kv_cache_config = KVCacheConfig(

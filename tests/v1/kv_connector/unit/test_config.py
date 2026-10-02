@@ -71,7 +71,10 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
                 use_sequence_parallel_moe=False,
                 enable_elastic_ep=False,
             ),
-            cache_config=SimpleNamespace(swa_bounded_replay=values["bounded_replay"]),
+            cache_config=SimpleNamespace(
+                swa_bounded_replay=values["bounded_replay"],
+                cache_dtype="fp8_ds_mxfp8",
+            ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=values["async_scheduling"]
             ),

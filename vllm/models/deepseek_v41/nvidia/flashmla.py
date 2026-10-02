@@ -300,6 +300,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + self.window_size, 128)
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
+            local_start = local_end = None
+            if cp_plan is not None:
+                local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
+                local_end = int(cp_plan.local_query_start_loc_cpu[chunk_end].item())
+                if local_start == local_end:
+                    continue
             chunk_size = chunk_end - chunk_start
             workspace = workspace_manager.get_simultaneous(
                 ((chunk_size, chunk_M, q.shape[-1]), torch.bfloat16),
@@ -358,10 +364,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 out=(combined_indices_out, combined_lens_out),
             )
             if cp_plan is not None:
-                local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
-                local_end = int(cp_plan.local_query_start_loc_cpu[chunk_end].item())
-                if local_start == local_end:
-                    continue
+                assert local_start is not None and local_end is not None
                 global_token_indices = cp_plan.token_indices[local_start:local_end]
                 query_indices = global_token_indices - prefill_token_base
                 chunk_indices = query_indices - query_start
