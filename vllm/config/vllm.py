@@ -2809,6 +2809,7 @@ class VllmConfig:
             raise ValueError("dsv41_encoder_only_prefill requires model runner V2.")
         dsv41_encoder_only_boundary_layer(model_config.hf_text_config)
         pp_size = self.parallel_config.pipeline_parallel_size
+        supports_l8_cache_relay = False
         if pp_size != 1:
             from vllm.distributed.utils import get_pp_indices
 
@@ -2852,11 +2853,12 @@ class VllmConfig:
         if (
             kv_config.kv_role == "kv_producer"
             and self.scheduler_config.async_scheduling
+            and not supports_l8_cache_relay
         ):
             raise ValueError(
-                "The dsv41_encoder_only_prefill producer requires "
-                "--no-async-scheduling while cache-only completion does not "
-                "consume output placeholders."
+                "Async scheduling for the dsv41_encoder_only_prefill producer "
+                "is limited to the validated TP4/PP2/attention-CP4 10,30 "
+                "cache-relay topology."
             )
         if not self.cache_config.swa_bounded_replay:
             raise ValueError("dsv41_encoder_only_prefill requires SWA bounded replay.")

@@ -121,6 +121,19 @@ def test_dsv41_encoder_only_handoff_accepts_pp10_cache_relay(monkeypatch):
     VllmConfig._verify_dsv41_encoder_only_handoff(config)
 
 
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_accepts_async_pp10_cache_relay(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,30")
+    config = _dsv41_handoff_config(
+        pp=2,
+        tp=4,
+        attn_cp=4,
+        async_scheduling=True,
+    )
+
+    VllmConfig._verify_dsv41_encoder_only_handoff(config)
+
+
 @pytest.mark.parametrize(
     ("tp", "attn_cp"),
     [(4, 2), (8, 4)],
@@ -202,7 +215,7 @@ def test_dsv41_encoder_only_handoff_separates_producer_compile_hash():
         ({"pp": 2}, "PP cut must start a local sharing group"),
         ({"pcp": 2}, "does not support prefill context parallelism"),
         ({"ubatching": True}, "does not support DBO or microbatching"),
-        ({"async_scheduling": True}, "requires --no-async-scheduling"),
+        ({"async_scheduling": True}, "limited to the validated"),
         ({"bounded_replay": False}, "requires SWA bounded replay"),
         ({"num_layers": 39}, "requires the 40-layer"),
         ({"index_sources": (2, 8, 14)}, "complete Main-KV/Indexer-K sources"),

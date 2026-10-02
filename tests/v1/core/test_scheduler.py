@@ -6743,6 +6743,51 @@ def test_dsv41_cache_only_prefill_pp_waits_for_last_inflight_chunk():
     scheduler.connector.request_finished.assert_called_once()
 
 
+@pytest.mark.skip_global_cleanup
+def test_dsv41_cache_only_prefill_async_uses_no_output_placeholders():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        kv_role="kv_producer",
+        dsv41_encoder_only_prefill=True,
+    )
+    scheduler.connector.request_finished = Mock(return_value=(True, None))
+    (request,) = create_requests(num_requests=1, num_tokens=32, max_tokens=8)
+    request.kv_transfer_params = {
+        "do_remote_decode": True,
+        "cache_only": True,
+        "transfer_id": "xfer-test",
+    }
+    scheduler.add_request(request)
+
+    first_chunk = scheduler.schedule()
+    last_chunk = scheduler.schedule()
+    blocked = scheduler.schedule()
+
+    assert scheduler.num_sampled_tokens_per_step == 0
+    assert request.num_output_placeholders == 0
+    assert request.num_computed_tokens == request.num_prompt_tokens
+    assert request.num_in_flight_tokens == 32
+    assert blocked.total_num_scheduled_tokens == 0
+
+    scheduler.update_from_output(
+        first_chunk, make_empty_encoder_model_runner_output(first_chunk)
+    )
+    assert request.status == RequestStatus.RUNNING
+    scheduler.connector.request_finished.assert_not_called()
+
+    scheduler.update_from_output(
+        last_chunk, make_empty_encoder_model_runner_output(last_chunk)
+    )
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert request.num_output_tokens == 0
+    assert request.num_output_placeholders == 0
+    scheduler.connector.request_finished.assert_called_once()
+
+
 @pytest.mark.parametrize("ec_role", ["ec_producer", "ec_consumer"])
 def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str):
     """Neither role re-encodes what the connector already holds.

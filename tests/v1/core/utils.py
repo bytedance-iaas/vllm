@@ -77,6 +77,7 @@ def create_scheduler(
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
     scheduling_policy: SchedulerPolicy = "fcfs",
+    dsv41_encoder_only_prefill: bool = False,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -193,6 +194,9 @@ def create_scheduler(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
         ),
     )
+    if dsv41_encoder_only_prefill:
+        assert vllm_config.kv_transfer_config is not None
+        vllm_config.kv_transfer_config.dsv41_encoder_only_prefill = True
     if kv_cache_spec is None:
         kv_cache_spec = FullAttentionSpec(
             block_size=block_size,
