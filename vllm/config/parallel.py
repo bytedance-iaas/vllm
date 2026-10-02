@@ -131,6 +131,9 @@ class ParallelConfig:
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
+    attention_context_parallel_size: int = Field(default=1, ge=1)
+    """Number of attention-only context parallel ranks carved out of each
+    tensor-parallel group. This does not increase the physical world size."""
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor, prefill-context, and data parallel sizes."""
@@ -564,6 +567,17 @@ class ParallelConfig:
         tp = self.tensor_parallel_size
         pcp = self.prefill_context_parallel_size
         dcp = self.decode_context_parallel_size
+        attn_cp = self.attention_context_parallel_size
+        if tp % attn_cp != 0:
+            raise ValueError(
+                f"tp_size={tp} must be divisible by "
+                f"attention_context_parallel_size={attn_cp}."
+            )
+        if attn_cp > 1 and (pcp > 1 or dcp > 1):
+            raise ValueError(
+                "Attention context parallelism cannot be combined with "
+                "prefill or decode context parallelism."
+            )
         if pcp == 1:
             # DCP reuses the TP ranks when PCP is disabled.
             if tp % dcp != 0:

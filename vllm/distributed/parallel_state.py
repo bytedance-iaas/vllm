@@ -1549,6 +1549,22 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+_ATTN_TP: GroupCoordinator | None = None
+
+
+def get_attn_tp_group() -> GroupCoordinator:
+    # Attention TP is identical to model TP when attention CP is disabled.
+    return _ATTN_TP if _ATTN_TP is not None else get_tp_group()
+
+
+_ATTN_CP: GroupCoordinator | None = None
+
+
+def get_attn_cp_group() -> GroupCoordinator:
+    assert _ATTN_CP is not None, "attention context parallel group is not initialized"
+    return _ATTN_CP
+
+
 _ETP: GroupCoordinator | None = None
 
 
@@ -1964,12 +1980,45 @@ def _engram_dp_shard_size(
     return shard_size
 
 
+def _get_attention_parallel_group_ranks(
+    ranks: torch.Tensor,
+    tensor_model_parallel_size: int,
+    attention_context_model_parallel_size: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Split each TP group into orthogonal attention TP and CP groups."""
+    if tensor_model_parallel_size % attention_context_model_parallel_size != 0:
+        raise ValueError(
+            "tensor_model_parallel_size must be divisible by "
+            "attention_context_model_parallel_size"
+        )
+
+    attention_tensor_model_parallel_size = (
+        tensor_model_parallel_size // attention_context_model_parallel_size
+    )
+    layout = ranks.reshape(
+        *ranks.shape[:-1],
+        attention_context_model_parallel_size,
+        attention_tensor_model_parallel_size,
+    )
+    attn_tp_ranks = layout.reshape(-1, attention_tensor_model_parallel_size).unbind(0)
+    attn_cp_ranks = (
+        layout.transpose(-2, -1)
+        .reshape(-1, attention_context_model_parallel_size)
+        .unbind(0)
+    )
+    return (
+        [group.tolist() for group in attn_tp_ranks],
+        [group.tolist() for group in attn_cp_ranks],
+    )
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    attention_context_model_parallel_size: int = 1,
 ) -> None:
     """Initialize model parallel groups.
 
@@ -1983,6 +2032,8 @@ def initialize_model_parallel(
         decode_context_model_parallel_size: number of GPUs used for context
             parallelism during decode.
         backend: name of torch distributed communication backend.
+        attention_context_model_parallel_size: number of ranks in each
+            attention-only context parallel group carved out of TP.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2067,6 +2118,28 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=True,
         group_name="tp",
     )
+
+    global _ATTN_TP, _ATTN_CP
+    assert _ATTN_TP is None, "attention tensor parallel group is already initialized"
+    assert _ATTN_CP is None, "attention context parallel group is already initialized"
+    if attention_context_model_parallel_size > 1:
+        attn_tp_ranks, attn_cp_ranks = _get_attention_parallel_group_ranks(
+            all_ranks,
+            tensor_model_parallel_size,
+            attention_context_model_parallel_size,
+        )
+        _ATTN_TP = init_model_parallel_group(
+            attn_tp_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="attention_tensor",
+        )
+        _ATTN_CP = init_model_parallel_group(
+            attn_cp_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="attention_context",
+        )
 
     global _ETP
     assert _ETP is None, "Engram tensor-parallel group is already initialized"
@@ -2258,16 +2331,25 @@ def initialize_model_parallel(
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
 
+    attn_tp_rank = _ATTN_TP.rank_in_group if _ATTN_TP is not None else _TP.rank_in_group
+    attn_tp_size = _ATTN_TP.world_size if _ATTN_TP is not None else _TP.world_size
+    attn_cp_rank = _ATTN_CP.rank_in_group if _ATTN_CP is not None else 0
+    attn_cp_size = _ATTN_CP.world_size if _ATTN_CP is not None else 1
     logger.info_once(
         "rank %s in world size %s is assigned as "
         "DP rank %s, PP rank %s, PCP rank %s, "
-        "TP rank %s, ETP rank %s, EP rank %s, EPLB rank %s",
+        "TP rank %s, ATTN_TP rank %s/%s, ATTN_CP rank %s/%s, "
+        "ETP rank %s, EP rank %s, EPLB rank %s",
         rank,
         world_size,
         _DP.rank_in_group,
         _PP.rank_in_group,
         _PCP.rank_in_group,
         _TP.rank_in_group,
+        attn_tp_rank,
+        attn_tp_size,
+        attn_cp_rank,
+        attn_cp_size,
         _ETP.rank_in_group,
         _EP.rank_in_group if _EP is not None else "N/A",
         _EPLB.rank_in_group if _EPLB is not None else "N/A",
@@ -2280,6 +2362,7 @@ def ensure_model_parallel_initialized(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    attention_context_model_parallel_size: int = 1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2297,6 +2380,7 @@ def ensure_model_parallel_initialized(
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,
+            attention_context_model_parallel_size,
         )
         return
 
@@ -2324,6 +2408,24 @@ def ensure_model_parallel_initialized(
         f"{dcp_world_size=} vs. "
         f"{dcp_model_parallel_size=}"
     )
+    if attention_context_model_parallel_size > 1:
+        attn_cp_world_size = get_attn_cp_group().world_size
+        assert attn_cp_world_size == attention_context_model_parallel_size, (
+            "attention context parallel group already initialized, but of "
+            f"unexpected size: {attn_cp_world_size=} vs. "
+            f"{attention_context_model_parallel_size=}"
+        )
+        expected_attn_tp_world_size = (
+            tensor_model_parallel_size // attention_context_model_parallel_size
+        )
+        attn_tp_world_size = get_attn_tp_group().world_size
+        assert attn_tp_world_size == expected_attn_tp_world_size, (
+            "attention tensor parallel group already initialized, but of "
+            f"unexpected size: {attn_tp_world_size=} vs. "
+            f"{expected_attn_tp_world_size=}"
+        )
+    else:
+        assert _ATTN_TP is None and _ATTN_CP is None
 
 
 def checkpoint_prepare_distributed_state() -> None:
@@ -2363,11 +2465,19 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP, _ETP
+    global _TP, _ATTN_TP, _ATTN_CP, _ETP
 
     if _ETP and _ETP is not _TP:
         _ETP.destroy()
     _ETP = None
+
+    if _ATTN_CP:
+        _ATTN_CP.destroy()
+    _ATTN_CP = None
+
+    if _ATTN_TP:
+        _ATTN_TP.destroy()
+    _ATTN_TP = None
 
     if _TP:
         _TP.destroy()

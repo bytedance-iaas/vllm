@@ -1326,10 +1326,11 @@ class VllmConfig:
             if (
                 self.parallel_config.decode_context_parallel_size > 1
                 or self.parallel_config.prefill_context_parallel_size > 1
+                or self.parallel_config.attention_context_parallel_size > 1
             ):
                 raise ValueError(
                     "--enable-return-routed-experts is incompatible with context "
-                    "parallelism (DCP > 1 or PCP > 1)."
+                    "parallelism (DCP > 1, PCP > 1, or attention CP > 1)."
                 )
 
             # Incompatible with any KV connector — covers both PD disaggregation
@@ -2053,6 +2054,7 @@ class VllmConfig:
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
         self._verify_dsv41_encoder_only_handoff()
+        self._verify_attention_context_parallel()
 
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
             # Such an instance publishes encoder embeddings and runs no language
@@ -2704,6 +2706,7 @@ class VllmConfig:
             f"tensor_parallel_size={self.parallel_config.tensor_parallel_size}, "  # noqa
             f"pipeline_parallel_size={self.parallel_config.pipeline_parallel_size}, "  # noqa
             f"data_parallel_size={self.parallel_config.data_parallel_size}, "  # noqa
+            f"attention_context_parallel_size={self.parallel_config.attention_context_parallel_size}, "  # noqa
             f"decode_context_parallel_size={self.parallel_config.decode_context_parallel_size}, "  # noqa
             f"dcp_comm_backend={self.parallel_config.dcp_comm_backend}, "  # noqa
             f"disable_custom_all_reduce={self.parallel_config.disable_custom_all_reduce}, "  # noqa
@@ -2877,6 +2880,87 @@ class VllmConfig:
                     "The DSpark window must be known and no wider than the "
                     "128-token replay window."
                 )
+
+    def _verify_attention_context_parallel(self) -> None:
+        """Fail closed outside the DeepSeek-V4.1 Prefill validation boundary."""
+        attn_cp_size = self.parallel_config.attention_context_parallel_size
+        if attn_cp_size == 1:
+            return
+
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        model_config = self.model_config
+        if (
+            model_config is None
+            or model_config.architecture != "DeepseekV41ForCausalLM"
+            or not model_config.use_mla
+        ):
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only "
+                "DeepseekV41ForCausalLM MLA."
+            )
+        if not current_platform.is_cuda():
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only CUDA."
+            )
+        capability = current_platform.get_device_capability()
+        if capability is None or capability.major != 9:
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only SM90."
+            )
+        if not self.is_dsv41_encoder_only_prefill:
+            raise NotImplementedError(
+                "Attention context parallelism requires a dedicated DeepSeek-V4.1 "
+                "encoder-only Mooncake KV producer."
+            )
+        pp_size = self.parallel_config.pipeline_parallel_size
+        tp_size = self.parallel_config.tensor_parallel_size
+        if pp_size != 1 and (pp_size, tp_size, attn_cp_size) != (2, 4, 4):
+            raise NotImplementedError(
+                "Attention context parallelism with pipeline parallelism "
+                "currently supports only PP=2, TP=4, attention CP=4."
+            )
+        if self.parallel_config.data_parallel_size != 1:
+            raise NotImplementedError(
+                "Attention context parallelism does not support data parallelism."
+            )
+        if (
+            self.parallel_config.enable_expert_parallel
+            or self.parallel_config.use_sequence_parallel_moe
+        ):
+            raise NotImplementedError(
+                "Attention context parallelism does not support expert or "
+                "sequence parallelism."
+            )
+        if self.parallel_config.enable_elastic_ep:
+            raise NotImplementedError(
+                "Attention context parallelism does not support elastic expert "
+                "parallelism."
+            )
+        if self.parallel_config.use_ubatching:
+            raise NotImplementedError(
+                "Attention context parallelism does not support DBO or microbatching."
+            )
+        if self.speculative_config is not None:
+            raise NotImplementedError(
+                "Attention context parallelism does not support speculative Prefill."
+            )
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise NotImplementedError(
+                "Attention context parallelism requires cudagraph_mode=NONE."
+            )
+        backend = self.attention_config.backend
+        if backend not in (None, AttentionBackendEnum.FLASHMLA_SPARSE_DSV41):
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only "
+                "FLASHMLA_SPARSE_DSV41."
+            )
+        if self.cache_config.cache_dtype not in ("auto", "fp8_ds_mla"):
+            raise NotImplementedError(
+                "Attention context parallelism currently supports only the "
+                "fp8_ds_mla KV cache."
+            )
 
     def _resolve_mm_processor_device(self) -> None:
         """Settle `--mm-processor-device=auto` now that the EC role is known.

@@ -17,7 +17,6 @@ from vllm.config.kv_transfer import dsv41_encoder_only_boundary_layer
 from vllm.distributed import (
     get_engram_dp_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -74,7 +73,10 @@ from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
     prepare_mega_gate_routing_metadata,
 )
-from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.attention import (
+    DeepseekV4Attention,
+    get_attention_tp_head_range,
+)
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
     DeepseekV4MegaAttnAttention,
@@ -1199,12 +1201,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
 
         # TP for attention
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
         n_head = self.config.num_attention_heads
-        n_local_head = n_head // tp_size
-        head_rank_start = n_local_head * tp_rank
-        head_rank_end = n_local_head * (tp_rank + 1)
+        head_rank_start, head_rank_end = get_attention_tp_head_range(n_head)
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()

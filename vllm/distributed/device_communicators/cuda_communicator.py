@@ -758,12 +758,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     return outs
 
         pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None and not pynccl_comm.disabled
+        use_pynccl = pynccl_comm is not None and not pynccl_comm.disabled
 
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
-        if sizes is None and should_nccl_symm_mem_ag_rs():
+        if use_pynccl and sizes is None and should_nccl_symm_mem_ag_rs():
             if isinstance(input_, torch.Tensor):
                 return self._all_gather_symm_mem(input_)
             return self._all_gather_batched_symm_mem(input_)
@@ -782,20 +782,49 @@ class CudaCommunicator(DeviceCommunicatorBase):
             output_tensor = torch.empty(
                 output_size, dtype=input_.dtype, device=input_.device
             )
-            if sizes is not None:
+            if use_pynccl and sizes is not None:
+                assert pynccl_comm is not None
                 pynccl_comm.all_gatherv(output_tensor, input_, sizes=sizes)
-            else:
+            elif use_pynccl:
+                assert pynccl_comm is not None
                 pynccl_comm.all_gather(output_tensor, input_)
+            elif sizes is not None:
+                assert self.device_group is not None
+                all_gather_list = [
+                    torch.empty(
+                        (size,) + input_.shape[1:],
+                        dtype=input_.dtype,
+                        device=input_.device,
+                    )
+                    for size in sizes
+                ]
+                torch.distributed.all_gather(
+                    all_gather_list,
+                    input_,
+                    group=self.device_group,
+                )
+                output_tensor = torch.cat(all_gather_list, dim=0)
+            else:
+                assert self.device_group is not None
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor,
+                    input_,
+                    group=self.device_group,
+                )
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
             return _all_gather_single(input_, sizes)
 
         output_list = []
-        pynccl_comm.group_start()
+        if use_pynccl:
+            assert pynccl_comm is not None
+            pynccl_comm.group_start()
         for inp in input_:
             output_list.append(_all_gather_single(inp, sizes=sizes))
-        pynccl_comm.group_end()
+        if use_pynccl:
+            assert pynccl_comm is not None
+            pynccl_comm.group_end()
 
         return output_list
 

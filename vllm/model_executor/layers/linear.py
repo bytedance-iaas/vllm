@@ -3,7 +3,7 @@
 
 from abc import abstractmethod
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn.parameter import Parameter
@@ -43,6 +43,9 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
 
 logger = init_logger(__name__)
 
@@ -1655,6 +1658,7 @@ class RowParallelLinear(LinearBase):
                         (e.g. model.layers.0.down_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        tp_group: Optional process group overriding the global tensor-parallel group.
 
     """
 
@@ -1674,10 +1678,20 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        tp_group: "GroupCoordinator | None" = None,
     ):
         # Divide the weight matrix along the first dimension.
-        self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
-        self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        if disable_tp:
+            if tp_group is not None:
+                raise ValueError("tp_group cannot be set when disable_tp=True")
+            self.tp_rank, self.tp_size = 0, 1
+        elif tp_group is not None:
+            self.tp_rank = tp_group.rank_in_group
+            self.tp_size = tp_group.world_size
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_group = tp_group
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1692,6 +1706,8 @@ class RowParallelLinear(LinearBase):
             prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         self.input_is_parallel = input_is_parallel
@@ -1778,7 +1794,11 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            output = (
+                self.tp_group.all_reduce(output_parallel)
+                if self.tp_group is not None
+                else tensor_model_parallel_all_reduce(output_parallel)
+            )
         else:
             output = output_parallel
 
