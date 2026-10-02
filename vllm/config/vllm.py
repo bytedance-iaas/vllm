@@ -2914,9 +2914,12 @@ class VllmConfig:
                 "Attention context parallelism requires a dedicated DeepSeek-V4.1 "
                 "encoder-only Mooncake KV producer."
             )
-        if self.parallel_config.pipeline_parallel_size != 1:
+        pp_size = self.parallel_config.pipeline_parallel_size
+        tp_size = self.parallel_config.tensor_parallel_size
+        if pp_size != 1 and (pp_size, tp_size, attn_cp_size) != (2, 4, 4):
             raise NotImplementedError(
-                "Attention context parallelism does not support pipeline parallelism."
+                "Attention context parallelism with pipeline parallelism "
+                "currently supports only PP=2, TP=4, attention CP=4."
             )
         if self.parallel_config.data_parallel_size != 1:
             raise NotImplementedError(

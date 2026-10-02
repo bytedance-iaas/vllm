@@ -758,6 +758,7 @@ def test_get_mooncake_bootstrap_addr_selects_expected_host(
 @pytest.mark.parametrize(
     ("kv_role", "world_size", "attn_cp_size", "expected"),
     [
+        ("kv_producer", 8, 4, 2),
         ("kv_producer", 8, 2, 4),
         ("kv_producer", 8, 1, 8),
         ("kv_consumer", 8, 1, None),

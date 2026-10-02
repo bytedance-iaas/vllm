@@ -73,6 +73,19 @@ def test_attention_parallel_groups_match_tp8_layout():
     assert attn_cp_groups == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
+def test_attention_parallel_groups_match_pp2_tp4_cp4_layout():
+    ranks = torch.arange(8).reshape(1, 1, 2, 1, 4)
+
+    attn_tp_groups, attn_cp_groups = _get_attention_parallel_group_ranks(
+        ranks,
+        tensor_model_parallel_size=4,
+        attention_context_model_parallel_size=4,
+    )
+
+    assert attn_tp_groups == [[0], [1], [2], [3], [4], [5], [6], [7]]
+    assert attn_cp_groups == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
 def test_attention_parallel_groups_preserve_outer_dimensions():
     # ExternalDP=1, DP=2, PP=2, PCP=1, TP=4.
     ranks = torch.arange(16).reshape(1, 2, 2, 1, 4)

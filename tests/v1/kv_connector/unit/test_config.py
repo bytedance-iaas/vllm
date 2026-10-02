@@ -5,10 +5,12 @@
 
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 
 from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
 pytestmark = pytest.mark.cpu_test
@@ -21,6 +23,8 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
         "architecture": "DeepseekV41ForCausalLM",
         "use_v2": True,
         "pp": 1,
+        "tp": 8,
+        "attn_cp": 1,
         "executor": "mp",
         "pcp": 1,
         "ubatching": False,
@@ -44,6 +48,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
             ),
             model_config=SimpleNamespace(
                 architecture=values["architecture"],
+                use_mla=True,
                 hf_text_config=SimpleNamespace(
                     sliding_window=128,
                     num_hidden_layers=values["num_layers"],
@@ -53,17 +58,26 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
                 ),
             ),
             use_v2_model_runner=values["use_v2"],
+            is_dsv41_encoder_only_prefill=values["role"] == "kv_producer",
             parallel_config=SimpleNamespace(
                 pipeline_parallel_size=values["pp"],
+                tensor_parallel_size=values["tp"],
+                attention_context_parallel_size=values["attn_cp"],
+                data_parallel_size=1,
                 distributed_executor_backend=values["executor"],
                 prefill_context_parallel_size=values["pcp"],
                 use_ubatching=values["ubatching"],
+                enable_expert_parallel=False,
+                use_sequence_parallel_moe=False,
+                enable_elastic_ep=False,
             ),
             cache_config=SimpleNamespace(swa_bounded_replay=values["bounded_replay"]),
             scheduler_config=SimpleNamespace(
                 async_scheduling=values["async_scheduling"]
             ),
             speculative_config=values["speculative_config"],
+            compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+            attention_config=SimpleNamespace(backend=None),
         ),
     )
 
@@ -79,6 +93,39 @@ def test_dsv41_encoder_only_handoff_accepts_initial_boundary(role):
 def test_dsv41_encoder_only_handoff_accepts_aligned_prefill_pp(monkeypatch, partition):
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
     VllmConfig._verify_dsv41_encoder_only_handoff(_dsv41_handoff_config(pp=2))
+
+
+@pytest.mark.skip_global_cleanup
+def test_attention_context_parallel_accepts_pp2_tp4_cp4(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "8,32")
+    config = _dsv41_handoff_config(pp=2, tp=4, attn_cp=4)
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=9),
+    )
+
+    with patch("vllm.platforms.current_platform", platform):
+        VllmConfig._verify_dsv41_encoder_only_handoff(config)
+        VllmConfig._verify_attention_context_parallel(config)
+
+
+@pytest.mark.parametrize(
+    ("tp", "attn_cp"),
+    [(4, 2), (8, 4)],
+)
+@pytest.mark.skip_global_cleanup
+def test_attention_context_parallel_rejects_other_pp2_layouts(tp, attn_cp):
+    config = _dsv41_handoff_config(pp=2, tp=tp, attn_cp=attn_cp)
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=9),
+    )
+
+    with (
+        patch("vllm.platforms.current_platform", platform),
+        pytest.raises(NotImplementedError, match="only PP=2, TP=4"),
+    ):
+        VllmConfig._verify_attention_context_parallel(config)
 
 
 @pytest.mark.parametrize("partition", ["10,30", "12,28", "20,20"])
