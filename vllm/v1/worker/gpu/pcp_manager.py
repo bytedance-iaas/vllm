@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu.input_batch import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 logger = init_logger(__name__)
@@ -138,27 +139,26 @@ class PCPManager:
 
         if not model_config.use_mla:
             raise NotImplementedError("MRV2 PCP currently supports MLA models only.")
-        if parallel_config.pipeline_parallel_size > 1:
-            supports_dsv41_prefill_pp = (
-                vllm_config.is_dsv41_encoder_only_prefill
-                and parallel_config.pipeline_parallel_size == 2
-                and parallel_config.tensor_parallel_size == 1
-                and pcp_size == 4
-                and parallel_config.decode_context_parallel_size == 1
-                and parallel_config.attention_context_parallel_size == 1
-                and parallel_config.distributed_executor_backend == "mp"
+        supports_dsv41_prefill_pp = (
+            vllm_config.is_dsv41_encoder_only_prefill
+            and parallel_config.pipeline_parallel_size == 2
+            and parallel_config.tensor_parallel_size == 1
+            and pcp_size == 4
+            and parallel_config.decode_context_parallel_size == 1
+            and parallel_config.attention_context_parallel_size == 1
+            and parallel_config.distributed_executor_backend == "mp"
+        )
+        if parallel_config.pipeline_parallel_size > 1 and not supports_dsv41_prefill_pp:
+            raise NotImplementedError(
+                "MRV2 PCP with PP currently supports only the DeepSeek-V4.1 "
+                "encoder-only Prefill topology PP2/TP1/PCP4/DCP1 with the "
+                "multiprocessing executor."
             )
-            if not supports_dsv41_prefill_pp:
-                raise NotImplementedError(
-                    "MRV2 PCP with PP currently supports only the DeepSeek-V4.1 "
-                    "encoder-only Prefill topology PP2/TP1/PCP4/DCP1 with the "
-                    "multiprocessing executor."
-                )
         if model_config.is_encoder_decoder:
             raise NotImplementedError(
                 "MRV2 PCP does not support encoder-decoder models yet."
             )
-        if supports_mm_inputs:
+        if supports_mm_inputs and not supports_dsv41_prefill_pp:
             raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
@@ -209,6 +209,13 @@ class PCPManager:
             raise NotImplementedError(
                 "MRV2 PCP + DCP requires dcp_comm_backend='ag_rs'; got "
                 f"'{parallel_config.dcp_comm_backend}'."
+            )
+
+    @staticmethod
+    def validate_scheduler_output(scheduler_output: "SchedulerOutput") -> None:
+        if scheduler_output.scheduled_encoder_inputs:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 PP2/PCP4 Prefill currently supports text-only requests."
             )
 
     @staticmethod

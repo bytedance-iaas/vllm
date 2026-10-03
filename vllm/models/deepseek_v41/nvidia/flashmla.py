@@ -142,6 +142,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+        if swa_metadata.num_decode_tokens == 0 and swa_metadata.num_prefill_tokens == 0:
+            output.zero_()
+            return
 
         swa_only = self.compress_ratio == 0
         # SWA-only layers (compress_ratio == 0) don't have their own KV cache

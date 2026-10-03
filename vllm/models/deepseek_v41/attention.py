@@ -1118,7 +1118,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         latent is ready, main-cache insertion overlaps indexer preparation;
         both cache writes finish before sparse attention reads either cache.
         """
-        attn_metadata = get_forward_context().attn_metadata
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        swa_metadata = (
+            cast(
+                "DeepseekSparseSWAMetadata | None",
+                attn_metadata.get(self.swa_cache_layer.prefix),
+            )
+            if self.use_pcp and isinstance(attn_metadata, dict)
+            else None
+        )
         indexer = self.indexer
         compressor = self.compressor
         aux_streams = self.aux_stream_list
@@ -1140,11 +1149,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             cache_kv = kv
             cache_positions = positions
             cache_kwargs = {}
-            if self.use_pcp and isinstance(attn_metadata, dict):
-                swa_metadata = cast(
-                    "DeepseekSparseSWAMetadata",
-                    attn_metadata[self.swa_cache_layer.prefix],
-                )
+            if (
+                self.use_pcp
+                and isinstance(attn_metadata, dict)
+                and not forward_context.is_profile
+            ):
+                assert swa_metadata is not None
                 assert swa_metadata.cache_slot_mapping is not None
                 (cache_kv, cache_positions), cache_slot_mapping = (
                     maybe_gather_pcp_cache_inputs(
@@ -1191,7 +1201,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_positions = positions
         if compressor is not None:
             cache_latent, cache_positions, _ = compressor.prepare_cache_inputs(
-                latent, positions
+                latent,
+                positions,
+                num_decode_tokens=(
+                    swa_metadata.num_decode_tokens if swa_metadata is not None else 0
+                ),
             )
 
         def prepare_indexer():

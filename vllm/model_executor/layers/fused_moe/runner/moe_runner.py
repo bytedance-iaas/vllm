@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -53,6 +54,10 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+_PCP_MOE_PADDING_MASK_KEY = (
+    "vllm.model_executor.layers.fused_moe.runner.moe_runner:pcp_moe_padding_mask"
+)
 
 
 def register_layer_for_moe_forward_op(
@@ -646,6 +651,7 @@ class MoERunner(MoERunnerInterface):
             fused_out,
         )
 
+    @contextmanager
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
         redistribution.
@@ -655,11 +661,35 @@ class MoERunner(MoERunnerInterface):
         returns a no-op context.
         """
         ctx = get_forward_context()
-        return (
+        local_is_padding = ctx.is_padding
+        if (
+            envs.VLLM_MOE_SKIP_PADDING
+            and local_is_padding is not None
+            and self.moe_config.pcp_size > 1
+            and not self.moe_config.moe_parallel_config.use_all2all_kernels
+        ):
+            global_is_padding = ctx.additional_kwargs.get(_PCP_MOE_PADDING_MASK_KEY)
+            if global_is_padding is None:
+                global_is_padding = (
+                    local_is_padding.repeat(self.moe_config.pcp_size)
+                    if ctx.is_profile
+                    else get_pcp_group()
+                    .all_gather(local_is_padding.to(torch.uint8), dim=0)
+                    .bool()
+                )
+                ctx.additional_kwargs[_PCP_MOE_PADDING_MASK_KEY] = global_is_padding
+            ctx.is_padding = global_is_padding
+
+        sp_context = (
             ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)
             if ctx.dp_metadata
             else nullcontext()
         )
+        try:
+            with sp_context:
+                yield
+        finally:
+            ctx.is_padding = local_is_padding
 
     def _maybe_add_zero_expert_output(
         self,
@@ -818,6 +848,16 @@ class MoERunner(MoERunnerInterface):
         ):
             hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
             router_logits = get_pcp_group().all_gather(router_logits, dim=0)
+            is_padding = get_forward_context().is_padding
+            if (
+                envs.VLLM_MOE_SKIP_PADDING
+                and is_padding is not None
+                and is_padding.shape != (hidden_states.shape[0],)
+            ):
+                raise RuntimeError(
+                    "PCP MoE padding mask does not match gathered token rows: "
+                    f"{is_padding.shape=} {hidden_states.shape[0]=}."
+                )
 
         return hidden_states, router_logits
 

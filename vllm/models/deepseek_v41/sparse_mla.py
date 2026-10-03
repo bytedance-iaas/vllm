@@ -67,15 +67,12 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         )
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
         if (
-            getattr(
-                parallel_config,
-                "attention_context_parallel_size",
-                1,
-            )
-            > 1
+            getattr(parallel_config, "attention_context_parallel_size", 1) > 1
+            or self.pcp_world_size > 1
         ):
             # Encoder-only producers can still emit one-token prompt tails.
-            # Keep every row on the Prefill path so the CP query plan owns it.
+            # Keep every row on the Prefill path so context-parallel cache
+            # collectives remain symmetric.
             self.decode_threshold = 0
         compress_ratios = getattr(
             self.vllm_config.model_config.hf_config, "compress_ratios", None

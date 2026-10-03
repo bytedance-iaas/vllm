@@ -1718,6 +1718,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            if self.pcp_manager is not None:
+                self.pcp_manager.validate_scheduler_output(scheduler_output)
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)

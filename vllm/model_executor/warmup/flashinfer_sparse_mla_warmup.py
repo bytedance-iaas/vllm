@@ -256,7 +256,11 @@ def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
 def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     """Warm DSv4 sparse-MLA mixed prefill+decode attention."""
     runner = worker.model_runner
-    if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
+    if (
+        runner.is_pooling_model
+        or worker.vllm_config.is_dsv41_encoder_only_prefill
+        or not _has_deepseek_v4_sparse_mla_backend(runner)
+    ):
         return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens

@@ -245,7 +245,10 @@ def _warmup_kernels(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
 ) -> None:
-    if model_runner.vllm_config.is_mm_encoder_only:
+    if (
+        model_runner.vllm_config.is_mm_encoder_only
+        or model_runner.vllm_config.is_dsv41_encoder_only_prefill
+    ):
         return
 
     num_spec_steps = model_runner.num_speculative_steps

@@ -84,13 +84,15 @@ def test_validate_config_rejects_full_graph_for_prefills():
         )
 
 
-def test_validate_config_accepts_dsv41_encoder_only_pp2_pcp4():
+@pytest.mark.parametrize("supports_mm_inputs", [False, True])
+@pytest.mark.skip_global_cleanup
+def test_validate_config_accepts_dsv41_encoder_only_pp2_pcp4(supports_mm_inputs):
     config = _make_config(CUDAGraphMode.NONE)
     config.is_dsv41_encoder_only_prefill = True
     config.parallel_config.pipeline_parallel_size = 2
     config.parallel_config.prefill_context_parallel_size = 4
 
-    PCPManager.validate_config(config, supports_mm_inputs=False)
+    PCPManager.validate_config(config, supports_mm_inputs=supports_mm_inputs)
 
 
 def test_validate_config_rejects_generic_pp2_pcp():
@@ -99,6 +101,24 @@ def test_validate_config_rejects_generic_pp2_pcp():
 
     with pytest.raises(NotImplementedError, match="PP2/TP1/PCP4"):
         PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
+@pytest.mark.skip_global_cleanup
+def test_validate_config_rejects_generic_multimodal_pcp():
+    config = _make_config(CUDAGraphMode.NONE)
+
+    with pytest.raises(NotImplementedError, match="MM inputs"):
+        PCPManager.validate_config(config, supports_mm_inputs=True)
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsv41_pcp_rejects_scheduled_multimodal_inputs():
+    with pytest.raises(NotImplementedError, match="text-only"):
+        PCPManager.validate_scheduler_output(
+            SimpleNamespace(scheduled_encoder_inputs={"req": [object()]})
+        )
+
+    PCPManager.validate_scheduler_output(SimpleNamespace(scheduled_encoder_inputs={}))
 
 
 def test_aligned_dual_chunks_preserve_cr2_boundaries_and_empty_ranks():

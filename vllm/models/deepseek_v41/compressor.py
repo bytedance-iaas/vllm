@@ -283,6 +283,19 @@ class DeepseekCompressor(nn.Module):
         if self.state_cache is None:
             state_cache = query_start_loc = token_to_req_indices = None
             slot_mapping = cast(Any, attn_metadata[self.k_cache_prefix]).slot_mapping
+            if self.use_pcp:
+                pcp_group = get_pcp_group()
+                local_num_tokens = positions.numel()
+                expected_num_tokens = local_num_tokens * pcp_group.world_size
+                if slot_mapping.numel() != expected_num_tokens:
+                    raise RuntimeError(
+                        "PCP compressor cache mapping must contain one padded "
+                        "local slice per rank: "
+                        f"{slot_mapping.numel()} != {local_num_tokens} * "
+                        f"{pcp_group.world_size}."
+                    )
+                rank_start = pcp_group.rank_in_group * local_num_tokens
+                slot_mapping = slot_mapping[rank_start : rank_start + local_num_tokens]
         else:
             state_metadata = cast(
                 CompressorMetadata, attn_metadata[self.state_cache.prefix]
@@ -358,17 +371,19 @@ class DeepseekCompressor(nn.Module):
         self,
         latent: torch.Tensor | None,
         positions: torch.Tensor,
+        num_decode_tokens: int = 0,
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
-        if latent is None or not self.use_pcp:
+        forward_context = get_forward_context()
+        if latent is None or not self.use_pcp or forward_context.is_profile:
             return latent, positions, None
 
-        attn_metadata = get_forward_context().attn_metadata
+        attn_metadata = forward_context.attn_metadata
         assert isinstance(attn_metadata, dict)
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         (cache_latent, cache_positions), slot_mapping = maybe_gather_pcp_cache_inputs(
             (latent, positions),
             k_cache_metadata.slot_mapping,
-            k_cache_metadata.num_decode_tokens,
+            num_decode_tokens,
             True,
         )
         return cache_latent, cache_positions, slot_mapping

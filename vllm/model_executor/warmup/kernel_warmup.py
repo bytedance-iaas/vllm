@@ -400,6 +400,14 @@ def _run_flashinfer_bf16_autotune_dummy_run(
         )
 
 
+def _skip_attention_in_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
+    vllm_config = runner.vllm_config
+    return vllm_config.attention_config.hisparse_config is not None or (
+        vllm_config.is_dsv41_encoder_only_prefill
+        and vllm_config.parallel_config.prefill_context_parallel_size > 1
+    )
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
@@ -465,12 +473,13 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
-            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=hisparse_enabled)
+            skip_attn = _skip_attention_in_flashinfer_autotune(runner)
+            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
         with torch.inference_mode():
             _run_flashinfer_bf16_autotune_dummy_run(
-                runner, skip_ops=skip_ops, skip_attn=hisparse_enabled
+                runner, skip_ops=skip_ops, skip_attn=skip_attn
             )
     finally:
         set_autotune_process_group(None)

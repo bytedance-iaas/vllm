@@ -8,6 +8,8 @@ import pytest
 import torch
 
 import vllm.models.deepseek_v41.attention as attention_module
+import vllm.models.deepseek_v41.compressor as compressor_module
+import vllm.models.deepseek_v41.nvidia.flashmla as flashmla_module
 import vllm.models.deepseek_v41.sparse_mla as sparse_mla_module
 import vllm.v1.attention.ops.pcp as pcp_ops
 from vllm.forward_context import get_forward_context, set_forward_context
@@ -353,6 +355,35 @@ def test_attention_cp_plan_supports_empty_shard(monkeypatch):
     torch.testing.assert_close(restored, gathered)
 
 
+def test_flashmla_empty_pcp_shard_is_a_noop():
+    layer = SimpleNamespace(
+        compressed_cache_prefix=None,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
+    )
+    metadata = SimpleNamespace(
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=0,
+        num_prefill_tokens=0,
+    )
+    q = torch.empty(8, 1, 4)
+    output = torch.full_like(q, float("nan"))
+
+    with set_forward_context(
+        {"swa": metadata},
+        make_forward_context_config(),
+    ):
+        flashmla_module.DeepseekV4FlashMLAAttention.forward_mqa(
+            layer,
+            q,
+            torch.empty(8, 2),
+            torch.arange(8),
+            output,
+        )
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
+
+
 def test_attention_cp_projects_only_local_queries_before_full_kv_insert():
     plan = attention_module.AttentionCPPlan(
         token_indices=torch.tensor([1, 3]),
@@ -461,7 +492,8 @@ def test_attention_cp_profile_bypass_and_decode_rejection(monkeypatch):
         )
 
 
-def test_pcp_profile_bypasses_cache_gather():
+@pytest.mark.parametrize("attn_metadata", [None, {"swa": SimpleNamespace()}])
+def test_pcp_profile_bypasses_cache_gather(monkeypatch, attn_metadata):
     qr = torch.arange(12, dtype=torch.float32).reshape(4, 3)
     kv = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     positions = torch.arange(4, dtype=torch.int64)
@@ -492,14 +524,24 @@ def test_pcp_profile_bypasses_cache_gather():
         compressor=None,
         aux_stream_list=None,
         use_pcp=True,
+        swa_cache_layer=SimpleNamespace(prefix="swa"),
         n_local_heads=1,
         head_dim=2,
         _wq_b_proj=project,
         _fused_qnorm_rope_kv_insert=insert,
         _sparse_indexer_and_attn=lambda *args: None,
     )
+    monkeypatch.setattr(
+        attention_module,
+        "maybe_gather_pcp_cache_inputs",
+        lambda *args, **kwargs: pytest.fail("profile must not gather PCP cache inputs"),
+    )
 
-    with set_forward_context(None, make_forward_context_config(), is_profile=True):
+    with set_forward_context(
+        attn_metadata,
+        make_forward_context_config(),
+        is_profile=True,
+    ):
         attention_module.DeepseekV4Attention._prepare_and_attn(
             layer,
             hidden_states=torch.empty(4, 1),
@@ -515,8 +557,210 @@ def test_pcp_profile_bypasses_cache_gather():
 
     assert observed["kv"] is kv
     assert observed["kv_positions"] is positions
-    assert observed["attn_metadata"] is None
+    assert observed["attn_metadata"] is attn_metadata
     assert observed["split_q"] is True
+
+
+def test_pcp_compressor_profile_bypasses_cache_gather(monkeypatch):
+    latent = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    positions = torch.arange(4, dtype=torch.int64)
+    compressor = SimpleNamespace(use_pcp=True)
+    monkeypatch.setattr(
+        attention_module,
+        "maybe_gather_pcp_cache_inputs",
+        lambda *args, **kwargs: pytest.fail("profile must not gather PCP cache inputs"),
+    )
+
+    with set_forward_context(
+        {"cache": SimpleNamespace()},
+        make_forward_context_config(),
+        is_profile=True,
+    ):
+        cache_latent, cache_positions, slot_mapping = (
+            attention_module.DeepseekCompressor.prepare_cache_inputs(
+                compressor,
+                latent,
+                positions,
+            )
+        )
+
+    assert cache_latent is latent
+    assert cache_positions is positions
+    assert slot_mapping is None
+
+
+def test_pcp_compressor_uses_explicit_swa_decode_count(monkeypatch):
+    latent = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    positions = torch.arange(4, dtype=torch.int64)
+    slot_mapping = torch.arange(4, dtype=torch.int64)
+    compressor = SimpleNamespace(use_pcp=True, k_cache_prefix="main")
+    observed: dict[str, object] = {}
+
+    def gather(tensors, slots, num_decode_tokens, use_pcp):
+        observed.update(
+            tensors=tensors,
+            slots=slots,
+            num_decode_tokens=num_decode_tokens,
+            use_pcp=use_pcp,
+        )
+        return tensors, slots
+
+    monkeypatch.setattr(compressor_module, "maybe_gather_pcp_cache_inputs", gather)
+
+    with set_forward_context(
+        {"main": SimpleNamespace(slot_mapping=slot_mapping)},
+        make_forward_context_config(),
+    ):
+        cache_latent, cache_positions, cache_slots = (
+            attention_module.DeepseekCompressor.prepare_cache_inputs(
+                compressor,
+                latent,
+                positions,
+                num_decode_tokens=3,
+            )
+        )
+
+    gathered_tensors = observed["tensors"]
+    assert isinstance(gathered_tensors, tuple)
+    assert gathered_tensors[0] is latent
+    assert gathered_tensors[1] is positions
+    assert observed["slots"] is slot_mapping
+    assert observed["num_decode_tokens"] == 3
+    assert observed["use_pcp"] is True
+    assert cache_latent is latent
+    assert cache_positions is positions
+    assert cache_slots is slot_mapping
+
+
+@pytest.mark.parametrize("pcp_rank", range(4))
+def test_ratio1_pcp_compressor_uses_rank_local_cache_mapping(monkeypatch, pcp_rank):
+    kv_score = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    positions = torch.arange(8, dtype=torch.int64)
+    global_slots = torch.full((32,), -1, dtype=torch.int64)
+    global_slots[:8] = torch.arange(8, dtype=torch.int64)
+    observed: dict[str, object] = {}
+    compressor = SimpleNamespace(
+        state_cache=None,
+        k_cache_prefix="main",
+        use_pcp=True,
+        head_dim=2,
+        norm=SimpleNamespace(weight=torch.ones(2)),
+        rms_norm_eps=1e-6,
+        compress_ratio=1,
+    )
+
+    monkeypatch.setattr(
+        compressor_module,
+        "get_pcp_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=pcp_rank),
+    )
+
+    def save_compress(
+        kv_score,
+        positions,
+        state_cache,
+        slot_mapping,
+        query_start_loc,
+        token_to_req_indices,
+        rms_norm_weight,
+        rms_norm_eps,
+        compress_ratio,
+        latent,
+    ):
+        observed.update(
+            state_cache=state_cache,
+            slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            token_to_req_indices=token_to_req_indices,
+        )
+        latent.zero_()
+
+    monkeypatch.setattr(compressor_module, "fused_save_compress_norm", save_compress)
+
+    with set_forward_context(
+        {"main": SimpleNamespace(slot_mapping=global_slots)},
+        make_forward_context_config(),
+    ):
+        latent = attention_module.DeepseekCompressor.forward(
+            compressor, kv_score, positions
+        )
+
+    assert latent.shape == (8, 2)
+    rank_start = pcp_rank * positions.numel()
+    torch.testing.assert_close(
+        observed["slot_mapping"],
+        global_slots[rank_start : rank_start + positions.numel()],
+    )
+    assert observed["state_cache"] is None
+    assert observed["query_start_loc"] is None
+    assert observed["token_to_req_indices"] is None
+
+
+def test_ratio2_pcp_compressor_keeps_local_state_mapping(monkeypatch):
+    kv_score = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    positions = torch.arange(8, dtype=torch.int64)
+    local_slots = torch.arange(8, dtype=torch.int64)
+    query_start_loc = torch.tensor([0, 8], dtype=torch.int32)
+    token_to_req_indices = torch.zeros(8, dtype=torch.int32)
+    state_cache = torch.empty(1)
+    observed: dict[str, object] = {}
+    compressor = SimpleNamespace(
+        state_cache=SimpleNamespace(prefix="state", kv_cache=state_cache),
+        k_cache_prefix="main",
+        use_pcp=True,
+        head_dim=2,
+        norm=SimpleNamespace(weight=torch.ones(2)),
+        rms_norm_eps=1e-6,
+        compress_ratio=2,
+    )
+
+    monkeypatch.setattr(
+        compressor_module,
+        "get_pcp_group",
+        lambda: pytest.fail("ratio-2 state mapping is already rank-local"),
+    )
+
+    def save_compress(
+        kv_score,
+        positions,
+        state_cache,
+        slot_mapping,
+        query_start_loc,
+        token_to_req_indices,
+        rms_norm_weight,
+        rms_norm_eps,
+        compress_ratio,
+        latent,
+    ):
+        observed.update(
+            state_cache=state_cache,
+            slot_mapping=slot_mapping,
+            query_start_loc=query_start_loc,
+            token_to_req_indices=token_to_req_indices,
+        )
+        latent.zero_()
+
+    monkeypatch.setattr(compressor_module, "fused_save_compress_norm", save_compress)
+
+    with set_forward_context(
+        {
+            "state": SimpleNamespace(
+                slot_mapping=local_slots,
+                query_start_loc=query_start_loc,
+                token_to_req_indices=token_to_req_indices,
+            )
+        },
+        make_forward_context_config(),
+    ):
+        latent = attention_module.DeepseekCompressor.forward(
+            compressor, kv_score, positions
+        )
+
+    assert latent.shape == (8, 2)
+    assert observed["state_cache"] is state_cache
+    assert observed["slot_mapping"] is local_slots
+    assert observed["query_start_loc"] is query_start_loc
+    assert observed["token_to_req_indices"] is token_to_req_indices
 
 
 def test_attention_cp_plan_is_reused_within_forward_context(monkeypatch):
@@ -631,11 +875,17 @@ def test_attention_cp_uses_local_q_and_full_kv_kernel_modes(monkeypatch):
     assert calls == [("q", (2, 16, 512), 0), ("kv", (4, 512), 4)]
 
 
-def test_attention_cp_keeps_short_prompt_tails_on_prefill_path(monkeypatch):
+@pytest.mark.parametrize(
+    ("attention_cp_size", "pcp_size", "expected_threshold"),
+    [(2, 1, 0), (1, 4, 0), (1, 1, 1)],
+)
+def test_context_parallel_keeps_short_prompt_tails_on_prefill_path(
+    monkeypatch, attention_cp_size, pcp_size, expected_threshold
+):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            attention_context_parallel_size=2,
-            prefill_context_parallel_size=1,
+            attention_context_parallel_size=attention_cp_size,
+            prefill_context_parallel_size=pcp_size,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(compress_ratios=[0, 1, 2])
@@ -651,10 +901,15 @@ def test_attention_cp_keeps_short_prompt_tails_on_prefill_path(monkeypatch):
         "__init__",
         initialize_base,
     )
+    monkeypatch.setattr(
+        sparse_mla_module,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
 
     builder = sparse_mla_module.DeepseekV41SparseSWAMetadataBuilder()
 
-    assert builder.decode_threshold == 0
+    assert builder.decode_threshold == expected_threshold
 
 
 def test_pcp_swa_metadata_uses_local_slots_and_keeps_cache_write_view(monkeypatch):
