@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_MAX_AUDIO_PREPROCESS_WORKERS: int = max(1, min(os.cpu_count() or 1, 2))
     VLLM_MAX_EMBED_DECODE_BYTES: int = 2_147_483_648
     VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS: int = 0
+    VLLM_DSV41_ATTN_INPUT_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_ENGRAM_TOKEN_EXCHANGE: bool = False
     VLLM_DSV41_STACK_CONTEXT_WKV: bool = False
     VLLM_DSV41_VALIDATE_STACK_CONTEXT_WKV: bool = False
@@ -1045,6 +1046,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Zero keeps the replicated path.
     "VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_DSV41_ENGRAM_TOKEN_SHARD_MIN_TOKENS", "0")
+    ),
+    # Token threshold for the TP-sharded DeepSeek-V4.1 Attention input
+    # projection. Zero keeps the replicated path.
+    "VLLM_DSV41_ATTN_INPUT_TOKEN_SHARD_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV41_ATTN_INPUT_TOKEN_SHARD_MIN_TOKENS", "0")
     ),
     # Exchange heads directly to token owners in the eager TP-sharded path.
     "VLLM_DSV41_ENGRAM_TOKEN_EXCHANGE": lambda: bool(
