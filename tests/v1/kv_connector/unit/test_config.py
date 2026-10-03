@@ -52,6 +52,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
                 hf_text_config=SimpleNamespace(
                     sliding_window=128,
                     num_hidden_layers=values["num_layers"],
+                    compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
                     kv_source_layer_ids=values["kv_sources"],
                     index_source_layer_ids=values["index_sources"],
                     engram_layer_ids=values["engram_layers"],
@@ -73,7 +74,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
             ),
             cache_config=SimpleNamespace(
                 swa_bounded_replay=values["bounded_replay"],
-                cache_dtype="fp8_ds_mxfp8",
+                cache_dtype="fp8_ds_mla",
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=values["async_scheduling"]
@@ -112,6 +113,14 @@ def test_attention_context_parallel_accepts_pp2_tp4_cp4(monkeypatch):
         VllmConfig._verify_attention_context_parallel(config)
 
 
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_accepts_pp10_cache_relay(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,30")
+    config = _dsv41_handoff_config(pp=2, tp=4, attn_cp=4)
+
+    VllmConfig._verify_dsv41_encoder_only_handoff(config)
+
+
 @pytest.mark.parametrize(
     ("tp", "attn_cp"),
     [(4, 2), (8, 4)],
@@ -131,7 +140,7 @@ def test_attention_context_parallel_rejects_other_pp2_layouts(tp, attn_cp):
         VllmConfig._verify_attention_context_parallel(config)
 
 
-@pytest.mark.parametrize("partition", ["10,30", "12,28", "20,20"])
+@pytest.mark.parametrize("partition", ["12,28", "20,20"])
 @pytest.mark.skip_global_cleanup
 def test_dsv41_encoder_only_handoff_rejects_unsafe_pp_cut(monkeypatch, partition):
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)

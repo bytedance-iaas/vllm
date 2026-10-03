@@ -33,7 +33,9 @@ from vllm.models.deepseek_v41.common.ops import (
     MXFP4_BLOCK_SIZE,
     compute_global_topk_indices_and_lens,
     fused_indexer_q_rope_quant,
+    gather_packed_kv_cache_rows,
     indexer_k_norm_rope_store,
+    scatter_packed_kv_cache_rows,
 )
 
 if TYPE_CHECKING:
@@ -457,6 +459,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         candidate_compact_logits_buffer: torch.Tensor | None = None,
         candidate_compact_indices_buffer: torch.Tensor | None = None,
         candidate_compact_ends_buffer: torch.Tensor | None = None,
+        cross_stage_kv_cache_layer_id: int | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -552,6 +555,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             self.kv_source_layer_id = None
             self.index_source_layer_id = None
+        self.cross_stage_kv_cache_layer_id = cross_stage_kv_cache_layer_id
+        self.is_cross_stage_kv_cache_owner = cross_stage_kv_cache_layer_id == layer_id
+        if cross_stage_kv_cache_layer_id is not None and (
+            self.compress_ratio != 2
+            or self.kv_source_layer_id is None
+            or cross_stage_kv_cache_layer_id > layer_id
+        ):
+            raise ValueError(
+                "DeepSeek V4.1 cross-stage KV relay requires a ratio-2 "
+                "consumer at or after its receiver layer."
+            )
         reuse_decode_global_topk = os.environ.get(
             "VLLM_DSV41_REUSE_DECODE_GLOBAL_TOPK", "0"
         )
@@ -801,11 +815,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # cache (self for kv sources).
         if self.compress_ratio > 0:
             assert self.kv_source_layer_id is not None
+            cache_layer_id = (
+                self.cross_stage_kv_cache_layer_id
+                if self.cross_stage_kv_cache_layer_id is not None
+                else self.kv_source_layer_id
+            )
             self.compressed_cache_prefix: str | None = _replace_layer_index(
-                prefix, self.kv_source_layer_id
+                prefix, cache_layer_id
             )
             if (
-                not self.is_kv_source
+                not (self.is_kv_source or self.is_cross_stage_kv_cache_owner)
                 and self.compressed_cache_prefix not in self._static_forward_context
             ):
                 raise NotImplementedError(
@@ -1204,9 +1223,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 quant_method.input_schema,
                 self.fused_wqa_wkv.params_dtype,
             )
-        elif isinstance(
-            quant_method, ModelOptLinearMethod
-        ) and isinstance(quant_method.kernel, HummingMxfp8LinearKernel):
+        elif isinstance(quant_method, ModelOptLinearMethod) and isinstance(
+            quant_method.kernel, HummingMxfp8LinearKernel
+        ):
             quant_key = quant_method.spec.activation
         else:
             return False
@@ -1250,9 +1269,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         tp_group = get_tp_group()
-        logger.info_once(
-            "Running TP-sharded DeepSeek V4.1 Attention input projection."
-        )
+        logger.info_once("Running TP-sharded DeepSeek V4.1 Attention input projection.")
         num_tokens = hidden_states.shape[0]
         shard_size = (num_tokens + tp_group.world_size - 1) // tp_group.world_size
         start = min(tp_group.rank_in_group * shard_size, num_tokens)
@@ -1264,9 +1281,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 (shard_size, hidden_states.shape[1])
             )
             if valid:
-                local_hidden_states[:valid].copy_(
-                    hidden_states[start : start + valid]
-                )
+                local_hidden_states[:valid].copy_(hidden_states[start : start + valid])
 
         local_qr_kv, _ = self.fused_wqa_wkv(local_hidden_states)
         qr_kv = tp_group.all_gather(local_qr_kv, dim=0)
@@ -1534,6 +1549,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
 
+    def export_cross_stage_kv(self, positions: torch.Tensor) -> torch.Tensor:
+        if not self.is_kv_source or self.compress_ratio != 2:
+            raise RuntimeError(
+                f"Layer {self.layer_id} is not a ratio-2 cross-stage KV producer."
+            )
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            raise RuntimeError(
+                "Cross-stage KV export requires real attention metadata."
+            )
+        metadata = cast(Any, attn_metadata[self.prefix])
+        if metadata.num_actual_tokens != positions.shape[0]:
+            raise NotImplementedError(
+                "Cross-stage KV relay does not support padded token rows."
+            )
+        return gather_packed_kv_cache_rows(
+            self.kv_cache,
+            positions,
+            metadata.req_id_per_token,
+            metadata.block_table,
+            self.compress_ratio,
+        )
+
+    def import_cross_stage_kv(
+        self, packed_rows: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        if not self.is_cross_stage_kv_cache_owner or self.compress_ratio != 2:
+            raise RuntimeError(
+                f"Layer {self.layer_id} is not a ratio-2 cross-stage KV receiver."
+            )
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            raise RuntimeError(
+                "Cross-stage KV import requires real attention metadata."
+            )
+        metadata = cast(Any, attn_metadata[self.prefix])
+        if (
+            metadata.num_actual_tokens != positions.shape[0]
+            or packed_rows.shape[0] != positions.shape[0]
+        ):
+            raise NotImplementedError(
+                "Cross-stage KV relay does not support padded token rows."
+            )
+        scatter_packed_kv_cache_rows(
+            packed_rows,
+            positions,
+            self.kv_cache,
+            metadata.slot_mapping,
+            self.compress_ratio,
+        )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
@@ -1542,7 +1608,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # source's cache through the forward context, and cr==0 layers are
         # pure SWA. The SWA cache is allocated separately as
         # DeepseekV4SWACache.
-        if not self.is_kv_source:
+        if not (self.is_kv_source or self.is_cross_stage_kv_cache_owner):
             return None
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout whose page rounds up
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
@@ -1567,7 +1633,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def _compressed_kv_cache(self) -> torch.Tensor:
         """The compressed-KV cache tensor of this layer's kv source (own
         cache for kv-source layers)."""
-        if self.is_kv_source:
+        if self.is_kv_source or self.is_cross_stage_kv_cache_owner:
             return self.kv_cache
         assert self.compressed_cache_prefix is not None
         source = self._static_forward_context[self.compressed_cache_prefix]

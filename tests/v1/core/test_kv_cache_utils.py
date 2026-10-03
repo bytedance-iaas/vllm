@@ -504,6 +504,77 @@ def test_dsv41_encoder_only_profile_projects_prefill_pp_groups(monkeypatch, cut)
 
 
 @pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_pp10_isolates_local_relay_group(monkeypatch):
+    sources = (2, 8, 14, 20)
+    config = VllmConfig(model_config=ModelConfig(max_model_len=128))
+    config.kv_transfer_config = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        dsv41_encoder_only_prefill=True,
+    )
+    config.cache_config.kv_cache_layout = "BLNHC"
+    config.parallel_config.pipeline_parallel_size = 2
+    config.model_config.hf_text_config.num_hidden_layers = 40
+    config.model_config.hf_text_config.kv_source_layer_ids = sources
+    config.model_config.hf_text_config.index_source_layer_ids = sources
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,30")
+    specs: dict[str, KVCacheSpec] = {}
+    global_names = set()
+    for layer in sources:
+        for suffix, head_size in (("", 576), (".indexer.k_cache", 132)):
+            name = f"model.layers.{layer}.attn{suffix}"
+            global_names.add(name)
+            specs[name] = MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=head_size,
+                dtype=torch.uint8,
+                tokens_per_state=1 if layer == 20 else 2,
+                model_version="deepseek_v4",
+            )
+    relay_name = "model.layers.10.attn"
+    specs[relay_name] = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        tokens_per_state=2,
+        model_version="deepseek_v4",
+    )
+    for layer in range(40):
+        specs[f"model.layers.{layer}.swa"] = SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+            bounded_replay=True,
+            model_version="deepseek_v4",
+        )
+
+    worker_specs = [
+        {
+            name: spec
+            for name, spec in specs.items()
+            if start <= int(name.split(".")[2]) < end
+        }
+        for start, end in ((0, 10), (10, 40))
+    ]
+    workers = get_kv_cache_configs(config, worker_specs, [64 * 1024**2] * 2)
+    scheduler = generate_scheduler_kv_cache_config(
+        workers, merge_pp_transfer_groups=True
+    )
+
+    relay_groups = [
+        group for group in scheduler.kv_cache_groups if relay_name in group.layer_names
+    ]
+    assert len(relay_groups) == 1
+    assert relay_groups[0].enable_kv_transfer is False
+    assert relay_groups[0].kv_cache_spec.prefix_cacheable is True
+    assert set(scheduler.transfer_group_index_by_layer) == global_names
+
+
+@pytest.mark.skip_global_cleanup
 def test_dsv41_encoder_only_profile_rejects_missing_or_mixed_global_state():
     global_name = "model.layers.20.attn"
     index_name = "model.layers.20.attn.indexer.k_cache"

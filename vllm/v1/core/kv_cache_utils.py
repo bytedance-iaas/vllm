@@ -2702,6 +2702,40 @@ def _apply_dsv41_encoder_only_transfer_profile(
         )
 
 
+def _extract_dsv41_pipeline_relay_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Keep the PP 10,30 L8 replica local while preserving prefix caching."""
+    if (
+        not vllm_config.is_dsv41_encoder_only_prefill
+        or vllm_config.parallel_config.pipeline_parallel_size != 2
+    ):
+        return []
+
+    from vllm.distributed.utils import get_pp_indices
+
+    num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
+    _, cut = get_pp_indices(num_layers, 0, 2)
+    if cut != 10:
+        return []
+
+    suffix = ".layers.10.attn"
+    relay_names = [name for name in kv_cache_spec if name.endswith(suffix)]
+    if len(relay_names) != 1:
+        raise ValueError(
+            "The DeepSeek V4.1 PP 10,30 cache relay requires exactly one "
+            "layer-10 receiver cache."
+        )
+    name = relay_names[0]
+    spec = kv_cache_spec.pop(name)
+    if not isinstance(spec, MLAAttentionSpec) or spec.tokens_per_state != 2:
+        raise ValueError(
+            "The DeepSeek V4.1 PP 10,30 receiver must use a ratio-2 MLA cache."
+        )
+    return [KVCacheGroupSpec([name], spec, enable_kv_transfer=False)]
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2753,6 +2787,9 @@ def get_kv_cache_configs(
     # Check if the KV cache specs are registered correctly.
     # This is to prevent that some layers are initialized with unregistered specs.
     KVCacheSpecRegistry.check_kv_cache_spec_registry(merged_kv_cache_specs)
+    pipeline_relay_groups = _extract_dsv41_pipeline_relay_groups(
+        vllm_config, merged_kv_cache_specs
+    )
 
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
@@ -2774,6 +2811,7 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    global_kv_cache_groups.extend(pipeline_relay_groups)
     if vllm_config.uses_dsv41_encoder_only_handoff:
         hf_config = vllm_config.model_config.hf_text_config
         _apply_dsv41_encoder_only_transfer_profile(

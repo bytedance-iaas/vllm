@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.models.deepseek_v41.common.pipeline import (
+    get_encoder_only_cache_relay,
     get_sharing_dependencies,
     validate_local_sharing,
 )
@@ -49,11 +50,32 @@ def test_equal_pp4_reports_cross_stage_kv_index_and_candidates():
         validate_local_sharing(dependencies)
 
 
+def test_prefill_pp_10_30_admits_exact_layer_8_cache_relay():
+    dependencies = get_sharing_dependencies(_config(), [(0, 10), (10, 40)])
+    relay = get_encoder_only_cache_relay(_config(), [(0, 10), (10, 40)], dependencies)
+
+    assert relay is not None
+    assert relay.source_layer == 8
+    assert relay.receiver_layer == 10
+    assert relay.consumer_layers == (10, 11, 12, 13)
+    validate_local_sharing(dependencies, relay)
+
+
 @pytest.mark.parametrize("cut", [10, 12])
 def test_prefill_pp_cut_inside_shared_group_fails_closed(cut):
     dependencies = get_sharing_dependencies(_config(), [(0, cut), (cut, 40)])
     with pytest.raises(NotImplementedError, match="source layer 8"):
         validate_local_sharing(dependencies)
+
+
+def test_prefill_pp_cache_relay_rejects_changed_dependency_set():
+    config = _config()
+    config.index_source_layer_ids = [2, 8, 12, 14, 20, 24, 28, 32, 36]
+    dependencies = get_sharing_dependencies(config, [(0, 10), (10, 40)])
+
+    assert (
+        get_encoder_only_cache_relay(config, [(0, 10), (10, 40)], dependencies) is None
+    )
 
 
 @pytest.mark.parametrize("values", [[8, 2], [2, 2], [0, 2], [-1, 2], [2, 40]])
