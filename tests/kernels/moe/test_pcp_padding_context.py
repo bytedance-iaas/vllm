@@ -28,6 +28,8 @@ class FakePCPGroup:
 def make_runner() -> MoERunner:
     runner = MoERunner.__new__(MoERunner)
     runner.moe_config = SimpleNamespace(
+        dp_size=1,
+        is_sequence_parallel=False,
         pcp_size=2,
         sp_size=1,
         moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
@@ -85,3 +87,43 @@ def test_pcp_profile_padding_mask_avoids_collective(monkeypatch):
 
     assert context.is_padding is local_mask
     assert group.calls == 0
+
+
+def test_pcp_dispatch_gathers_input_ids_with_routed_rows(monkeypatch):
+    hidden_states = torch.tensor([[1.0], [2.0]])
+    router_logits = torch.tensor([[3.0, 4.0], [5.0, 6.0]])
+    input_ids = torch.tensor([10, 11])
+    gathered = [
+        torch.cat((hidden_states, hidden_states + 100)),
+        torch.cat((router_logits, router_logits + 100)),
+        torch.cat((input_ids, input_ids + 100)),
+    ]
+
+    class OrderedGatherGroup:
+        def __init__(self):
+            self.calls = 0
+
+        def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+            assert dim == 0
+            expected = (hidden_states, router_logits, input_ids)[self.calls]
+            assert tensor is expected
+            result = gathered[self.calls]
+            self.calls += 1
+            return result
+
+    group = OrderedGatherGroup()
+    context = SimpleNamespace(is_padding=None)
+    monkeypatch.setattr(moe_runner_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(moe_runner_module, "get_pcp_group", lambda: group)
+
+    actual_hidden, actual_router, actual_input_ids = make_runner()._maybe_dispatch(
+        hidden_states,
+        router_logits,
+        input_ids,
+    )
+
+    torch.testing.assert_close(actual_hidden, gathered[0])
+    torch.testing.assert_close(actual_router, gathered[1])
+    torch.testing.assert_close(actual_input_ids, gathered[2])
+    assert actual_input_ids.shape[0] == actual_hidden.shape[0]
+    assert group.calls == 3
