@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
 from vllm.distributed.parallel_state import (
     get_attn_cp_group,
     get_attn_tp_group,
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -556,6 +557,16 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                 "Mooncake attention context parallelism supports pure "
                 "kv_producer instances only."
             )
+        pcp_size = getattr(
+            vllm_config.parallel_config, "prefill_context_parallel_size", 1
+        )
+        if pcp_size > 1:
+            if vllm_config.kv_transfer_config.kv_role != "kv_producer":
+                raise NotImplementedError(
+                    "Mooncake PCP requires a pure kv_producer instance."
+                )
+            if vllm_config.parallel_config.decode_context_parallel_size > 1:
+                raise NotImplementedError("Mooncake PCP producers require DCP1.")
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
@@ -640,8 +651,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished_count(self) -> int | None:
         if self._kv_transfer_config.kv_role != "kv_producer":
             return None
-        attn_cp_size = self._vllm_config.parallel_config.attention_context_parallel_size
-        return self._vllm_config.parallel_config.world_size // attn_cp_size
+        parallel_config = self._vllm_config.parallel_config
+        replicated_cp_size = parallel_config.attention_context_parallel_size * getattr(
+            parallel_config, "prefill_context_parallel_size", 1
+        )
+        return parallel_config.world_size // replicated_cp_size
 
     ############################################################
     # Worker Side Methods
@@ -1094,9 +1108,13 @@ class MooncakeConnectorWorker:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
             self.attn_cp_rank = 0
+        self.pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.is_canonical_attn_cp_rank = self.attn_cp_rank == 0
         self.is_sender_worker = (
-            not self.is_kv_consumer and self.is_canonical_attn_cp_rank
+            not self.is_kv_consumer
+            and self.is_canonical_attn_cp_rank
+            and self.pcp_rank == 0
         )
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
@@ -1885,7 +1903,7 @@ class MooncakeConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
-        if self.is_kv_producer and not self.is_canonical_attn_cp_rank:
+        if self.is_kv_producer and not self.is_sender_worker:
             self.device_kv_caches = kv_caches
             return
 
@@ -2495,6 +2513,11 @@ def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     if (
         parallel_config.attention_context_parallel_size > 1
         and get_attn_cp_group().rank_in_group != 0
+    ):
+        return False
+    if (
+        getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
+        and get_pcp_group().rank_in_group != 0
     ):
         return False
 

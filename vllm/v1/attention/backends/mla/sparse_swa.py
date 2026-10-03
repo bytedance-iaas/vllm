@@ -143,6 +143,10 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
 
 
 class DeepseekSparseSWABackend(AttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_SPARSE_SWA"
@@ -206,6 +210,9 @@ class DeepseekSparseSWAMetadata:
     # window attention may read (SWA bounded replay);
     # zeros when nothing replays.
     replay_start: torch.Tensor | None = None
+    # Under PCP, query metadata uses this rank's slot slice while cache writers
+    # consume the complete rank-major mapping.
+    cache_slot_mapping: torch.Tensor | None = None
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0

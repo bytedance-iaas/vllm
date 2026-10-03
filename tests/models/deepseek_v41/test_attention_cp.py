@@ -9,7 +9,11 @@ import torch
 
 import vllm.models.deepseek_v41.attention as attention_module
 import vllm.models.deepseek_v41.sparse_mla as sparse_mla_module
+import vllm.v1.attention.ops.pcp as pcp_ops
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.models.deepseek_v41.compressor import CompressorBackend
+from vllm.models.deepseek_v41.sparse_mla import DeepseekV4FlashMLABackend
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
@@ -37,6 +41,39 @@ class FakeGroup:
         assert dim == 0
         self.all_gatherv_sizes = sizes
         return tensor if self.all_gatherv_result is None else self.all_gatherv_result
+
+
+def test_dsv41_cache_backends_advertise_pcp_support():
+    assert CompressorBackend.supports_pcp()
+    assert DeepseekSparseSWABackend.supports_pcp()
+    assert DeepseekV4FlashMLABackend.supports_pcp()
+
+
+def test_pcp_cache_inputs_gather_only_partitioned_prefill(monkeypatch):
+    class GatherGroup:
+        world_size = 2
+
+        def all_gather(self, tensor, dim=0):
+            assert dim == 0
+            return torch.cat((tensor, tensor + 100), dim=0)
+
+    monkeypatch.setattr(pcp_ops, "get_pcp_group", GatherGroup)
+    values = torch.tensor([10, 20, 21])
+    positions = torch.tensor([0, 1, 2])
+    slots = torch.arange(6)
+
+    (cache_values, cache_positions), cache_slots = (
+        pcp_ops.maybe_gather_pcp_cache_inputs(
+            (values, positions),
+            slots,
+            num_decode_tokens=1,
+            use_pcp=True,
+        )
+    )
+
+    torch.testing.assert_close(cache_values, torch.tensor([10, 20, 21, 120, 121]))
+    torch.testing.assert_close(cache_positions, torch.tensor([0, 1, 2, 101, 102]))
+    torch.testing.assert_close(cache_slots, torch.tensor([0, 1, 2, 4, 5]))
 
 
 def make_forward_context_config() -> SimpleNamespace:
@@ -357,6 +394,7 @@ def test_attention_cp_projects_only_local_queries_before_full_kv_insert():
         indexer=None,
         compressor=None,
         aux_stream_list=None,
+        use_pcp=False,
         n_local_heads=1,
         head_dim=2,
         _wq_b_proj=project,
@@ -421,6 +459,64 @@ def test_attention_cp_profile_bypass_and_decode_rejection(monkeypatch):
         attention_module.DeepseekV4Attention._build_attention_cp_plan(
             layer, torch.device("cpu")
         )
+
+
+def test_pcp_profile_bypasses_cache_gather():
+    qr = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    kv = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    positions = torch.arange(4, dtype=torch.int64)
+    observed: dict[str, object] = {}
+
+    def project(local_qr: torch.Tensor, qr_scale: None) -> torch.Tensor:
+        return local_qr[:, :2]
+
+    def insert(
+        q: torch.Tensor,
+        full_kv: torch.Tensor,
+        q_positions: torch.Tensor,
+        kv_positions: torch.Tensor,
+        attn_metadata: object,
+        *,
+        split_q: bool,
+    ) -> torch.Tensor:
+        observed.update(
+            kv=full_kv,
+            kv_positions=kv_positions,
+            attn_metadata=attn_metadata,
+            split_q=split_q,
+        )
+        return q
+
+    layer = SimpleNamespace(
+        indexer=None,
+        compressor=None,
+        aux_stream_list=None,
+        use_pcp=True,
+        n_local_heads=1,
+        head_dim=2,
+        _wq_b_proj=project,
+        _fused_qnorm_rope_kv_insert=insert,
+        _sparse_indexer_and_attn=lambda *args: None,
+    )
+
+    with set_forward_context(None, make_forward_context_config(), is_profile=True):
+        attention_module.DeepseekV4Attention._prepare_and_attn(
+            layer,
+            hidden_states=torch.empty(4, 1),
+            qr=qr,
+            kv=kv,
+            qr_scale=None,
+            kv_score=torch.empty(4, 1),
+            indexer_weights=torch.empty(4, 1),
+            positions=positions,
+            attn_out=torch.empty(4, 1, 2),
+            cp_plan=None,
+        )
+
+    assert observed["kv"] is kv
+    assert observed["kv_positions"] is positions
+    assert observed["attn_metadata"] is None
+    assert observed["split_q"] is True
 
 
 def test_attention_cp_plan_is_reused_within_forward_context(monkeypatch):
@@ -537,7 +633,10 @@ def test_attention_cp_uses_local_q_and_full_kv_kernel_modes(monkeypatch):
 
 def test_attention_cp_keeps_short_prompt_tails_on_prefill_path(monkeypatch):
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(attention_context_parallel_size=2),
+        parallel_config=SimpleNamespace(
+            attention_context_parallel_size=2,
+            prefill_context_parallel_size=1,
+        ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(compress_ratios=[0, 1, 2])
         ),
@@ -556,6 +655,57 @@ def test_attention_cp_keeps_short_prompt_tails_on_prefill_path(monkeypatch):
     builder = sparse_mla_module.DeepseekV41SparseSWAMetadataBuilder()
 
     assert builder.decode_threshold == 0
+
+
+def test_pcp_swa_metadata_uses_local_slots_and_keeps_cache_write_view(monkeypatch):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            attention_context_parallel_size=1,
+            prefill_context_parallel_size=4,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(compress_ratios=[0, 1, 2])
+        ),
+    )
+    observed: dict[str, torch.Tensor] = {}
+
+    def initialize_base(builder, *args, **kwargs):
+        builder.vllm_config = config
+        builder.decode_threshold = 1
+
+    def build_base(
+        builder,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        replay_start=None,
+    ):
+        observed["slot_mapping"] = common_attn_metadata.slot_mapping
+        return SimpleNamespace(cache_slot_mapping=None)
+
+    monkeypatch.setattr(
+        sparse_mla_module.DeepseekSparseSWAMetadataBuilder,
+        "__init__",
+        initialize_base,
+    )
+    monkeypatch.setattr(
+        sparse_mla_module.DeepseekSparseSWAMetadataBuilder,
+        "build",
+        build_base,
+    )
+    monkeypatch.setattr(
+        sparse_mla_module,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=2),
+    )
+
+    slots = torch.arange(16, dtype=torch.int64)
+    common = SimpleNamespace(slot_mapping=slots)
+    common.replace = lambda **kwargs: SimpleNamespace(**kwargs)
+    metadata = sparse_mla_module.DeepseekV41SparseSWAMetadataBuilder().build(0, common)
+
+    torch.testing.assert_close(observed["slot_mapping"], slots[8:12])
+    assert metadata.cache_slot_mapping.data_ptr() == slots.data_ptr()
 
 
 def test_cp1_keeps_opaque_quantized_query_path():
@@ -580,6 +730,7 @@ def test_cp1_keeps_opaque_quantized_query_path():
         indexer=None,
         compressor=None,
         aux_stream_list=None,
+        use_pcp=False,
         n_local_heads=1,
         head_dim=2,
         _wq_b_proj=project,

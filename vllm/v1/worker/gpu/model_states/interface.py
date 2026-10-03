@@ -153,6 +153,15 @@ class ModelState(ABC):
         across block boundaries. No-op by default."""
         return None
 
+    def preprocess_pcp_slot_mappings(
+        self,
+        global_input_batch: InputBatch,
+        global_slot_mappings: torch.Tensor,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        """Update global PCP slot mappings before rank-major expansion."""
+        return None
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,

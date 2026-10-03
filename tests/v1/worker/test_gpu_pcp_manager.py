@@ -14,7 +14,10 @@ from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
-from vllm.v1.worker.gpu.pcp_manager import PCPManager
+from vllm.v1.worker.gpu.pcp_manager import (
+    PCPManager,
+    maybe_restore_pcp_input_batch,
+)
 
 
 def _copy_to_cpu(value, device=None, dtype=None, out=None):
@@ -30,8 +33,13 @@ def _make_config(cudagraph_mode: CUDAGraphMode):
             prefill_context_parallel_size=2,
             decode_context_parallel_size=1,
             pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+            attention_context_parallel_size=1,
+            distributed_executor_backend="mp",
             dcp_comm_backend="ag_rs",
         ),
+        is_dsv41_encoder_only_prefill=False,
+        cache_config=SimpleNamespace(block_size=64),
         model_config=SimpleNamespace(
             use_mla=True,
             is_encoder_decoder=False,
@@ -74,6 +82,82 @@ def test_validate_config_rejects_full_graph_for_prefills():
         PCPManager.validate_config(
             _make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+def test_validate_config_accepts_dsv41_encoder_only_pp2_pcp4():
+    config = _make_config(CUDAGraphMode.NONE)
+    config.is_dsv41_encoder_only_prefill = True
+    config.parallel_config.pipeline_parallel_size = 2
+    config.parallel_config.prefill_context_parallel_size = 4
+
+    PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
+def test_validate_config_rejects_generic_pp2_pcp():
+    config = _make_config(CUDAGraphMode.NONE)
+    config.parallel_config.pipeline_parallel_size = 2
+
+    with pytest.raises(NotImplementedError, match="PP2/TP1/PCP4"):
+        PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
+def test_aligned_dual_chunks_preserve_cr2_boundaries_and_empty_ranks():
+    query_lens = np.array([65], dtype=np.int32)
+    is_prefilling = np.ones(1, dtype=np.bool_)
+    chunks_by_rank = []
+
+    for rank in range(4):
+        manager = PCPManager(
+            pcp_world_size=4,
+            pcp_rank=rank,
+            device=torch.device("cpu"),
+            prefill_chunk_alignment=64,
+        )
+        chunks = list(manager._iter_rank_chunks(rank, query_lens, is_prefilling))
+        chunks_by_rank.append(chunks)
+        for _, offset, _ in chunks:
+            assert offset % 64 == 0
+
+    assert chunks_by_rank == [[(0, 0, 64)], [(0, 64, 1)], [], []]
+
+
+def test_unaligned_continued_prefill_is_replicated_for_compressor_state():
+    query_lens = np.array([65], dtype=np.int32)
+    starts = np.array([0], dtype=np.int32)
+    prefill_lens = np.array([1000], dtype=np.int32)
+    is_prefilling = np.ones(1, dtype=np.bool_)
+
+    for rank in range(4):
+        manager = PCPManager(
+            pcp_world_size=4,
+            pcp_rank=rank,
+            device=torch.device("cpu"),
+            prefill_chunk_alignment=64,
+        )
+        assert list(
+            manager._iter_rank_chunks(
+                rank,
+                query_lens,
+                is_prefilling,
+                starts,
+                prefill_lens,
+            )
+        ) == [(0, 0, 65)]
+
+
+def test_restore_input_batch_does_not_gather_hidden_states():
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    global_batch = MagicMock()
+    local_batch = MagicMock()
+    manager._global_batch = global_batch
+    manager._local_batch = local_batch
+
+    assert maybe_restore_pcp_input_batch(manager, local_batch) is global_batch
+    assert maybe_restore_pcp_input_batch(manager, global_batch) is global_batch
 
 
 def test_replicated_decode_piecewise_graph_padding(monkeypatch):

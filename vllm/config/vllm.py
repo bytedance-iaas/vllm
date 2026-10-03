@@ -2840,10 +2840,23 @@ class VllmConfig:
                     "sharing group before L20, except for the validated TP4/PP2/"
                     "attention-CP4 10,30 layer-8 cache relay."
                 )
-        if self.parallel_config.prefill_context_parallel_size != 1:
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        if pcp_size != 1 and (
+            pp_size,
+            self.parallel_config.tensor_parallel_size,
+            pcp_size,
+            self.parallel_config.decode_context_parallel_size,
+        ) != (2, 1, 4, 1):
             raise ValueError(
-                "dsv41_encoder_only_prefill does not support prefill context "
-                "parallelism."
+                "dsv41_encoder_only_prefill supports PCP only with PP2/TP1/PCP4/DCP1."
+            )
+        if pcp_size > 1 and self.cache_config.cache_dtype not in (
+            "auto",
+            "fp8_ds_mla",
+        ):
+            raise ValueError(
+                "dsv41_encoder_only_prefill PCP requires the packed "
+                "fp8_ds_mla KV cache."
             )
         if self.parallel_config.use_ubatching:
             raise ValueError(

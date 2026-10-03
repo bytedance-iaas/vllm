@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -25,6 +26,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.ops.pcp import maybe_gather_pcp_cache_inputs
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 
 
@@ -35,6 +37,10 @@ class CompressorBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "CompressorBackend"
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -90,6 +96,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, CircularBufferSpec)
         self.capacity = self.kv_cache_spec.block_size
+        parallel_config = self.vllm_config.parallel_config
+        self.pcp_world_size = getattr(
+            parallel_config, "prefill_context_parallel_size", 1
+        )
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
         max_num_batched_tokens = (
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
@@ -106,7 +117,14 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
-        num_tokens = common_attn_metadata.slot_mapping.numel()
+        slot_mapping = common_attn_metadata.slot_mapping
+        if self.pcp_world_size > 1:
+            padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+            slot_mapping = slot_mapping[
+                self.pcp_rank * padded_num_tokens : (self.pcp_rank + 1)
+                * padded_num_tokens
+            ]
+        num_tokens = slot_mapping.numel()
         positions = common_attn_metadata.positions
         assert positions is not None
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
@@ -215,6 +233,7 @@ class DeepseekCompressor(nn.Module):
         self.device = current_platform.device_type
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
 
         wkv_wgate_sizes = (
             [self.head_dim, self.head_dim] if self.has_gate else [self.head_dim]
@@ -298,6 +317,8 @@ class DeepseekCompressor(nn.Module):
         latent: torch.Tensor | None,
         positions: torch.Tensor,
         rotary_emb,
+        *,
+        cache_inputs_prepared: bool = False,
     ) -> None:
         """Publish compressed main-cache rows after the latent becomes ready."""
         if latent is None:
@@ -305,6 +326,14 @@ class DeepseekCompressor(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         assert isinstance(attn_metadata, dict)
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+        slot_mapping = k_cache_metadata.slot_mapping
+        if self.use_pcp and not cache_inputs_prepared:
+            (latent, positions), slot_mapping = maybe_gather_pcp_cache_inputs(
+                (latent, positions),
+                slot_mapping,
+                k_cache_metadata.num_decode_tokens,
+                True,
+            )
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
         # Plain-row per-tensor fp8 caches (FlashInfer) carry the layer's scale;
@@ -320,7 +349,26 @@ class DeepseekCompressor(nn.Module):
             positions,
             rotary_emb.cos_sin_cache,
             kv_cache,
-            k_cache_metadata.slot_mapping,
+            slot_mapping,
             self.compress_ratio,
             fp8_scale=fp8_scale,
         )
+
+    def prepare_cache_inputs(
+        self,
+        latent: torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        if latent is None or not self.use_pcp:
+            return latent, positions, None
+
+        attn_metadata = get_forward_context().attn_metadata
+        assert isinstance(attn_metadata, dict)
+        k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+        (cache_latent, cache_positions), slot_mapping = maybe_gather_pcp_cache_inputs(
+            (latent, positions),
+            k_cache_metadata.slot_mapping,
+            k_cache_metadata.num_decode_tokens,
+            True,
+        )
+        return cache_latent, cache_positions, slot_mapping

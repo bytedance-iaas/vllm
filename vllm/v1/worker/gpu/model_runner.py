@@ -1538,7 +1538,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         if self.pcp_manager is not None:
-            return self.pcp_manager.prepare_attn(input_batch)
+            return self.pcp_manager.prepare_attn(
+                input_batch,
+                lambda global_batch, global_slot_mappings: (
+                    self.model_state.preprocess_pcp_slot_mappings(
+                        global_batch,
+                        global_slot_mappings,
+                        self.kv_cache_config,
+                    )
+                ),
+            )
 
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(
@@ -1736,6 +1745,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
                     batch_req_state.num_scheduled_tokens,
                     batch_req_state.is_prefilling_np,
+                    batch_req_state.num_computed_prefill_tokens_np,
+                    batch_req_state.prefill_len_np,
                 )
         has_prefill = (
             batch_req_state.has_prefill if batch_req_state is not None else False
@@ -2125,6 +2136,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         if self.is_dsv41_encoder_only_prefill:
+            input_batch = pcp.maybe_restore_pcp_input_batch(
+                self.pcp_manager, input_batch
+            )
             self.postprocess_num_computed_tokens(input_batch)
             self.model_state.postprocess_state(input_batch.idx_mapping, 0)
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

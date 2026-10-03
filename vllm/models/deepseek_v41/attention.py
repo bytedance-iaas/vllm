@@ -81,6 +81,7 @@ from vllm.v1.attention.backends.mla.sparse_indexer import (
     DeepseekV41SparseIndexerBackend,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.ops.pcp import maybe_gather_pcp_cache_inputs
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -466,6 +467,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
+        self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         self.attn_cp_size = vllm_config.parallel_config.attention_context_parallel_size
         self.attn_tp_size = tp_size // self.attn_cp_size
         self.input_proj_token_shard_min_tokens = max(
@@ -771,17 +773,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "takes part in prefix caching instead."
             )
             swa_bounded_replay = False
-        if (
-            swa_bounded_replay
-            and vllm_config.parallel_config.prefill_context_parallel_size > 1
-        ):
-            logger.warning_once(
-                "SWA bounded replay is off under prefill context parallelism "
-                "(the replayed tokens' slot padding knows the rank-local batch "
-                "only); the sliding-window cache takes part in prefix caching "
-                "instead."
-            )
-            swa_bounded_replay = False
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -1004,10 +995,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
 
         latent = compressor(self._compressor_kv_score(hidden_states), positions)
+        cache_latent, cache_positions, _ = compressor.prepare_cache_inputs(
+            latent, positions
+        )
         aux_stream = self.aux_stream_list[0] if self.aux_stream_list else None
         maybe_execute_in_parallel(
-            lambda: indexer.insert_cache(latent, positions, self.indexer_rotary_emb),
-            lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+            lambda: indexer.insert_cache(
+                cache_latent, cache_positions, self.indexer_rotary_emb
+            ),
+            lambda: compressor.insert_cache(
+                cache_latent,
+                cache_positions,
+                self.rotary_emb,
+                cache_inputs_prepared=True,
+            ),
             self.ln_events[0],
             self.ln_events[1],
             aux_stream,
@@ -1136,13 +1137,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q = self._wq_b_proj(local_qr, qr_scale).view(
                     -1, self.n_local_heads, self.head_dim
                 )
+            cache_kv = kv
+            cache_positions = positions
+            cache_kwargs = {}
+            if self.use_pcp and isinstance(attn_metadata, dict):
+                swa_metadata = cast(
+                    "DeepseekSparseSWAMetadata",
+                    attn_metadata[self.swa_cache_layer.prefix],
+                )
+                assert swa_metadata.cache_slot_mapping is not None
+                (cache_kv, cache_positions), cache_slot_mapping = (
+                    maybe_gather_pcp_cache_inputs(
+                        (kv, positions),
+                        swa_metadata.cache_slot_mapping,
+                        swa_metadata.num_decode_tokens,
+                        True,
+                    )
+                )
+                cache_kwargs = {
+                    "cache_kv": cache_kv,
+                    "cache_slot_mapping": cache_slot_mapping,
+                }
             return self._fused_qnorm_rope_kv_insert(
                 q,
                 kv,
                 q_positions,
-                positions,
+                cache_positions,
                 attn_metadata,
-                split_q=cp_plan is not None,
+                split_q=cp_plan is not None or self.use_pcp,
+                **cache_kwargs,
             )
 
         index_q: torch.Tensor | None = None
@@ -1164,6 +1187,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             q = project_query_and_cache_kv()
 
+        cache_latent = latent
+        cache_positions = positions
+        if compressor is not None:
+            cache_latent, cache_positions, _ = compressor.prepare_cache_inputs(
+                latent, positions
+            )
+
         def prepare_indexer():
             if indexer is None:
                 return None, None, None
@@ -1174,12 +1204,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 positions,
                 self.indexer_rotary_emb,
                 qr_scale,
+                cache_latent=cache_latent,
+                cache_positions=cache_positions,
             )
 
         if compressor is not None:
             indexer_result, _ = maybe_execute_in_parallel(
                 prepare_indexer,
-                lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+                lambda: compressor.insert_cache(
+                    cache_latent,
+                    cache_positions,
+                    self.rotary_emb,
+                    cache_inputs_prepared=True,
+                ),
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
@@ -1394,6 +1431,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         ),
         *,
         split_q: bool,
+        cache_kv: torch.Tensor | None = None,
+        cache_slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Ready ``q`` for the attention kernel and publish this step's KV.
 
@@ -1425,6 +1464,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+        if cache_kv is None:
+            cache_kv = kv
+        if cache_slot_mapping is None:
+            cache_slot_mapping = swa_metadata.slot_mapping
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         # The fused insert ops require int64 position_ids; the runner's positions
@@ -1472,9 +1515,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         )
                     )
                 torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-                    kv,
+                    cache_kv,
                     swa_kv_cache,
-                    swa_metadata.slot_mapping,
+                    cache_slot_mapping,
                     kv_positions,
                     cos_sin_cache,
                     swa_metadata.block_size,
@@ -1484,9 +1527,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return q_padded
             q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
-                kv,
+                cache_kv,
                 swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
+                cache_slot_mapping,
                 kv_positions,
                 cos_sin_cache,
                 pad_to,
@@ -1516,9 +1559,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if cache_dtype == torch.bfloat16:
             torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
                 q,
-                kv,
+                cache_kv,
                 swa_kv_cache_3d,
-                swa_metadata.slot_mapping,
+                cache_slot_mapping,
                 kv_positions,
                 cos_sin_cache,
                 self.eps,
@@ -1531,10 +1574,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
             q,
-            kv,
+            cache_kv,
             q_fp8,
             swa_kv_cache_3d,
-            swa_metadata.slot_mapping,
+            cache_slot_mapping,
             kv_positions,
             cos_sin_cache,
             self._flashinfer_fp8_kv_scale,
@@ -1944,7 +1987,14 @@ class DeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
         qr_scale: torch.Tensor | None = None,
+        *,
+        cache_latent: torch.Tensor | None = None,
+        cache_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if cache_latent is None:
+            cache_latent = latent
+        if cache_positions is None:
+            cache_positions = positions
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
@@ -1955,7 +2005,7 @@ class DeepseekV4Indexer(nn.Module):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
                 if self.owns_k:
-                    self._produce_k(latent, positions, rotary_emb)
+                    self._produce_k(cache_latent, cache_positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
@@ -1975,7 +2025,7 @@ class DeepseekV4Indexer(nn.Module):
         if self.owns_k:
             # K write must land before indexer_op reads the cache
             # (skip_k_cache_insert=True).
-            self._produce_k(latent, positions, rotary_emb)
+            self._produce_k(cache_latent, cache_positions, rotary_emb)
 
         q = self._wq_b_proj(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)

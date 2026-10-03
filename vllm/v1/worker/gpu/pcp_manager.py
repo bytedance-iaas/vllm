@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -55,13 +55,20 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        prefill_chunk_alignment: int = 1,
     ) -> None:
+        if prefill_chunk_alignment < 1:
+            raise ValueError(
+                "prefill_chunk_alignment must be positive, got "
+                f"{prefill_chunk_alignment}."
+            )
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
         self.device = device
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self.prefill_chunk_alignment = prefill_chunk_alignment
 
         self._global_batch: InputBatch | None = None
         self._local_batch: InputBatch | None = None
@@ -132,7 +139,21 @@ class PCPManager:
         if not model_config.use_mla:
             raise NotImplementedError("MRV2 PCP currently supports MLA models only.")
         if parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError("MRV2 PCP does not support PP yet.")
+            supports_dsv41_prefill_pp = (
+                vllm_config.is_dsv41_encoder_only_prefill
+                and parallel_config.pipeline_parallel_size == 2
+                and parallel_config.tensor_parallel_size == 1
+                and pcp_size == 4
+                and parallel_config.decode_context_parallel_size == 1
+                and parallel_config.attention_context_parallel_size == 1
+                and parallel_config.distributed_executor_backend == "mp"
+            )
+            if not supports_dsv41_prefill_pp:
+                raise NotImplementedError(
+                    "MRV2 PCP with PP currently supports only the DeepSeek-V4.1 "
+                    "encoder-only Prefill topology PP2/TP1/PCP4/DCP1 with the "
+                    "multiprocessing executor."
+                )
         if model_config.is_encoder_decoder:
             raise NotImplementedError(
                 "MRV2 PCP does not support encoder-decoder models yet."
@@ -221,22 +242,47 @@ class PCPManager:
         self,
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
+        prefill_lens: np.ndarray | None = None,
     ) -> np.ndarray:
         """Per global request, whether every PCP rank gets the whole query."""
         num_chunks = 2 * self.pcp_world_size
         query_lens = np.asarray(num_scheduled_tokens, dtype=np.int64)
         replicated = ~np.asarray(is_prefilling, dtype=np.bool_)
         if self.dcp_world_size > 1:
-            chunk_sizes = (query_lens + num_chunks - 1) // num_chunks
+            chunk_sizes = self._aligned_chunk_sizes(query_lens, num_chunks)
             drops_a_chunk = (num_chunks - 1) * chunk_sizes >= query_lens
             replicated |= drops_a_chunk
+        if (
+            self.prefill_chunk_alignment > 1
+            and num_computed_tokens is not None
+            and prefill_lens is not None
+        ):
+            starts = np.asarray(num_computed_tokens, dtype=np.int64)
+            ends = starts + query_lens
+            continues = ends < np.asarray(prefill_lens, dtype=np.int64)
+            unsafe_boundary = (starts % self.prefill_chunk_alignment != 0) | (
+                continues & (ends % self.prefill_chunk_alignment != 0)
+            )
+            replicated |= np.asarray(is_prefilling, dtype=np.bool_) & unsafe_boundary
         return replicated
+
+    def _aligned_chunk_sizes(
+        self, query_lens: np.ndarray, num_chunks: int
+    ) -> np.ndarray:
+        chunk_sizes = (query_lens + num_chunks - 1) // num_chunks
+        alignment = self.prefill_chunk_alignment
+        if alignment > 1:
+            chunk_sizes = (chunk_sizes + alignment - 1) // alignment * alignment
+        return chunk_sizes
 
     def _iter_rank_chunks(
         self,
         rank: int,
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
+        prefill_lens: np.ndarray | None = None,
     ) -> Iterator[tuple[int, int, int]]:
         """Yield ``(request index, query offset, length)`` for one PCP rank.
 
@@ -251,14 +297,23 @@ class PCPManager:
         Decodes, and prefills too short to fill all eight, are replicated instead.
         """
         num_chunks = 2 * self.pcp_world_size
-        replicated = self.replicated_requests(num_scheduled_tokens, is_prefilling)
+        replicated = self.replicated_requests(
+            num_scheduled_tokens,
+            is_prefilling,
+            num_computed_tokens,
+            prefill_lens,
+        )
         for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
             query_len = int(num_tokens)
             if query_len == 0:
                 continue
             chunk_indices: tuple[int, ...]
             if not replicated[global_batch_req_idx]:
-                chunk_size = (query_len + num_chunks - 1) // num_chunks
+                chunk_size = int(
+                    self._aligned_chunk_sizes(
+                        np.asarray([query_len], dtype=np.int64), num_chunks
+                    )[0]
+                )
                 chunk_indices = (rank, num_chunks - 1 - rank)
             else:  # decodes, and short prefills under DCP, are replicated
                 chunk_size = query_len
@@ -277,11 +332,17 @@ class PCPManager:
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
+        prefill_lens: np.ndarray | None = None,
     ) -> list[RankSegment]:
         rank_segments = []
         rank_offset = 0
         for global_batch_req_idx, chunk_offset, chunk_len in self._iter_rank_chunks(
-            rank, num_scheduled_tokens, is_prefilling
+            rank,
+            num_scheduled_tokens,
+            is_prefilling,
+            num_computed_tokens,
+            prefill_lens,
         ):
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
             chunk_start = global_batch_start + chunk_offset
@@ -302,8 +363,14 @@ class PCPManager:
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
         padded_num_tokens: int | None = None,
+        prefill_lens: np.ndarray | None = None,
     ) -> tuple[list[list[RankSegment]], list[int]]:
-        replicated = self.replicated_requests(num_scheduled_tokens, is_prefilling)
+        replicated = self.replicated_requests(
+            num_scheduled_tokens,
+            is_prefilling,
+            num_computed_tokens,
+            prefill_lens,
+        )
         segments_by_rank = []
         per_rank_num_tokens = []
         for rank in range(self.pcp_world_size):
@@ -312,6 +379,8 @@ class PCPManager:
                 num_scheduled_tokens,
                 is_prefilling,
                 query_start_loc_np,
+                num_computed_tokens,
+                prefill_lens,
             )
             num_rank_tokens = sum(segment.num_tokens for segment in segments)
             segments_by_rank.append(segments)
@@ -373,13 +442,19 @@ class PCPManager:
         self,
         num_scheduled_tokens: np.ndarray,
         is_prefilling: np.ndarray,
+        num_computed_tokens: np.ndarray | None = None,
+        prefill_lens: np.ndarray | None = None,
     ) -> int:
         """Return the largest real rank-local batch before graph padding."""
         return max(
             sum(
                 chunk_len
                 for _, _, chunk_len in self._iter_rank_chunks(
-                    rank, num_scheduled_tokens, is_prefilling
+                    rank,
+                    num_scheduled_tokens,
+                    is_prefilling,
+                    num_computed_tokens,
+                    prefill_lens,
                 )
             )
             for rank in range(self.pcp_world_size)
@@ -428,6 +503,7 @@ class PCPManager:
             is_prefilling,
             global_batch.query_start_loc_np,
             padded_num_tokens=padded_num_tokens,
+            prefill_lens=global_batch.prefill_len_np,
         )
 
         local_segments = segments_by_rank[self.pcp_rank]
@@ -680,7 +756,10 @@ class PCPManager:
         )
 
     def prepare_attn(
-        self, input_batch: InputBatch
+        self,
+        input_batch: InputBatch,
+        slot_mapping_preprocessor: Callable[[InputBatch, torch.Tensor], None]
+        | None = None,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         assert self._block_tables is not None
         assert self._local_block_tables is not None
@@ -691,10 +770,14 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
-        slot_mappings = self.prepare_slot_mappings()
+        slot_mappings = self.prepare_slot_mappings(slot_mapping_preprocessor)
         return block_tables, slot_mappings
 
-    def prepare_slot_mappings(self) -> torch.Tensor:
+    def prepare_slot_mappings(
+        self,
+        slot_mapping_preprocessor: Callable[[InputBatch, torch.Tensor], None]
+        | None = None,
+    ) -> torch.Tensor:
         assert self._block_tables is not None
         assert self._global_batch_slot_mappings is not None
         assert self._global_batch is not None
@@ -706,7 +789,15 @@ class PCPManager:
             global_batch.num_tokens,
             out=self._global_batch_slot_mappings,
         )
+        if slot_mapping_preprocessor is not None:
+            slot_mapping_preprocessor(global_batch, global_batch_slot_mappings)
         return self._convert_to_gathered_slot_mappings(global_batch_slot_mappings)
+
+    def restore_input_batch(self, input_batch: InputBatch) -> InputBatch:
+        if input_batch is not self._local_batch:
+            return input_batch
+        assert self._global_batch is not None
+        return self._global_batch
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         assert self._gathered_kv_slot_mappings is not None
@@ -839,6 +930,15 @@ def maybe_restore_pcp_for_sampling(
     return manager.restore_for_sampling(hidden_states)
 
 
+def maybe_restore_pcp_input_batch(
+    manager: PCPManager | None,
+    input_batch: InputBatch,
+) -> InputBatch:
+    if manager is None:
+        return input_batch
+    return manager.restore_input_batch(input_batch)
+
+
 def maybe_build_pcp_manager(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -867,4 +967,9 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+        prefill_chunk_alignment=(
+            vllm_config.cache_config.block_size
+            if vllm_config.is_dsv41_encoder_only_prefill
+            else 1
+        ),
     )

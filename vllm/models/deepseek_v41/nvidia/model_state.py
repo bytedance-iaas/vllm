@@ -136,6 +136,15 @@ class DeepseekV41ModelState(DefaultModelState):
             self.max_num_reqs, dtype=torch.int32, device=device
         )
         self._replay_start_staging = UvaBufferPool(self.max_num_reqs, torch.int32)
+        self._global_replay_start = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
+        self._global_replay_start_staging = UvaBufferPool(
+            self.max_num_reqs, torch.int32
+        )
+        self.pcp_world_size = getattr(
+            vllm_config.parallel_config, "prefill_context_parallel_size", 1
+        )
         # The replay window and the indices of the prefix-cacheable groups, from
         # the KV cache config on first use; None until then.
         self._replay: tuple[int, torch.Tensor] | None = None
@@ -180,6 +189,57 @@ class DeepseekV41ModelState(DefaultModelState):
         replay_start = self._replay_start[:num_reqs].zero_()
         return ReplayAttnMetadata(replay_start)
 
+    def _get_replay_config(
+        self, kv_cache_config: KVCacheConfig
+    ) -> tuple[int, torch.Tensor]:
+        if self._replay is None:
+            specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
+            self._replay = (
+                max(spec.prefix_replay_tokens for spec in specs),
+                torch.tensor(
+                    [i for i, spec in enumerate(specs) if spec.prefix_cacheable],
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
+        return self._replay
+
+    def preprocess_pcp_slot_mappings(
+        self,
+        global_input_batch: InputBatch,
+        global_slot_mappings: torch.Tensor,
+        kv_cache_config: KVCacheConfig,
+    ) -> None:
+        window, cacheable_groups = self._get_replay_config(kv_cache_config)
+        if not window:
+            return
+
+        num_reqs = global_input_batch.num_reqs
+        replay_start_np = np.where(
+            global_input_batch.is_prefilling_np[:num_reqs],
+            self._replay_start_np[global_input_batch.idx_mapping_np[:num_reqs]],
+            0,
+        ).astype(np.int32)
+        if not replay_start_np.any():
+            return
+
+        replay_start = self._global_replay_start_staging.copy_to_gpu(
+            replay_start_np,
+            out=self._global_replay_start[:num_reqs],
+        )
+        _pad_replayed_slots_kernel[(num_reqs,)](
+            global_slot_mappings,
+            global_slot_mappings.stride(0),
+            cacheable_groups,
+            global_input_batch.query_start_loc,
+            global_input_batch.positions,
+            replay_start,
+            window,
+            PAD_SLOT_ID,
+            NUM_GROUPS=cacheable_groups.numel(),
+            BLOCK=1024,
+        )
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -192,17 +252,7 @@ class DeepseekV41ModelState(DefaultModelState):
         ubatch_idx: int = 0,
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
-        if self._replay is None:
-            specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
-            self._replay = (
-                max(spec.prefix_replay_tokens for spec in specs),
-                torch.tensor(
-                    [i for i, spec in enumerate(specs) if spec.prefix_cacheable],
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-            )
-        window, cacheable_groups = self._replay
+        window, cacheable_groups = self._get_replay_config(kv_cache_config)
         if window:
             num_reqs = input_batch.num_reqs
             # Decode rows sit above the hit, so only prefills carry a replay
@@ -215,7 +265,7 @@ class DeepseekV41ModelState(DefaultModelState):
             replay_start = self._replay_start_staging.copy_to_gpu(
                 replay_start_np, out=self._replay_start[:num_reqs]
             )
-            if replay_start_np.any():
+            if replay_start_np.any() and self.pcp_world_size == 1:
                 # The replayed tokens rebuild window KV only: their slots in the
                 # prefix-cacheable groups are padded so the cached KV stays as is.
                 _pad_replayed_slots_kernel[(num_reqs,)](

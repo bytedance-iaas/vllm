@@ -648,6 +648,7 @@ def _make_bootstrap_vllm_config(
     data_parallel_index: int = 0,
     nnodes_within_dp: int = 1,
     attention_context_parallel_size: int = 1,
+    prefill_context_parallel_size: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -656,6 +657,7 @@ def _make_bootstrap_vllm_config(
             data_parallel_index=data_parallel_index,
             nnodes_within_dp=nnodes_within_dp,
             attention_context_parallel_size=attention_context_parallel_size,
+            prefill_context_parallel_size=prefill_context_parallel_size,
             master_addr="model-parallel-master",
             data_parallel_master_ip="data-parallel-master",
         )
@@ -730,6 +732,32 @@ def test_should_launch_bootstrap_server_selects_single_owner(
         assert should_launch_bootstrap_server(vllm_config) is expected
 
 
+@pytest.mark.parametrize(("pcp_rank", "expected"), [(0, True), (1, False)])
+def test_should_launch_bootstrap_server_selects_canonical_pcp_rank(
+    pcp_rank: int,
+    expected: bool,
+):
+    vllm_config = _make_bootstrap_vllm_config(prefill_context_parallel_size=4)
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pp_group"
+        ) as mock_pp_group,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pcp_group"
+        ) as mock_pcp_group,
+    ):
+        mock_pp_group.return_value.rank_in_group = 0
+        mock_pcp_group.return_value.rank_in_group = pcp_rank
+        assert should_launch_bootstrap_server(vllm_config) is expected
+
+
 @pytest.mark.parametrize(
     ("local_engines_only", "nnodes_within_dp", "expected_host"),
     [
@@ -756,18 +784,20 @@ def test_get_mooncake_bootstrap_addr_selects_expected_host(
 
 
 @pytest.mark.parametrize(
-    ("kv_role", "world_size", "attn_cp_size", "expected"),
+    ("kv_role", "world_size", "attn_cp_size", "pcp_size", "expected"),
     [
-        ("kv_producer", 8, 4, 2),
-        ("kv_producer", 8, 2, 4),
-        ("kv_producer", 8, 1, 8),
-        ("kv_consumer", 8, 1, None),
+        ("kv_producer", 8, 4, 1, 2),
+        ("kv_producer", 8, 2, 1, 4),
+        ("kv_producer", 8, 1, 4, 2),
+        ("kv_producer", 8, 1, 1, 8),
+        ("kv_consumer", 8, 1, 1, None),
     ],
 )
-def test_mooncake_finished_count_uses_canonical_attention_cp_workers(
+def test_mooncake_finished_count_uses_canonical_context_workers(
     kv_role: str,
     world_size: int,
     attn_cp_size: int,
+    pcp_size: int,
     expected: int | None,
 ):
     connector = object.__new__(MooncakeConnector)
@@ -776,6 +806,7 @@ def test_mooncake_finished_count_uses_canonical_attention_cp_workers(
         parallel_config=SimpleNamespace(
             world_size=world_size,
             attention_context_parallel_size=attn_cp_size,
+            prefill_context_parallel_size=pcp_size,
         )
     )
 

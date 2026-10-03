@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_pcp_group
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
@@ -60,9 +61,14 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        parallel_config = self.vllm_config.parallel_config
+        self.pcp_world_size = getattr(
+            parallel_config, "prefill_context_parallel_size", 1
+        )
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
         if (
             getattr(
-                self.vllm_config.parallel_config,
+                parallel_config,
                 "attention_context_parallel_size",
                 1,
             )
@@ -77,6 +83,35 @@ class DeepseekV41SparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
         self._layer_types = {
             deepseek_v41_layer_type(int(ratio)) for ratio in compress_ratios
         }
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        replay_start: torch.Tensor | None = None,
+    ):
+        if self.pcp_world_size == 1:
+            return super().build(
+                common_prefix_len,
+                common_attn_metadata,
+                fast_build,
+                replay_start,
+            )
+
+        cache_slot_mapping = common_attn_metadata.slot_mapping
+        padded_num_tokens = cache_slot_mapping.shape[0] // self.pcp_world_size
+        local_slot_mapping = cache_slot_mapping[
+            self.pcp_rank * padded_num_tokens : (self.pcp_rank + 1) * padded_num_tokens
+        ]
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata.replace(slot_mapping=local_slot_mapping),
+            fast_build,
+            replay_start,
+        )
+        metadata.cache_slot_mapping = cache_slot_mapping
+        return metadata
 
 
 class DeepseekV4SparseMLABackend(AttentionBackend):
@@ -95,6 +130,10 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
     ]
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -171,6 +210,11 @@ class DeepseekV4SparseMLAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        self.pcp_world_size = getattr(
+            parallel_config, "prefill_context_parallel_size", 1
+        )
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
@@ -209,9 +253,17 @@ class DeepseekV4SparseMLAMetadataBuilder(
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
+            local_slot_mapping = slot_mapping
+            padded_num_tokens = cm.num_actual_tokens
+            if self.pcp_world_size > 1:
+                padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+                local_slot_mapping = slot_mapping[
+                    self.pcp_rank * padded_num_tokens : (self.pcp_rank + 1)
+                    * padded_num_tokens
+                ]
             slot_mapping = get_compressed_slot_mapping(
                 cm.num_actual_tokens,
-                cm.slot_mapping,
+                local_slot_mapping,
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp_(min=0),
@@ -219,6 +271,11 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
+            if self.pcp_world_size > 1:
+                slot_mapping = get_pcp_group().all_gather(
+                    self.compressed_slot_mapping_buffer[:padded_num_tokens],
+                    dim=0,
+                )
 
         return DeepseekV4FlashMLAMetadata(
             num_reqs=cm.num_reqs,

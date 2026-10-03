@@ -30,6 +30,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
         "ubatching": False,
         "async_scheduling": False,
         "bounded_replay": True,
+        "cache_dtype": "fp8_ds_mla",
         "num_layers": 40,
         "kv_sources": (2, 8, 14, 20),
         "index_sources": (2, 8, 14, 20, 24, 28, 32, 36),
@@ -67,6 +68,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
                 data_parallel_size=1,
                 distributed_executor_backend=values["executor"],
                 prefill_context_parallel_size=values["pcp"],
+                decode_context_parallel_size=1,
                 use_ubatching=values["ubatching"],
                 enable_expert_parallel=False,
                 use_sequence_parallel_moe=False,
@@ -74,7 +76,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
             ),
             cache_config=SimpleNamespace(
                 swa_bounded_replay=values["bounded_replay"],
-                cache_dtype="fp8_ds_mla",
+                cache_dtype=values["cache_dtype"],
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=values["async_scheduling"]
@@ -97,6 +99,33 @@ def test_dsv41_encoder_only_handoff_accepts_initial_boundary(role):
 def test_dsv41_encoder_only_handoff_accepts_aligned_prefill_pp(monkeypatch, partition):
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
     VllmConfig._verify_dsv41_encoder_only_handoff(_dsv41_handoff_config(pp=2))
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_accepts_pp2_tp1_pcp4(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "8,32")
+    VllmConfig._verify_dsv41_encoder_only_handoff(
+        _dsv41_handoff_config(pp=2, tp=1, pcp=4)
+    )
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_pcp_accepts_packed_cache(cache_dtype, monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "8,32")
+    VllmConfig._verify_dsv41_encoder_only_handoff(
+        _dsv41_handoff_config(pp=2, tp=1, pcp=4, cache_dtype=cache_dtype)
+    )
+
+
+@pytest.mark.parametrize("cache_dtype", ["bfloat16", "fp8"])
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_pcp_rejects_unpacked_cache(cache_dtype, monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "8,32")
+    with pytest.raises(ValueError, match="packed fp8_ds_mla"):
+        VllmConfig._verify_dsv41_encoder_only_handoff(
+            _dsv41_handoff_config(pp=2, tp=1, pcp=4, cache_dtype=cache_dtype)
+        )
 
 
 @pytest.mark.skip_global_cleanup
@@ -200,7 +229,7 @@ def test_dsv41_encoder_only_handoff_separates_producer_compile_hash():
         ({"architecture": "LlamaForCausalLM"}, "DeepseekV41ForCausalLM only"),
         ({"use_v2": False}, "requires model runner V2"),
         ({"pp": 2}, "PP cut must start a local sharing group"),
-        ({"pcp": 2}, "does not support prefill context parallelism"),
+        ({"pcp": 2}, "supports PCP only with PP2/TP1/PCP4/DCP1"),
         ({"ubatching": True}, "does not support DBO or microbatching"),
         ({"async_scheduling": True}, "requires --no-async-scheduling"),
         ({"bounded_replay": False}, "requires SWA bounded replay"),
