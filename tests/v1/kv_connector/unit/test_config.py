@@ -12,6 +12,7 @@ import pytest
 from vllm.config import CacheConfig, KVTransferConfig, ParallelConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 pytestmark = pytest.mark.cpu_test
 
@@ -36,6 +37,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
         "index_sources": (2, 8, 14, 20, 24, 28, 32, 36),
         "engram_layers": (1, 14),
         "speculative_config": None,
+        "backend": None,
     }
     values.update(overrides)
     return cast(
@@ -83,7 +85,7 @@ def _dsv41_handoff_config(**overrides) -> VllmConfig:
             ),
             speculative_config=values["speculative_config"],
             compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
-            attention_config=SimpleNamespace(backend=None),
+            attention_config=SimpleNamespace(backend=values["backend"]),
         ),
     )
 
@@ -148,6 +150,48 @@ def test_dsv41_encoder_only_handoff_accepts_pp10_cache_relay(monkeypatch):
     config = _dsv41_handoff_config(pp=2, tp=4, attn_cp=4)
 
     VllmConfig._verify_dsv41_encoder_only_handoff(config)
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_accepts_pp10_pcp_cache_relay(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,30")
+    config = _dsv41_handoff_config(pp=2, tp=1, pcp=4)
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=9),
+    )
+
+    with patch("vllm.platforms.current_platform", platform):
+        VllmConfig._verify_dsv41_encoder_only_handoff(config)
+
+
+@pytest.mark.parametrize(
+    ("capability", "backend", "error"),
+    [
+        (10, None, "requires SM90"),
+        (
+            9,
+            AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41,
+            "supports only FLASHMLA_SPARSE_DSV41",
+        ),
+    ],
+)
+@pytest.mark.skip_global_cleanup
+def test_dsv41_encoder_only_handoff_rejects_unvalidated_pp10_pcp_cache_relay(
+    monkeypatch, capability, backend, error
+):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "10,30")
+    config = _dsv41_handoff_config(pp=2, tp=1, pcp=4, backend=backend)
+    platform = SimpleNamespace(
+        is_cuda=lambda: True,
+        get_device_capability=lambda: SimpleNamespace(major=capability),
+    )
+
+    with (
+        patch("vllm.platforms.current_platform", platform),
+        pytest.raises(NotImplementedError, match=error),
+    ):
+        VllmConfig._verify_dsv41_encoder_only_handoff(config)
 
 
 @pytest.mark.parametrize(

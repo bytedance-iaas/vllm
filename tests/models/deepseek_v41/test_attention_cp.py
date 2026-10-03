@@ -78,6 +78,132 @@ def test_pcp_cache_inputs_gather_only_partitioned_prefill(monkeypatch):
     torch.testing.assert_close(cache_slots, torch.tensor([0, 1, 2, 4, 5]))
 
 
+def test_cross_stage_kv_export_zero_pads_to_local_pcp_width(monkeypatch):
+    positions = torch.tensor([10, 11, 0, 0], dtype=torch.int64)
+    actual_rows = torch.full((2, 584), 7, dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        req_id_per_token=torch.tensor([0, 0], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        is_kv_source=True,
+        compress_ratio=2,
+        prefix="main",
+        kv_cache=torch.empty((1, 1, 584), dtype=torch.uint8),
+    )
+    observed: dict[str, object] = {}
+
+    def gather(kv_cache, actual_positions, req_ids, block_table, compress_ratio):
+        observed.update(
+            kv_cache=kv_cache,
+            positions=actual_positions,
+            req_ids=req_ids,
+            block_table=block_table,
+            compress_ratio=compress_ratio,
+        )
+        return actual_rows
+
+    monkeypatch.setattr(attention_module, "gather_packed_kv_cache_rows", gather)
+
+    with set_forward_context({"main": metadata}, make_forward_context_config()):
+        packed_rows = attention_module.DeepseekV4Attention.export_cross_stage_kv(
+            layer, positions
+        )
+
+    torch.testing.assert_close(observed["positions"], positions[:2])
+    torch.testing.assert_close(observed["req_ids"], metadata.req_id_per_token)
+    torch.testing.assert_close(packed_rows[:2], actual_rows)
+    assert torch.count_nonzero(packed_rows[2:]) == 0
+
+
+def test_cross_stage_kv_export_empty_pcp_shard_is_all_padding(monkeypatch):
+    positions = torch.zeros(4, dtype=torch.int64)
+    metadata = SimpleNamespace(
+        num_actual_tokens=0,
+        req_id_per_token=torch.empty(0, dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        is_kv_source=True,
+        compress_ratio=2,
+        prefix="main",
+        kv_cache=torch.empty((1, 1, 584), dtype=torch.uint8),
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "gather_packed_kv_cache_rows",
+        lambda *args: pytest.fail("an empty PCP shard must not launch a gather kernel"),
+    )
+
+    with set_forward_context({"main": metadata}, make_forward_context_config()):
+        packed_rows = attention_module.DeepseekV4Attention.export_cross_stage_kv(
+            layer, positions
+        )
+
+    assert packed_rows.shape == (4, 584)
+    assert torch.count_nonzero(packed_rows) == 0
+
+
+def test_cross_stage_kv_import_gathers_pcp_rows_and_empty_rank_participates(
+    monkeypatch,
+):
+    positions = torch.tensor([0, 0, 0], dtype=torch.int64)
+    packed_rows = torch.zeros((3, 584), dtype=torch.uint8)
+    gathered_rows = torch.cat((packed_rows, torch.ones_like(packed_rows)), dim=0)
+    gathered_positions = torch.tensor([0, 0, 0, 20, 21, 22], dtype=torch.int64)
+    gathered_slots = torch.tensor([-1, -1, -1, 10, 11, 12], dtype=torch.int64)
+    metadata = SimpleNamespace(
+        num_actual_tokens=0,
+        slot_mapping=gathered_slots,
+    )
+    layer = SimpleNamespace(
+        is_cross_stage_kv_cache_owner=True,
+        compress_ratio=2,
+        prefix="main",
+        use_pcp=True,
+        kv_cache=torch.empty((1, 1, 584), dtype=torch.uint8),
+    )
+    observed: dict[str, object] = {}
+
+    def gather(tensors, slots, num_decode_tokens, use_pcp):
+        observed.update(
+            tensors=tensors,
+            slots=slots,
+            num_decode_tokens=num_decode_tokens,
+            use_pcp=use_pcp,
+        )
+        return (gathered_rows, gathered_positions), gathered_slots
+
+    def scatter(rows, cache_positions, kv_cache, slots, compress_ratio):
+        observed.update(
+            rows=rows,
+            cache_positions=cache_positions,
+            kv_cache=kv_cache,
+            cache_slots=slots,
+            compress_ratio=compress_ratio,
+        )
+
+    monkeypatch.setattr(attention_module, "maybe_gather_pcp_cache_inputs", gather)
+    monkeypatch.setattr(attention_module, "scatter_packed_kv_cache_rows", scatter)
+
+    with set_forward_context({"main": metadata}, make_forward_context_config()):
+        attention_module.DeepseekV4Attention.import_cross_stage_kv(
+            layer, packed_rows, positions
+        )
+
+    gathered_inputs = observed["tensors"]
+    assert isinstance(gathered_inputs, tuple)
+    assert gathered_inputs[0] is packed_rows
+    assert gathered_inputs[1] is positions
+    assert observed["slots"] is gathered_slots
+    assert observed["num_decode_tokens"] == 0
+    assert observed["use_pcp"] is True
+    assert observed["rows"] is gathered_rows
+    assert observed["cache_positions"] is gathered_positions
+    assert observed["cache_slots"] is gathered_slots
+
+
 def make_forward_context_config() -> SimpleNamespace:
     return SimpleNamespace(
         compilation_config=SimpleNamespace(

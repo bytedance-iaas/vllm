@@ -31,6 +31,7 @@ from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.deepseek_v41.common.ops import (
     MXFP4_BLOCK_SIZE,
+    SM90_PACKED_KV_RECORD_BYTES,
     compute_global_topk_indices_and_lens,
     fused_indexer_q_rope_quant,
     gather_packed_kv_cache_rows,
@@ -1617,17 +1618,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "Cross-stage KV export requires real attention metadata."
             )
         metadata = cast(Any, attn_metadata[self.prefix])
-        if metadata.num_actual_tokens != positions.shape[0]:
-            raise NotImplementedError(
-                "Cross-stage KV relay does not support padded token rows."
+        num_actual_tokens = int(metadata.num_actual_tokens)
+        num_padded_tokens = positions.shape[0]
+        if not 0 <= num_actual_tokens <= num_padded_tokens:
+            raise RuntimeError(
+                "Cross-stage KV export received invalid actual/padded token counts: "
+                f"{num_actual_tokens}/{num_padded_tokens}."
             )
-        return gather_packed_kv_cache_rows(
-            self.kv_cache,
-            positions,
-            metadata.req_id_per_token,
-            metadata.block_table,
-            self.compress_ratio,
+        packed_rows = torch.zeros(
+            (num_padded_tokens, SM90_PACKED_KV_RECORD_BYTES),
+            dtype=torch.uint8,
+            device=self.kv_cache.device,
         )
+        if num_actual_tokens > 0:
+            actual_rows = gather_packed_kv_cache_rows(
+                self.kv_cache,
+                positions[:num_actual_tokens].contiguous(),
+                metadata.req_id_per_token[:num_actual_tokens].contiguous(),
+                metadata.block_table,
+                self.compress_ratio,
+            )
+            packed_rows[:num_actual_tokens].copy_(actual_rows)
+        return packed_rows
 
     def import_cross_stage_kv(
         self, packed_rows: torch.Tensor, positions: torch.Tensor
@@ -1642,18 +1654,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "Cross-stage KV import requires real attention metadata."
             )
         metadata = cast(Any, attn_metadata[self.prefix])
-        if (
-            metadata.num_actual_tokens != positions.shape[0]
-            or packed_rows.shape[0] != positions.shape[0]
-        ):
-            raise NotImplementedError(
-                "Cross-stage KV relay does not support padded token rows."
+        num_actual_tokens = int(metadata.num_actual_tokens)
+        num_padded_tokens = positions.shape[0]
+        if not 0 <= num_actual_tokens <= num_padded_tokens:
+            raise RuntimeError(
+                "Cross-stage KV import received invalid actual/padded token counts: "
+                f"{num_actual_tokens}/{num_padded_tokens}."
             )
+        if packed_rows.dtype != torch.uint8 or packed_rows.shape != (
+            num_padded_tokens,
+            SM90_PACKED_KV_RECORD_BYTES,
+        ):
+            raise RuntimeError(
+                "Cross-stage KV relay received an invalid packed KV payload."
+            )
+        (cache_packed_rows, cache_positions), cache_slot_mapping = (
+            maybe_gather_pcp_cache_inputs(
+                (packed_rows, positions),
+                metadata.slot_mapping,
+                num_decode_tokens=0,
+                use_pcp=self.use_pcp,
+            )
+        )
         scatter_packed_kv_cache_rows(
-            packed_rows,
-            positions,
+            cache_packed_rows,
+            cache_positions,
             self.kv_cache,
-            metadata.slot_mapping,
+            cache_slot_mapping,
             self.compress_ratio,
         )
 

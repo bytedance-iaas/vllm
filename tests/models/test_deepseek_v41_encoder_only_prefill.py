@@ -167,6 +167,7 @@ def test_global_cache_writer_publishes_same_latent_to_main_and_indexer():
     score = torch.randn(4, 8)
     latent = torch.randn(4, 8)
     compressor = Mock(return_value=latent)
+    compressor.prepare_cache_inputs.return_value = (latent, positions, None)
     indexer = SimpleNamespace(owns_k=True, insert_cache=Mock())
     attention = SimpleNamespace(
         compressor=compressor,
@@ -184,8 +185,12 @@ def test_global_cache_writer_publishes_same_latent_to_main_and_indexer():
 
     attention._compressor_kv_score.assert_called_once_with(hidden_states)
     compressor.assert_called_once_with(score, positions)
+    compressor.prepare_cache_inputs.assert_called_once_with(latent, positions)
     compressor.insert_cache.assert_called_once_with(
-        latent, positions, attention.rotary_emb
+        latent,
+        positions,
+        attention.rotary_emb,
+        cache_inputs_prepared=True,
     )
     indexer.insert_cache.assert_called_once_with(
         latent, positions, attention.indexer_rotary_emb
@@ -275,26 +280,66 @@ def test_pipeline_cache_relay_exports_source_payload(monkeypatch):
     monkeypatch.setattr(
         dsv41_model,
         "get_forward_context",
-        lambda: SimpleNamespace(is_profile=False),
+        lambda: SimpleNamespace(
+            is_profile=False,
+            attn_metadata={"source": SimpleNamespace(num_actual_tokens=3)},
+        ),
     )
     model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
     torch.nn.Module.__init__(model)
     layers = [_RecordingLayer() for _ in range(40)]
-    packed_kv = torch.randint(0, 256, (3, 584), dtype=torch.uint8)
-    layers[8].attn = SimpleNamespace(export_cross_stage_kv=Mock(return_value=packed_kv))
+    packed_kv = torch.randint(0, 256, (5, 584), dtype=torch.uint8)
+    layers[8].attn = SimpleNamespace(
+        prefix="source",
+        export_cross_stage_kv=Mock(return_value=packed_kv),
+    )
     model.layers = torch.nn.ModuleList(layers)
     model.config = SimpleNamespace(index_topk=4)
     model.pipeline_cache_relay = _cache_relay()
     model.topk_indices_buffer = torch.arange(32, dtype=torch.int32).view(8, 4)
-    positions = torch.arange(3)
+    positions = torch.arange(5)
 
     payload = model._export_pipeline_cache_relay(positions)
 
     layers[8].attn.export_cross_stage_kv.assert_called_once_with(positions)
     assert payload["dsv41_relay_l8_main_kv"] is packed_kv
     torch.testing.assert_close(
-        payload["dsv41_relay_l8_topk"], model.topk_indices_buffer[:3]
+        payload["dsv41_relay_l8_topk"][:3], model.topk_indices_buffer[:3]
     )
+    assert torch.all(payload["dsv41_relay_l8_topk"][3:] == -1)
+
+
+def test_pipeline_cache_relay_rejects_non_int32_topk(monkeypatch):
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=1),
+    )
+    monkeypatch.setattr(
+        dsv41_model,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_profile=False),
+    )
+    model = dsv41_model.DeepseekV4Model.__new__(dsv41_model.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    layers = [_RecordingLayer() for _ in range(40)]
+    layers[10].attn = SimpleNamespace(import_cross_stage_kv=Mock())
+    model.layers = torch.nn.ModuleList(layers)
+    model.config = SimpleNamespace(index_topk=4)
+    model.pipeline_cache_relay = _cache_relay()
+    model.topk_indices_buffer = torch.empty((8, 4), dtype=torch.int32)
+    positions = torch.arange(3)
+    intermediate = dsv41_model.IntermediateTensors(
+        {
+            "dsv41_relay_l8_main_kv": torch.zeros((3, 584), dtype=torch.uint8),
+            "dsv41_relay_l8_topk": torch.zeros((3, 4), dtype=torch.int64),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="invalid shape or dtype"):
+        model._import_pipeline_cache_relay(intermediate, positions)
+
+    layers[10].attn.import_cross_stage_kv.assert_not_called()
 
 
 def test_pipeline_cache_relay_import_precedes_layer_10_forward(monkeypatch):
