@@ -141,7 +141,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.num_experts = moe_config.num_local_experts
         self.global_num_experts = moe_config.num_experts
         self.quant_config = humming_quant_config
-        self.init_humming_moe()
 
         if self.is_batched():
             assert max_num_tokens is not None and num_dispatchers is not None
@@ -152,30 +151,80 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        self.init_humming_moe()
 
     def init_humming_moe(self):
         from vllm.utils.humming import get_heuristics_config
 
+        self.use_m_major_input_scale = self._use_h20_mxfp4_fp8_grouped_m_major()
         self.compute_config = {
             "use_batch_invariant": envs.VLLM_BATCH_INVARIANT,
             "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+            "use_m_major_input_scale": self.use_m_major_input_scale,
             "gemm_type": self.humming_gemm_type().value,
         }
         self.w13_tuning_config = get_heuristics_config(
             layer_config=self.humming_configs["w13"],
             use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
             use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            use_m_major_input_scale=self.use_m_major_input_scale,
             gemm_type=self.humming_gemm_type(),
+            device=self.locks.device,
         )
         self.w2_tuning_config = get_heuristics_config(
             layer_config=self.humming_configs["w2"],
             use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
             use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+            use_m_major_input_scale=self.use_m_major_input_scale,
             gemm_type=self.humming_gemm_type(),
+            device=self.locks.device,
         )
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
+
+    def _use_h20_mxfp4_fp8_grouped_m_major(self) -> bool:
+        from vllm.utils.humming import GemmType as HummingGemmType
+        from vllm.utils.humming import dtypes
+
+        device_index = self.locks.device.index
+        assert device_index is not None
+        device_name = current_platform.get_device_name(device_index).upper()
+        if (
+            self.humming_gemm_type() != HummingGemmType.GROUPED_CONTIGUOUS
+            or self.moe_config.moe_parallel_config.use_ep
+            or "H20" not in device_name
+            or "H200" in device_name
+        ):
+            return False
+
+        expected_shapes = {
+            "w13": (1280, 5120),
+            "w2": (5120, 640),
+        }
+        for name, config in self.humming_configs.items():
+            if (
+                (config.shape_n, config.shape_k) != expected_shapes[name]
+                or config.pad_shape_n != 0
+                or config.pad_shape_k != 0
+                or config.sm_version != 90
+                or config.num_experts != 384
+                or config.a_dtype != dtypes.float8e4m3
+                or config.as_dtype != dtypes.float32
+                or config.input_scale_group_size != 128
+                or config.b_dtype != dtypes.float4e2m1
+                or config.bs_dtype != dtypes.float8e8m0
+                or config.weight_scale_group_size != 32
+                or config.c_dtype != dtypes.bfloat16
+                or not config.use_fused_e8m0_scale
+                or not config.use_packed_k_layout
+            ):
+                return False
+
+        logger.info_once(
+            "Using H20 MXFP4 x FP8-block grouped MoE with m-major input scales"
+        )
+        return True
 
     def process_input(
         self,
@@ -224,6 +273,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             expert_tokens=expert_tokens if layout == "grouped_mask" else None,
             scatter_idx=scatter_idx,
             num_valid_tokens=num_valid_tokens,
+            m_major_scale=self.use_m_major_input_scale,
             **activation_kwargs,
         )
         input_scale = group_scales if mode.has_group_scale else token_scales
@@ -376,6 +426,8 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         row-major) matches what the Humming WGMMA grouped GEMM expects.
         """
         quant_config = self.quant_config
+        if self.use_m_major_input_scale:
+            return False
         return (
             quant_config.is_block_quantized
             and quant_config.quant_dtype == current_platform.fp8_dtype()
