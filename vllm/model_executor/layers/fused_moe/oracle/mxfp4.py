@@ -452,12 +452,24 @@ def _return_or_raise(
     activation_key: QuantKey | None,
     activation_format: mk.FusedMoEActivationFormat,
     scope: Literal["process", "global", "local"] = "local",
+    additional_activation_keys: tuple[QuantKey | None, ...] = (),
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts]]:
     reason: str | None = None
     for k_cls in backend_to_kernel_cls(backend):
-        supported, reason = k_cls.is_supported_config(
-            k_cls, config, weight_key, activation_key, activation_format
-        )
+        supported = True
+        for current_activation_key in (
+            activation_key,
+            *additional_activation_keys,
+        ):
+            supported, reason = k_cls.is_supported_config(
+                k_cls,
+                config,
+                weight_key,
+                current_activation_key,
+                activation_format,
+            )
+            if not supported:
+                break
         if supported:
             logger.info_once(_make_log_backend(backend), scope=scope)
             return backend, k_cls
@@ -656,6 +668,7 @@ def select_mxfp4_moe_backend(
 
 def select_deepseek_v4_mxfp4_moe_backend(
     config: FusedMoEConfig,
+    humming_activation_keys: tuple[QuantKey | None, QuantKey | None] | None = None,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the MXFP4 MoE backend with MXFP8 activation as top priority.
     Falls back through BF16 and other backends.
@@ -685,12 +698,19 @@ def select_deepseek_v4_mxfp4_moe_backend(
         last_error: Exception | None = None
         for requested_backend in requested_backends:
             try:
+                activation_keys = (
+                    humming_activation_keys
+                    if requested_backend == Mxfp4MoeBackend.HUMMING
+                    and humming_activation_keys is not None
+                    else (_backend_activation_key(requested_backend),)
+                )
                 return _return_or_raise(
                     requested_backend,
                     config,
                     kMxfp4Static,
-                    _backend_activation_key(requested_backend),
+                    activation_keys[0],
                     activation_format,
+                    additional_activation_keys=activation_keys[1:],
                 )
             except ValueError as e:
                 last_error = e
@@ -712,11 +732,25 @@ def select_deepseek_v4_mxfp4_moe_backend(
 
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
     for backend in priority_backends:
-        activation_key = _backend_activation_key(backend)
+        activation_keys = (
+            humming_activation_keys
+            if backend == Mxfp4MoeBackend.HUMMING
+            and humming_activation_keys is not None
+            else (_backend_activation_key(backend),)
+        )
         for k_cls in backend_to_kernel_cls(backend):
-            supported, reason = k_cls.is_supported_config(
-                k_cls, config, kMxfp4Static, activation_key, activation_format
-            )
+            supported = True
+            reason = None
+            for activation_key in activation_keys:
+                supported, reason = k_cls.is_supported_config(
+                    k_cls,
+                    config,
+                    kMxfp4Static,
+                    activation_key,
+                    activation_format,
+                )
+                if not supported:
+                    break
             if supported:
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
@@ -1382,6 +1416,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     w2_bias: torch.Tensor | None = None,
     _cache_permute_indices: dict[torch.Size, torch.Tensor] | None = None,
     activation: MoEActivation | None = None,
+    humming_input_layer_skipped: bool | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1433,7 +1468,9 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         )
 
         convert_to_humming_moe_kernel_format(
-            layer, quant_config={"quant_method": "mxfp4"}
+            layer,
+            quant_config={"quant_method": "mxfp4"},
+            input_layer_skipped=humming_input_layer_skipped,
         )
         return (
             layer.w13_weight,

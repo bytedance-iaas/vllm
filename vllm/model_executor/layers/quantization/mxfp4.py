@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -46,6 +47,19 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def humming_input_layer_skipped(prefix: str, hf_to_vllm_mapper=None) -> bool:
+    config = envs.VLLM_HUMMING_INPUT_QUANT_CONFIG
+    if not config:
+        return True
+
+    from vllm.model_executor.layers.quantization.humming import HummingConfig
+
+    checker = HummingConfig()
+    if hf_to_vllm_mapper is not None:
+        checker.apply_vllm_mapper(hf_to_vllm_mapper)
+    return checker.is_layer_skipped(config, prefix)
+
+
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -77,10 +91,28 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
-    def _make_moe_method(self, moe: FusedMoEConfig) -> FusedMoEMethodBase:
+    def apply_vllm_mapper(self, hf_to_vllm_mapper):
+        self.hf_to_vllm_mapper = hf_to_vllm_mapper
+
+    def _humming_input_layer_skipped(self, prefix: str) -> bool:
+        return humming_input_layer_skipped(
+            prefix,
+            getattr(self, "hf_to_vllm_mapper", None),
+        )
+
+    def _make_moe_method(
+        self,
+        moe: FusedMoEConfig,
+        prefix: str,
+        humming_input_layer_skipped: bool,
+    ) -> FusedMoEMethodBase:
         """MoE method for RoutedExperts. Subclasses override to pick a
         checkpoint-specific kernel family."""
-        return Mxfp4MoEMethod(moe)
+        return Mxfp4MoEMethod(
+            moe,
+            layer_name=prefix,
+            humming_input_layer_skipped=humming_input_layer_skipped,
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -98,7 +130,11 @@ class Mxfp4Config(QuantizationConfig):
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
-            return self._make_moe_method(layer.moe_config)
+            return self._make_moe_method(
+                layer.moe_config,
+                prefix,
+                self._humming_input_layer_skipped(prefix),
+            )
         elif isinstance(layer, Attention):
             logger.debug_once(
                 "MXFP4 attention layer is not implemented. "
@@ -139,7 +175,12 @@ class GptOssMxfp4Config(Mxfp4Config):
             return None
         return "gpt_oss_mxfp4"
 
-    def _make_moe_method(self, moe: FusedMoEConfig) -> FusedMoEMethodBase:
+    def _make_moe_method(
+        self,
+        moe: FusedMoEConfig,
+        prefix: str,
+        humming_input_layer_skipped: bool,
+    ) -> FusedMoEMethodBase:
         return GptOssMxfp4MoEMethod(moe)
 
 
@@ -480,11 +521,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     supports_pre_processed_weights = True
 
-    def __init__(self, moe: FusedMoEConfig):
+    def __init__(
+        self,
+        moe: FusedMoEConfig,
+        layer_name: str,
+        humming_input_layer_skipped: bool,
+    ):
         super().__init__(moe)
 
         self.weight_dtype = "mxfp4"
-        self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
+        self.layer_name = layer_name
+        self.humming_input_layer_skipped = humming_input_layer_skipped
+        humming_activation_keys = None
+        if moe.moe_backend == "humming" and envs.VLLM_HUMMING_INPUT_QUANT_CONFIG:
+            from vllm.model_executor.layers.quantization.utils.humming import (
+                resolve_humming_moe_activation_keys,
+            )
+            from vllm.utils.humming import BaseWeightSchema
+
+            weight_schema = BaseWeightSchema.from_config({"quant_method": "mxfp4"})
+            humming_activation_keys = resolve_humming_moe_activation_keys(
+                layer_name=layer_name,
+                weight_schema=weight_schema,
+                param_dtype=moe.in_dtype,
+                layer_skipped=humming_input_layer_skipped,
+            )
+        self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
+            moe,
+            humming_activation_keys=humming_activation_keys,
+        )
 
         self.max_capture_size = moe.max_capture_size
 
@@ -736,6 +801,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_bias=w2_bias,
                 _cache_permute_indices=self._cache_permute_indices,
                 activation=self.moe.activation,
+                humming_input_layer_skipped=self.humming_input_layer_skipped,
             )
         )
 

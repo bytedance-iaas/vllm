@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
     kInt4Static,
+    kInt8Dynamic128Sym,
     kInt8DynamicTokenSym,
     kInt8Static,
     kInt8StaticChannelSym,
@@ -156,18 +157,28 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
     def init_humming_moe(self):
         from vllm.utils.humming import get_heuristics_config
 
-        self.use_m_major_input_scale = self._use_h20_mxfp4_fp8_grouped_m_major()
-        self.compute_config = {
-            "use_batch_invariant": envs.VLLM_BATCH_INVARIANT,
-            "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
-            "use_m_major_input_scale": self.use_m_major_input_scale,
-            "gemm_type": self.humming_gemm_type().value,
+        self.use_m_major_input_scale_by_sublayer = {
+            name: self._use_h20_mxfp4_fp8_grouped_m_major(name)
+            for name in self.humming_configs
+        }
+        # Preserve the dispatch-input attribute for existing callers.
+        self.use_m_major_input_scale = self.use_m_major_input_scale_by_sublayer["w13"]
+        self.compute_configs = {
+            name: {
+                "use_batch_invariant": envs.VLLM_BATCH_INVARIANT,
+                "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+                "use_m_major_input_scale": (
+                    self.use_m_major_input_scale_by_sublayer[name]
+                ),
+                "gemm_type": self.humming_gemm_type().value,
+            }
+            for name in self.humming_configs
         }
         self.w13_tuning_config = get_heuristics_config(
             layer_config=self.humming_configs["w13"],
             use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
             use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
-            use_m_major_input_scale=self.use_m_major_input_scale,
+            use_m_major_input_scale=(self.use_m_major_input_scale_by_sublayer["w13"]),
             gemm_type=self.humming_gemm_type(),
             device=self.locks.device,
         )
@@ -175,15 +186,22 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             layer_config=self.humming_configs["w2"],
             use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
             use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
-            use_m_major_input_scale=self.use_m_major_input_scale,
+            use_m_major_input_scale=self.use_m_major_input_scale_by_sublayer["w2"],
             gemm_type=self.humming_gemm_type(),
             device=self.locks.device,
         )
+        self.compute_config_strs = {
+            name: json.dumps(config) for name, config in self.compute_configs.items()
+        }
+        self.compute_config = self.compute_configs["w13"]
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
 
-    def _use_h20_mxfp4_fp8_grouped_m_major(self) -> bool:
+    def _use_h20_mxfp4_fp8_grouped_m_major(
+        self,
+        sublayer_name: str,
+    ) -> bool:
         from vllm.utils.humming import GemmType as HummingGemmType
         from vllm.utils.humming import dtypes
 
@@ -198,31 +216,32 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         ):
             return False
 
-        expected_shapes = {
+        expected_shape = {
             "w13": (1280, 5120),
             "w2": (5120, 640),
-        }
-        for name, config in self.humming_configs.items():
-            if (
-                (config.shape_n, config.shape_k) != expected_shapes[name]
-                or config.pad_shape_n != 0
-                or config.pad_shape_k != 0
-                or config.sm_version != 90
-                or config.num_experts != 384
-                or config.a_dtype != dtypes.float8e4m3
-                or config.as_dtype != dtypes.float32
-                or config.input_scale_group_size != 128
-                or config.b_dtype != dtypes.float4e2m1
-                or config.bs_dtype != dtypes.float8e8m0
-                or config.weight_scale_group_size != 32
-                or config.c_dtype != dtypes.bfloat16
-                or not config.use_fused_e8m0_scale
-                or not config.use_packed_k_layout
-            ):
-                return False
+        }[sublayer_name]
+        config = self.humming_configs[sublayer_name]
+        if (
+            (config.shape_n, config.shape_k) != expected_shape
+            or config.pad_shape_n != 0
+            or config.pad_shape_k != 0
+            or config.sm_version != 90
+            or config.num_experts != 384
+            or config.a_dtype != dtypes.float8e4m3
+            or config.as_dtype != dtypes.float32
+            or config.input_scale_group_size != 128
+            or config.b_dtype != dtypes.float4e2m1
+            or config.bs_dtype != dtypes.float8e8m0
+            or config.weight_scale_group_size != 32
+            or config.c_dtype != dtypes.bfloat16
+            or not config.use_fused_e8m0_scale
+            or not config.use_packed_k_layout
+        ):
+            return False
 
         logger.info_once(
-            "Using H20 MXFP4 x FP8-block grouped MoE with m-major input scales"
+            "Using H20 MXFP4 x FP8-block grouped %s with m-major input scales",
+            sublayer_name,
         )
         return True
 
@@ -273,7 +292,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             expert_tokens=expert_tokens if layout == "grouped_mask" else None,
             scatter_idx=scatter_idx,
             num_valid_tokens=num_valid_tokens,
-            m_major_scale=self.use_m_major_input_scale,
+            m_major_scale=self.use_m_major_input_scale_by_sublayer[sublayer_name],
             **activation_kwargs,
         )
         input_scale = group_scales if mode.has_group_scale else token_scales
@@ -317,6 +336,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         max_expanded_rows = (
             self.moe_config.max_num_tokens
             * self.moe_config.dp_size
+            * self.moe_config.pcp_size
             * self.moe_config.experts_per_token
         )
         return get_moe_permute_scratch(
@@ -372,10 +392,11 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             (kMxfp4Static, kMxfp4Dynamic),
             (kMxfp4Static, kMxfp8Dynamic),
             (kMxfp4Static, kFp8DynamicTokenSym),
-            # MXFP4 weight (group-32 e8m0) with block-FP8 activation
-            # (group-128 float32). Runs via WGMMA software dequant, so it
-            # works on Hopper (SM90/H200) as well as Blackwell.
+            # MXFP4 weight (group-32 e8m0) with group-128 FP8 or INT8
+            # activation and float32 scales. Runs via WGMMA software dequant,
+            # so it works on Hopper (SM90/H200) as well as Blackwell.
             (kMxfp4Static, kFp8Dynamic128Sym),
+            (kMxfp4Static, kInt8Dynamic128Sym),
             (kNvfp4Static, None),
             (kNvfp4Static, kFp8DynamicTokenSym),
             (kMxfp8Static, None),
@@ -780,13 +801,20 @@ class HummingIndexedExperts(HummingExpertsBase):
             "sorted_ids": sorted_ids,
             "expert_ids": expert_ids,
             "num_tokens_padded": num_tokens_padded,
-            "compute_config": self.compute_config_str,
             "valid_shape_m": valid_shape_m,
         }
 
         top_k = topk_ids.size(1)
-        moe_kwargs1 = {"top_k": top_k, "tuning_config": self.w13_tuning_config_str}
-        moe_kwargs2 = {"top_k": 1, "tuning_config": self.w2_tuning_config_str}
+        moe_kwargs1 = {
+            "top_k": top_k,
+            "compute_config": self.compute_config_strs["w13"],
+            "tuning_config": self.w13_tuning_config_str,
+        }
+        moe_kwargs2 = {
+            "top_k": 1,
+            "compute_config": self.compute_config_strs["w2"],
+            "tuning_config": self.w2_tuning_config_str,
+        }
         moe_kwargs1.update(moe_common_kwargs)
         moe_kwargs2.update(moe_common_kwargs)
 
@@ -1001,7 +1029,7 @@ class HummingGroupedExperts(HummingExpertsBase):
             outputs=buffers["gate_up_output"],
             valid_shape_m=valid_shape_m,
             expert_layout=expert_offsets,
-            compute_config=self.compute_config_str,
+            compute_config=self.compute_config_strs["w13"],
             tuning_config=self.w13_tuning_config_str,
         )
 
@@ -1022,7 +1050,7 @@ class HummingGroupedExperts(HummingExpertsBase):
             outputs=buffers["down_output"],
             valid_shape_m=valid_shape_m,
             expert_layout=expert_offsets,
-            compute_config=self.compute_config_str,
+            compute_config=self.compute_config_strs["w2"],
             tuning_config=self.w2_tuning_config_str,
         )
 
@@ -1113,7 +1141,7 @@ class BatchedHummingGroupedExperts(HummingExpertsBase):
             outputs=buffers["gate_up_output"],
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
-            compute_config=self.compute_config_str,
+            compute_config=self.compute_config_strs["w13"],
             tuning_config=self.w13_tuning_config_str,
         )
 
@@ -1134,6 +1162,6 @@ class BatchedHummingGroupedExperts(HummingExpertsBase):
             outputs=output.view(-1, hidden_states.size(-1)),
             valid_shape_m=valid_shape_m,
             expert_layout=expert_num_tokens,
-            compute_config=self.compute_config_str,
+            compute_config=self.compute_config_strs["w2"],
             tuning_config=self.w2_tuning_config_str,
         )

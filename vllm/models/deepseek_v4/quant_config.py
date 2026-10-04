@@ -13,7 +13,10 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.mxfp4 import (
+    Mxfp4MoEMethod,
+    humming_input_layer_skipped,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
@@ -188,7 +191,14 @@ class DeepseekV4FP8Config(Fp8Config):
                         quant_config=self._get_nvfp4_config(),
                         moe_config=layer.moe_config,
                     )
-                return Mxfp4MoEMethod(layer.moe_config)
+                return Mxfp4MoEMethod(
+                    layer.moe_config,
+                    layer_name=prefix,
+                    humming_input_layer_skipped=humming_input_layer_skipped(
+                        prefix,
+                        getattr(self, "hf_to_vllm_mapper", None),
+                    ),
+                )
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
         return super().get_quant_method(layer, prefix)
