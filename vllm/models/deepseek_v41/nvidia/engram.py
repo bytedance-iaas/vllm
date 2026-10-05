@@ -10,6 +10,7 @@ from contextlib import ExitStack
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
@@ -351,6 +352,7 @@ class Engram(BaseEngram):
     """NVIDIA Engram with asynchronous offload and node-local DP lookup."""
 
     _prefetch_stream: torch.cuda.Stream | None = None
+    _prefetch_done: torch.cuda.Event | None = None
 
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
@@ -369,6 +371,7 @@ class Engram(BaseEngram):
         super()._init_staging(max_tokens * self.embed_tokens.dp_size, head_dim)
         if self.embed_tokens.cpu_offload:
             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
+            self._prefetch_done = torch.cuda.Event()
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Prefetch local shared rows or the DP group's gathered hash IDs."""
@@ -382,20 +385,30 @@ class Engram(BaseEngram):
     def _start_prefetch(
         self, hash_ids: torch.Tensor, rows: torch.Tensor, stream: torch.cuda.Stream
     ) -> None:
-        # Eager boundaries let the lookup span piecewise graph segments.
-        stream.wait_stream(torch.cuda.current_stream())
-        # Keep temporary hash storage alive until lookup finishes reading it.
-        hash_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
-            self.embed_tokens.lookup(hash_ids, rows, background=True)
+        # Eager boundaries decide per replay whether the lookup runs inline.
+        current = torch.cuda.current_stream()
+        inline_min_tokens = max(
+            0, envs.VLLM_DSV41_ENGRAM_INLINE_MIN_TOKENS
+        )
+        if inline_min_tokens and hash_ids.shape[0] >= inline_min_tokens:
+            stream = current
+            self.embed_tokens.lookup(hash_ids, rows)
+        else:
+            stream.wait_stream(current)
+            # Keep temporary hash storage alive until lookup finishes reading it.
+            hash_ids.record_stream(stream)
+            with torch.cuda.stream(stream):
+                self.embed_tokens.lookup(hash_ids, rows, background=True)
+        assert self._prefetch_done is not None
+        self._prefetch_done.record(stream)
 
     @eager_break_during_capture
-    def _finish_prefetch(self, stream: torch.cuda.Stream) -> None:
-        torch.cuda.current_stream().wait_stream(stream)
+    def _finish_prefetch(self, event: torch.cuda.Event) -> None:
+        torch.cuda.current_stream().wait_event(event)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
-        if self._prefetch_stream is not None:
-            self._finish_prefetch(self._prefetch_stream)
+        if self._prefetch_done is not None:
+            self._finish_prefetch(self._prefetch_done)
         if self.embed_tokens.dp_size > 1:
             slot = engram_gathered_num_tokens()
             staged = self.staged_rows[: slot * self.embed_tokens.dp_size]

@@ -596,6 +596,7 @@ def _engram_lookup_kernel(
     weight,
     scales,
     ids,
+    sorted_dst,
     out,
     vocab_start,
     vocab_end,
@@ -609,27 +610,37 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID,
+    SORTED: tl.constexpr,
 ):
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA.
+    `weight`/`scales` may address pinned host memory through UVA. If SORTED,
+    `ids` contains rows relative to vocab_start in table order and
+    `sorted_dst` contains their output rows.
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
     for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
         rows = base + tl.arange(0, BLOCK_R)
         valid = rows < num_rows
-        head = HEAD_START + rows % LOCAL_HEADS
-        token = (rows // LOCAL_HEADS).to(tl.int64)
-        index = tl.load(
-            ids + token * ids_stride_t + head * ids_stride_h,
-            mask=valid & (head < TOTAL_HEADS),
-            other=-1,
-        ).to(tl.int64)
-        owned = valid & (head < TOTAL_HEADS)
-        owned &= (index >= vocab_start) & (index < vocab_end)
-        local = tl.where(owned, index - vocab_start, 0)
+        if SORTED:
+            local = tl.load(ids + rows, mask=valid, other=-1).to(tl.int64)
+            dst = tl.load(sorted_dst + rows, mask=valid, other=0).to(tl.int32)
+            owned = valid & (local >= 0) & (local < vocab_end - vocab_start)
+        else:
+            head = HEAD_START + rows % LOCAL_HEADS
+            token = (rows // LOCAL_HEADS).to(tl.int64)
+            index = tl.load(
+                ids + token * ids_stride_t + head * ids_stride_h,
+                mask=valid & (head < TOTAL_HEADS),
+                other=-1,
+            ).to(tl.int64)
+            dst = rows
+            owned = valid & (head < TOTAL_HEADS)
+            owned &= (index >= vocab_start) & (index < vocab_end)
+            local = index - vocab_start
+        local = tl.where(owned, local, 0)
         values = tl.load(
             weight + local[:, None] * DIM + cols[None, :],
             mask=owned[:, None],
@@ -643,7 +654,7 @@ def _engram_lookup_kernel(
         # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         tl.store(
-            out + rows[:, None] * DIM + cols[None, :],
+            out + dst[:, None] * DIM + cols[None, :],
             (values.to(tl.float32) * scale).to(tl.bfloat16),
             mask=valid[:, None],
         )
@@ -721,6 +732,21 @@ class ParallelEngramEmbedding(nn.Module):
         if not rows:
             return
         weight, scales = self._storage()
+        ids_stride_t, ids_stride_h = indices.stride()
+        sort_min_rows = max(0, envs.VLLM_DSV41_ENGRAM_SORT_MIN_ROWS)
+        sort = (
+            bool(getattr(self, "cpu_offload", False))
+            and sort_min_rows > 0
+            and rows >= sort_min_rows
+        )
+        sorted_dst = indices
+        if sort:
+            head_end = self.head_start + self.part_n_hash_cols
+            local = indices[:, self.head_start : head_end] - self.vocab_start_idx
+            if (pad := self.part_n_hash_cols - local.shape[1]) > 0:
+                local = nn.functional.pad(local, (0, pad), value=-1)
+            indices, sorted_dst = local.flatten().sort()
+            sorted_dst = sorted_dst.int()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
@@ -729,12 +755,13 @@ class ParallelEngramEmbedding(nn.Module):
             weight,
             scales,
             indices,
+            sorted_dst,
             out,
             self.vocab_start_idx,
             self.vocab_end_idx,
             rows,
-            indices.stride(0),
-            indices.stride(1),
+            ids_stride_t,
+            ids_stride_h,
             HEAD_START=self.head_start,
             LOCAL_HEADS=self.part_n_hash_cols,
             TOTAL_HEADS=self.n_hash_cols,
@@ -742,6 +769,7 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            SORTED=sort,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
