@@ -94,6 +94,12 @@
     "DSV41_HUMMING_VERSION": {
       "default": "0.1.12"
     },
+    "DSV41_PREFILL_HUMMING_COMMIT": {
+      "default": "3632a5052b6e42011415ee1390cba6b614567059"
+    },
+    "DSV41_PREFILL_HUMMING_PATH": {
+      "default": "/opt/humming-dsv41-prefill-3632a505"
+    },
     "FLASHINFER_VERSION": {
       "default": "0.6.18.post1"
     },

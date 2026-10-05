@@ -1,0 +1,447 @@
+#define USE_CUDA 1
+
+#include <cuda.h>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "./elf.h"
+#include "./mapped_file.h"
+#include "./process_input.h"
+#include "./tensor.h"
+#include "./torch_api.h"
+#include "./utils.h"
+
+struct RegisteredKernel {
+  std::shared_ptr<const MappedFile> cubin;
+  std::string cubin_path;
+  std::string kernel_name;
+  KernelData metadata;
+};
+
+static std::shared_mutex g_kernel_mutex;
+static std::unordered_map<std::string, std::tuple<int64_t, std::string>> g_path_ids;
+static std::unordered_map<int64_t, RegisteredKernel> g_registered_kernels;
+static std::unordered_map<CUcontext, std::unordered_map<int64_t, LoadedKernel>> g_loaded_kernels;
+
+inline int64_t find_kernel_configs_target_index(IntArrayRef &configs, int64_t shape_m) {
+  size_t n = configs.size();
+  if (n <= 2) return 0;
+  if (n > 0 && n % 4 == 0) {
+    for (size_t i = 0; i < n; i += 4) {
+      int64_t min_val = configs[i];
+      int64_t max_val = configs[i + 1];
+      max_val = max_val > 0 ? max_val : (1 << 30);
+      if (shape_m > min_val && shape_m <= max_val) return i + 2;
+    }
+
+    ASSERT_CHECK(false, "shape_m is not within any range defined in configs.");
+  }
+
+  ASSERT_CHECK(false, "configs length must be 1-2 or a non-zero multiple of 4.");
+};
+
+inline KernelData find_registered_kernel_data(int64_t kernel_id) {
+  std::shared_lock lock(g_kernel_mutex);
+  auto it = g_registered_kernels.find(kernel_id);
+  ASSERT_CHECK(it != g_registered_kernels.end(), "kernel not registered.");
+  return it->second.metadata;
+}
+
+inline LoadedKernel get_or_load_kernel(int64_t kernel_id, CUcontext context) {
+  std::shared_ptr<const MappedFile> cubin;
+  std::string kernel_name;
+  {
+    std::shared_lock lock(g_kernel_mutex);
+    auto context_it = g_loaded_kernels.find(context);
+    if (context_it != g_loaded_kernels.end()) {
+      auto kernel_it = context_it->second.find(kernel_id);
+      if (kernel_it != context_it->second.end()) return kernel_it->second;
+    }
+
+    auto registered_it = g_registered_kernels.find(kernel_id);
+    ASSERT_CHECK(registered_it != g_registered_kernels.end(), "kernel not registered.");
+    cubin = registered_it->second.cubin;
+    kernel_name = registered_it->second.kernel_name;
+  }
+
+  LoadedKernel kernel = {};
+  check_curesult(cuModuleLoadData(&kernel.module, cubin->data()), "cuModuleLoadData");
+  check_curesult(
+      cuModuleGetFunction(&kernel.func, kernel.module, kernel_name.c_str()),
+      "cuModuleGetFunction");
+
+  std::unique_lock lock(g_kernel_mutex);
+  auto &context_data = g_loaded_kernels[context];
+  auto [it, inserted] = context_data.emplace(kernel_id, kernel);
+  if (!inserted) check_curesult(cuModuleUnload(kernel.module), "cuModuleUnload");
+  return it->second;
+}
+
+inline KernelData find_registered_kernel_data(IntArrayRef &configs, int64_t shape_m) {
+  int64_t index = find_kernel_configs_target_index(configs, shape_m);
+  int64_t kernel_id = configs[index];
+  return find_registered_kernel_data(kernel_id);
+}
+
+inline KernelLaunchData find_kernel_launch_data(IntArrayRef &configs, int64_t shape_m, CUcontext context) {
+  auto n = configs.size();
+  int64_t index = find_kernel_configs_target_index(configs, shape_m);
+  int64_t kernel_id = configs[index];
+  int64_t num_sms = n < 2 ? 0 : configs[index + 1];
+  KernelData metadata = find_registered_kernel_data(kernel_id);
+  LoadedKernel kernel = get_or_load_kernel(kernel_id, context);
+  KernelLaunchData kernel_launch_data = {metadata, kernel.func, num_sms};
+  return kernel_launch_data;
+};
+
+inline int64_t get_num_sms(int64_t num_sms, int64_t dev) {
+  if (num_sms > 0) return num_sms;
+  CUdevice device;
+  int32_t dev_sms;
+  check_curesult(cuDeviceGet(&device, dev), "cuDeviceGet");
+  char device_name[256];
+  check_curesult(cuDeviceGetName(device_name, sizeof(device_name), device), "cuDeviceGetName");
+  if (std::string(device_name).find("ZW810E") != std::string::npos) return 20;
+  check_curesult(
+      cuDeviceGetAttribute(&dev_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device),
+      "cuDeviceGetAttribute");
+  return static_cast<int64_t>(dev_sms);
+}
+
+Tensor launch_kernel_impl(
+    IntArrayRef configs,
+    Tensor a,
+    Tensor b,
+    Tensor bs,
+    std::optional<Tensor> bs2_,
+    std::optional<Tensor> as_,
+    std::optional<Tensor> as2_,
+    std::optional<Tensor> bzp_,
+    std::optional<Tensor> bias_,
+    std::optional<Tensor> c_,
+    std::optional<Tensor> sorted_ids_,
+    std::optional<Tensor> expert_ids_,
+    std::optional<Tensor> num_tokens_padded_,
+    std::optional<Tensor> expert_layout_,
+    std::optional<Tensor> locks_,
+    int64_t top_k,
+    int64_t valid_shape_m,
+    bool should_check_tensor = true) {
+
+  if (locks_.has_value() && locks_->numel() == 0) locks_.reset();
+  int64_t dev = a.get_device();
+  DeviceContextGuard context_guard(dev);
+  CUcontext context = get_current_context();
+  KernelData base_kernel_data = find_registered_kernel_data(configs, 1);
+
+  int64_t shape_m = a.size(0);
+  if (valid_shape_m <= 0) {
+    valid_shape_m = shape_m * (base_kernel_data.gemm_type_id == 1 ? top_k : 1);
+  }
+  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, valid_shape_m, context);
+  KernelData &kernel_data = kernel_launch_data.metadata;
+  int64_t &num_sms = kernel_launch_data.num_sms;
+  Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
+  uint32_t num_ctas = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
+  Tensor tensor_map_buffer = make_tensor_map_buffer(a, kernel_data, num_ctas);
+  a = torch_contiguous(a);
+
+  if (should_check_tensor) {
+    check_tensor_a(a, kernel_data, dev);
+    check_tensor_b(b, kernel_data, dev);
+    check_tensor_c(c, kernel_data, dev, shape_m, top_k);
+    check_tensor_as(as_, kernel_data, dev, shape_m, top_k);
+    check_tensor_as2(as2_, kernel_data, dev, shape_m);
+    check_tensor_bs(bs, kernel_data, dev);
+    check_tensor_bzp(bzp_, kernel_data, dev);
+    check_tensor_bias(bias_, kernel_data, dev);
+    check_tensor_bs2(bs2_, kernel_data, dev);
+    check_tensor_locks(locks_, kernel_data, dev);
+    check_tensor_moe(sorted_ids_, expert_ids_, num_tokens_padded_, expert_layout_, kernel_data, dev, shape_m);
+  }
+
+  void *a_ptr = a.data_ptr();
+  void *b_ptr = b.data_ptr();
+  void *c_ptr = c.data_ptr();
+  void *as_ptr = as_.has_value() ? as_->data_ptr() : nullptr;
+  void *as2_ptr = as2_.has_value() ? as2_->data_ptr() : nullptr;
+  void *bs_ptr = bs.data_ptr();
+  void *bzp_ptr = bzp_.has_value() ? bzp_->data_ptr() : nullptr;
+  void *bias_ptr = bias_.has_value() ? bias_->data_ptr() : nullptr;
+  void *bs2_ptr = bs2_.has_value() ? bs2_->data_ptr() : nullptr;
+  void *sorted_ids_ptr = sorted_ids_.has_value() ? sorted_ids_->data_ptr() : nullptr;
+  void *expert_ids_ptr = expert_ids_.has_value() ? expert_ids_->data_ptr() : nullptr;
+  void *num_tokens_padded_ptr = num_tokens_padded_.has_value() ? num_tokens_padded_->data_ptr() : nullptr;
+  void *expert_layout_ptr = expert_layout_.has_value() ? expert_layout_->data_ptr() : nullptr;
+  void *locks_ptr = locks_.has_value() ? locks_->data_ptr() : nullptr;
+  void *tensor_map_buffer_ptr = tensor_map_buffer.data_ptr();
+
+  auto tensor_map_a = make_tma_desc_a(a, kernel_data);
+  auto tensor_map_as = make_tma_desc_as(as_, kernel_data);
+  auto tensor_map_as2 = make_tma_desc_as2(as2_, kernel_data);
+  auto tensor_map_b = make_tma_desc_b(b, kernel_data);
+  auto tensor_map_c = make_tma_desc_c(c, kernel_data);
+  auto tensor_map_bs = make_tma_desc_bs(bs, kernel_data);
+  auto tensor_map_bzp = make_tma_desc_bzp(bzp_, kernel_data);
+  auto tensor_map_bias = make_tma_desc_bias(bias_, kernel_data);
+  auto tensor_map_bs2 = make_tma_desc_bs2(bs2_, kernel_data);
+  auto to_void_ptr = [&](void *ptr) { return ptr; };
+  bool use_int64_expert_layout = false;
+  if (expert_layout_.has_value()) {
+    use_int64_expert_layout = expert_layout_.value().scalar_type() == ScalarType::Long;
+  }
+
+  uint32_t shape_m_u32 = static_cast<uint32_t>(shape_m);
+  uint32_t top_k_u32 = static_cast<uint32_t>(top_k);
+  ASSERT_CHECK(static_cast<int64_t>(shape_m_u32) == shape_m, "shape_m overflows uint32_t: ", shape_m);
+  ASSERT_CHECK(static_cast<int64_t>(top_k_u32) == top_k, "top_k overflows uint32_t: ", top_k);
+
+  void *kernel_args[] = {
+      kernel_data.use_tma_a ? to_void_ptr(&tensor_map_a) : to_void_ptr(&a_ptr),
+      kernel_data.use_tma_b ? to_void_ptr(&tensor_map_b) : to_void_ptr(&b_ptr),
+      kernel_data.use_tma_c ? to_void_ptr(&tensor_map_c) : to_void_ptr(&c_ptr),
+      kernel_data.use_tma_as ? to_void_ptr(&tensor_map_as) : to_void_ptr(&as_ptr),
+      kernel_data.use_tma_as2 ? to_void_ptr(&tensor_map_as2) : to_void_ptr(&as2_ptr),
+      kernel_data.use_tma_bs ? to_void_ptr(&tensor_map_bs) : to_void_ptr(&bs_ptr),
+      kernel_data.use_tma_bzp ? to_void_ptr(&tensor_map_bzp) : to_void_ptr(&bzp_ptr),
+      kernel_data.use_tma_bias ? to_void_ptr(&tensor_map_bias) : to_void_ptr(&bias_ptr),
+      kernel_data.use_tma_bs2 ? to_void_ptr(&tensor_map_bs2) : to_void_ptr(&bs2_ptr),
+      &sorted_ids_ptr,
+      &expert_ids_ptr,
+      &num_tokens_padded_ptr,
+      &expert_layout_ptr,
+      &tensor_map_buffer_ptr,
+      &locks_ptr,
+      &shape_m_u32,
+      &top_k_u32,
+      &use_int64_expert_layout};
+
+  CUlaunchConfig config = {};
+  config.gridDimX = num_ctas;
+  config.gridDimY = 1;
+  config.gridDimZ = 1;
+  config.blockDimX = kernel_data.num_threads;
+  config.blockDimY = 1;
+  config.blockDimZ = 1;
+
+  CUlaunchAttribute attrs[2];
+  uint32_t num_attrs = 0;
+  uint32_t cluster_size = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b * kernel_data.umma_cta_group_size;
+  config.gridDimX = (num_ctas / cluster_size) * cluster_size;
+  ASSERT_CHECK(config.gridDimX > 0, "not enough SMs for the requested CTA cluster");
+  if (cluster_size > 1) {
+    attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    attrs[num_attrs].value.clusterDim.x = cluster_size;
+    attrs[num_attrs].value.clusterDim.y = 1;
+    attrs[num_attrs].value.clusterDim.z = 1;
+    num_attrs++;
+  }
+  if (kernel_data.use_pdl) {
+    attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    attrs[num_attrs].value.programmaticStreamSerializationAllowed = 1;
+    num_attrs++;
+  }
+  if (num_attrs > 0) {
+    config.attrs = attrs;
+    config.numAttrs = num_attrs;
+  }
+
+  config.sharedMemBytes = kernel_data.smem_size;
+  config.hStream = get_current_cuda_stream(dev);
+
+  CUfunction &func = kernel_launch_data.func;
+  constexpr auto SMEM_SIZE_ATTR = CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+  check_curesult(cuFuncSetAttribute(func, SMEM_SIZE_ATTR, kernel_data.smem_size), "cuFuncSetAttribute");
+  check_curesult(cuLaunchKernelEx(&config, func, kernel_args, nullptr), "cuLaunchKernelEx");
+
+  return c;
+};
+
+std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) {
+  {
+    std::shared_lock lock(g_kernel_mutex);
+    auto it = g_path_ids.find(cubin_path);
+    if (it != g_path_ids.end()) return it->second;
+  }
+
+  auto cubin = std::make_shared<MappedFile>(cubin_path);
+  auto reader = CubinReader(cubin_path);
+  std::string kernel_name;
+  for (const auto &name : reader.getKernelNames()) {
+    if (name.find("humming") == std::string::npos) continue;
+    ASSERT_CHECK(kernel_name.empty(), "multiple humming kernels found in ", cubin_path);
+    kernel_name = name;
+  }
+  ASSERT_CHECK(!kernel_name.empty(), "no humming kernel found in ", cubin_path);
+
+  KernelData metadata = {
+      reader.getUint32("SMEM_SIZE"),
+      reader.getUint32("NUM_THREADS"),
+      reader.getUint32("A_DTYPE_ID"),
+      reader.getUint32("B_DTYPE_ID"),
+      reader.getUint32("C_DTYPE_ID"),
+      reader.getUint32("BS_DTYPE_ID"),
+      reader.getUint32("PROBLEM_SHAPE_N"),
+      reader.getUint32("PROBLEM_SHAPE_K"),
+      reader.getUint32("BLOCK_SHAPE_M"),
+      reader.getUint32("BLOCK_SHAPE_N"),
+      reader.getUint32("BLOCK_SHAPE_K"),
+      reader.getUint32("PAD_SHAPE_N"),
+      reader.getUint32("PAD_SHAPE_K"),
+      reader.getUint32("NUM_EXPERTS"),
+      reader.getUint32("INPUT_SCALE_GROUP_SIZE"),
+      reader.getUint32("WEIGHT_SCALE_GROUP_SIZE"),
+      reader.getUint32("WEIGHT_SCALE_GROUP_SIZE_N"),
+      reader.getUint32("NUM_CTAS_PER_SM"),
+      reader.getUint32("UMMA_CTA_GROUP_SIZE"),
+      reader.getUint32("UMMA_OUTPUT_CHUNK_ROWS"),
+      reader.getUint32("MULTI_CAST_SIZE_A"),
+      reader.getUint32("MULTI_CAST_SIZE_B"),
+      reader.getUint32("GEMM_TYPE_ID"),
+      reader.getUint32("MMA_TYPE_ID"),
+
+      reader.getBool("USE_STREAM_K"),
+      reader.getBool("IS_FP_ZERO_POINT"),
+      reader.getBool("IS_CHANNEL_WEIGHT_SCALE"),
+      reader.getBool("IS_GROUP_WEIGHT_SCALE"),
+      reader.getBool("IS_BLOCK_WEIGHT_SCALE"),
+      reader.getBool("IS_TENSOR_WEIGHT_SCALE"),
+      reader.getBool("IS_CHANNEL_WEIGHT_SCALE_2"),
+      reader.getBool("IS_TENSOR_WEIGHT_SCALE_2"),
+      reader.getBool("HAS_ZERO_POINT"),
+      reader.getBool("HAS_BIAS"),
+      reader.getBool("HAS_INPUT_SCALE_2"),
+      reader.getBool("IS_TENSOR_INPUT_SCALE"),
+      reader.getBool("IS_TENSOR_INPUT_SCALE_2"),
+      reader.getBool("USE_M_MAJOR_INPUT_SCALE"),
+      reader.getBool("USE_TMA_A"),
+      reader.getBool("USE_TMA_AS"),
+      reader.getBool("USE_TMA_AS2"),
+      reader.getBool("USE_TMA_B"),
+      reader.getBool("USE_TMA_C"),
+      reader.getBool("USE_TMA_BS"),
+      reader.getBool("USE_TMA_BS2"),
+      reader.getBool("USE_TMA_BZP"),
+      reader.getBool("USE_TMA_BIAS"),
+      reader.getBool("USE_PDL"),
+      reader.getBool("USE_PACKED_K_LAYOUT")};
+
+  std::unique_lock lock(g_kernel_mutex);
+  auto path_it = g_path_ids.find(cubin_path);
+  if (path_it != g_path_ids.end()) return path_it->second;
+
+  int64_t hash_id = manual_crc32(cubin_path);
+  hash_id = (hash_id << 30) + manual_crc32(kernel_name);
+  auto kernel_it = g_registered_kernels.find(hash_id);
+  bool no_collision = kernel_it == g_registered_kernels.end() || kernel_it->second.cubin_path == cubin_path;
+  ASSERT_CHECK(no_collision, "kernel id collision for ", cubin_path);
+  if (kernel_it == g_registered_kernels.end()) {
+    g_registered_kernels.emplace(hash_id, RegisteredKernel{cubin, cubin_path, kernel_name, metadata});
+  }
+  auto result = std::make_tuple(hash_id, kernel_name);
+  g_path_ids[cubin_path] = result;
+  return result;
+}
+
+int64_t get_kernel_smem_size(int64_t kernel_id) {
+  return static_cast<int64_t>(find_registered_kernel_data(kernel_id).smem_size);
+}
+
+Tensor launch_kernel(
+    Tensor configs_t,
+    Tensor a,
+    Tensor b,
+    Tensor bs,
+    std::optional<Tensor> bs2_,
+    std::optional<Tensor> as_,
+    std::optional<Tensor> as2_,
+    std::optional<Tensor> bzp_,
+    std::optional<Tensor> bias_,
+    std::optional<Tensor> c_,
+    std::optional<Tensor> sorted_ids_,
+    std::optional<Tensor> expert_ids_,
+    std::optional<Tensor> num_tokens_padded_,
+    std::optional<Tensor> expert_layout_,
+    std::optional<Tensor> locks_,
+    int64_t top_k,
+    int64_t valid_shape_m,
+    bool should_check_tensor = true) {
+  ASSERT_CHECK(configs_t.scalar_type() == ScalarType::Long, "configs must be int64 tensor.");
+  ASSERT_CHECK(configs_t.is_contiguous(), "configs must be contiguous.");
+  ASSERT_CHECK(configs_t.get_device() < 0, "configs must be a CPU tensor.");
+  IntArrayRef configs(static_cast<int64_t *>(configs_t.data_ptr()),
+                      static_cast<size_t>(configs_t.numel()));
+  return launch_kernel_impl(configs, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c_, sorted_ids_, expert_ids_,
+                            num_tokens_padded_, expert_layout_, locks_, top_k, valid_shape_m, should_check_tensor);
+}
+
+void launch_kernel_out(
+    Tensor configs_t,
+    Tensor a,
+    Tensor b,
+    Tensor bs,
+    std::optional<Tensor> bs2_,
+    std::optional<Tensor> as_,
+    std::optional<Tensor> as2_,
+    std::optional<Tensor> bzp_,
+    std::optional<Tensor> bias_,
+    Tensor c,
+    std::optional<Tensor> sorted_ids_,
+    std::optional<Tensor> expert_ids_,
+    std::optional<Tensor> num_tokens_padded_,
+    std::optional<Tensor> expert_layout_,
+    Tensor locks,
+    int64_t top_k,
+    int64_t valid_shape_m,
+    bool should_check_tensor = true) {
+  if (!a.is_cuda()) return;
+  (void)launch_kernel(configs_t, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c, sorted_ids_, expert_ids_,
+                      num_tokens_padded_, expert_layout_, locks, top_k, valid_shape_m, should_check_tensor);
+}
+
+COMMON_TORCH_LIBRARY(humming, m) {
+  m.def(
+      "launch_kernel(Tensor configs, Tensor a, Tensor b, Tensor bs, "
+      "Tensor? bs2, Tensor? as_, Tensor? as2, Tensor? bzp, Tensor? bias, Tensor? c, "
+      "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
+      "Tensor? locks, SymInt top_k, SymInt valid_shape_m, bool should_check_tensor = True) -> Tensor");
+  m.def(
+      "launch_kernel.out(Tensor configs, Tensor a, Tensor b, Tensor bs, "
+      "Tensor? bs2, Tensor? as_, Tensor? as2, Tensor? bzp, Tensor? bias, Tensor(a!) c, "
+      "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
+      "Tensor(b!) locks, SymInt top_k, SymInt valid_shape_m, bool should_check_tensor = True) -> ()");
+  m.def("register_kernel(str cubin_path) -> (int, str)");
+  m.def("register_process_input_kernel(str cubin_path) -> (int, str)");
+  m.def("get_kernel_smem_size(int kernel_id) -> int");
+  m.def(
+      "launch_process_input(Tensor configs, Tensor inputs, Tensor(a!) outputs, "
+      "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_tokens, "
+      "Tensor? scatter_idx, Tensor? num_valid_tokens) -> ()");
+  m.def(
+      "launch_process_input.inplace(Tensor configs, Tensor(a!) inputs, "
+      "Tensor? expert_tokens, Tensor? scatter_idx, Tensor? num_valid_tokens) -> ()");
+};
+
+COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {
+  m.impl("launch_kernel", COMMON_TORCH_BOX(&launch_kernel));
+  m.impl("launch_process_input", COMMON_TORCH_BOX(&launch_process_input));
+  m.impl("launch_process_input.inplace", COMMON_TORCH_BOX(&launch_process_input_inplace));
+  m.impl("launch_kernel.out", COMMON_TORCH_BOX(&launch_kernel_out));
+};
+
+COMMON_TORCH_LIBRARY_IMPL(humming, Undefined, m) {
+  m.impl("register_kernel", COMMON_TORCH_BOX(&register_kernel));
+  m.impl("register_process_input_kernel", COMMON_TORCH_BOX(&register_process_input_kernel));
+  m.impl("get_kernel_smem_size", COMMON_TORCH_BOX(&get_kernel_smem_size));
+};
+
+COMMON_TORCH_LIBRARY_IMPL(humming, Meta, m) {
+  m.impl("launch_kernel.out", COMMON_TORCH_BOX(&launch_kernel_out));
+  m.impl("launch_process_input", COMMON_TORCH_BOX(&launch_process_input));
+  m.impl("launch_process_input.inplace", COMMON_TORCH_BOX(&launch_process_input_inplace));
+};

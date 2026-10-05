@@ -864,6 +864,8 @@ ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_VERSION
 ARG DSV41_HUMMING_VERSION=0.1.12
+ARG DSV41_PREFILL_HUMMING_COMMIT=3632a5052b6e42011415ee1390cba6b614567059
+ARG DSV41_PREFILL_HUMMING_PATH=/opt/humming-dsv41-prefill-3632a505
 
 # Keep the output image's CUDA metadata aligned with the selected toolkit.
 # This also normalizes prerelease base images with four-component metadata for
@@ -1117,6 +1119,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         "humming-kernels[${humming_extra}]==${DSV41_HUMMING_VERSION}" \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         ${uv_extra_index_args}
+
+# Package the exact, separately qualified H20 Prefill runtime. Decode keeps
+# using /opt/humming-${DSV41_HUMMING_VERSION}.
+COPY third_party/humming-dsv41-prefill ${DSV41_PREFILL_HUMMING_PATH}
+RUN test "$(cat ${DSV41_PREFILL_HUMMING_PATH}/SOURCE_COMMIT)" = \
+        "${DSV41_PREFILL_HUMMING_COMMIT}" \
+    && PYTHONPATH="${DSV41_PREFILL_HUMMING_PATH}" python3 -c \
+        "from humming.build import build_native; print(build_native())" \
+    && find "${DSV41_PREFILL_HUMMING_PATH}/humming/_native" \
+        -maxdepth 2 -type f -print -exec sha256sum {} \;
 
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
 # https://docs.flashinfer.ai/installation.html
