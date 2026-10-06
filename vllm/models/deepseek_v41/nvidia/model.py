@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.config.kv_transfer import dsv41_encoder_only_boundary_layer
@@ -764,21 +763,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
             self.decoder_replay_start = cut + 1
-            # Batch sizes the runner captures piecewise (breakable) graphs for.
-            compilation_config = vllm_config.compilation_config
-            graph_sizes: list[int] = []
-            if (
-                compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
-                and is_breakable_cudagraph_enabled()
-            ):
-                graph_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+            # The attention metadata keys the replay layers read.
+            metadata_prefixes = set()
+            for layer in islice(self.layers, cut + 1, self.end_layer):
+                attn = typing.cast(DeepseekV4DecoderLayer, layer).attn
+                metadata_prefixes.add(attn.swa_cache_layer.prefix)
+                if attn.compressed_cache_prefix is not None:
+                    metadata_prefixes.add(attn.compressed_cache_prefix)
+                if attn.indexer is not None:
+                    metadata_prefixes.add(attn.indexer.k_cache.prefix)
             self.decoder_replay_layers = DecoderReplayLayers(
-                vllm_config,
                 config.sliding_window,
-                self.layers[cut].attn,
-                [self.layers[i].attn for i in range(cut + 1, self.end_layer)],
                 self._run_decoder_replay_layers,
-                graph_sizes,
+                [
+                    buf
+                    for buf in (self.topk_indices_buffer, self.candidate_block_buffer)
+                    if buf is not None
+                ],
+                metadata_prefixes,
+            )
+            logger.info_once(
+                "Decoder SWA bounded replay: in eager prefill steps, layers "
+                "%d-%d run on each request's last %d tokens only.",
+                cut + 1,
+                self.end_layer - 1,
+                config.sliding_window,
             )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
@@ -1280,12 +1289,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         elif (
             self.use_sequence_parallel
-            or parallel_config.data_parallel_size > 1
             or parallel_config.prefill_context_parallel_size > 1
+            or parallel_config.use_ubatching
         ):
             reason = (
-                "the replay-layer batch shrinks per rank, which sequence, data "
-                "and prefill-context parallelism cannot follow"
+                "the replay-layer batch shrinks per rank, which sequence and "
+                "prefill-context parallelism and microbatching cannot follow"
             )
         elif any(i > cut for i in getattr(self.config, "engram_layer_ids", ())):
             reason = "an Engram layer sits after the last KV source layer"
@@ -1705,6 +1714,12 @@ class DeepseekV41LLMForCausalLM(
         passes them as `lookback_token_ids`."""
         engram_hash = self.model.engram_hash
         return engram_hash.lookback_depth if engram_hash is not None else 0
+
+    @property
+    def decoder_replay_layers(self) -> DecoderReplayLayers | None:
+        if self.model.encoder_only_prefill:
+            return None
+        return self.model.decoder_replay_layers
 
     def forward(
         self,
