@@ -277,10 +277,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         tuple[int, int, int, int, int, int, int, int, str], object
     ] = {}
     _capacity_warmup_done: set[tuple[int, float | None, bool]] = set()
-    _validated_num_sms: set[tuple[int, int]] = set()
-    _runtime_fingerprint_logged: set[tuple[int, str, int, int]] = set()
+    _validated_num_sms: set[tuple[int, str, int]] = set()
+    _runtime_fingerprint_logged: set[tuple[int, str, int, int, int]] = set()
     _telemetry_sample_counts: dict[int, int] = {}
     _target_num_sms_batch_sizes = frozenset((48, 56, 64))
+    _high_row_num_sms_batch_sizes = frozenset((128, 384))
 
     @staticmethod
     def _is_dsv41_target_mega_moe(
@@ -347,6 +348,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self._mega_moe_num_sms = _read_nonnegative_int_env("VLLM_DSV4_MEGAMOE_NUM_SMS")
         self._target_mega_moe_num_sms = (
             _read_nonnegative_int_env("VLLM_DSV41_TARGET_MEGAMOE_NUM_SMS")
+            if self._is_dsv41_target_mega_moe(
+                vllm_config,
+                prefix,
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                top_k,
+                sequence_parallel_size,
+            )
+            else 0
+        )
+        self._high_row_mega_moe_num_sms = (
+            _read_nonnegative_int_env("VLLM_DSV41_HIGH_ROW_MEGAMOE_NUM_SMS")
             if self._is_dsv41_target_mega_moe(
                 vllm_config,
                 prefix,
@@ -437,9 +451,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 "VLLM_DSV41_TARGET_MEGAMOE_NUM_SMS",
                 self._target_mega_moe_num_sms,
             ),
+            (
+                "VLLM_DSV41_HIGH_ROW_MEGAMOE_NUM_SMS",
+                self._high_row_mega_moe_num_sms,
+            ),
         )
         for env_name, num_sms in values:
-            validation_key = (id(ep_group.device_group), num_sms)
+            validation_key = (id(ep_group.device_group), env_name, num_sms)
             if validation_key in self._validated_num_sms:
                 continue
             if num_sms and (num_sms <= 1 or num_sms > max_num_sms or num_sms % 2):
@@ -496,6 +514,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             and uniform_num_tokens in self._target_num_sms_batch_sizes
         ):
             return self._target_mega_moe_num_sms
+        if (
+            self._high_row_mega_moe_num_sms
+            and uniform_num_tokens in self._high_row_num_sms_batch_sizes
+        ):
+            return self._high_row_mega_moe_num_sms
         return self._mega_moe_num_sms
 
     def _log_runtime_fingerprint(self, deep_gemm, device: torch.device) -> None:
@@ -505,6 +528,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             module_name,
             self._mega_moe_num_sms,
             self._target_mega_moe_num_sms,
+            self._high_row_mega_moe_num_sms,
         )
         if log_key in self._runtime_fingerprint_logged:
             return
@@ -526,6 +550,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             "module=%s version=%s module_file=%s module_sha256=%s "
             "mega_sha256=%s extension_sha256=%s jit_header_sha256=%s "
             "api=%s gpu=%s sm_count=%d num_sms=%d target_num_sms=%d "
+            "high_row_num_sms=%d "
             "H=%d I=%d E=%d topk=%d decode_capacity=%d max_batched_tokens=%d",
             ep_group.rank_in_group,
             ep_group.world_size,
@@ -541,6 +566,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             torch.cuda.get_device_properties(device).multi_processor_count,
             self._mega_moe_num_sms,
             self._target_mega_moe_num_sms,
+            self._high_row_mega_moe_num_sms,
             self.hidden_size,
             self.intermediate_size,
             self.num_experts,
@@ -1889,8 +1915,13 @@ class DeepseekV4MoE(nn.Module):
             and self.ep_size == 8
             and current_platform.is_device_capability_family(90)
             and os.environ.get("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
-            and self._supports_shared_overlap_num_sms(
-                self.experts._target_mega_moe_num_sms
+            and (
+                self._supports_shared_overlap_num_sms(
+                    self.experts._target_mega_moe_num_sms
+                )
+                or self._supports_shared_overlap_num_sms(
+                    self.experts._high_row_mega_moe_num_sms
+                )
             )
         )
         self._shared_overlap_stream = (
@@ -1904,8 +1935,10 @@ class DeepseekV4MoE(nn.Module):
         if self._shared_overlap_enabled:
             logger.info_once(
                 "DeepSeek V4 target routed/shared overlap enabled: "
-                "target_num_sms=%d EP8 TP1 M=(48,56,64).",
+                "target_num_sms=%d M=(48,56,64) high_row_num_sms=%d "
+                "M=(128,384) EP8 TP1.",
                 self.experts._target_mega_moe_num_sms,
+                self.experts._high_row_mega_moe_num_sms,
             )
 
     def _init_mega_moe_experts(

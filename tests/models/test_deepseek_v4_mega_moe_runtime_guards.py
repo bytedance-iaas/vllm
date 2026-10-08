@@ -28,6 +28,9 @@ def _make_vllm_config(
     num_speculative_tokens: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=1),
+        ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
@@ -225,6 +228,91 @@ def test_get_max_num_tokens_across_dp_localizes_sequence_parallel():
         assert experts._get_max_num_tokens_across_dp(8) == 17
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (48, 76),
+        (56, 76),
+        (64, 76),
+        (128, 72),
+        (384, 72),
+        (96, 0),
+        (256, 0),
+    ],
+)
+def test_get_mega_moe_num_sms_selects_separate_low_and_high_row_budgets(
+    num_tokens, expected
+):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._mega_moe_num_sms = 0
+    experts._target_mega_moe_num_sms = 76
+    experts._high_row_mega_moe_num_sms = 72
+    dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.full((8,), num_tokens, dtype=torch.int32)
+    )
+
+    with override_forward_context(SimpleNamespace(dp_metadata=dp_metadata)):
+        assert experts._get_mega_moe_num_sms(num_tokens) == expected
+
+
+def test_get_mega_moe_num_sms_falls_back_for_nonuniform_dp_rows():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._mega_moe_num_sms = 0
+    experts._target_mega_moe_num_sms = 76
+    experts._high_row_mega_moe_num_sms = 72
+    dp_metadata = SimpleNamespace(
+        num_tokens_across_dp_cpu=torch.tensor(
+            [128, 128, 128, 128, 384, 128, 128, 128], dtype=torch.int32
+        )
+    )
+
+    with override_forward_context(SimpleNamespace(dp_metadata=dp_metadata)):
+        assert experts._get_mega_moe_num_sms(128) == 0
+
+
+def test_get_mega_moe_num_sms_preserves_base_budget_without_dp_metadata():
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._mega_moe_num_sms = 64
+    experts._target_mega_moe_num_sms = 76
+    experts._high_row_mega_moe_num_sms = 72
+
+    assert experts._get_mega_moe_num_sms(128) == 64
+
+
+def test_validate_ep_uniform_num_sms_keeps_each_env_collective_distinct(monkeypatch):
+    experts = object.__new__(DeepseekV4MegaMoEExperts)
+    experts._use_sm90_fp4_mega_moe = True
+    experts._mega_moe_num_sms = 76
+    experts._target_mega_moe_num_sms = 76
+    experts._high_row_mega_moe_num_sms = 76
+    group = SimpleNamespace(world_size=1, device_group=object())
+    calls = []
+
+    monkeypatch.setattr(dsv4_model, "get_ep_group", lambda: group)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=78),
+    )
+
+    def fake_all_gather_into_tensor(output, input, *, group):
+        calls.append(int(input.item()))
+        output.copy_(input)
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather_into_tensor,
+    )
+    monkeypatch.setattr(DeepseekV4MegaMoEExperts, "_validated_num_sms", set())
+    deep_gemm = SimpleNamespace(fp8_fp4_mega_moe=lambda num_sms=0: None)
+
+    experts._validate_ep_uniform_num_sms(deep_gemm, torch.device("cpu"))
+    experts._validate_ep_uniform_num_sms(deep_gemm, torch.device("cpu"))
+
+    assert calls == [76, 76, 76]
+
+
 def test_get_symm_buffer_for_num_tokens_rejects_beyond_batched():
     experts = object.__new__(DeepseekV4MegaMoEExperts)
     experts._use_prepared_capacity_buckets = False
@@ -354,6 +442,7 @@ def test_prepare_capacity_buckets_allocates_and_prewarms_in_order(monkeypatch):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
     experts._capacity_buffers = None
     experts._use_prepared_capacity_buckets = False
+    experts._mega_moe_num_sms = 0
     experts._transformed_l1_weights = (torch.empty(1), torch.empty(1))
     calls: list[tuple[str, int]] = []
 
@@ -814,7 +903,7 @@ def test_symm_buffer_cache_separates_architecture_and_dtype_modes(monkeypatch):
     sm90_fp8.get_symm_buffer()
 
     assert calls == [
-        {},
+        {"num_shared_experts": 0},
         {"use_fp8_dispatch": True, "activation": "swiglu"},
         {"use_fp8_dispatch": True, "activation": "swiglu"},
     ]
