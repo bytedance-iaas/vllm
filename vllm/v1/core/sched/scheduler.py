@@ -578,6 +578,37 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _align_dsv41_pcp_prefill_chunk(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        """Keep ordinary encoder-only PCP Prefill boundaries block aligned."""
+        if (
+            not self.is_dsv41_encoder_only_prefill
+            or self.pcp_world_size <= 1
+            or num_new_tokens <= 0
+            or num_computed_tokens >= request.num_prompt_tokens
+        ):
+            return num_new_tokens
+
+        alignment = self.cache_config.block_size
+        start_remainder = num_computed_tokens % alignment
+        if start_remainder:
+            aligned_tokens = min(num_new_tokens, alignment - start_remainder)
+        elif num_computed_tokens + num_new_tokens >= request.num_prompt_tokens:
+            return num_new_tokens
+        else:
+            aligned_tokens = num_new_tokens // alignment * alignment
+            if aligned_tokens == 0:
+                return num_new_tokens
+
+        remaining = request.num_tokens - num_computed_tokens - aligned_tokens
+        if 0 < remaining < self.num_prefill_lookahead:
+            return num_new_tokens
+        return aligned_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -720,6 +751,9 @@ class Scheduler(SchedulerInterface):
             # Multi-module MTP: avoid ending a prefill chunk within
             # num_prefill_lookahead of the prefill end.
             num_new_tokens = self._reserve_prefill_lookahead(
+                request, request.num_computed_tokens, num_new_tokens
+            )
+            num_new_tokens = self._align_dsv41_pcp_prefill_chunk(
                 request, request.num_computed_tokens, num_new_tokens
             )
 
@@ -1174,6 +1208,9 @@ class Scheduler(SchedulerInterface):
                     # Multi-module MTP: avoid ending a prefill chunk within
                     # num_prefill_lookahead of the prefill end.
                     num_new_tokens = self._reserve_prefill_lookahead(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    num_new_tokens = self._align_dsv41_pcp_prefill_chunk(
                         request, num_computed_tokens, num_new_tokens
                     )
 
