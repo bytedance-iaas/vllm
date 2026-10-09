@@ -1646,6 +1646,17 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         deep_gemm = _import_deepseek_v4_mega_moe_deep_gemm()
         if symm_buffer is None:
             symm_buffer = self.get_symm_buffer_for_num_tokens(hidden_states.shape[0])
+        collect_telemetry = self._should_collect_telemetry(hidden_states.device)
+        if collect_telemetry:
+            # The staging kernel may reuse or mutate the routing buffer in
+            # place. Snapshot the bounded expert histogram before staging so
+            # the diagnostic reflects the router output rather than workspace
+            # contents.
+            routed_ids = topk_ids.reshape(-1)
+            routed_ids = routed_ids[routed_ids >= 0]
+            local_histogram = torch.bincount(
+                routed_ids, minlength=self.num_experts
+            ).to(torch.int64)
         # SM90 staging fills the full symmetric buffer (padded topk rows get
         # -1 / 0.0). routed_scaling_factor is already folded into topk_weights
         # by fused_topk_bias upstream, so pass 1.0 here to avoid double-apply.
@@ -1662,17 +1673,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
-        collect_telemetry = self._should_collect_telemetry(hidden_states.device)
         if collect_telemetry:
-            # DeepGEMM may reuse or mutate the routing buffer in place. Snapshot
-            # the bounded expert histogram before launching the kernel so the
-            # diagnostic reflects the router output rather than post-call
-            # workspace contents.
-            routed_ids = topk_ids.reshape(-1)
-            routed_ids = routed_ids[routed_ids >= 0]
-            local_histogram = torch.bincount(
-                routed_ids, minlength=self.num_experts
-            ).to(torch.int64)
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()

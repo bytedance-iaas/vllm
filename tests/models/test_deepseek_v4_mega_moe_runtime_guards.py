@@ -1074,10 +1074,13 @@ def test_sm90_telemetry_snapshots_routing_before_kernel_mutation(monkeypatch):
         "get_symm_buffer_for_num_tokens",
         lambda num_tokens: symm_buffer,
     )
+    def mutate_routing_during_staging(*args, **kwargs):
+        args[2].zero_()
+
     monkeypatch.setattr(
         dsv4_model,
         "prepare_megamoe_inputs_sm90",
-        lambda *args, **kwargs: None,
+        mutate_routing_during_staging,
     )
     monkeypatch.setattr(experts, "_should_collect_telemetry", lambda device: True)
 
@@ -1096,7 +1099,7 @@ def test_sm90_telemetry_snapshots_routing_before_kernel_mutation(monkeypatch):
 
     class FakeDeepGemm:
         def fp8_fp4_mega_moe(self, *args, **kwargs):
-            topk_ids.zero_()
+            pass
 
     monkeypatch.setattr(
         deep_gemm_utils,
