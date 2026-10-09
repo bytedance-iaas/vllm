@@ -303,6 +303,7 @@ def _prepare_megamoe_sm90_quant_kernel(
 def _prepare_megamoe_sm90_topk_copy_kernel(
     topk_ids,
     topk_weights,
+    logical_to_physical_map,
     topk_idx_out,
     topk_weights_out,
     routed_scaling_factor,
@@ -315,6 +316,7 @@ def _prepare_megamoe_sm90_topk_copy_kernel(
     topk_weights_out_stride_m: tl.constexpr,
     topk_weights_out_stride_k: tl.constexpr,
     top_k: tl.constexpr,
+    HAS_STATIC_EXPERT_MAP: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ) -> None:
     # One program per *valid* token (grid = (num_tokens,)). Padded rows are
@@ -328,6 +330,14 @@ def _prepare_megamoe_sm90_topk_copy_kernel(
         mask=topk_mask,
         other=0,
     ).to(tl.int64)
+    if HAS_STATIC_EXPERT_MAP:
+        valid_id = topk_mask & (ids >= 0)
+        safe_id = tl.where(ids >= 0, ids, 0)
+        ids = tl.load(
+            logical_to_physical_map + safe_id,
+            mask=valid_id,
+            other=-1,
+        ).to(tl.int64)
     weights = tl.load(
         topk_weights
         + token_id * topk_weights_stride_m
@@ -390,6 +400,7 @@ def _prepare_megamoe_inputs_sm90_triton(
     topk_weights_out: torch.Tensor,
     *,
     routed_scaling_factor: float = 1.0,
+    logical_to_physical_map: torch.Tensor | None = None,
 ) -> None:
     """Triton implementation for SM90 MegaMoE input staging.
 
@@ -418,6 +429,16 @@ def _prepare_megamoe_inputs_sm90_triton(
             "DeepSeek V4 SM90 MegaMoE input staging requires topk_weights and "
             "topk_ids to have the same shape."
         )
+    if logical_to_physical_map is not None:
+        if logical_to_physical_map.ndim != 1:
+            raise ValueError(
+                "DeepSeek V4 static MegaMoE expert map must be one-dimensional."
+            )
+        if logical_to_physical_map.device != topk_ids.device:
+            raise ValueError(
+                "DeepSeek V4 static MegaMoE expert map must be on the same "
+                "device as topk_ids."
+            )
 
     group_k = 128
     block_topk = triton.next_power_of_2(top_k)
@@ -442,6 +463,7 @@ def _prepare_megamoe_inputs_sm90_triton(
         _prepare_megamoe_sm90_topk_copy_kernel[(num_tokens,)](
             topk_ids,
             topk_weights,
+            logical_to_physical_map,
             topk_idx_out,
             topk_weights_out,
             float(routed_scaling_factor),
@@ -454,6 +476,7 @@ def _prepare_megamoe_inputs_sm90_triton(
             topk_weights_out.stride(0),
             topk_weights_out.stride(1),
             top_k,
+            HAS_STATIC_EXPERT_MAP=logical_to_physical_map is not None,
             BLOCK_TOPK=block_topk,
             num_warps=4,
         )
@@ -486,6 +509,7 @@ def prepare_megamoe_inputs_sm90(
     topk_weights_out: torch.Tensor,
     *,
     routed_scaling_factor: float = 1.0,
+    logical_to_physical_map: torch.Tensor | None = None,
 ) -> None:
     """SM90 (Hopper) MegaMoE input staging.
 
@@ -509,4 +533,5 @@ def prepare_megamoe_inputs_sm90(
         topk_idx_out,
         topk_weights_out,
         routed_scaling_factor=routed_scaling_factor,
+        logical_to_physical_map=logical_to_physical_map,
     )

@@ -28,6 +28,7 @@ def _make_vllm_config(
     num_speculative_tokens: int | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_eplb=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=1),
         ),
@@ -130,6 +131,67 @@ def test_resolve_mega_moe_decode_capacity_accounts_for_sequence_parallel():
         )
         == 20
     )
+
+
+def test_static_expert_mapping_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", raising=False)
+    monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
+
+    assert dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4) == (
+        None,
+        None,
+    )
+
+
+def test_static_expert_mapping_requires_paired_env(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
+    monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
+
+    with pytest.raises(ValueError, match="must be set together"):
+        dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4)
+
+
+def test_static_expert_mapping_targets_layer_and_builds_inverse(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
+    monkeypatch.setenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "2,0,3,1")
+
+    assert dsv4_model._read_static_expert_mapping("model.layers.13.ffn.experts", 4) == (
+        None,
+        None,
+    )
+    # A non-target DSpark/draft module with a different expert count must not
+    # validate or consume the main-model permutation.
+    assert dsv4_model._read_static_expert_mapping("model.layers.37.ffn.experts", 2) == (
+        None,
+        None,
+    )
+    assert dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4) == (
+        (2, 0, 3, 1),
+        (1, 3, 0, 2),
+    )
+
+
+def test_static_expert_mapping_rejects_non_permutation(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
+    monkeypatch.setenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "0,0,2,3")
+
+    with pytest.raises(ValueError, match="must be a permutation"):
+        dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4)
+
+
+def test_static_expert_mapping_drives_weight_slots(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "0")
+    monkeypatch.setenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "2,0,3,1")
+    experts = _make_fp4_experts(
+        num_experts=4,
+        num_local_experts=2,
+        experts_start_idx=0,
+        top_k=2,
+    )
+
+    assert experts._map_global_expert_id(2) == [0]
+    assert experts._map_global_expert_id(0) == [1]
+    assert experts._map_global_expert_id(1) == []
 
 
 def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
@@ -1120,3 +1182,63 @@ def test_sm90_telemetry_snapshots_routing_before_kernel_mutation(monkeypatch):
     assert torch.equal(topk_ids, torch.zeros_like(topk_ids))
     assert len(captured) == 1
     assert torch.equal(captured[0], torch.tensor([1, 2, 0, 1]))
+
+
+def test_sm90_static_expert_map_is_forwarded_to_staging(monkeypatch):
+    experts = _make_fp4_experts(
+        num_experts=4,
+        num_local_experts=2,
+        experts_start_idx=0,
+        top_k=2,
+    )
+    experts._transformed_l1_weights = (object(), object())
+    experts._transformed_l2_weights = (object(), object())
+    experts._use_sm90_mega_moe = True
+    experts._use_sm90_fp4_mega_moe = True
+    experts._static_logical_to_physical = torch.tensor([1, 3, 0, 2])
+
+    symm_buffer = SimpleNamespace(
+        x=object(),
+        x_sf=object(),
+        topk_idx=object(),
+        topk_weights=object(),
+    )
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda num_tokens: symm_buffer,
+    )
+    staging_calls = []
+
+    def capture_staging(*args, **kwargs):
+        staging_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        dsv4_model,
+        "prepare_megamoe_inputs_sm90",
+        capture_staging,
+    )
+
+    class FakeDeepGemm:
+        def fp8_fp4_mega_moe(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+
+    experts._run_mega_moe_sm90(
+        torch.empty(2, experts.hidden_size),
+        torch.empty(2, experts.top_k),
+        torch.tensor([[0, 1], [2, 3]], dtype=torch.int64),
+        torch.empty(2, experts.hidden_size),
+        activation_clamp=None,
+        fast_math=True,
+    )
+
+    assert len(staging_calls) == 1
+    assert staging_calls[0]["logical_to_physical_map"] is (
+        experts._static_logical_to_physical
+    )

@@ -1077,3 +1077,40 @@ def test_deepseek_v4_mega_moe_sm90_input_staging_matches_reference(
     # Padded rows.
     assert torch.all(topk_idx_out[num_tokens:] == -1)
     assert torch.all(topk_weights_out[num_tokens:] == 0.0)
+
+
+@pytest.mark.parametrize("topk_ids_dtype", [torch.int32, torch.int64])
+def test_deepseek_v4_mega_moe_sm90_input_staging_applies_static_expert_map(
+    topk_ids_dtype,
+):
+    device = torch.device("cuda")
+    hidden_states = torch.randn(3, 256, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 1], [2, 3], [3, 0]], device=device, dtype=topk_ids_dtype
+    )
+    topk_weights = torch.randn(3, 2, device=device, dtype=torch.float32)
+    logical_to_physical = torch.tensor([1, 3, 0, 2], device=device, dtype=torch.int64)
+    x_fp8 = torch.empty(5, 256, device=device, dtype=torch.float8_e4m3fn)
+    x_sf = torch.empty(5, 2, device=device, dtype=torch.float32)
+    topk_idx_out = torch.empty(5, 2, device=device, dtype=torch.int64)
+    topk_weights_out = torch.empty(5, 2, device=device, dtype=torch.float32)
+
+    prepare_megamoe_inputs_sm90(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        x_fp8,
+        x_sf,
+        topk_idx_out,
+        topk_weights_out,
+        logical_to_physical_map=logical_to_physical,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(
+        topk_idx_out[:3],
+        torch.tensor([[1, 3], [0, 2], [2, 1]], device=device),
+    )
+    assert torch.equal(topk_weights_out[:3], topk_weights)
+    assert torch.all(topk_idx_out[3:] == -1)
+    assert torch.all(topk_weights_out[3:] == 0.0)

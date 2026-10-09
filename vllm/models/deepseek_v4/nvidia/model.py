@@ -170,6 +170,45 @@ def _read_nonnegative_int_env(name: str, default: int = 0) -> int:
     return value
 
 
+def _read_static_expert_mapping(
+    prefix: str,
+    num_experts: int,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    layers_raw = os.environ.get("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "").strip()
+    mapping_raw = os.environ.get("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "").strip()
+    if not layers_raw and not mapping_raw:
+        return None, None
+    if not layers_raw or not mapping_raw:
+        raise ValueError(
+            "VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS and "
+            "VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL must be set together."
+        )
+    try:
+        layers = tuple(int(value) for value in layers_raw.split(","))
+        physical_to_logical = tuple(int(value) for value in mapping_raw.split(","))
+    except ValueError as exc:
+        raise ValueError("DeepSeek V4 static expert map values must be integers.") from exc
+    if len(set(layers)) != len(layers) or any(layer < 0 for layer in layers):
+        raise ValueError(
+            "VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS must contain unique "
+            "nonnegative layer indices."
+        )
+    layer_index = extract_layer_index(prefix)
+    if layer_index not in layers:
+        return None, None
+    if len(physical_to_logical) != num_experts or set(physical_to_logical) != set(
+        range(num_experts)
+    ):
+        raise ValueError(
+            "VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL must be a permutation of "
+            f"[0, {num_experts})."
+        )
+    logical_to_physical = [0] * num_experts
+    for physical, logical in enumerate(physical_to_logical):
+        logical_to_physical[logical] = physical
+    return physical_to_logical, tuple(logical_to_physical)
+
+
 def _sha256_file(path: str | None) -> str:
     if not path or not os.path.isfile(path):
         return "missing"
@@ -380,6 +419,18 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
         )
+        (
+            self._static_physical_to_logical,
+            self._static_logical_to_physical_cpu,
+        ) = _read_static_expert_mapping(prefix, self.num_logical_experts)
+        if (
+            self._static_physical_to_logical is not None
+            and vllm_config.parallel_config.enable_eplb
+        ):
+            raise ValueError(
+                "DeepSeek V4 static expert mapping is incompatible with EPLB."
+            )
+        self._static_logical_to_physical: torch.Tensor | None = None
 
         self.eplb_state = EplbLayerState()
 
@@ -489,6 +540,31 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                     f"{env_name} must be identical on every EP rank; got {budgets}."
                 )
             self._validated_num_sms.add(validation_key)
+
+    def _validate_ep_uniform_static_map(self, device: torch.device) -> None:
+        if self._static_physical_to_logical is None:
+            return
+        ep_group = get_ep_group()
+        local_map = torch.tensor(
+            self._static_physical_to_logical,
+            dtype=torch.int32,
+            device=device,
+        )
+        gathered_maps = torch.empty(
+            ep_group.world_size * local_map.numel(),
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_maps,
+            local_map,
+            group=ep_group.device_group,
+        )
+        gathered_maps = gathered_maps.view(ep_group.world_size, -1)
+        if not bool(torch.all(gathered_maps == gathered_maps[0]).item()):
+            raise RuntimeError(
+                "DeepSeek V4 static expert mapping must be identical on every EP rank."
+            )
 
     @staticmethod
     def _get_uniform_dp_num_tokens(num_tokens: int) -> int | None:
@@ -751,7 +827,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         """
         physical_ids: list[int] = []
         for p in range(self.experts_start_idx, self.experts_end_idx):
-            if p % self.num_logical_experts == expert_id:
+            logical_id = (
+                self._static_physical_to_logical[p]
+                if self._static_physical_to_logical is not None
+                else p % self.num_logical_experts
+            )
+            if logical_id == expert_id:
                 physical_ids.append(p - self.experts_start_idx)
         return physical_ids
 
@@ -872,6 +953,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 f"{missing}. Update the DeepGEMM wheel/image."
             )
         self._validate_ep_uniform_num_sms(deep_gemm, device)
+        self._validate_ep_uniform_static_map(device)
         self._log_runtime_fingerprint(deep_gemm, device)
 
     @staticmethod
@@ -1050,6 +1132,23 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             else:
                 self._finalize_weights_sm100()
             self._drop_loader_side_params()
+            if self._static_logical_to_physical_cpu is not None:
+                self._static_logical_to_physical = torch.tensor(
+                    self._static_logical_to_physical_cpu,
+                    dtype=torch.int64,
+                    device=self._transformed_l1_weights[0].device,
+                )
+                mapping_text = ",".join(
+                    str(value) for value in self._static_physical_to_logical
+                )
+                logger.info_once(
+                    "DeepSeek V4 static expert mapping enabled for %s: "
+                    "physical_to_logical_sha256=%s rank0_head=%s rank7_tail=%s.",
+                    self.prefix,
+                    hashlib.sha256(mapping_text.encode()).hexdigest(),
+                    self._static_physical_to_logical[:8],
+                    self._static_physical_to_logical[-8:],
+                )
 
         if shared_experts is None or self.num_shared_experts == 0:
             return
@@ -1669,6 +1768,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
             routed_scaling_factor=1.0,
+            logical_to_physical_map=self._static_logical_to_physical,
         )
 
         assert self._transformed_l1_weights is not None
