@@ -930,6 +930,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             local_output = self._o_proj(attn_out, local_positions)
         return cp_plan.restore_output(local_output, hidden_states.shape[0])
 
+    def forward_kv(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> None:
+        """Write only the KV ``forward`` writes, skipping query and attention."""
+        attn_metadata = get_forward_context().attn_metadata
+        qr_kv, kv_score, _ = self._run_parallel_input_projections(hidden_states)
+        _, _, kv = self._split_qkv_and_norm(qr_kv)
+        if isinstance(attn_metadata, dict):
+            cache = self.swa_cache_layer.kv_cache
+            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+                kv,
+                cache,
+                cast(Any, attn_metadata[self.swa_cache_layer.prefix]).slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.swa_cache_layer.block_size,
+                self._flashinfer_fp8_kv_scale
+                if cache.dtype == torch.float8_e4m3fn
+                else None,
+                self.kv_mxfp8,
+            )
+        if self.compressor is not None:
+            latent = self.compressor(kv_score, positions)
+            self.compressor.insert_cache(latent, positions, self.rotary_emb)
+            if self.indexer is not None and self.indexer.owns_k:
+                self.indexer._produce_k(latent, positions, self.indexer_rotary_emb)
+
     def _build_attention_cp_plan(self, device: torch.device) -> AttentionCPPlan | None:
         if self.attn_cp_size == 1:
             return None
