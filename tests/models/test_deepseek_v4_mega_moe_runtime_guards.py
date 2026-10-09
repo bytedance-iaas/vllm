@@ -1048,3 +1048,72 @@ def test_sm90_fp8_dispatch_preserves_weight_scale_pairs(monkeypatch):
     assert args[1] is l1_weights
     assert args[2] is l2_weights
     assert kwargs["recipe"] == (128, 128, 128)
+
+
+def test_sm90_telemetry_snapshots_routing_before_kernel_mutation(monkeypatch):
+    experts = _make_fp4_experts(
+        num_experts=4,
+        num_local_experts=2,
+        experts_start_idx=0,
+        top_k=2,
+    )
+    experts._transformed_l1_weights = (object(), object())
+    experts._transformed_l2_weights = (object(), object())
+    experts._use_sm90_mega_moe = True
+    experts._use_sm90_fp4_mega_moe = True
+
+    symm_buffer = SimpleNamespace(
+        x=object(),
+        x_sf=object(),
+        topk_idx=object(),
+        topk_weights=object(),
+        num_max_tokens_per_rank=16,
+    )
+    monkeypatch.setattr(
+        experts,
+        "get_symm_buffer_for_num_tokens",
+        lambda num_tokens: symm_buffer,
+    )
+    monkeypatch.setattr(
+        dsv4_model,
+        "prepare_megamoe_inputs_sm90",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(experts, "_should_collect_telemetry", lambda device: True)
+
+    captured = []
+
+    def finish(**kwargs):
+        captured.append(kwargs["local_histogram"].clone())
+
+    monkeypatch.setattr(experts, "_finish_telemetry_sample", finish)
+
+    class FakeEvent:
+        def record(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: FakeEvent())
+
+    class FakeDeepGemm:
+        def fp8_fp4_mega_moe(self, *args, **kwargs):
+            topk_ids.zero_()
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_import_deep_gemm",
+        lambda: FakeDeepGemm(),
+    )
+
+    topk_ids = torch.tensor([[0, 1], [1, 3]], dtype=torch.int64)
+    experts._run_mega_moe_sm90(
+        torch.empty(2, experts.hidden_size),
+        torch.empty(2, experts.top_k),
+        topk_ids,
+        torch.empty(2, experts.hidden_size),
+        activation_clamp=None,
+        fast_math=True,
+    )
+
+    assert torch.equal(topk_ids, torch.zeros_like(topk_ids))
+    assert len(captured) == 1
+    assert torch.equal(captured[0], torch.tensor([1, 2, 0, 1]))

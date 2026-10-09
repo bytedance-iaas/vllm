@@ -597,13 +597,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         *,
         start_event: torch.cuda.Event,
         end_event: torch.cuda.Event,
-        topk_ids: torch.Tensor,
+        local_histogram: torch.Tensor,
         num_tokens: int,
         max_num_tokens_across_dp: int,
         capacity: int,
     ) -> None:
         end_event.synchronize()
-        device = topk_ids.device
+        device = local_histogram.device
         ep_group = get_ep_group()
         local_latency = torch.tensor(
             [start_event.elapsed_time(end_event)],
@@ -619,11 +619,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             group=ep_group.device_group,
         )
 
-        routed_ids = topk_ids.reshape(-1)
-        routed_ids = routed_ids[routed_ids >= 0]
-        local_histogram = torch.bincount(routed_ids, minlength=self.num_experts).to(
-            torch.int64
-        )
         all_histograms = torch.empty(
             ep_group.world_size * self.num_experts,
             dtype=torch.int64,
@@ -1669,6 +1664,15 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         assert self._transformed_l2_weights is not None
         collect_telemetry = self._should_collect_telemetry(hidden_states.device)
         if collect_telemetry:
+            # DeepGEMM may reuse or mutate the routing buffer in place. Snapshot
+            # the bounded expert histogram before launching the kernel so the
+            # diagnostic reflects the router output rather than post-call
+            # workspace contents.
+            routed_ids = topk_ids.reshape(-1)
+            routed_ids = routed_ids[routed_ids >= 0]
+            local_histogram = torch.bincount(
+                routed_ids, minlength=self.num_experts
+            ).to(torch.int64)
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
@@ -1702,7 +1706,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             self._finish_telemetry_sample(
                 start_event=start_event,
                 end_event=end_event,
-                topk_ids=topk_ids,
+                local_histogram=local_histogram,
                 num_tokens=hidden_states.shape[0],
                 max_num_tokens_across_dp=self._get_max_num_tokens_across_dp(
                     hidden_states.shape[0]
