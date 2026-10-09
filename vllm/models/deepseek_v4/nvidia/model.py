@@ -95,6 +95,7 @@ from vllm.utils.flashinfer_moe_ep import (
     is_fi_moe_ep_backend,
     validate_fi_moe_ep_config,
 )
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import (
@@ -318,7 +319,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     _capacity_warmup_done: set[tuple[int, float | None, bool]] = set()
     _validated_num_sms: set[tuple[int, str, int]] = set()
     _runtime_fingerprint_logged: set[tuple[int, str, int, int, int]] = set()
-    _telemetry_sample_counts: dict[tuple[int, str], int] = {}
+    _telemetry_sample_counts: dict[tuple[int, str, int], int] = {}
     _target_num_sms_batch_sizes = frozenset((48, 56, 64))
     _high_row_num_sms_batch_sizes = frozenset((128, 384))
 
@@ -682,12 +683,23 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         device_index = device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        sample_key = (device_index, self.prefix)
+        sample_key = (device_index, self.prefix, num_tokens)
         count = self._telemetry_sample_counts.get(sample_key, 0)
         if count >= self._telemetry_max_samples:
             return False
         self._telemetry_sample_counts[sample_key] = count + 1
         return True
+
+    def _discard_empty_telemetry_sample(
+        self, device: torch.device, num_tokens: int
+    ) -> None:
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        sample_key = (device_index, self.prefix, num_tokens)
+        count = self._telemetry_sample_counts.get(sample_key, 0)
+        assert count > 0
+        self._telemetry_sample_counts[sample_key] = count - 1
 
     def _finish_telemetry_sample(
         self,
@@ -1779,6 +1791,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             local_histogram = torch.bincount(
                 routed_ids, minlength=self.num_experts
             ).to(torch.int64)
+            with gpu_sync_allowed():
+                has_routes = bool(torch.any(local_histogram).item())
+            if not has_routes:
+                self._discard_empty_telemetry_sample(
+                    hidden_states.device, hidden_states.shape[0]
+                )
+                collect_telemetry = False
         # SM90 staging fills the full symmetric buffer (padded topk rows get
         # -1 / 0.0). routed_scaling_factor is already folded into topk_weights
         # by fused_topk_bias upstream, so pass 1.0 here to avoid double-apply.

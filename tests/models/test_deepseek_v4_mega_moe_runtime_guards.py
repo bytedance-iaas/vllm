@@ -221,6 +221,8 @@ def test_megamoe_telemetry_budget_is_per_layer(monkeypatch):
     assert first._should_collect_telemetry(device, 96) is False
     assert first._should_collect_telemetry(device, 108) is True
     assert first._should_collect_telemetry(device, 108) is False
+    first._discard_empty_telemetry_sample(device, 108)
+    assert first._should_collect_telemetry(device, 108) is True
     assert second._should_collect_telemetry(device, 108) is True
 
 
