@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import json
 import os
 import typing
 from collections.abc import Callable, Iterable
@@ -177,32 +178,64 @@ def _read_static_expert_mapping(
 ) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
     layers_raw = os.environ.get("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "").strip()
     mapping_raw = os.environ.get("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "").strip()
-    if not layers_raw and not mapping_raw:
+    mappings_file = os.environ.get("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", "").strip()
+    if mappings_file and (layers_raw or mapping_raw):
+        raise ValueError(
+            "VLLM_DSV41_STATIC_EXPERT_MAPS_FILE cannot be combined with the "
+            "legacy static expert map environment variables."
+        )
+    if mappings_file:
+        try:
+            with open(mappings_file) as file:
+                mappings = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Unable to read DeepSeek V4 static expert maps from {mappings_file!r}."
+            ) from exc
+        if not isinstance(mappings, dict):
+            raise ValueError(
+                "DeepSeek V4 static expert maps file must contain an object."
+            )
+        mapping = mappings.get(prefix)
+        if mapping is None:
+            return None, None
+        if not isinstance(mapping, list) or any(
+            type(value) is not int for value in mapping
+        ):
+            raise ValueError(
+                "DeepSeek V4 static expert map for "
+                f"{prefix!r} must be a list of integers."
+            )
+        physical_to_logical = tuple(mapping)
+    elif not layers_raw and not mapping_raw:
         return None, None
-    if not layers_raw or not mapping_raw:
+    elif not layers_raw or not mapping_raw:
         raise ValueError(
             "VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS and "
             "VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL must be set together."
         )
-    try:
-        layers = tuple(int(value) for value in layers_raw.split(","))
-        physical_to_logical = tuple(int(value) for value in mapping_raw.split(","))
-    except ValueError as exc:
-        raise ValueError("DeepSeek V4 static expert map values must be integers.") from exc
-    if len(set(layers)) != len(layers) or any(layer < 0 for layer in layers):
-        raise ValueError(
-            "VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS must contain unique "
-            "nonnegative layer indices."
-        )
-    layer_index = extract_layer_index(prefix)
-    if layer_index not in layers:
-        return None, None
+    else:
+        try:
+            layers = tuple(int(value) for value in layers_raw.split(","))
+            physical_to_logical = tuple(int(value) for value in mapping_raw.split(","))
+        except ValueError as exc:
+            raise ValueError(
+                "DeepSeek V4 static expert map values must be integers."
+            ) from exc
+        if len(set(layers)) != len(layers) or any(layer < 0 for layer in layers):
+            raise ValueError(
+                "VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS must contain unique "
+                "nonnegative layer indices."
+            )
+        layer_index = extract_layer_index(prefix)
+        if layer_index not in layers:
+            return None, None
     if len(physical_to_logical) != num_experts or set(physical_to_logical) != set(
         range(num_experts)
     ):
         raise ValueError(
-            "VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL must be a permutation of "
-            f"[0, {num_experts})."
+            f"DeepSeek V4 static expert map for {prefix!r} must be a permutation "
+            f"of [0, {num_experts})."
         )
     logical_to_physical = [0] * num_experts
     for physical, logical in enumerate(physical_to_logical):
@@ -669,9 +702,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         self._runtime_fingerprint_logged.add(log_key)
 
-    def _should_collect_telemetry(
-        self, device: torch.device, num_tokens: int
-    ) -> bool:
+    def _should_collect_telemetry(self, device: torch.device, num_tokens: int) -> bool:
         if not self._telemetry_max_samples or not is_forward_context_available():
             return False
         if self._telemetry_layer and self._telemetry_layer not in self.prefix:
@@ -1788,9 +1819,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             # contents.
             routed_ids = topk_ids.reshape(-1)
             routed_ids = routed_ids[routed_ids >= 0]
-            local_histogram = torch.bincount(
-                routed_ids, minlength=self.num_experts
-            ).to(torch.int64)
+            local_histogram = torch.bincount(routed_ids, minlength=self.num_experts).to(
+                torch.int64
+            )
             with gpu_sync_allowed():
                 has_routes = bool(torch.any(local_histogram).item())
             if not has_routes:

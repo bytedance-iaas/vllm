@@ -7,6 +7,7 @@ loader-side parameter shapes and FP8 scale sharding logic, which are pure
 PyTorch/host operations and do not require a GPU.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -136,6 +137,7 @@ def test_resolve_mega_moe_decode_capacity_accounts_for_sequence_parallel():
 def test_static_expert_mapping_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", raising=False)
     monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", raising=False)
 
     assert dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4) == (
         None,
@@ -144,6 +146,7 @@ def test_static_expert_mapping_disabled_by_default(monkeypatch):
 
 
 def test_static_expert_mapping_requires_paired_env(monkeypatch):
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", raising=False)
     monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
     monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
 
@@ -152,6 +155,7 @@ def test_static_expert_mapping_requires_paired_env(monkeypatch):
 
 
 def test_static_expert_mapping_targets_layer_and_builds_inverse(monkeypatch):
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", raising=False)
     monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
     monkeypatch.setenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "2,0,3,1")
 
@@ -172,6 +176,7 @@ def test_static_expert_mapping_targets_layer_and_builds_inverse(monkeypatch):
 
 
 def test_static_expert_mapping_rejects_non_permutation(monkeypatch):
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", raising=False)
     monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
     monkeypatch.setenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "0,0,2,3")
 
@@ -179,7 +184,70 @@ def test_static_expert_mapping_rejects_non_permutation(monkeypatch):
         dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4)
 
 
+def test_static_expert_mapping_file_targets_exact_prefix(monkeypatch, tmp_path):
+    mappings_file = tmp_path / "expert-maps.json"
+    mappings_file.write_text(
+        json.dumps(
+            {
+                "model.layers.13.ffn.experts": [2, 0, 3, 1],
+                "model.layers.14.ffn.experts": [1, 3, 0, 2],
+            }
+        )
+    )
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", raising=False)
+    monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", str(mappings_file))
+
+    assert dsv4_model._read_static_expert_mapping("model.layers.13.ffn.experts", 4) == (
+        (2, 0, 3, 1),
+        (1, 3, 0, 2),
+    )
+    assert dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4) == (
+        (1, 3, 0, 2),
+        (2, 0, 3, 1),
+    )
+    assert dsv4_model._read_static_expert_mapping(
+        "model.drafter.layers.14.ffn.experts", 128
+    ) == (None, None)
+
+
+def test_static_expert_mapping_file_rejects_legacy_env(monkeypatch, tmp_path):
+    mappings_file = tmp_path / "expert-maps.json"
+    mappings_file.write_text("{}")
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", str(mappings_file))
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "14")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4)
+
+
+@pytest.mark.parametrize("contents", ("[]", "{bad json"))
+def test_static_expert_mapping_file_rejects_invalid_content(
+    monkeypatch, tmp_path, contents
+):
+    mappings_file = tmp_path / "expert-maps.json"
+    mappings_file.write_text(contents)
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", raising=False)
+    monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", str(mappings_file))
+
+    with pytest.raises(ValueError, match="static expert maps"):
+        dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4)
+
+
+def test_static_expert_mapping_file_rejects_non_permutation(monkeypatch, tmp_path):
+    mappings_file = tmp_path / "expert-maps.json"
+    mappings_file.write_text(json.dumps({"model.layers.14.ffn.experts": [0, 0, 2, 3]}))
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", raising=False)
+    monkeypatch.delenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", raising=False)
+    monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", str(mappings_file))
+
+    with pytest.raises(ValueError, match="must be a permutation"):
+        dsv4_model._read_static_expert_mapping("model.layers.14.ffn.experts", 4)
+
+
 def test_static_expert_mapping_drives_weight_slots(monkeypatch):
+    monkeypatch.delenv("VLLM_DSV41_STATIC_EXPERT_MAPS_FILE", raising=False)
     monkeypatch.setenv("VLLM_DSV41_STATIC_EXPERT_MAP_LAYERS", "0")
     monkeypatch.setenv("VLLM_DSV41_STATIC_PHYSICAL_TO_LOGICAL", "2,0,3,1")
     experts = _make_fp4_experts(
@@ -1168,6 +1236,7 @@ def test_sm90_telemetry_snapshots_routing_before_kernel_mutation(monkeypatch):
         "get_symm_buffer_for_num_tokens",
         lambda num_tokens: symm_buffer,
     )
+
     def mutate_routing_during_staging(*args, **kwargs):
         args[2].zero_()
 
