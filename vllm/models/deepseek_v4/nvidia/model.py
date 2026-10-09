@@ -318,7 +318,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     _capacity_warmup_done: set[tuple[int, float | None, bool]] = set()
     _validated_num_sms: set[tuple[int, str, int]] = set()
     _runtime_fingerprint_logged: set[tuple[int, str, int, int, int]] = set()
-    _telemetry_sample_counts: dict[int, int] = {}
+    _telemetry_sample_counts: dict[tuple[int, str], int] = {}
     _target_num_sms_batch_sizes = frozenset((48, 56, 64))
     _high_row_num_sms_batch_sizes = frozenset((128, 384))
 
@@ -415,6 +415,22 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             "VLLM_DSV4_MEGAMOE_TELEMETRY_SAMPLES"
         )
         self._telemetry_layer = os.environ.get("VLLM_DSV4_MEGAMOE_TELEMETRY_LAYER", "")
+        telemetry_rows_raw = os.environ.get(
+            "VLLM_DSV4_MEGAMOE_TELEMETRY_ROWS", ""
+        ).strip()
+        try:
+            self._telemetry_rows = frozenset(
+                int(value) for value in telemetry_rows_raw.split(",") if value
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_DSV4_MEGAMOE_TELEMETRY_ROWS must contain comma-separated "
+                "integers."
+            ) from exc
+        if any(value <= 0 for value in self._telemetry_rows):
+            raise ValueError(
+                "VLLM_DSV4_MEGAMOE_TELEMETRY_ROWS values must be positive."
+            )
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -652,20 +668,25 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         self._runtime_fingerprint_logged.add(log_key)
 
-    def _should_collect_telemetry(self, device: torch.device) -> bool:
+    def _should_collect_telemetry(
+        self, device: torch.device, num_tokens: int
+    ) -> bool:
         if not self._telemetry_max_samples or not is_forward_context_available():
             return False
         if self._telemetry_layer and self._telemetry_layer not in self.prefix:
+            return False
+        if self._telemetry_rows and num_tokens not in self._telemetry_rows:
             return False
         if torch.cuda.is_current_stream_capturing():
             return False
         device_index = device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        count = self._telemetry_sample_counts.get(device_index, 0)
+        sample_key = (device_index, self.prefix)
+        count = self._telemetry_sample_counts.get(sample_key, 0)
         if count >= self._telemetry_max_samples:
             return False
-        self._telemetry_sample_counts[device_index] = count + 1
+        self._telemetry_sample_counts[sample_key] = count + 1
         return True
 
     def _finish_telemetry_sample(
@@ -1745,7 +1766,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         deep_gemm = _import_deepseek_v4_mega_moe_deep_gemm()
         if symm_buffer is None:
             symm_buffer = self.get_symm_buffer_for_num_tokens(hidden_states.shape[0])
-        collect_telemetry = self._should_collect_telemetry(hidden_states.device)
+        collect_telemetry = self._should_collect_telemetry(
+            hidden_states.device, hidden_states.shape[0]
+        )
         if collect_telemetry:
             # The staging kernel may reuse or mutate the routing buffer in
             # place. Snapshot the bounded expert histogram before staging so

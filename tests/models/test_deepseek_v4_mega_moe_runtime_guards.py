@@ -194,6 +194,36 @@ def test_static_expert_mapping_drives_weight_slots(monkeypatch):
     assert experts._map_global_expert_id(1) == []
 
 
+def test_megamoe_telemetry_rows_validate_and_parse(monkeypatch):
+    monkeypatch.setenv("VLLM_DSV4_MEGAMOE_TELEMETRY_ROWS", "108,126")
+    experts = _make_fp4_experts()
+    assert experts._telemetry_rows == frozenset((108, 126))
+
+    monkeypatch.setenv("VLLM_DSV4_MEGAMOE_TELEMETRY_ROWS", "108,bad")
+    with pytest.raises(ValueError, match="comma-separated integers"):
+        _make_fp4_experts()
+
+
+def test_megamoe_telemetry_budget_is_per_layer(monkeypatch):
+    first = object.__new__(DeepseekV4MegaMoEExperts)
+    second = object.__new__(DeepseekV4MegaMoEExperts)
+    for experts, prefix in ((first, "model.layers.1"), (second, "model.layers.14")):
+        experts._telemetry_max_samples = 1
+        experts._telemetry_layer = ""
+        experts._telemetry_rows = frozenset((108,))
+        experts.prefix = prefix
+    monkeypatch.setattr(dsv4_model, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(DeepseekV4MegaMoEExperts, "_telemetry_sample_counts", {})
+    device = torch.device("cuda")
+
+    assert first._should_collect_telemetry(device, 96) is False
+    assert first._should_collect_telemetry(device, 108) is True
+    assert first._should_collect_telemetry(device, 108) is False
+    assert second._should_collect_telemetry(device, 108) is True
+
+
 def test_get_symm_buffer_for_num_tokens_uses_decode_buffer(monkeypatch):
     experts = object.__new__(DeepseekV4MegaMoEExperts)
     experts._use_prepared_capacity_buckets = False
@@ -1144,7 +1174,11 @@ def test_sm90_telemetry_snapshots_routing_before_kernel_mutation(monkeypatch):
         "prepare_megamoe_inputs_sm90",
         mutate_routing_during_staging,
     )
-    monkeypatch.setattr(experts, "_should_collect_telemetry", lambda device: True)
+    monkeypatch.setattr(
+        experts,
+        "_should_collect_telemetry",
+        lambda device, num_tokens: True,
+    )
 
     captured = []
 
