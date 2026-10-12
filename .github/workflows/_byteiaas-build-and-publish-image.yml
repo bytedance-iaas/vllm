@@ -69,7 +69,9 @@ jobs:
       BYTEIAAS_TOKENIZERS_GIT_REPOSITORY: https://github.com/wangyicong52/tokenizers.git
       BYTEIAAS_TOKENIZERS_GIT_REF: vllm
       BYTEIAAS_TOKENIZERS_GIT_COMMIT: 441393c720fbd27a4faea02b7af18ebe08a65a01
-      BYTEIAAS_VLLM_ROUTER_VERSION: "0.1.15"
+      BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY: https://github.com/wangyicong52/router.git
+      BYTEIAAS_VLLM_ROUTER_GIT_REF: dev/dsv4.1-flash
+      BYTEIAAS_VLLM_ROUTER_GIT_COMMIT: ef339bc73a04872dc7999aebf761c5f86263af64
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
       BYTEIAAS_TAG_MODE: ${{ inputs.tag_mode }}
       BYTEIAAS_TAG_VALUE: ${{ inputs.tag_value }}
@@ -265,7 +267,12 @@ jobs:
             echo "::error::Invalid tokenizers commit: ${BYTEIAAS_TOKENIZERS_GIT_COMMIT}"
             exit 1
           fi
+          if ! [[ "${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid vLLM Router commit: ${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
+            exit 1
+          fi
           echo "Building tokenizers ${BYTEIAAS_TOKENIZERS_GIT_REF}@${BYTEIAAS_TOKENIZERS_GIT_COMMIT}"
+          echo "Building vLLM Router ${BYTEIAAS_VLLM_ROUTER_GIT_REF}@${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
 
           mkdir -p "${cache_root}"
 
@@ -341,7 +348,9 @@ jobs:
               --build-arg TOKENIZERS_GIT_COMMIT="${BYTEIAAS_TOKENIZERS_GIT_COMMIT}"
               --build-arg INSTALL_KV_CONNECTORS=true
               --build-arg INSTALL_VLLM_ROUTER=true
-              --build-arg VLLM_ROUTER_VERSION="${BYTEIAAS_VLLM_ROUTER_VERSION}"
+              --build-arg VLLM_ROUTER_GIT_REPOSITORY="${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY}"
+              --build-arg VLLM_ROUTER_GIT_REF="${BYTEIAAS_VLLM_ROUTER_GIT_REF}"
+              --build-arg VLLM_ROUTER_GIT_COMMIT="${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
               --build-arg VLLM_BUILD_COMMIT="${build_commit}"
               --build-arg VLLM_BUILD_PIPELINE="${GITHUB_WORKFLOW}"
               --build-arg VLLM_BUILD_URL="${build_url}"

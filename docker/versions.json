@@ -40,6 +40,18 @@
     "TOKENIZERS_GIT_COMMIT": {
       "default": "441393c720fbd27a4faea02b7af18ebe08a65a01"
     },
+    "INSTALL_VLLM_ROUTER": {
+      "default": "false"
+    },
+    "VLLM_ROUTER_GIT_REPOSITORY": {
+      "default": "https://github.com/wangyicong52/router.git"
+    },
+    "VLLM_ROUTER_GIT_REF": {
+      "default": "dev/dsv4.1-flash"
+    },
+    "VLLM_ROUTER_GIT_COMMIT": {
+      "default": "ef339bc73a04872dc7999aebf761c5f86263af64"
+    },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
@@ -114,12 +126,6 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
-    },
-    "INSTALL_VLLM_ROUTER": {
-      "default": "false"
-    },
-    "VLLM_ROUTER_VERSION": {
-      "default": "0.1.15"
     },
     "VLLM_IMAGE_SOURCE": {
       "default": "https://github.com/vllm-project/vllm"

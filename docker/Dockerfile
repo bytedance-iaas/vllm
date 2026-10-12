@@ -66,6 +66,13 @@ ARG TOKENIZERS_GIT_REPOSITORY=https://github.com/wangyicong52/tokenizers.git
 ARG TOKENIZERS_GIT_REF=vllm
 ARG TOKENIZERS_GIT_COMMIT=441393c720fbd27a4faea02b7af18ebe08a65a01
 
+# Router source used by ByteIAAS PD images. Keep the branch for provenance and
+# the full commit for reproducible builds.
+ARG INSTALL_VLLM_ROUTER=false
+ARG VLLM_ROUTER_GIT_REPOSITORY=https://github.com/wangyicong52/router.git
+ARG VLLM_ROUTER_GIT_REF=dev/dsv4.1-flash
+ARG VLLM_ROUTER_GIT_COMMIT=ef339bc73a04872dc7999aebf761c5f86263af64
+
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
 # installation of the GPG key of the PPA, as done by add-apt-repository, so we
@@ -454,6 +461,72 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     test -f "$1"; \
     sha256sum "$1" > /tmp/tokenizers-dist/wheels.sha256
 #################### TOKENIZERS BUILD IMAGE ####################
+
+#################### VLLM ROUTER BUILD IMAGE ####################
+FROM rust-build AS vllm-router-build
+ARG INSTALL_VLLM_ROUTER
+ARG VLLM_ROUTER_GIT_REPOSITORY
+ARG VLLM_ROUTER_GIT_REF
+ARG VLLM_ROUTER_GIT_COMMIT
+
+RUN mkdir -p /tmp/vllm-router-dist \
+    && if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
+        dnf install -y --setopt=install_weak_deps=False \
+            --enablerepo=powertools \
+            openssl-devel protobuf-compiler protobuf-devel \
+        && dnf clean all \
+        && rm -rf /var/cache/dnf \
+        && uv pip install --python /opt/venv/bin/python3 \
+            "auditwheel==6.5.0" \
+            "build==1.3.0" \
+            "patchelf==0.17.2.4"; \
+    fi
+
+WORKDIR /tmp/vllm-router-src
+RUN if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
+        set -eux; \
+        test -n "${VLLM_ROUTER_GIT_REPOSITORY}"; \
+        test -n "${VLLM_ROUTER_GIT_REF}"; \
+        test "${#VLLM_ROUTER_GIT_COMMIT}" -eq 40; \
+        case "${VLLM_ROUTER_GIT_COMMIT}" in *[!0-9a-f]*) exit 1;; esac; \
+        git init .; \
+        git remote add origin "${VLLM_ROUTER_GIT_REPOSITORY}"; \
+        git fetch --no-tags --depth 1 origin "${VLLM_ROUTER_GIT_COMMIT}"; \
+        git checkout --detach FETCH_HEAD; \
+        test "$(git rev-parse HEAD)" = "${VLLM_ROUTER_GIT_COMMIT}"; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/opt/uv/cache \
+    if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
+        set -eux; \
+        . /root/.cargo/env; \
+        export RUSTUP_TOOLCHAIN="$(sed -n \
+            's/^channel = "\(.*\)"/\1/p' /workspace/rust-toolchain.toml)"; \
+        test -n "${RUSTUP_TOOLCHAIN}"; \
+        rustc --version; \
+        cargo --version; \
+        mkdir -p /tmp/vllm-router-unrepaired; \
+        python3 -m build --wheel --no-isolation \
+            --outdir /tmp/vllm-router-unrepaired; \
+        git diff --exit-code -- Cargo.lock; \
+        set -- /tmp/vllm-router-unrepaired/*.whl; \
+        test "$#" -eq 1; \
+        test -f "$1"; \
+        auditwheel repair \
+            --plat "manylinux_2_28_$(uname -m)" \
+            --wheel-dir /tmp/vllm-router-dist \
+            "$1"; \
+        rm -rf /tmp/vllm-router-unrepaired; \
+        set -- /tmp/vllm-router-dist/*.whl; \
+        test "$#" -eq 1; \
+        test -f "$1"; \
+        case "$1" in *manylinux_2_28*) ;; *) exit 1;; esac; \
+        auditwheel show "$1"; \
+        sha256sum "$1" > /tmp/vllm-router-dist/wheels.sha256; \
+    fi
+#################### VLLM ROUTER BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
@@ -1406,8 +1479,10 @@ ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
 ARG TRITON_INSTALL_FROM_SOURCE_REPO
-ARG INSTALL_VLLM_ROUTER=false
-ARG VLLM_ROUTER_VERSION=0.1.15
+ARG INSTALL_VLLM_ROUTER
+ARG VLLM_ROUTER_GIT_REPOSITORY
+ARG VLLM_ROUTER_GIT_REF
+ARG VLLM_ROUTER_GIT_COMMIT
 ARG CUDA_VERSION
 ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
@@ -1506,10 +1581,18 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         /tmp/triton-source-wheel.sha256
 
 RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=vllm-router-build,src=/tmp/vllm-router-dist,target=/tmp/vllm-router-dist,ro \
     if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
-        uv pip install --system "vllm-router==${VLLM_ROUTER_VERSION}" && \
+        sha256sum --check --strict /tmp/vllm-router-dist/wheels.sha256 && \
+        set -- /tmp/vllm-router-dist/*.whl && \
+        test "$#" -eq 1 && \
+        test -f "$1" && \
+        uv pip install --system "$1" && \
         command -v vllm-router && \
-        python3 -m pip show vllm-router >/dev/null; \
+        python3 -m pip show vllm-router >/dev/null && \
+        python3 -c "from vllm_router_rs import Router; print(Router)" && \
+        vllm-router --help | grep -F -- "--encoder-only-prefill" && \
+        echo "vllm-router verified at ${VLLM_ROUTER_GIT_REF}@${VLLM_ROUTER_GIT_COMMIT}"; \
     fi
 
 # Install the source-built tokenizers wheel after all runtime dependencies so
@@ -1540,7 +1623,10 @@ LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
-      ai.vllm.tokenizers.commit="${TOKENIZERS_GIT_COMMIT}"
+      ai.vllm.tokenizers.commit="${TOKENIZERS_GIT_COMMIT}" \
+      ai.vllm.router.repository="${VLLM_ROUTER_GIT_REPOSITORY}" \
+      ai.vllm.router.ref="${VLLM_ROUTER_GIT_REF}" \
+      ai.vllm.router.commit="${VLLM_ROUTER_GIT_COMMIT}"
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
