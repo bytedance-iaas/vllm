@@ -232,8 +232,19 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        dense = getattr(self.gate_up_proj.quant_method, "_dense_mxfp8", None)
+        if (
+            dense is not None
+            and dense.supports(x)
+            and isinstance(self.act_fn, SiluAndMulWithClamp)
+            and self.act_fn.swiglu_limit == 10.0
+            and self.act_fn.alpha == 1.0
+            and self.act_fn.beta == 0.0
+        ):
+            x = dense(x, swiglu_limit=10.0)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
