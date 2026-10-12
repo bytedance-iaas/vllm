@@ -79,9 +79,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 "is the bonus token."
             )
         self.sample_from_anchor = False
-        self._dummy_rank_request_clamp = (
-            envs.VLLM_DFLASH_DUMMY_RANK_REQUEST_CLAMP
-        )
+        self._dummy_rank_request_clamp = envs.VLLM_DFLASH_DUMMY_RANK_REQUEST_CLAMP
         if self._dummy_rank_request_clamp:
             logger.info_once("DFlash DP dummy request clamp enabled.")
 
@@ -326,9 +324,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs_override: int | None = None,
     ) -> None:
         num_reqs = (
-            input_batch.num_reqs
-            if num_reqs_override is None
-            else num_reqs_override
+            input_batch.num_reqs if num_reqs_override is None else num_reqs_override
         )
         assert 0 < num_reqs <= input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -456,11 +452,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         input_num_reqs = input_batch.num_reqs
         num_reqs = input_num_reqs
         num_reqs_override = None
-        if (
-            self._dummy_rank_request_clamp
-            and dummy_run
-            and dp_sync is not None
-        ):
+        if self._dummy_rank_request_clamp and dummy_run and dp_sync is not None:
             num_reqs = min(num_reqs, dp_sync.num_reqs_unpadded)
             assert num_reqs > 0
             num_reqs_override = num_reqs
@@ -799,9 +791,7 @@ def prepare_dflash_inputs(
     sample_from_anchor: bool = False,
     num_reqs_override: int | None = None,
 ) -> None:
-    num_reqs = (
-        input_batch.num_reqs if num_reqs_override is None else num_reqs_override
-    )
+    num_reqs = input_batch.num_reqs if num_reqs_override is None else num_reqs_override
     assert 0 < num_reqs <= input_batch.num_reqs
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
