@@ -33,6 +33,7 @@ from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
