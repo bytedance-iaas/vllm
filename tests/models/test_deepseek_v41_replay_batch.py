@@ -169,7 +169,10 @@ def test_replay_batch_keeps_each_request_window(state):
         "swa_first": first.attn_metadata,
     }
     assert torch.equal(context.slot_mapping["mla"], _slot_mappings(401)[1, rows])
-    assert context.dp_metadata is None and context.is_padding is None
+    assert context.dp_metadata is None
+    assert context.is_padding is not None
+    assert context.is_padding.shape == (len(REPLAY_ROWS),)
+    assert not context.is_padding.any().item()
 
 
 def test_replay_batch_keeps_device_decode_boundaries(state):

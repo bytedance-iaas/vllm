@@ -97,6 +97,61 @@ def _pad_replayed_slots_kernel(
             )
 
 
+@triton.jit
+def _gather_replay_batch_kernel(
+    query_start_loc_ptr,  # [num_reqs + 1]
+    dropped_before_ptr,  # [num_reqs + 1] rows trimmed before each boundary
+    seq_lens_ptr,  # [num_reqs]
+    replay_start_ptr,  # [num_reqs] the encoder-side replay start
+    positions_ptr,
+    slot_mappings_ptr,  # [num_groups, num_tokens]
+    slot_mappings_stride,
+    rows_ptr,  # out: [num_kept] batch row of every kept row
+    kept_query_start_loc_ptr,  # out: [num_reqs + 1]
+    kept_positions_ptr,  # out: [num_kept]
+    kept_slot_mappings_ptr,  # out: [num_groups, num_kept]
+    kept_slot_mappings_stride,
+    kept_kv_start_ptr,  # out: [num_reqs]
+    window,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program per request: its kept rows are the last ones before its
+    boundary, and land at that boundary minus the rows trimmed before it."""
+    req = tl.program_id(0)
+    begin = tl.load(query_start_loc_ptr + req)
+    end = tl.load(query_start_loc_ptr + req + 1)
+    kept_begin = begin - tl.load(dropped_before_ptr + req)
+    kept_end = end - tl.load(dropped_before_ptr + req + 1)
+    if req == 0:
+        tl.store(kept_query_start_loc_ptr, kept_begin)
+    tl.store(kept_query_start_loc_ptr + req + 1, kept_end)
+
+    # A trimmed request holds no replay-layer window KV below its kept rows.
+    kv_start = tl.load(replay_start_ptr + req)
+    if kept_end - kept_begin < end - begin:
+        kv_start = tl.maximum(kv_start, tl.load(seq_lens_ptr + req) - window)
+    tl.store(kept_kv_start_ptr + req, kv_start)
+
+    first_row = end - (kept_end - kept_begin)
+    for tok in range(kept_begin, kept_end, BLOCK):
+        offs = tok + tl.arange(0, BLOCK)
+        mask = offs < kept_end
+        row = first_row + (offs - kept_begin)
+        tl.store(rows_ptr + offs, row.to(tl.int64), mask=mask)
+        tl.store(
+            kept_positions_ptr + offs,
+            tl.load(positions_ptr + row, mask=mask),
+            mask=mask,
+        )
+        for g in tl.static_range(NUM_GROUPS):
+            tl.store(
+                kept_slot_mappings_ptr + g * kept_slot_mappings_stride + offs,
+                tl.load(slot_mappings_ptr + g * slot_mappings_stride + row, mask=mask),
+                mask=mask,
+            )
+
+
 class ReplayAttnMetadata(ModelSpecificAttnMetadata):
     """Hands the batch's replay starts to the sliding-window builders."""
 
