@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4.1 FlashMLA sparse backend, metadata, and metadata builders."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import torch
@@ -139,6 +139,9 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     block_size: int
     topk_tokens: int
+    decode_global_topk_cache: dict[
+        tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
     common: Any = None
     builder: Any = None
 
