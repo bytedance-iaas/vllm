@@ -24,6 +24,8 @@ from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureController,
     RetainedReplayFixtureError,
     TouchedStateRegistry,
+    _cache_record_format,
+    _decode_cache_record_cpu,
     _speculative_config_identity,
     canonical_decision_reference,
     clone_owned,
@@ -128,6 +130,91 @@ def test_decision_reference_ignores_unused_sample_tail() -> None:
         [1, 2],
         [3],
     ]
+
+
+def test_decode_page_segregated_cache_records() -> None:
+    fp8_one = torch.tensor([1.0], dtype=torch.float8_e4m3fn).view(torch.uint8).item()
+
+    mxfp8 = torch.zeros((1, 2, 528), dtype=torch.uint8)
+    mxfp8_bytes = mxfp8.view(-1)
+    mxfp8_bytes[512:1024].fill_(fp8_one)
+    mxfp8_bytes[2 * 512 + 16 : 2 * 512 + 32].fill_(127)
+    raw, scales, decoded = _decode_cache_record_cpu(mxfp8, 0, 1)
+    assert _cache_record_format(mxfp8) == "v41_ue8m0_mxfp8"
+    assert raw.shape == (512,)
+    assert scales.tolist() == [127] * 16
+    assert torch.equal(decoded, torch.ones(512))
+
+    nvfp4 = torch.zeros((1, 2, 288), dtype=torch.uint8)
+    nvfp4_bytes = nvfp4.view(-1)
+    nvfp4_bytes[256:512].fill_(0x66)
+    nvfp4_scale = (
+        torch.tensor([1.0], dtype=torch.float8_e4m3fn).view(torch.uint8).item()
+    )
+    nvfp4_bytes[2 * 256 + 32 : 2 * 256 + 64].fill_(nvfp4_scale)
+    raw, scales, decoded = _decode_cache_record_cpu(nvfp4, 0, 1)
+    assert _cache_record_format(nvfp4) == "v41_nvfp4"
+    assert raw.shape == (256,)
+    assert scales.shape == (32,)
+    assert torch.equal(decoded, torch.full((512,), 4.0))
+
+
+def test_decode_v4_and_indexer_cache_records() -> None:
+    fp8_one = torch.tensor([1.0], dtype=torch.float8_e4m3fn).view(torch.uint8).item()
+
+    v4 = torch.zeros((1, 2, 584), dtype=torch.uint8)
+    v4_bytes = v4.view(-1)
+    v4_bytes[576:1024].fill_(fp8_one)
+    rope = torch.ones(64, dtype=torch.bfloat16).view(torch.uint8)
+    v4_bytes[576 + 448 : 2 * 576].copy_(rope)
+    v4_bytes[2 * 576 + 8 : 2 * 576 + 15].fill_(127)
+    _, scales, decoded = _decode_cache_record_cpu(v4, 0, 1)
+    assert scales.tolist() == [127] * 7 + [0]
+    assert torch.equal(decoded, torch.ones(512))
+
+    indexer_fp8 = torch.zeros((1, 2, 132), dtype=torch.uint8)
+    indexer_fp8_bytes = indexer_fp8.view(-1)
+    indexer_fp8_bytes[128:256].fill_(fp8_one)
+    indexer_fp8_bytes[2 * 128 + 4 : 2 * 128 + 8].copy_(
+        torch.tensor([2.0], dtype=torch.float32).view(torch.uint8)
+    )
+    _, _, decoded = _decode_cache_record_cpu(indexer_fp8, 0, 1)
+    assert torch.equal(decoded, torch.full((128,), 2.0))
+
+    indexer_mxfp4 = torch.zeros((1, 2, 68), dtype=torch.uint8)
+    indexer_mxfp4_bytes = indexer_mxfp4.view(-1)
+    indexer_mxfp4_bytes[64:128].fill_(0x66)
+    indexer_mxfp4_bytes[2 * 64 + 4 : 2 * 64 + 8].fill_(127)
+    _, _, decoded = _decode_cache_record_cpu(indexer_mxfp4, 0, 1)
+    assert torch.equal(decoded, torch.full((128,), 4.0))
+
+
+def test_decode_plain_and_ring_cache_records() -> None:
+    bf16 = torch.arange(1024, dtype=torch.float32).to(torch.bfloat16)
+    bf16 = bf16[:512].reshape(1, 1, 512)
+    raw, scales, decoded = _decode_cache_record_cpu(bf16, 0, 0)
+    assert raw.numel() == 1024
+    assert scales.numel() == 0
+    assert torch.equal(decoded, bf16[0, 0].float())
+
+    fp8 = torch.ones((1, 1, 512), dtype=torch.float8_e4m3fn)
+    _, _, decoded = _decode_cache_record_cpu(fp8, 0, 0, fp8_scale=3.0)
+    assert torch.equal(decoded, torch.full((512,), 3.0))
+
+    ring = torch.arange(1024, dtype=torch.float32).reshape(1, 1, 1024)
+    _, _, decoded = _decode_cache_record_cpu(ring, 0, 0)
+    assert torch.equal(decoded, ring[0, 0])
+
+
+def test_cache_record_decoder_rejects_unknown_or_nonfinite_layout() -> None:
+    with pytest.raises(RetainedReplayFixtureError, match="record width"):
+        _cache_record_format(torch.zeros((1, 1, 64), dtype=torch.uint8))
+
+    plain = torch.ones((1, 1, 512), dtype=torch.float8_e4m3fn)
+    with pytest.raises(RetainedReplayFixtureError, match="dequantization scale"):
+        _decode_cache_record_cpu(plain, 0, 0)
+    with pytest.raises(RetainedReplayFixtureError, match="finite scalar"):
+        _decode_cache_record_cpu(plain, 0, 0, fp8_scale=float("inf"))
 
 
 def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:

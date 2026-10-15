@@ -38,6 +38,14 @@ class RetainedReplayFixtureError(RuntimeError):
 
 _ByteInterval = tuple[int, int]
 
+_PACKED_CACHE_FORMATS = {
+    584: "v4_ue8m0_fp8_bf16",
+    528: "v41_ue8m0_mxfp8",
+    288: "v41_nvfp4",
+    132: "indexer_fp8",
+    68: "indexer_mxfp4",
+}
+
 
 def _clone_flashmla_scheduler(value: Any, memo: dict[int, Any]) -> Any | None:
     if type(value).__name__ != "FlashMLASchedMeta":
@@ -169,6 +177,159 @@ def _subtract_byte_intervals(
         if cursor < end:
             result.append((cursor, end))
     return result
+
+
+def _cache_record_format(cache: torch.Tensor) -> str:
+    if cache.ndim != 3:
+        raise RetainedReplayFixtureError(
+            f"unsupported logical cache shape {tuple(cache.shape)}"
+        )
+    width = int(cache.shape[-1])
+    if cache.dtype == torch.uint8:
+        try:
+            return _PACKED_CACHE_FORMATS[width]
+        except KeyError as error:
+            raise RetainedReplayFixtureError(
+                f"unsupported packed cache record width {width}"
+            ) from error
+    if width == 512 and cache.dtype == torch.bfloat16:
+        return "plain_bf16"
+    if width == 512 and cache.dtype == torch.float8_e4m3fn:
+        return "plain_fp8"
+    if width == 1024 and cache.dtype == torch.float32:
+        return "compressor_ring_fp32"
+    raise RetainedReplayFixtureError(
+        f"unsupported cache record dtype/width {cache.dtype}/{width}"
+    )
+
+
+def _decode_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    codes = codes.to(torch.int64)
+    magnitude_code = codes & 7
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+    )
+    values = magnitudes.index_select(0, magnitude_code.reshape(-1)).reshape(
+        magnitude_code.shape
+    )
+    return torch.where(codes >= 8, -values, values)
+
+
+def _decode_cache_record_cpu(
+    cache: torch.Tensor,
+    block: int,
+    row: int,
+    *,
+    record_format: str | None = None,
+    fp8_scale: torch.Tensor | float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy one actual cache record and decode its stored value to FP32."""
+    if cache.ndim != 3:
+        raise RetainedReplayFixtureError(
+            f"unsupported logical cache shape {tuple(cache.shape)}"
+        )
+    if not 0 <= block < cache.shape[0] or not 0 <= row < cache.shape[1]:
+        raise RetainedReplayFixtureError(
+            f"cache record ({block}, {row}) exceeds {tuple(cache.shape[:2])}"
+        )
+    record_format = record_format or _cache_record_format(cache)
+
+    if record_format in ("plain_bf16", "plain_fp8", "compressor_ring_fp32"):
+        raw_row = cache[block, row].detach().contiguous().cpu()
+        raw_values = raw_row.view(torch.uint8).clone()
+        raw_scales = torch.empty(0, dtype=torch.uint8)
+        decoded = raw_row.to(torch.float32)
+        if record_format == "plain_fp8":
+            if fp8_scale is None:
+                raise RetainedReplayFixtureError(
+                    "plain FP8 cache record lacks its dequantization scale"
+                )
+            scale = torch.as_tensor(fp8_scale, dtype=torch.float32).reshape(-1)
+            if scale.numel() != 1 or not bool(torch.isfinite(scale).all()):
+                raise RetainedReplayFixtureError(
+                    "plain FP8 cache scale must be one finite scalar"
+                )
+            decoded = decoded * scale.item()
+    else:
+        if cache.dtype != torch.uint8:
+            raise RetainedReplayFixtureError(
+                f"{record_format}: packed cache must use uint8 storage"
+            )
+        page = (cache.storage_offset() + block * cache.stride(0)) * cache.element_size()
+        rows_per_page = int(cache.shape[1])
+        storage = _storage_bytes_view(cache)
+
+        if record_format == "v4_ue8m0_fp8_bf16":
+            value_bytes, scale_bytes = 576, 8
+        elif record_format == "v41_ue8m0_mxfp8":
+            value_bytes, scale_bytes = 512, 16
+        elif record_format == "v41_nvfp4":
+            value_bytes, scale_bytes = 256, 32
+        elif record_format == "indexer_fp8":
+            value_bytes, scale_bytes = 128, 4
+        elif record_format == "indexer_mxfp4":
+            value_bytes, scale_bytes = 64, 4
+        else:
+            raise RetainedReplayFixtureError(
+                f"unsupported packed cache format {record_format}"
+            )
+
+        value_begin = page + row * value_bytes
+        scale_begin = page + rows_per_page * value_bytes + row * scale_bytes
+        raw_values = (
+            storage[value_begin : value_begin + value_bytes].detach().cpu().clone()
+        )
+        raw_scales = (
+            storage[scale_begin : scale_begin + scale_bytes].detach().cpu().clone()
+        )
+
+        if record_format == "v4_ue8m0_fp8_bf16":
+            fp8 = raw_values[:448].view(torch.float8_e4m3fn).to(torch.float32)
+            scales = torch.exp2(raw_scales[:7].to(torch.float32) - 127.0)
+            nope = fp8.reshape(7, 64) * scales[:, None]
+            rope = raw_values[448:].view(torch.bfloat16).to(torch.float32)
+            decoded = torch.cat((nope.reshape(-1), rope))
+            if int(raw_scales[7]) != 0:
+                raise RetainedReplayFixtureError(
+                    "V4 packed cache padding scale is nonzero"
+                )
+        elif record_format == "v41_ue8m0_mxfp8":
+            fp8 = raw_values.view(torch.float8_e4m3fn).to(torch.float32)
+            scales = torch.exp2(raw_scales.to(torch.float32) - 127.0)
+            decoded = (fp8.reshape(16, 32) * scales[:, None]).reshape(-1)
+        elif record_format == "v41_nvfp4":
+            codes = torch.stack(
+                (raw_values & 0xF, raw_values >> 4),
+                dim=1,
+            ).reshape(-1)
+            scales = raw_scales.view(torch.float8_e4m3fn).to(torch.float32)
+            decoded = (_decode_e2m1(codes).reshape(32, 16) * scales[:, None]).reshape(
+                -1
+            )
+        elif record_format == "indexer_fp8":
+            scale = raw_scales.view(torch.float32)
+            if scale.numel() != 1:
+                raise RetainedReplayFixtureError(
+                    "indexer FP8 record has an invalid scale"
+                )
+            decoded = (
+                raw_values.view(torch.float8_e4m3fn).to(torch.float32) * scale.item()
+            )
+        else:
+            assert record_format == "indexer_mxfp4"
+            codes = torch.stack(
+                (raw_values & 0xF, raw_values >> 4),
+                dim=1,
+            ).reshape(-1)
+            scales = torch.exp2(raw_scales.to(torch.float32) - 127.0)
+            decoded = (_decode_e2m1(codes).reshape(4, 32) * scales[:, None]).reshape(-1)
+
+    if not bool(torch.isfinite(decoded).all()):
+        raise RetainedReplayFixtureError(
+            f"{record_format}: decoded cache record is nonfinite"
+        )
+    return raw_values, raw_scales, decoded
 
 
 def _cache_block_byte_intervals(
