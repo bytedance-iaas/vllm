@@ -132,10 +132,18 @@ def test_numeric_comparator_accepts_matching_infinity_masks() -> None:
         torch.tensor([1.0, float("-inf"), 3.0]),
         torch.tensor([1.25, float("-inf"), 3.0]),
         denominator_floor=1e-12,
+        allow_negative_infinity=True,
     )
 
     assert metrics["negative_infinities"] == 1
     assert metrics["max_abs"] == 0.25
+
+    with pytest.raises(ValueError, match="unexpected negative infinity"):
+        _floating_metrics(
+            torch.tensor([1.0, float("-inf")]),
+            torch.tensor([1.0, float("-inf")]),
+            denominator_floor=1e-12,
+        )
 
     with pytest.raises(ValueError, match="negative-infinity masks differ"):
         _floating_metrics(

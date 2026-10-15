@@ -63,6 +63,10 @@ EXACT_FLOAT_REGISTRY_PREFIXES = (
     "registry/sampler:",
     "registry/speculator:temperature",
 )
+MASKED_NEGATIVE_INFINITY_PREFIXES = (
+    "registry/speculator:draft_logits",
+    "registry/speculator:_draft_scatter_buf",
+)
 TRIMMABLE_REGISTRY_NAMES = {
     "replay_graph:input:0",
     "replay_graph:input:1",
@@ -249,6 +253,28 @@ def _validate_evidence_contract(
             f"{path}: configured registry entries are absent: "
             f"{sorted(missing_configured)}"
         )
+    non_tensor_runtime_entries = {
+        "adaptive:_stale_idx",
+        "adaptive:_pending_resets",
+        "adaptive:_batch_budget",
+    }
+    required_tensors = (
+        required_registry - non_tensor_runtime_entries
+    ) | expected_graph_names
+    if speculative.get("enable_adaptive_verification") is True:
+        required_tensors.update(
+            name
+            for name in registry_entries
+            if name.startswith(("adaptive:stale_gpu:", "adaptive:stale_cpu:"))
+        )
+    for checkpoint in ("post_sampling", "s1"):
+        for name in required_tensors:
+            key = f"{checkpoint}:registry/{_safe_path_component(name)}"
+            leaf = leaves.get(key)
+            if leaf is None or leaf.get("payload_key") is None:
+                raise ValueError(f"{path}: required tensor evidence is absent: {key}")
+            if not leaf.get("shape") or any(int(size) <= 0 for size in leaf["shape"]):
+                raise ValueError(f"{path}: required tensor evidence is empty: {key}")
 
     if not set(meaningful_counts).issubset(TRIMMABLE_REGISTRY_NAMES):
         raise ValueError(f"{path}: unsupported meaningful-row trimming family")
@@ -262,6 +288,21 @@ def _validate_evidence_contract(
             actual_prefix = leaf.get("metadata", {}).get("compare_prefix")
             if actual_prefix != expected_prefix:
                 raise ValueError(f"{path}: meaningful-row prefix differs for {name}")
+        for leaf in leaves.values():
+            if leaf["checkpoint"] != checkpoint:
+                continue
+            actual_prefix = leaf.get("metadata", {}).get("compare_prefix")
+            if actual_prefix is None:
+                continue
+            matching_names = [
+                name
+                for name in meaningful_counts
+                if leaf["path"] == f"registry/{_safe_path_component(name)}"
+            ]
+            if len(matching_names) != 1:
+                raise ValueError(
+                    f"{path}: undeclared meaningful-row prefix at {leaf['path']}"
+                )
     _validate_container_children(path, leaves)
 
 
@@ -589,6 +630,7 @@ def _floating_metrics(
     right: torch.Tensor,
     *,
     denominator_floor: float,
+    allow_negative_infinity: bool = False,
 ) -> dict[str, Any]:
     if left.shape != right.shape or left.dtype != right.dtype:
         raise ValueError("floating tensor shape or dtype mismatch")
@@ -596,12 +638,16 @@ def _floating_metrics(
     right64 = right.to(torch.float64)
     if bool(torch.isnan(left64).any()) or bool(torch.isnan(right64).any()):
         raise ValueError("unexpected NaN in floating evidence")
-    for predicate, name in (
-        (torch.isposinf, "positive-infinity"),
-        (torch.isneginf, "negative-infinity"),
-    ):
-        if not torch.equal(predicate(left64), predicate(right64)):
-            raise ValueError(f"{name} masks differ")
+    left_positive = torch.isposinf(left64)
+    right_positive = torch.isposinf(right64)
+    if bool(left_positive.any()) or bool(right_positive.any()):
+        raise ValueError("unexpected positive infinity in floating evidence")
+    left_negative = torch.isneginf(left64)
+    right_negative = torch.isneginf(right64)
+    if not torch.equal(left_negative, right_negative):
+        raise ValueError("negative-infinity masks differ")
+    if not allow_negative_infinity and bool(left_negative.any()):
+        raise ValueError("unexpected negative infinity in floating evidence")
     left_finite = torch.isfinite(left64)
     right_finite = torch.isfinite(right64)
     if not torch.equal(left_finite, right_finite):
@@ -694,6 +740,10 @@ def _compare_runs(
             left_tensor,
             right_tensor,
             denominator_floor=denominator_floor,
+            allow_negative_infinity=any(
+                left_leaf["path"].startswith(prefix)
+                for prefix in MASKED_NEGATIVE_INFINITY_PREFIXES
+            ),
         )
         family = _envelope_key(left_leaf)
         passed = None
