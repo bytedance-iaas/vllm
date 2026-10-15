@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-SCHEMA = 1
+SCHEMA = 2
 QUANTILES = (0.5, 0.9, 0.99, 0.999, 1.0)
 REQUIRED_CHECKPOINTS = {"l20", "target", "post_sampling", "s1"}
 REQUIRED_PATHS = {
@@ -323,12 +323,14 @@ def _validate_evidence_contract(
     registry_entries = contract.get("registry_entries")
     meaningful_counts = contract.get("meaningful_counts")
     graph_input_count = contract.get("graph_input_count")
+    logical_cache_views = contract.get("logical_cache_views")
     if not (
         isinstance(checkpoint_paths, dict)
         and isinstance(comparison_classes, dict)
         and isinstance(registry_entries, list)
         and isinstance(meaningful_counts, dict)
         and isinstance(graph_input_count, int)
+        and isinstance(logical_cache_views, list)
     ):
         raise ValueError(f"{path}: evidence contract is incomplete")
 
@@ -364,6 +366,39 @@ def _validate_evidence_contract(
     }
     if graph_names != expected_graph_names:
         raise ValueError(f"{path}: graph input inventory is incomplete")
+
+    if manifest.get("active_role") == "active" and not logical_cache_views:
+        raise ValueError(f"{path}: active evidence has no logical cache views")
+    logical_view_ids = set()
+    for view in logical_cache_views:
+        if not isinstance(view, dict) or view.get("schema") != 1:
+            raise ValueError(f"{path}: logical cache view metadata is invalid")
+        view_id = view.get("view_id")
+        if not isinstance(view_id, str) or not view_id or view_id in logical_view_ids:
+            raise ValueError(f"{path}: logical cache view identity is invalid")
+        logical_view_ids.add(view_id)
+        if (
+            not isinstance(view.get("aliases"), list)
+            or not isinstance(view.get("consumers"), list)
+            or not isinstance(view.get("destination_blocks"), list)
+            or not isinstance(view.get("spec_metadata"), dict)
+        ):
+            raise ValueError(f"{path}: logical cache view contract is incomplete")
+        root = f"logical_kv/{_safe_path_component(view_id)}"
+        for checkpoint in ("post_sampling", "s1"):
+            required = {
+                f"{checkpoint}:{root}/descriptors": "exact",
+                f"{checkpoint}:{root}/decoded": "floating",
+                f"{checkpoint}:{root}/raw_values": "diagnostic",
+                f"{checkpoint}:{root}/raw_scales": "diagnostic",
+            }
+            for key, comparison in required.items():
+                leaf = leaves.get(key)
+                if leaf is None or leaf.get("comparison") != comparison:
+                    raise ValueError(
+                        f"{path}: logical cache evidence is absent or misclassified: "
+                        f"{key}"
+                    )
 
     required_registry = {
         "model:_mtp_hidden_buffer",
@@ -556,16 +591,43 @@ def _load_run(path: Path) -> EvidenceRun:
         dtype = str(leaf["dtype"])
         is_float = dtype.startswith("torch.float") or dtype.startswith("torch.bfloat")
         is_tensor = leaf.get("payload_key") is not None
-        if is_tensor and not is_float and comparison != "exact":
+        is_logical_raw = path_name.startswith("logical_kv/") and path_name.endswith(
+            ("/raw_values", "/raw_scales")
+        )
+        if (
+            is_tensor
+            and not is_float
+            and comparison != "exact"
+            and not (is_logical_raw and comparison == "diagnostic")
+        ):
             raise ValueError(f"{path}: non-floating tensor must be exact: {key}")
         if path_name.startswith("registry/kv-") and comparison != "exact":
             raise ValueError(f"{path}: KV bytes must remain exact: {key}")
         if path_name.startswith("decisions/") and comparison != "exact":
             raise ValueError(f"{path}: decisions must remain exact: {key}")
+        if path_name.startswith("logical_kv/"):
+            if path_name.endswith("/decoded"):
+                if not (is_tensor and is_float and comparison == "floating"):
+                    raise ValueError(
+                        f"{path}: logical decoded values must be floating: {key}"
+                    )
+            elif path_name.endswith(("/raw_values", "/raw_scales")):
+                if not (
+                    is_tensor and dtype == "torch.uint8" and comparison == "diagnostic"
+                ):
+                    raise ValueError(
+                        f"{path}: logical raw bytes must be diagnostic uint8: {key}"
+                    )
+            elif comparison != "exact":
+                raise ValueError(
+                    f"{path}: logical metadata/descriptors must be exact: {key}"
+                )
         if not (is_tensor and is_float):
             continue
         expected = None
-        if leaf["checkpoint"] in ("l20", "target"):
+        if (
+            path_name.startswith("logical_kv/") and path_name.endswith("/decoded")
+        ) or leaf["checkpoint"] in ("l20", "target"):
             expected = "floating"
         elif path_name.startswith("registry/"):
             if any(
@@ -880,6 +942,7 @@ def _compare_runs(
             f"missing_right={missing_right[:4]}"
         )
     floating = []
+    diagnostic = []
     exact_mismatches = []
     for key in sorted(left.leaves):
         left_leaf = left.leaves[key]
@@ -897,6 +960,22 @@ def _compare_runs(
             )
             if not equal:
                 exact_mismatches.append(key)
+            continue
+        if left_leaf["comparison"] == "diagnostic":
+            left_tensor = _meaningful_tensor(left, left_leaf)
+            right_tensor = _meaningful_tensor(right, right_leaf)
+            if left_tensor.shape != right_tensor.shape or left_tensor.dtype != (
+                right_tensor.dtype
+            ):
+                raise ValueError(f"{key}: diagnostic tensor shape or dtype differs")
+            mismatches = int(torch.count_nonzero(left_tensor != right_tensor).item())
+            diagnostic.append(
+                {
+                    "leaf": key,
+                    "elements": left_tensor.numel(),
+                    "mismatches": mismatches,
+                }
+            )
             continue
         if left_leaf["comparison"] != "floating":
             raise ValueError(f"{key}: invalid comparison class")
@@ -941,6 +1020,7 @@ def _compare_runs(
         },
         "exact_mismatches": exact_mismatches,
         "floating": floating,
+        "diagnostic": diagnostic,
         "passed": not exact_mismatches
         and all(row["passed"] is not False for row in floating),
     }

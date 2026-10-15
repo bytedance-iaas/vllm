@@ -25,7 +25,9 @@ from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureError,
     TouchedStateRegistry,
     _cache_record_format,
+    _CacheWriter,
     _decode_cache_record_cpu,
+    _LogicalCacheView,
     _speculative_config_identity,
     canonical_decision_reference,
     clone_owned,
@@ -215,6 +217,77 @@ def test_cache_record_decoder_rejects_unknown_or_nonfinite_layout() -> None:
         _decode_cache_record_cpu(plain, 0, 0)
     with pytest.raises(RetainedReplayFixtureError, match="finite scalar"):
         _decode_cache_record_cpu(plain, 0, 0, fp8_scale=float("inf"))
+
+
+def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
+    cache = torch.zeros((4, 4, 528), dtype=torch.uint8)
+    storage = cache.view(-1)
+    for block in (1, 3):
+        page = block * cache.stride(0)
+        storage[page + 4 * 512 : page + 4 * 512 + 64].fill_(127)
+    view = _LogicalCacheView(
+        view_id="group-0:layer",
+        storage_id="storage-000",
+        group_id=0,
+        layer_name="layer",
+        owner_type="Owner",
+        spec_type="Spec",
+        spec_metadata={"type": "Spec"},
+        cache_kind="compressed_main",
+        record_format="v41_ue8m0_mxfp8",
+        tensor=cache,
+        block_size=4,
+        tokens_per_state=1,
+        destination_blocks={1, 3},
+        consumers=["layer"],
+        aliases=[],
+        fp8_scale=None,
+    )
+    writer = _CacheWriter(
+        phase="target-full",
+        positions=torch.tensor([4]),
+        request_ordinals=torch.tensor([0]),
+        request_state_slots=torch.tensor([7]),
+        slots_by_layer={"layer": torch.tensor([12])},
+    )
+    registry = TouchedStateRegistry()
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_computed_tokens_np=np.array([4], dtype=np.int32),
+        idx_mapping=torch.tensor([7]),
+    )
+    registry.configure_logical_cache(
+        [view],
+        [writer],
+        input_batch,
+        (torch.tensor([[1, 3]], dtype=torch.int32),),
+    )
+
+    page = 3 * cache.stride(0)
+    storage[page : page + 512].fill_(
+        torch.tensor([1.0], dtype=torch.float8_e4m3fn).view(torch.uint8).item()
+    )
+    storage[page + 4 * 512 : page + 4 * 512 + 16].fill_(127)
+    snapshot = registry.logical_cache_snapshot(
+        "post_sampling",
+        torch.tensor([1], dtype=torch.int32),
+    )
+    leaves = {leaf["path"]: leaf for leaf in snapshot["leaves"]}
+    root = "logical_kv/group-0:layer"
+    descriptors = snapshot["tensors"][leaves[f"{root}/descriptors"]["payload_key"]]
+    decoded = snapshot["tensors"][leaves[f"{root}/decoded"]["payload_key"]]
+    assert descriptors.shape == (5, 6)
+    assert descriptors[-1].tolist() == [0, 7, 4, 3, 0, 0]
+    assert torch.equal(decoded[-1], torch.ones(512))
+    assert leaves[f"{root}/decoded"]["comparison"] == "floating"
+    assert leaves[f"{root}/raw_values"]["comparison"] == "diagnostic"
+
+    storage[cache.stride(0) : cache.stride(0) + 1].fill_(1)
+    with pytest.raises(RetainedReplayFixtureError, match="unwritten live record"):
+        registry.logical_cache_snapshot(
+            "post_sampling",
+            torch.tensor([1], dtype=torch.int32),
+        )
 
 
 def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:

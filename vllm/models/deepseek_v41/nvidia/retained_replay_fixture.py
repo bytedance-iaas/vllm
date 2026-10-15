@@ -460,7 +460,7 @@ def canonical_decision_reference(
     }
 
 
-_TYPED_EVIDENCE_SCHEMA = 1
+_TYPED_EVIDENCE_SCHEMA = 2
 _FLOATING_REGISTRY_PREFIXES = (
     "model:_mtp_hidden_buffer",
     "model:candidate_compact_logits_buffer",
@@ -1079,6 +1079,17 @@ class TouchedStateRegistry:
         self.sources: list[_SourceRows | _SourceIntervals] = []
         self._names: set[str] = set()
         self._meaningful_counts: dict[str, int] = {}
+        self._cache_views: list[_LogicalCacheView] = []
+        self._cache_writers: list[_CacheWriter] = []
+        self._cache_block_tables: tuple[torch.Tensor, ...] = ()
+        self._cache_base_extents: tuple[int, ...] = ()
+        self._cache_request_slots: tuple[int, ...] = ()
+        self._cache_s0_records: dict[
+            str, dict[tuple[int, int, int, int, int], _LogicalCacheRecord]
+        ] = {}
+        self._cache_s0_raw_digests: dict[
+            tuple[str, tuple[int, int, int, int, int]], str
+        ] = {}
 
     def _claim(self, name: str) -> None:
         if name in self._names:
@@ -1147,6 +1158,302 @@ class TouchedStateRegistry:
         self._claim(name)
         intervals = _merge_byte_intervals(intervals)
         self.sources.append(_SourceIntervals.capture(name, tensor, intervals))
+
+    def configure_logical_cache(
+        self,
+        views: list[_LogicalCacheView],
+        writers: list[_CacheWriter],
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+    ) -> None:
+        if self._cache_views:
+            raise RetainedReplayFixtureError(
+                "logical cache evidence is configured twice"
+            )
+        num_reqs = int(input_batch.num_reqs)
+        self._cache_views = sorted(views, key=lambda view: view.view_id)
+        self._cache_writers = writers
+        self._cache_block_tables = tuple(
+            table[:num_reqs].detach().cpu().clone() for table in block_tables
+        )
+        self._cache_base_extents = tuple(
+            int(value)
+            for value in input_batch.num_computed_tokens_np[:num_reqs].tolist()
+        )
+        self._cache_request_slots = tuple(
+            int(value)
+            for value in input_batch.idx_mapping[:num_reqs].detach().cpu().tolist()
+        )
+        for view in self._cache_views:
+            records = self._logical_records_for_extents(
+                view,
+                self._cache_base_extents,
+                writer="s0",
+            )
+            self._cache_s0_records[view.view_id] = {
+                record.identity: record for record in records
+            }
+            for record in records:
+                raw_values, raw_scales, _ = _decode_cache_record_cpu(
+                    view.tensor,
+                    record.physical_block,
+                    record.physical_row,
+                    record_format=view.record_format,
+                    fp8_scale=view.fp8_scale,
+                )
+                self._cache_s0_raw_digests[(view.view_id, record.identity)] = (
+                    _tree_digest((raw_values, raw_scales))
+                )
+
+    def _logical_records_for_extents(
+        self,
+        view: _LogicalCacheView,
+        extents: tuple[int, ...],
+        *,
+        writer: str,
+    ) -> list[_LogicalCacheRecord]:
+        table = self._cache_block_tables[view.group_id]
+        records: list[_LogicalCacheRecord] = []
+        for request_ordinal, extent in enumerate(extents):
+            if extent <= 0:
+                continue
+            request_slot = self._cache_request_slots[request_ordinal]
+            if view.cache_kind == "compressor_ring":
+                physical_block = int(table[request_ordinal, 0])
+                if physical_block <= 0 or physical_block not in view.destination_blocks:
+                    continue
+                lower = max(0, extent - view.block_size)
+                for position in range(lower, extent):
+                    records.append(
+                        _LogicalCacheRecord(
+                            request_ordinal=request_ordinal,
+                            request_state_slot=request_slot,
+                            position=position,
+                            physical_block=physical_block,
+                            physical_row=position % view.block_size,
+                            writer=writer,
+                        )
+                    )
+                continue
+
+            ratio = view.tokens_per_state
+            if ratio <= 0:
+                raise RetainedReplayFixtureError(
+                    f"{view.view_id}: invalid tokens_per_state={ratio}"
+                )
+            for logical_block, physical_value in enumerate(
+                table[request_ordinal].tolist()
+            ):
+                physical_block = int(physical_value)
+                if physical_block <= 0 or physical_block not in view.destination_blocks:
+                    continue
+                for physical_row in range(view.block_size):
+                    state_index = logical_block * view.block_size + physical_row
+                    position = state_index * ratio + ratio - 1
+                    if position >= extent:
+                        break
+                    records.append(
+                        _LogicalCacheRecord(
+                            request_ordinal=request_ordinal,
+                            request_state_slot=request_slot,
+                            position=position,
+                            physical_block=physical_block,
+                            physical_row=physical_row,
+                            writer=writer,
+                        )
+                    )
+        return records
+
+    def _target_writer_records(
+        self,
+        view: _LogicalCacheView,
+        extents: tuple[int, ...],
+    ) -> list[_LogicalCacheRecord]:
+        table = self._cache_block_tables[view.group_id]
+        records: dict[tuple[int, int, int, int, int], _LogicalCacheRecord] = {}
+        for writer in self._cache_writers:
+            slots = writer.slots_by_layer.get(view.layer_name)
+            if slots is None:
+                continue
+            count = min(
+                writer.positions.numel(),
+                writer.request_ordinals.numel(),
+                writer.request_state_slots.numel(),
+                slots.numel(),
+            )
+            for row in range(count):
+                slot = int(slots[row])
+                if slot < 0:
+                    continue
+                request_ordinal = int(writer.request_ordinals[row])
+                request_slot = int(writer.request_state_slots[row])
+                position = int(writer.positions[row])
+                if not 0 <= request_ordinal < len(extents):
+                    raise RetainedReplayFixtureError(
+                        f"{writer.phase}: invalid request ordinal {request_ordinal}"
+                    )
+                if request_slot != self._cache_request_slots[request_ordinal]:
+                    raise RetainedReplayFixtureError(
+                        f"{writer.phase}: request state slot changed"
+                    )
+                if position >= extents[request_ordinal]:
+                    continue
+                ratio = view.tokens_per_state
+                if view.cache_kind != "compressor_ring":
+                    if (position + 1) % ratio:
+                        continue
+                    state_index = position // ratio
+                    logical_block = state_index // view.block_size
+                    if logical_block >= table.shape[1]:
+                        raise RetainedReplayFixtureError(
+                            f"{writer.phase}: logical cache block is out of range"
+                        )
+                    expected_block = int(table[request_ordinal, logical_block])
+                    expected_row = state_index % view.block_size
+                else:
+                    expected_block = int(table[request_ordinal, 0])
+                    expected_row = position % view.block_size
+                physical_block = slot // view.block_size
+                physical_row = slot % view.block_size
+                if (physical_block, physical_row) != (
+                    expected_block,
+                    expected_row,
+                ):
+                    raise RetainedReplayFixtureError(
+                        f"{writer.phase}: {view.view_id} slot {slot} differs from "
+                        f"block-table slot "
+                        f"{expected_block * view.block_size + expected_row}"
+                    )
+                if physical_block not in view.destination_blocks:
+                    raise RetainedReplayFixtureError(
+                        f"{writer.phase}: {view.view_id} writer escaped destination "
+                        f"coverage"
+                    )
+                record = _LogicalCacheRecord(
+                    request_ordinal=request_ordinal,
+                    request_state_slot=request_slot,
+                    position=position,
+                    physical_block=physical_block,
+                    physical_row=physical_row,
+                    writer=writer.phase,
+                )
+                records[record.identity] = record
+        return list(records.values())
+
+    def logical_cache_snapshot(
+        self,
+        checkpoint: str,
+        num_sampled: torch.Tensor,
+    ) -> dict[str, Any]:
+        sampled = tuple(int(value) for value in num_sampled.detach().cpu().tolist())
+        if len(sampled) != len(self._cache_base_extents):
+            raise RetainedReplayFixtureError(
+                f"{checkpoint}: sampled-count request cardinality differs"
+            )
+        extents = tuple(
+            base + accepted for base, accepted in zip(self._cache_base_extents, sampled)
+        )
+        builder = _TypedSnapshotBuilder(checkpoint)
+        for view in self._cache_views:
+            records = dict(self._cache_s0_records[view.view_id])
+            written = self._target_writer_records(view, extents)
+            for record in written:
+                records[record.identity] = record
+            ordered = sorted(records.values(), key=lambda record: record.identity)
+            if not ordered:
+                raise RetainedReplayFixtureError(
+                    f"{view.view_id}: logical destination coverage is empty"
+                )
+
+            descriptors = torch.tensor(
+                [
+                    [
+                        record.request_ordinal,
+                        record.request_state_slot,
+                        record.position,
+                        record.physical_block,
+                        record.physical_row,
+                        self._cache_writers.index(
+                            next(
+                                writer
+                                for writer in self._cache_writers
+                                if writer.phase == record.writer
+                            )
+                        )
+                        if record.writer != "s0"
+                        else -1,
+                    ]
+                    for record in ordered
+                ],
+                dtype=torch.int64,
+            )
+            raw_values = []
+            raw_scales = []
+            decoded = []
+            written_identities = {record.identity for record in written}
+            for record in ordered:
+                raw_value, raw_scale, value = _decode_cache_record_cpu(
+                    view.tensor,
+                    record.physical_block,
+                    record.physical_row,
+                    record_format=view.record_format,
+                    fp8_scale=view.fp8_scale,
+                )
+                if record.identity not in written_identities:
+                    expected = self._cache_s0_raw_digests[
+                        (view.view_id, record.identity)
+                    ]
+                    if _tree_digest((raw_value, raw_scale)) != expected:
+                        raise RetainedReplayFixtureError(
+                            f"{checkpoint}: unwritten live record changed in "
+                            f"{view.view_id}"
+                        )
+                raw_values.append(raw_value)
+                raw_scales.append(raw_scale)
+                decoded.append(value)
+
+            root = f"logical_kv/{_safe_path_component(view.view_id)}"
+            metadata = {
+                **view.metadata(),
+                "descriptor_columns": [
+                    "request_ordinal",
+                    "request_state_slot",
+                    "position",
+                    "physical_block",
+                    "physical_row",
+                    "writer_index",
+                ],
+                "writers": [writer.phase for writer in self._cache_writers],
+            }
+            builder.add(metadata, f"{root}/metadata", comparison="exact")
+            builder.add(
+                descriptors,
+                f"{root}/descriptors",
+                comparison="exact",
+            )
+            builder.add(
+                torch.stack(decoded),
+                f"{root}/decoded",
+                comparison="floating",
+                metadata={"record_format": view.record_format},
+            )
+            builder.add(
+                torch.stack(raw_values),
+                f"{root}/raw_values",
+                comparison="diagnostic",
+                metadata={"record_format": view.record_format},
+            )
+            if raw_scales[0].numel():
+                scale_rows = torch.stack(raw_scales)
+            else:
+                scale_rows = torch.empty((len(raw_scales), 0), dtype=torch.uint8)
+            builder.add(
+                scale_rows,
+                f"{root}/raw_scales",
+                comparison="diagnostic",
+                metadata={"record_format": view.record_format},
+            )
+        return builder.finish()
 
     def capture_epoch(self, epoch: str, *, cpu: bool = False) -> None:
         for entry in self.entries:
@@ -1290,6 +1597,88 @@ class _CacheIntervals:
     tensor: torch.Tensor
     destination: list[_ByteInterval]
     source: list[_ByteInterval]
+    views: list[_LogicalCacheView]
+
+
+@dataclass
+class _LogicalCacheView:
+    view_id: str
+    storage_id: str
+    group_id: int
+    layer_name: str
+    owner_type: str
+    spec_type: str
+    spec_metadata: dict[str, Any]
+    cache_kind: str
+    record_format: str
+    tensor: torch.Tensor
+    block_size: int
+    tokens_per_state: int
+    destination_blocks: set[int]
+    consumers: list[str]
+    aliases: list[str]
+    fp8_scale: torch.Tensor | None
+
+    def metadata(self) -> dict[str, Any]:
+        element_size = self.tensor.element_size()
+        return {
+            "schema": 1,
+            "view_id": self.view_id,
+            "storage_id": self.storage_id,
+            "group_id": self.group_id,
+            "layer_name": self.layer_name,
+            "owner_type": self.owner_type,
+            "spec_type": self.spec_type,
+            "spec_metadata": self.spec_metadata,
+            "cache_kind": self.cache_kind,
+            "record_format": self.record_format,
+            "dtype": str(self.tensor.dtype),
+            "shape": list(self.tensor.shape),
+            "strides_bytes": [
+                int(stride) * element_size for stride in self.tensor.stride()
+            ],
+            "storage_offset_bytes": self.tensor.storage_offset() * element_size,
+            "storage_nbytes": self.tensor.untyped_storage().nbytes(),
+            "block_size": self.block_size,
+            "tokens_per_state": self.tokens_per_state,
+            "destination_blocks": sorted(self.destination_blocks),
+            "consumers": self.consumers,
+            "aliases": self.aliases,
+            "fp8_scale": (
+                None
+                if self.fp8_scale is None
+                else float(self.fp8_scale.detach().float().cpu().reshape(-1).item())
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class _LogicalCacheRecord:
+    request_ordinal: int
+    request_state_slot: int
+    position: int
+    physical_block: int
+    physical_row: int
+    writer: str
+
+    @property
+    def identity(self) -> tuple[int, int, int, int, int]:
+        return (
+            self.request_ordinal,
+            self.request_state_slot,
+            self.position,
+            self.physical_block,
+            self.physical_row,
+        )
+
+
+@dataclass
+class _CacheWriter:
+    phase: str
+    positions: torch.Tensor
+    request_ordinals: torch.Tensor
+    request_state_slots: torch.Tensor
+    slots_by_layer: dict[str, torch.Tensor]
 
 
 class RetainedReplayFixtureController:
@@ -1545,10 +1934,24 @@ class RetainedReplayFixtureController:
                     ordinary_batch.input_batch.num_tokens_after_padding,
                 )
             )
+        logical_writers = [
+            self._cache_writer(
+                "target-full",
+                input_batch,
+                full_forward_context,
+            ),
+            self._cache_writer(
+                "target-replay",
+                input_batch,
+                production_replay_batch.forward_context,
+                rows=production_replay_batch.rows,
+            ),
+        ]
         registry = self._build_registry(
             input_batch,
             block_tables,
             tuple(writer_contexts),
+            logical_writers,
         )
         self._register_production_graph_inputs(
             registry,
@@ -1694,6 +2097,10 @@ class RetainedReplayFixtureController:
             checkpoints["post_sampling"] = merge_typed_snapshots(
                 "post_sampling",
                 fixture.registry.typed_snapshot("post_sampling"),
+                fixture.registry.logical_cache_snapshot(
+                    "post_sampling",
+                    num_sampled,
+                ),
                 typed_tree_snapshot(
                     "post_sampling",
                     decisions,
@@ -1746,6 +2153,7 @@ class RetainedReplayFixtureController:
         checkpoints["s1"] = merge_typed_snapshots(
             "s1",
             fixture.registry.typed_snapshot("s1", epoch="s1"),
+            fixture.registry.logical_cache_snapshot("s1", num_sampled),
             typed_tree_snapshot(
                 "s1",
                 {
@@ -1806,6 +2214,7 @@ class RetainedReplayFixtureController:
         checkpoints["s1"] = merge_typed_snapshots(
             "s1",
             fixture.registry.typed_snapshot("s1"),
+            fixture.registry.logical_cache_snapshot("s1", num_sampled),
             typed_tree_snapshot(
                 "s1",
                 {
@@ -1842,6 +2251,9 @@ class RetainedReplayFixtureController:
                 entry.name.startswith("replay_graph:input:")
                 for entry in fixture.registry.entries
             ),
+            "logical_cache_views": [
+                view.metadata() for view in fixture.registry._cache_views
+            ],
         }
 
     def _run_manifest(
@@ -1912,7 +2324,7 @@ class RetainedReplayFixtureController:
             },
         }
         return {
-            "comparator_schema": 1,
+            "comparator_schema": 2,
             "run_id": run_id,
             "worker_incarnation": self.worker_incarnation,
             "host": socket.gethostname(),
@@ -2273,18 +2685,239 @@ class RetainedReplayFixtureController:
             "source_digest": source_digest,
         }
 
+    @staticmethod
+    def _effective_layer_spec(group: Any, layer_name: str) -> Any:
+        spec = group.kv_cache_spec
+        per_layer = getattr(spec, "kv_cache_specs", None)
+        if isinstance(per_layer, dict):
+            try:
+                return per_layer[layer_name]
+            except KeyError as error:
+                raise RetainedReplayFixtureError(
+                    f"{layer_name}: per-layer KV spec is absent"
+                ) from error
+        return spec
+
+    @staticmethod
+    def _spec_metadata(spec: Any) -> dict[str, Any]:
+        names = (
+            "block_size",
+            "head_size",
+            "head_size_v",
+            "num_kv_heads",
+            "dtype",
+            "tokens_per_state",
+            "state_content_bytes",
+            "alignment",
+            "block_stride_alignment",
+            "cache_dtype_str",
+            "kv_quant_mode",
+            "sliding_window",
+            "bounded_replay",
+        )
+        metadata = {"type": type(spec).__qualname__}
+        for name in names:
+            if hasattr(spec, name):
+                metadata[name] = _manifest_value(getattr(spec, name))
+        for name in ("state_content_size_bytes", "page_size_bytes", "num_states"):
+            try:
+                metadata[name] = _manifest_value(getattr(spec, name))
+            except (AssertionError, NotImplementedError):
+                metadata[name] = None
+        return metadata
+
+    @staticmethod
+    def _tokens_per_state(spec: Any) -> int:
+        value = getattr(spec, "tokens_per_state", None)
+        numerator = getattr(value, "numerator", value)
+        denominator = getattr(value, "denominator", 1)
+        if (
+            not isinstance(numerator, int)
+            or not isinstance(denominator, int)
+            or denominator != 1
+            or numerator <= 0
+        ):
+            raise RetainedReplayFixtureError(
+                f"unsupported logical tokens_per_state={value!r}"
+            )
+        return numerator
+
+    def _cache_consumers_and_scale(
+        self,
+        layer_name: str,
+        owner: Any,
+        cache: torch.Tensor,
+    ) -> tuple[list[str], torch.Tensor | None]:
+        static_context = self.runner.compilation_config.static_forward_context
+        consumers = {layer_name}
+        scale = getattr(owner, "_flashinfer_fp8_kv_scale", None)
+        for name, candidate in static_context.items():
+            references = (
+                getattr(candidate, "swa_cache_layer", None) is owner
+                or getattr(candidate, "k_cache", None) is owner
+                or getattr(candidate, "state_cache", None) is owner
+                or getattr(candidate, "compressed_cache_prefix", None) == layer_name
+                or getattr(getattr(candidate, "compressor", None), "state_cache", None)
+                is owner
+            )
+            if not references:
+                continue
+            consumers.add(name)
+            candidate_scale = getattr(candidate, "_flashinfer_fp8_kv_scale", None)
+            if candidate_scale is not None:
+                if scale is not None and not torch.equal(
+                    scale.detach().cpu(),
+                    candidate_scale.detach().cpu(),
+                ):
+                    raise RetainedReplayFixtureError(
+                        f"{layer_name}: plain FP8 consumers disagree on scale"
+                    )
+                scale = candidate_scale
+        if cache.dtype == torch.float8_e4m3fn and scale is None:
+            raise RetainedReplayFixtureError(
+                f"{layer_name}: plain FP8 cache scale owner is absent"
+            )
+        return sorted(consumers), scale
+
+    @staticmethod
+    def _cache_kind(owner: Any, layer_name: str) -> str:
+        owner_type = type(owner).__name__
+        if owner_type == "CompressorStateCache":
+            return "compressor_ring"
+        if owner_type == "DeepseekV4IndexerCache" or layer_name.endswith(
+            ".indexer.k_cache"
+        ):
+            return "indexer"
+        if owner_type == "DeepseekV4SWACache":
+            return "swa"
+        return "compressed_main"
+
+    @staticmethod
+    def _view_page_span(view: _LogicalCacheView) -> tuple[int, int, int]:
+        element_size = view.tensor.element_size()
+        stride = view.tensor.stride(0) * element_size
+        begin = view.tensor.storage_offset() * element_size % stride
+        content = view.tensor.shape[1] * view.tensor.shape[2] * element_size
+        return stride, begin, begin + content
+
+    def _bind_cache_storage_views(
+        self,
+        records: list[_CacheIntervals],
+    ) -> None:
+        ordered = sorted(
+            records,
+            key=lambda record: min(view.layer_name for view in record.views),
+        )
+        for storage_index, record in enumerate(ordered):
+            storage_id = f"storage-{storage_index:03d}"
+            for view in record.views:
+                view.storage_id = storage_id
+            for left_index, left in enumerate(record.views):
+                left_stride, left_begin, left_end = self._view_page_span(left)
+                for right in record.views[left_index + 1 :]:
+                    right_stride, right_begin, right_end = self._view_page_span(right)
+                    exact_alias = (
+                        left.tensor.storage_offset() == right.tensor.storage_offset()
+                        and left.tensor.shape == right.tensor.shape
+                        and left.tensor.stride() == right.tensor.stride()
+                        and left.record_format == right.record_format
+                    )
+                    if exact_alias:
+                        left.aliases.append(right.view_id)
+                        right.aliases.append(left.view_id)
+                        continue
+                    if left_stride != right_stride:
+                        raise RetainedReplayFixtureError(
+                            f"{left.view_id}/{right.view_id}: shared storage has "
+                            "incompatible block strides"
+                        )
+                    if max(left_begin, right_begin) < min(left_end, right_end):
+                        raise RetainedReplayFixtureError(
+                            f"{left.view_id}/{right.view_id}: unexplained cache-view "
+                            "overlap"
+                        )
+            for view in record.views:
+                view.aliases.sort()
+
+    @staticmethod
+    def _cache_writer(
+        phase: str,
+        input_batch: InputBatch,
+        context: ForwardContext,
+        *,
+        rows: torch.Tensor | None = None,
+    ) -> _CacheWriter:
+        num_tokens = int(input_batch.num_tokens)
+        if rows is None:
+            rows = torch.arange(
+                num_tokens,
+                dtype=torch.int64,
+                device=input_batch.positions.device,
+            )
+        else:
+            rows = rows[:num_tokens].to(
+                device=input_batch.positions.device,
+                dtype=torch.int64,
+            )
+        positions = input_batch.positions.index_select(0, rows).detach().cpu()
+        query_ends = input_batch.query_start_loc[1 : input_batch.num_reqs + 1].to(
+            torch.int64
+        )
+        request_ordinals = torch.searchsorted(
+            query_ends,
+            rows,
+            right=True,
+        )
+        if bool((request_ordinals >= input_batch.num_reqs).any()):
+            raise RetainedReplayFixtureError(
+                f"{phase}: writer rows exceed request query bounds"
+            )
+        request_slots = (
+            input_batch.idx_mapping.index_select(0, request_ordinals).detach().cpu()
+        )
+        attn_metadata = context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            raise RetainedReplayFixtureError(
+                f"{phase}: attention metadata is not a dictionary"
+            )
+        slots_by_layer = {}
+        for layer_name, metadata in attn_metadata.items():
+            slots = getattr(metadata, "cache_slot_mapping", None)
+            if not isinstance(slots, torch.Tensor):
+                slots = getattr(metadata, "slot_mapping", None)
+            if not isinstance(slots, torch.Tensor):
+                continue
+            if slots.numel() < rows.numel():
+                raise RetainedReplayFixtureError(
+                    f"{phase}: {layer_name} slot mapping is too short"
+                )
+            slots_by_layer[layer_name] = slots[: rows.numel()].detach().cpu()
+        return _CacheWriter(
+            phase=phase,
+            positions=positions,
+            request_ordinals=request_ordinals.detach().cpu(),
+            request_state_slots=request_slots,
+            slots_by_layer=slots_by_layer,
+        )
+
     def _build_registry(
         self,
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         writer_contexts: tuple[tuple[ForwardContext, int], ...],
+        logical_writers: list[_CacheWriter],
     ) -> TouchedStateRegistry:
         registry = TouchedStateRegistry()
         cache_intervals = self._collect_cache_intervals(
-            input_batch, block_tables, writer_contexts
+            input_batch,
+            block_tables,
+            writer_contexts,
+            collect_logical=True,
         )
+        logical_views = []
         for key, cache in cache_intervals.items():
             del key
+            logical_views.extend(cache.views)
             if cache.destination:
                 registry.add_intervals(
                     f"kv-dst:{cache.name}", cache.tensor, cache.destination
@@ -2293,6 +2926,12 @@ class RetainedReplayFixtureController:
                 registry.add_source_intervals(
                     f"kv-src:{cache.name}", cache.tensor, cache.source
                 )
+        registry.configure_logical_cache(
+            logical_views,
+            logical_writers,
+            input_batch,
+            block_tables,
+        )
         self._register_runtime_state(registry, input_batch)
         return registry
 
@@ -2301,6 +2940,8 @@ class RetainedReplayFixtureController:
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         writer_contexts: tuple[tuple[ForwardContext, int], ...],
+        *,
+        collect_logical: bool = False,
     ) -> dict[tuple[str, int | None, int, int], _CacheIntervals]:
         runner = self.runner
         groups = runner.kv_cache_config.kv_cache_groups
@@ -2411,6 +3052,7 @@ class RetainedReplayFixtureController:
                         tensor=_storage_bytes_view(cache),
                         destination=[],
                         source=[],
+                        views=[],
                     )
                     intervals_by_storage[key] = record
                 destination_blocks: set[int] = set()
@@ -2418,7 +3060,9 @@ class RetainedReplayFixtureController:
                     metadata = attn_metadata.get(layer_name)
                     if metadata is None:
                         continue
-                    effective_slots = getattr(metadata, "slot_mapping", None)
+                    effective_slots = getattr(metadata, "cache_slot_mapping", None)
+                    if not isinstance(effective_slots, torch.Tensor):
+                        effective_slots = getattr(metadata, "slot_mapping", None)
                     if not isinstance(effective_slots, torch.Tensor):
                         raise RetainedReplayFixtureError(
                             f"{layer_name}: effective KV slot mapping is absent"
@@ -2429,6 +3073,7 @@ class RetainedReplayFixtureController:
                         for slot in effective_slots[effective_slots >= 0].cpu().tolist()
                     )
                 mutable_blocks = destination_blocks | frontier_blocks
+                logical_destination_blocks = mutable_blocks | proposal_blocks
                 record.destination.extend(
                     _cache_block_byte_intervals(layer_name, cache, mutable_blocks)
                 )
@@ -2438,8 +3083,37 @@ class RetainedReplayFixtureController:
                 record.source.extend(
                     _cache_block_byte_intervals(layer_name, cache, group_blocks)
                 )
+                if collect_logical and logical_destination_blocks:
+                    spec = self._effective_layer_spec(group, layer_name)
+                    consumers, fp8_scale = self._cache_consumers_and_scale(
+                        layer_name,
+                        owner,
+                        cache,
+                    )
+                    record.views.append(
+                        _LogicalCacheView(
+                            view_id=f"group-{group_id}:{layer_name}",
+                            storage_id="",
+                            group_id=group_id,
+                            layer_name=layer_name,
+                            owner_type=type(owner).__qualname__,
+                            spec_type=type(spec).__qualname__,
+                            spec_metadata=self._spec_metadata(spec),
+                            cache_kind=self._cache_kind(owner, layer_name),
+                            record_format=_cache_record_format(cache),
+                            tensor=cache,
+                            block_size=int(cache.shape[1]),
+                            tokens_per_state=self._tokens_per_state(spec),
+                            destination_blocks=logical_destination_blocks,
+                            consumers=consumers,
+                            aliases=[],
+                            fp8_scale=fp8_scale,
+                        )
+                    )
         if not intervals_by_storage:
             raise RetainedReplayFixtureError("no bound KV cache rows were discovered")
+        if collect_logical:
+            self._bind_cache_storage_views(list(intervals_by_storage.values()))
         for record in intervals_by_storage.values():
             record.destination = _merge_byte_intervals(record.destination)
             record.source = _subtract_byte_intervals(record.source, record.destination)
