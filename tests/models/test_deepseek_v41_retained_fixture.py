@@ -8,11 +8,17 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import BatchDescriptor, ForwardContext
+from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
 from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureController,
     RetainedReplayFixtureError,
     TouchedStateRegistry,
+    canonical_decision_reference,
     clone_owned,
+    typed_tree_snapshot,
+    write_typed_run_bundle,
 )
 
 
@@ -38,6 +44,143 @@ def test_retained_fixture_clone_owns_mutable_leaves() -> None:
     assert retained.tensor.tolist() == [0, 1, 2, 3]
     assert retained.array.tolist() == [0, 1, 2]
     assert retained.children["value"].tolist() == [0, 1]
+
+
+def test_clone_owned_preserves_aliases_and_resets_flashmla_holder(
+    monkeypatch,
+) -> None:
+    import vllm.v1.attention.ops.flashmla as flashmla
+
+    FlashMLASchedMeta = type("FlashMLASchedMeta", (), {})
+    source = FlashMLASchedMeta()
+    source.tile_scheduler_metadata = torch.tensor([1])
+    source.num_splits = torch.tensor([2])
+    source.have_initialized = True
+
+    def new_holder():
+        holder = FlashMLASchedMeta()
+        holder.tile_scheduler_metadata = None
+        holder.num_splits = None
+        holder.have_initialized = False
+        return holder, None
+
+    monkeypatch.setattr(flashmla, "get_mla_metadata", new_holder)
+    retained = clone_owned({"first": source, "second": source})
+
+    assert retained["first"] is retained["second"]
+    assert retained["first"] is not source
+    assert retained["first"].tile_scheduler_metadata.tolist() == [1]
+    assert retained["first"].num_splits.tolist() == [2]
+    assert retained["first"].have_initialized is True
+
+
+def test_decision_reference_ignores_unused_sample_tail() -> None:
+    sampled = torch.tensor([[1, 2, 99], [3, 98, 97]], dtype=torch.int64)
+    reference = canonical_decision_reference(
+        sampled,
+        torch.tensor([2, 1], dtype=torch.int32),
+        torch.tensor([1, 2], dtype=torch.int32),
+    )
+
+    sampled[:, 2].zero_()
+    assert [tokens.tolist() for tokens in reference["sampled_token_ids"]] == [
+        [1, 2],
+        [3],
+    ]
+
+
+def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
+    computed = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+    temperature = torch.tensor([0.7], dtype=torch.float32)
+    storage = torch.arange(16, dtype=torch.uint8)
+    registry = TouchedStateRegistry()
+    registry.add_rows("acceptance:features", computed, torch.tensor([0]))
+    registry.add_rows("sampler:temperature", temperature, torch.tensor([0]))
+    registry.add_intervals("kv-dst:test", storage, [(2, 6)])
+
+    snapshot = registry.typed_snapshot("s1")
+    comparison = {leaf["path"]: leaf["comparison"] for leaf in snapshot["leaves"]}
+
+    assert comparison["registry/acceptance:features"] == "floating"
+    assert comparison["registry/sampler:temperature"] == "exact"
+    assert comparison["registry/kv-dst:test"] == "exact"
+
+
+def test_typed_bundle_writes_tensor_only_payload(tmp_path) -> None:
+    snapshot = typed_tree_snapshot(
+        "target",
+        {
+            "hidden": torch.tensor([[1.0, 2.0]]),
+            "count": torch.tensor([2], dtype=torch.int32),
+        },
+        path="target",
+    )
+    result = write_typed_run_bundle(
+        str(tmp_path),
+        dp_rank=3,
+        run_kind="a",
+        ordinal=1,
+        checkpoints={"target": snapshot},
+        manifest={"run_id": "unit"},
+    )
+
+    manifest = __import__("json").loads(
+        (tmp_path / "rank-03" / "a-001.json").read_text()
+    )
+    payload = torch.load(result["payload_path"], weights_only=True)
+    assert manifest["complete"] is True
+    assert all(isinstance(value, torch.Tensor) for value in payload.values())
+
+
+def test_production_graph_observer_requires_actual_capture_replay() -> None:
+    class Capture:
+        num_graphs = 2
+        num_eager_breaks = 1
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def replay(self) -> None:
+            self.calls += 1
+
+    class Manager:
+        def __init__(self, descriptor, capture) -> None:
+            self.capture = capture
+            self.breakable_cg_runner = SimpleNamespace(
+                entries={
+                    descriptor: SimpleNamespace(capture=capture),
+                }
+            )
+
+        def run(self, rows, inputs):
+            del rows
+            self.capture.replay()
+            return inputs
+
+    descriptor = BatchDescriptor(num_tokens=8)
+    capture = Capture()
+    manager = Manager(descriptor, capture)
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        batch_descriptor=descriptor,
+    )
+    frozen = ReplayBatch(torch.tensor([0]), context, manager.run)
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller._graph_observations = {}
+
+    working = controller.observed_production_replay_batch(frozen, "a-001")
+    outputs = working.run_graph(torch.tensor([0]), (torch.tensor([3]),))
+    observation = controller.graph_observation("a-001")
+
+    assert outputs[0].tolist() == [3]
+    assert capture.calls == 1
+    assert observation["callback_calls"] == 1
+    assert observation["capture_replay_calls"] == 1
 
 
 def test_touched_registry_restores_epochs_without_restoring_source() -> None:

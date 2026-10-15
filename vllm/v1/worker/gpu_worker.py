@@ -1019,6 +1019,22 @@ class Worker(WorkerBase):
             return {"state": "unsupported", "error": "V2 model runner is required"}
         return self.model_runner.restore_dsv41_retained_fixture(epoch)
 
+    def run_dsv41_a_control(
+        self,
+        runs: str = "20",
+        output_dir: str = "/tmp/dsv41-retained-a-control",
+        run_id: str = "",
+        nonce: str = "",
+    ) -> dict[str, Any]:
+        if not self.use_v2_model_runner:
+            return {"state": "unsupported", "error": "V2 model runner is required"}
+        return self.model_runner.run_dsv41_a_control(
+            runs,
+            output_dir,
+            run_id,
+            nonce,
+        )
+
     def supports_draft_weight_updates(self) -> bool:
         engine = self.weight_transfer_engine
         speculative_config = self.speculative_config
