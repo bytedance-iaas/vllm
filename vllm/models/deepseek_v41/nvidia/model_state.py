@@ -974,14 +974,25 @@ class DeepseekV41ModelState(DefaultModelState):
                     DecoderReplayFrontCudaGraphManager.NUM_TOKENS,
                     self.device,
                 )
+                num_decode_reqs = min(16, self.max_num_reqs - 2)
+                generation_rows = np.zeros(num_decode_reqs, dtype=np.int32)
+                if num_decode_reqs:
+                    generation_rows.fill(96 // num_decode_reqs)
+                    generation_rows[: 96 % num_decode_reqs] += 1
+                query_lens = np.concatenate(
+                    (generation_rows, np.array([128], dtype=np.int32))
+                )
+                capture_reqs = query_lens.size
                 capture_batch = InputBatch.make_dummy(
-                    17,
+                    capture_reqs,
                     DecoderReplayFrontCudaGraphManager.NUM_TOKENS,
                     capture_buffers,
                 )
-                query_lens = np.array([6] * 16 + [128], dtype=np.int32)
-                query_start_loc_np = np.zeros(18, dtype=np.int32)
+                query_start_loc_np = np.zeros(capture_reqs + 1, dtype=np.int32)
                 np.cumsum(query_lens, out=query_start_loc_np[1:])
+                seq_lens = np.concatenate(
+                    (generation_rows + 512, np.array([128], dtype=np.int32))
+                )
                 capture_batch = replace(
                     capture_batch,
                     num_scheduled_tokens=query_lens,
@@ -992,14 +1003,14 @@ class DeepseekV41ModelState(DefaultModelState):
                     ),
                     query_start_loc_np=query_start_loc_np,
                     seq_lens=torch.tensor(
-                        [518] * 16 + [128],
+                        seq_lens,
                         dtype=torch.int32,
                         device=self.device,
                     ),
-                    seq_lens_cpu_upper_bound=torch.tensor(
-                        [518] * 16 + [128], dtype=torch.int32
+                    seq_lens_cpu_upper_bound=torch.tensor(seq_lens),
+                    is_prefilling_np=np.array(
+                        [False] * num_decode_reqs + [True], dtype=np.bool_
                     ),
-                    is_prefilling_np=np.array([False] * 16 + [True], dtype=np.bool_),
                     has_prefill=True,
                     max_query_len=128,
                 )
@@ -1010,17 +1021,35 @@ class DeepseekV41ModelState(DefaultModelState):
                 )
                 return self._prepare_replay_front_batch(
                     capture_batch,
-                    block_tables.get_dummy_block_tables(17),
+                    block_tables.get_dummy_block_tables(capture_reqs),
                     block_tables.get_dummy_slot_mappings(
                         DecoderReplayFrontCudaGraphManager.NUM_TOKENS
                     ),
                     attn_groups,
                     kv_cache_config,
-                    self._front_replay_start[:17].zero_(),
+                    self._front_replay_start[:capture_reqs].zero_(),
                     front_dp_tokens,
                 )
 
-            self.replay_front_cudagraph.capture_front_graphs(prepare_front)
+            front_capture_ok = False
+            try:
+                self.replay_front_cudagraph.capture_front_graphs(prepare_front)
+                front_capture_ok = self.replay_front_cudagraph.has_graph()
+            except Exception:
+                logger.exception(
+                    "Disabling DeepSeek V4.1 replay front graph after capture failure"
+                )
+            (front_capture_ok,) = self._all_dp_flags(front_capture_ok)
+            if not front_capture_ok:
+                self._mixed_replay_front_graph_enabled = False
+                self.replay_front_cudagraph.clear_runtime()
+                self.replay_front_cudagraph = None
+                if self._decoder_model is not None:
+                    self._decoder_model.decoder_replay_front_graph = None
+                logger.warning(
+                    "DeepSeek V4.1 replay front graph disabled; "
+                    "retaining eager prefix and dedicated replay suffix"
+                )
 
     def _prepare_replay_front_batch(
         self,

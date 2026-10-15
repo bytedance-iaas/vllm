@@ -79,6 +79,7 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
         )
         self._runtime_context: ForwardContext | None = None
         self._runtime_num_tokens = 0
+        self._aux_output_buffers: list[torch.Tensor] = []
 
     def _inputs(
         self,
@@ -110,7 +111,8 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
                 with override_forward_context(
                     replace(context, cudagraph_runtime_mode=cg_mode)
                 ):
-                    self.breakable_cg_runner(*inputs)
+                    outputs = self.breakable_cg_runner(*inputs)
+                self._protect_aux_outputs(outputs)
 
             return forward_fn
 
@@ -138,6 +140,29 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
     def clear_runtime(self) -> None:
         self._runtime_context = None
         self._runtime_num_tokens = 0
+
+    def _protect_aux_outputs(
+        self,
+        outputs: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        if (
+            not isinstance(outputs, tuple)
+            or len(outputs) < 6
+            or not all(isinstance(output, torch.Tensor) for output in outputs)
+        ):
+            raise RuntimeError("decoder replay front graph returned invalid outputs")
+        aux_outputs = outputs[6:]
+        if not self._aux_output_buffers:
+            self._aux_output_buffers = [
+                torch.empty_like(output) for output in aux_outputs
+            ]
+        if len(self._aux_output_buffers) != len(aux_outputs):
+            raise RuntimeError("decoder replay front auxiliary output count changed")
+        for buffer, output in zip(self._aux_output_buffers, aux_outputs):
+            if buffer.shape != output.shape or buffer.dtype != output.dtype:
+                raise RuntimeError("decoder replay front auxiliary shape changed")
+            buffer.copy_(output)
+        return outputs[:6] + tuple(self._aux_output_buffers)
 
     def run(
         self,
@@ -172,10 +197,7 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
 
         with override_forward_context(context):
             outputs = self.breakable_cg_runner(*self._inputs())
-        if not isinstance(outputs, tuple) or not all(
-            isinstance(output, torch.Tensor) for output in outputs
-        ):
-            raise RuntimeError("decoder replay front graph returned invalid outputs")
+        outputs = self._protect_aux_outputs(outputs)
         logger.info_once(
             "DSV41_REPLAY_FRONT_GRAPH_RUN rows=%d descriptor=%d",
             num_tokens,
