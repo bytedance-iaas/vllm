@@ -253,6 +253,10 @@ def test_comparator_normalizes_valid_dp_engine_id_suffixes_only() -> None:
             "names DP rank 1",
         ),
         (
+            _ranked_config_manifest(0, "shared-engine_dp00"),
+            "uses a noncanonical suffix",
+        ),
+        (
             _ranked_config_manifest(
                 0,
                 "shared-engine_dp0",
@@ -263,6 +267,29 @@ def test_comparator_normalizes_valid_dp_engine_id_suffixes_only() -> None:
                 ),
             ),
             "missing or ambiguous",
+        ),
+        (
+            _ranked_config_manifest(
+                0,
+                "shared-engine_dp0",
+                connector_repr=(
+                    "KVTransferConfig("
+                    "engine_id=None, "
+                    "kv_connector_extra_config={"
+                    "'note': \"prefix, engine_id='shared-engine_dp0', suffix\"})"
+                ),
+            ),
+            "is not a string",
+        ),
+        (
+            _ranked_config_manifest(
+                0,
+                "shared-engine_dp0",
+                connector_repr=(
+                    "KVTransferConfig(engine_id='shared-engine_dp0', bad=)"
+                ),
+            ),
+            "is malformed",
         ),
     ],
 )
@@ -288,6 +315,44 @@ def test_comparator_rejects_config_drift_and_broken_bindings() -> None:
     runs[("a", 1, 1)] = SimpleNamespace(rank=1, manifest=rank1)
     with pytest.raises(ValueError, match="differs after DP identity normalization"):
         _identity_normalization_provenance(runs)
+
+    nested_rank0 = _ranked_config_manifest(
+        0,
+        "shared-engine_dp0",
+        connector_repr=(
+            "KVTransferConfig("
+            "engine_id='shared-engine_dp0', "
+            "kv_connector_extra_config={'note': 'rank-zero'})"
+        ),
+    )
+    nested_rank1 = _ranked_config_manifest(
+        1,
+        "shared-engine_dp1",
+        connector_repr=(
+            "KVTransferConfig("
+            "engine_id='shared-engine_dp1', "
+            "kv_connector_extra_config={'note': 'rank-one'})"
+        ),
+    )
+    nested_runs = {
+        ("a", 0, 1): SimpleNamespace(rank=0, manifest=nested_rank0),
+        ("a", 1, 1): SimpleNamespace(rank=1, manifest=nested_rank1),
+    }
+    with pytest.raises(ValueError, match="differs after DP identity normalization"):
+        _identity_normalization_provenance(nested_runs)
+
+    within_rank_runs = {
+        ("a", 0, 1): SimpleNamespace(
+            rank=0,
+            manifest=_ranked_config_manifest(0, "shared-engine_dp0"),
+        ),
+        ("a", 0, 2): SimpleNamespace(
+            rank=0,
+            manifest=_ranked_config_manifest(0, "changed-engine_dp0"),
+        ),
+    }
+    with pytest.raises(ValueError, match="differs after DP identity normalization"):
+        _identity_normalization_provenance(within_rank_runs)
 
     broken = _ranked_config_manifest(0, "shared-engine_dp0")
     broken["config_digest"] = "0" * 64

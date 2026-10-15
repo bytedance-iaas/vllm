@@ -9,7 +9,6 @@ import copy
 import hashlib
 import itertools
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,12 +73,6 @@ IDENTITY_NORMALIZATION_VERSION = 1
 _RANK_LOCAL_ENGINE_ID_PATH = (
     "shared_config.speculative_config.target_kv_transfer_config.engine_id"
 )
-_ENGINE_ID_FIELD = re.compile(
-    r"(?P<prefix>^|, )engine_id="
-    r"(?P<literal>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
-    r"(?=, |$)"
-)
-_DP_ENGINE_ID = re.compile(r"(?P<stem>.+)_dp(?P<rank>[0-9]+)\Z")
 TRIMMABLE_REGISTRY_NAMES = {
     "replay_graph:input:0",
     "replay_graph:input:1",
@@ -149,45 +142,68 @@ def _canonicalize_rank_local_shared_config(
         or not connector_repr.endswith(")")
     ):
         raise ValueError(f"rank {rank}: target KV transfer identity is invalid")
-    body = connector_repr[len(prefix) : -1]
-    matches = list(_ENGINE_ID_FIELD.finditer(body))
-    if len(matches) != 1:
+    try:
+        expression = ast.parse(connector_repr, mode="eval")
+    except SyntaxError as error:
+        raise ValueError(
+            f"rank {rank}: target KV transfer identity is malformed"
+        ) from error
+    call = expression.body
+    if (
+        not isinstance(call, ast.Call)
+        or not isinstance(call.func, ast.Name)
+        or call.func.id != "KVTransferConfig"
+        or call.args
+        or any(keyword.arg is None for keyword in call.keywords)
+    ):
+        raise ValueError(f"rank {rank}: target KV transfer identity is invalid")
+    engine_keywords = [
+        (index, keyword)
+        for index, keyword in enumerate(call.keywords)
+        if keyword.arg == "engine_id"
+    ]
+    if len(engine_keywords) != 1:
         raise ValueError(
             f"rank {rank}: target KV engine identity is missing or ambiguous"
         )
-    match = matches[0]
-    try:
-        engine_id = ast.literal_eval(match.group("literal"))
-    except (SyntaxError, ValueError) as error:
-        raise ValueError(
-            f"rank {rank}: target KV engine identity literal is invalid"
-        ) from error
-    if not isinstance(engine_id, str):
+    engine_index, engine_keyword = engine_keywords[0]
+    if not (
+        isinstance(engine_keyword.value, ast.Constant)
+        and isinstance(engine_keyword.value.value, str)
+    ):
         raise ValueError(f"rank {rank}: target KV engine identity is not a string")
-    suffix = _DP_ENGINE_ID.fullmatch(engine_id)
-    if suffix is None or not suffix.group("stem"):
+    engine_id = engine_keyword.value.value
+    stem, marker, suffix_text = engine_id.rpartition("_dp")
+    if not marker or not stem or not suffix_text.isdigit():
         raise ValueError(f"rank {rank}: target KV engine identity lacks a DP suffix")
-    suffix_rank = int(suffix.group("rank"))
+    suffix_rank = int(suffix_text)
     if suffix_rank != rank:
         raise ValueError(
             f"rank {rank}: target KV engine identity names DP rank {suffix_rank}"
         )
+    if suffix_text != str(rank):
+        raise ValueError(
+            f"rank {rank}: target KV engine identity uses a noncanonical suffix"
+        )
 
     canonical = copy.deepcopy(shared_config)
     canonical_speculative = canonical["speculative_config"]
-    canonical_body = (
-        body[: match.start("literal")]
-        + repr(f"{suffix.group('stem')}_dp<RANK>")
-        + body[match.end("literal") :]
+    canonical_expression = copy.deepcopy(expression)
+    canonical_call = canonical_expression.body
+    assert isinstance(canonical_call, ast.Call)
+    canonical_call.keywords[engine_index].value = ast.Constant(value=f"{stem}_dp<RANK>")
+    canonical_speculative["target_kv_transfer_config"] = ast.dump(
+        canonical_expression,
+        annotate_fields=True,
+        include_attributes=False,
     )
-    canonical_speculative["target_kv_transfer_config"] = f"{prefix}{canonical_body})"
     canonical_digest = _config_digest(canonical)
     return canonical, {
         "version": IDENTITY_NORMALIZATION_VERSION,
         "path": _RANK_LOCAL_ENGINE_ID_PATH,
         "rank": rank,
         "engine_id": engine_id,
-        "engine_id_stem": suffix.group("stem"),
+        "engine_id_stem": stem,
         "original_config_digest": original_digest,
         "canonical_config_digest": canonical_digest,
     }
