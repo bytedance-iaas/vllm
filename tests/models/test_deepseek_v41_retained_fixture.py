@@ -8,7 +8,10 @@ import numpy as np
 import pytest
 import torch
 
-from benchmarks.replayssm.dsv41_retained_control_compare import _floating_metrics
+from benchmarks.replayssm.dsv41_retained_control_compare import (
+    MASKED_NEGATIVE_INFINITY_PATHS,
+    _floating_metrics,
+)
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
 from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
@@ -137,6 +140,12 @@ def test_numeric_comparator_accepts_matching_infinity_masks() -> None:
 
     assert metrics["negative_infinities"] == 1
     assert metrics["max_abs"] == 0.25
+    assert "registry/speculator:draft_logits_aux" not in (
+        MASKED_NEGATIVE_INFINITY_PATHS
+    )
+    assert "registry/speculator:_draft_scatter_buffer" not in (
+        MASKED_NEGATIVE_INFINITY_PATHS
+    )
 
     with pytest.raises(ValueError, match="unexpected negative infinity"):
         _floating_metrics(

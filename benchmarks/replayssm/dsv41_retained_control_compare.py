@@ -63,10 +63,10 @@ EXACT_FLOAT_REGISTRY_PREFIXES = (
     "registry/sampler:",
     "registry/speculator:temperature",
 )
-MASKED_NEGATIVE_INFINITY_PREFIXES = (
+MASKED_NEGATIVE_INFINITY_PATHS = {
     "registry/speculator:draft_logits",
     "registry/speculator:_draft_scatter_buf",
-)
+}
 TRIMMABLE_REGISTRY_NAMES = {
     "replay_graph:input:0",
     "replay_graph:input:1",
@@ -259,8 +259,10 @@ def _validate_evidence_contract(
         "adaptive:_batch_budget",
     }
     required_tensors = (
-        required_registry - non_tensor_runtime_entries
-    ) | expected_graph_names
+        (required_registry - non_tensor_runtime_entries)
+        | expected_graph_names
+        | set(meaningful_counts)
+    )
     if speculative.get("enable_adaptive_verification") is True:
         required_tensors.update(
             name
@@ -740,9 +742,8 @@ def _compare_runs(
             left_tensor,
             right_tensor,
             denominator_floor=denominator_floor,
-            allow_negative_infinity=any(
-                left_leaf["path"].startswith(prefix)
-                for prefix in MASKED_NEGATIVE_INFINITY_PREFIXES
+            allow_negative_infinity=(
+                left_leaf["path"] in MASKED_NEGATIVE_INFINITY_PATHS
             ),
         )
         family = _envelope_key(left_leaf)
