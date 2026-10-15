@@ -27,6 +27,7 @@ from vllm.models.deepseek_v41.decoder_replay_layers import (
 )
 from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
     DecoderReplayCudaGraphManager,
+    DecoderReplayFrontCaptureDisabled,
     DecoderReplayFrontCudaGraphManager,
 )
 from vllm.triton_utils import tl, triton
@@ -465,6 +466,10 @@ class DeepseekV41ModelState(DefaultModelState):
                 ),
                 inputs_embeds_size=self.inputs_embeds_size,
                 lookback_depth=depth,
+                num_aux_outputs=len(
+                    decoder_model._decoder_replay_front_aux_layer_ids()
+                ),
+                aux_hidden_size=vllm_config.model_config.hf_config.hidden_size,
             )
             logger.info("DeepSeek V4.1 mixed replay front graph enabled for 224 rows")
 
@@ -969,6 +974,7 @@ class DeepseekV41ModelState(DefaultModelState):
                     raise RuntimeError(
                         "decoder replay front graph received an invalid descriptor"
                     )
+                self.replay_front_cudagraph.prepare_capture_buffers()
                 capture_buffers = InputBuffers(
                     self.max_num_reqs,
                     DecoderReplayFrontCudaGraphManager.NUM_TOKENS,
@@ -1031,16 +1037,16 @@ class DeepseekV41ModelState(DefaultModelState):
                     front_dp_tokens,
                 )
 
-            front_capture_ok = False
+            def agree_front_capture(local_ready: bool) -> bool:
+                (ready,) = self._all_dp_flags(local_ready)
+                return ready
+
             try:
-                self.replay_front_cudagraph.capture_front_graphs(prepare_front)
-                front_capture_ok = self.replay_front_cudagraph.has_graph()
-            except Exception:
-                logger.exception(
-                    "Disabling DeepSeek V4.1 replay front graph after capture failure"
+                self.replay_front_cudagraph.capture_front_graphs(
+                    prepare_front,
+                    agree_front_capture,
                 )
-            (front_capture_ok,) = self._all_dp_flags(front_capture_ok)
-            if not front_capture_ok:
+            except DecoderReplayFrontCaptureDisabled:
                 self._mixed_replay_front_graph_enabled = False
                 self.replay_front_cudagraph.clear_runtime()
                 self.replay_front_cudagraph = None

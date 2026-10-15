@@ -28,6 +28,10 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 logger = init_logger(__name__)
 
 
+class DecoderReplayFrontCaptureDisabled(RuntimeError):
+    """A coordinated pre-capture failure that may preserve the suffix graph."""
+
+
 class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
     """One breakable graph for the 224-row mixed L0-L19 prefix."""
 
@@ -42,6 +46,8 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
         use_inputs_embeds: bool,
         inputs_embeds_size: int,
         lookback_depth: int,
+        num_aux_outputs: int,
+        aux_hidden_size: int,
     ) -> None:
         compilation = copy(vllm_config.compilation_config)
         compilation.cudagraph_capture_sizes = [self.NUM_TOKENS]
@@ -79,6 +85,9 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
         )
         self._runtime_context: ForwardContext | None = None
         self._runtime_num_tokens = 0
+        self._num_aux_outputs = num_aux_outputs
+        self._aux_hidden_size = aux_hidden_size
+        self._dtype = dtype
         self._aux_output_buffers: list[torch.Tensor] = []
 
     def _inputs(
@@ -99,12 +108,24 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
     def capture_front_graphs(
         self,
         prepare: Callable[[BatchExecutionDescriptor], ForwardContext],
+        agree_ready: Callable[[bool], bool],
     ) -> None:
         """Capture the single prefix graph after ``prepare`` builds its metadata."""
 
         def create_forward_fn(desc: BatchExecutionDescriptor, warmup: bool):
             del warmup
-            context = prepare(desc)
+            context = None
+            local_ready = True
+            try:
+                context = prepare(desc)
+            except Exception:
+                local_ready = False
+                logger.exception("DeepSeek V4.1 replay front preparation failed")
+            if not agree_ready(local_ready):
+                raise DecoderReplayFrontCaptureDisabled(
+                    "decoder replay front preparation failed on a DP rank"
+                )
+            assert context is not None
             inputs = self._inputs()
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
@@ -117,9 +138,9 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
             return forward_fn
 
         self.capture(create_forward_fn, "Capturing decoder replay front CUDA graph")
-        if not self.has_graph():
-            raise RuntimeError(
-                "decoder replay front capture produced no CUDA graph segment"
+        if not agree_ready(self.has_graph()):
+            raise DecoderReplayFrontCaptureDisabled(
+                "decoder replay front capture produced no graph on a DP rank"
             )
 
     def has_graph(self) -> bool:
@@ -141,6 +162,17 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
         self._runtime_context = None
         self._runtime_num_tokens = 0
 
+    def prepare_capture_buffers(self) -> None:
+        if not self._aux_output_buffers:
+            self._aux_output_buffers = [
+                torch.empty(
+                    (self.NUM_TOKENS, self._aux_hidden_size),
+                    dtype=self._dtype,
+                    device=self.device,
+                )
+                for _ in range(self._num_aux_outputs)
+            ]
+
     def _protect_aux_outputs(
         self,
         outputs: tuple[torch.Tensor, ...],
@@ -152,10 +184,6 @@ class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
         ):
             raise RuntimeError("decoder replay front graph returned invalid outputs")
         aux_outputs = outputs[6:]
-        if not self._aux_output_buffers:
-            self._aux_output_buffers = [
-                torch.empty_like(output) for output in aux_outputs
-            ]
         if len(self._aux_output_buffers) != len(aux_outputs):
             raise RuntimeError("decoder replay front auxiliary output count changed")
         for buffer, output in zip(self._aux_output_buffers, aux_outputs):
