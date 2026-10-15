@@ -1079,6 +1079,8 @@ class TouchedStateRegistry:
         self.sources: list[_SourceRows | _SourceIntervals] = []
         self._names: set[str] = set()
         self._meaningful_counts: dict[str, int] = {}
+        self._comparison_overrides: dict[str, str] = {}
+        self._selection_metadata: dict[str, dict[str, Any]] = {}
         self._cache_views: list[_LogicalCacheView] = []
         self._cache_writers: list[_CacheWriter] = []
         self._cache_block_tables: tuple[torch.Tensor, ...] = ()
@@ -1158,6 +1160,36 @@ class TouchedStateRegistry:
         self._claim(name)
         intervals = _merge_byte_intervals(intervals)
         self.sources.append(_SourceIntervals.capture(name, tensor, intervals))
+
+    def set_tensor_policy(
+        self,
+        name: str,
+        *,
+        comparison: str,
+        compare_prefix: int,
+        metadata: dict[str, Any],
+    ) -> None:
+        matching = [
+            entry
+            for entry in self.entries
+            if isinstance(entry, _TensorSelection) and entry.name == name
+        ]
+        if len(matching) != 1:
+            raise RetainedReplayFixtureError(
+                f"{name}: scratch policy tensor is absent or ambiguous"
+            )
+        entry = matching[0]
+        if entry.dim != 0 or not 0 < compare_prefix <= entry.indices.numel():
+            raise RetainedReplayFixtureError(
+                f"{name}: invalid scratch meaningful-row prefix"
+            )
+        if comparison not in ("canonical_membership", "diagnostic_topk"):
+            raise RetainedReplayFixtureError(
+                f"{name}: unsupported scratch comparison {comparison}"
+            )
+        self._meaningful_counts[name] = compare_prefix
+        self._comparison_overrides[name] = comparison
+        self._selection_metadata[name] = metadata
 
     def configure_logical_cache(
         self,
@@ -1268,10 +1300,11 @@ class TouchedStateRegistry:
         self,
         view: _LogicalCacheView,
         extents: tuple[int, ...],
+        writers: list[_CacheWriter],
     ) -> list[_LogicalCacheRecord]:
         table = self._cache_block_tables[view.group_id]
         records: dict[tuple[int, int, int, int, int], _LogicalCacheRecord] = {}
-        for writer in self._cache_writers:
+        for writer in writers:
             slots = writer.slots_by_layer.get(view.layer_name)
             if slots is None:
                 continue
@@ -1296,7 +1329,10 @@ class TouchedStateRegistry:
                     raise RetainedReplayFixtureError(
                         f"{writer.phase}: request state slot changed"
                     )
-                if position >= extents[request_ordinal]:
+                if (
+                    writer.enforce_committed_extent
+                    and position >= extents[request_ordinal]
+                ):
                     continue
                 ratio = view.tokens_per_state
                 if view.cache_kind != "compressor_ring":
@@ -1344,6 +1380,8 @@ class TouchedStateRegistry:
         self,
         checkpoint: str,
         num_sampled: torch.Tensor,
+        *,
+        extra_writers: list[_CacheWriter] | None = None,
     ) -> dict[str, Any]:
         sampled = tuple(int(value) for value in num_sampled.detach().cpu().tolist())
         if len(sampled) != len(self._cache_base_extents):
@@ -1353,10 +1391,16 @@ class TouchedStateRegistry:
         extents = tuple(
             base + accepted for base, accepted in zip(self._cache_base_extents, sampled)
         )
+        writers = [*self._cache_writers, *(extra_writers or ())]
+        writer_indices = {writer.phase: index for index, writer in enumerate(writers)}
+        if len(writer_indices) != len(writers):
+            raise RetainedReplayFixtureError(
+                f"{checkpoint}: logical writer phase identity is duplicated"
+            )
         builder = _TypedSnapshotBuilder(checkpoint)
         for view in self._cache_views:
             records = dict(self._cache_s0_records[view.view_id])
-            written = self._target_writer_records(view, extents)
+            written = self._target_writer_records(view, extents, writers)
             for record in written:
                 records[record.identity] = record
             ordered = sorted(records.values(), key=lambda record: record.identity)
@@ -1373,15 +1417,7 @@ class TouchedStateRegistry:
                         record.position,
                         record.physical_block,
                         record.physical_row,
-                        self._cache_writers.index(
-                            next(
-                                writer
-                                for writer in self._cache_writers
-                                if writer.phase == record.writer
-                            )
-                        )
-                        if record.writer != "s0"
-                        else -1,
+                        writer_indices[record.writer] if record.writer != "s0" else -1,
                     ]
                     for record in ordered
                 ],
@@ -1423,7 +1459,7 @@ class TouchedStateRegistry:
                     "physical_row",
                     "writer_index",
                 ],
-                "writers": [writer.phase for writer in self._cache_writers],
+                "writers": [writer.phase for writer in writers],
             }
             builder.add(metadata, f"{root}/metadata", comparison="exact")
             builder.add(
@@ -1502,6 +1538,7 @@ class TouchedStateRegistry:
                 }
                 if entry.name in self._meaningful_counts:
                     selection["compare_prefix"] = self._meaningful_counts[entry.name]
+                selection.update(self._selection_metadata.get(entry.name, {}))
             elif isinstance(entry, _TensorPoints):
                 value = entry._selected() if epoch is None else getattr(entry, epoch)
                 selection = {
@@ -1539,11 +1576,13 @@ class TouchedStateRegistry:
                 raise RetainedReplayFixtureError(
                     f"{entry.name}: epoch {epoch} is absent"
                 )
-            comparison = (
-                "exact"
-                if isinstance(entry, _TensorIntervals)
-                else _registry_comparison(entry.name, value)
-            )
+            comparison = self._comparison_overrides.get(entry.name)
+            if comparison is None:
+                comparison = (
+                    "exact"
+                    if isinstance(entry, _TensorIntervals)
+                    else _registry_comparison(entry.name, value)
+                )
             builder.add(
                 value,
                 f"registry/{_safe_path_component(entry.name)}",
@@ -1679,6 +1718,7 @@ class _CacheWriter:
     request_ordinals: torch.Tensor
     request_state_slots: torch.Tensor
     slots_by_layer: dict[str, torch.Tensor]
+    enforce_committed_extent: bool = True
 
 
 class RetainedReplayFixtureController:
@@ -1889,6 +1929,143 @@ class RetainedReplayFixtureController:
                 meaningful_count=int(replay_batch.rows.numel()),
             )
 
+    def _register_target_scratch_policies(
+        self,
+        registry: TouchedStateRegistry,
+        input_batch: InputBatch,
+        replay_batch: ReplayBatch,
+    ) -> None:
+        rows = replay_batch.rows.detach().to(
+            device=input_batch.positions.device,
+            dtype=torch.int64,
+        )
+        count = int(rows.numel())
+        if count <= 0:
+            raise RetainedReplayFixtureError(
+                "production replay has no scratch ownership rows"
+            )
+        positions = input_batch.positions.index_select(0, rows).detach().cpu()
+        query_ends = input_batch.query_start_loc[1 : input_batch.num_reqs + 1].to(
+            torch.int64
+        )
+        request_ordinals = torch.searchsorted(
+            query_ends,
+            rows,
+            right=True,
+        )
+        if bool((request_ordinals >= input_batch.num_reqs).any()):
+            raise RetainedReplayFixtureError(
+                "production replay scratch rows exceed request bounds"
+            )
+        request_slots = (
+            input_batch.idx_mapping.index_select(0, request_ordinals).detach().cpu()
+        )
+        row_identity = {
+            "row_writer": "target-replay",
+            "row_positions": positions.tolist(),
+            "row_request_ordinals": request_ordinals.detach().cpu().tolist(),
+            "row_request_state_slots": request_slots.tolist(),
+            "sentinel": -1,
+            "require_unique_valid_ids": True,
+            "require_trailing_sentinels": True,
+        }
+
+        model = self._target_decoder_model()
+        config = getattr(model, "config", self.runner.model_config.hf_config)
+        layers = getattr(model, "layers", None)
+        if layers is None:
+            raise RetainedReplayFixtureError(
+                "target scratch producer layers are absent"
+            )
+
+        candidate_name = "model:candidate_block_buffer"
+        if candidate_name in registry._names:
+            source_layer = int(getattr(config, "candidate_source_layer_id", -1))
+            block_size = int(getattr(config, "candidate_block_size", 0))
+            tensor = getattr(model, "candidate_block_buffer", None)
+            if (
+                source_layer < 0
+                or block_size <= 0
+                or not isinstance(tensor, torch.Tensor)
+            ):
+                raise RetainedReplayFixtureError(
+                    "candidate scratch producer configuration is invalid"
+                )
+            producer = getattr(layers[source_layer], "attn", None)
+            ratio = int(getattr(producer, "compress_ratio", 0))
+            if ratio <= 0:
+                raise RetainedReplayFixtureError(
+                    "candidate scratch producer ratio is invalid"
+                )
+            states = torch.div(
+                positions + 1,
+                ratio,
+                rounding_mode="floor",
+            )
+            bounds = torch.div(
+                states + block_size - 1,
+                block_size,
+                rounding_mode="floor",
+            )
+            width = int(tensor.shape[1])
+            registry.set_tensor_policy(
+                candidate_name,
+                comparison="canonical_membership",
+                compare_prefix=count,
+                metadata={
+                    **row_identity,
+                    "scratch_policy": "candidate_membership_v1",
+                    "producer_layer": source_layer,
+                    "cache_owner": getattr(producer, "compressed_cache_prefix", None),
+                    "compress_ratio": ratio,
+                    "candidate_block_size": block_size,
+                    "valid_id_exclusive_bounds": bounds.tolist(),
+                    "expected_valid_counts": torch.minimum(
+                        bounds,
+                        torch.full_like(bounds, width),
+                    ).tolist(),
+                },
+            )
+
+        topk_name = "model:topk_indices_buffer"
+        if topk_name in registry._names:
+            source_layers = list(getattr(config, "index_source_layer_ids", ()))
+            tensor = getattr(model, "topk_indices_buffer", None)
+            if not source_layers or not isinstance(tensor, torch.Tensor):
+                raise RetainedReplayFixtureError(
+                    "top-k scratch producer configuration is invalid"
+                )
+            source_layer = int(source_layers[-1])
+            producer = getattr(layers[source_layer], "attn", None)
+            ratio = int(getattr(producer, "compress_ratio", 0))
+            if ratio <= 0:
+                raise RetainedReplayFixtureError(
+                    "top-k scratch producer ratio is invalid"
+                )
+            bounds = torch.div(
+                positions + 1,
+                ratio,
+                rounding_mode="floor",
+            )
+            width = int(tensor.shape[1])
+            registry.set_tensor_policy(
+                topk_name,
+                comparison="diagnostic_topk",
+                compare_prefix=count,
+                metadata={
+                    **row_identity,
+                    "scratch_policy": "topk_diagnostic_v1",
+                    "producer_layer": source_layer,
+                    "cache_owner": getattr(producer, "compressed_cache_prefix", None),
+                    "compress_ratio": ratio,
+                    "valid_id_exclusive_bounds": bounds.tolist(),
+                    "expected_valid_counts": torch.minimum(
+                        bounds,
+                        torch.full_like(bounds, width),
+                    ).tolist(),
+                },
+            )
+
     def begin(
         self,
         *,
@@ -1955,6 +2132,11 @@ class RetainedReplayFixtureController:
         )
         self._register_production_graph_inputs(
             registry,
+            production_replay_batch,
+        )
+        self._register_target_scratch_policies(
+            registry,
+            input_batch,
             production_replay_batch,
         )
         source_digest = registry.source_capture_digest()
@@ -2150,10 +2332,15 @@ class RetainedReplayFixtureController:
             num_sampled,
             num_rejected,
         )
+        draft_writers = self._draft_cache_writers(fixture)
         checkpoints["s1"] = merge_typed_snapshots(
             "s1",
             fixture.registry.typed_snapshot("s1", epoch="s1"),
-            fixture.registry.logical_cache_snapshot("s1", num_sampled),
+            fixture.registry.logical_cache_snapshot(
+                "s1",
+                num_sampled,
+                extra_writers=draft_writers,
+            ),
             typed_tree_snapshot(
                 "s1",
                 {
@@ -2211,10 +2398,15 @@ class RetainedReplayFixtureController:
             num_sampled,
             num_rejected,
         )
+        draft_writers = self._draft_cache_writers(fixture)
         checkpoints["s1"] = merge_typed_snapshots(
             "s1",
             fixture.registry.typed_snapshot("s1"),
-            fixture.registry.logical_cache_snapshot("s1", num_sampled),
+            fixture.registry.logical_cache_snapshot(
+                "s1",
+                num_sampled,
+                extra_writers=draft_writers,
+            ),
             typed_tree_snapshot(
                 "s1",
                 {
@@ -2900,6 +3092,104 @@ class RetainedReplayFixtureController:
             slots_by_layer=slots_by_layer,
         )
 
+    def _draft_cache_writers(
+        self,
+        fixture: RetainedFixture,
+    ) -> list[_CacheWriter]:
+        speculator = self.runner.speculator
+        group_ids = tuple(getattr(speculator, "draft_kv_cache_group_ids", ()))
+        if fixture.is_dummy or speculator is None or not group_ids:
+            return []
+        num_reqs = int(fixture.input_batch.num_reqs)
+        num_target_tokens = int(fixture.input_batch.num_tokens)
+        query_ends = (
+            fixture.input_batch.query_start_loc[1 : num_reqs + 1]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+        )
+        target_rows = torch.arange(num_target_tokens, dtype=torch.int64)
+        context_request_ordinals = torch.searchsorted(
+            query_ends,
+            target_rows,
+            right=True,
+        )
+        if bool((context_request_ordinals >= num_reqs).any()):
+            raise RetainedReplayFixtureError(
+                "draft context rows exceed target query bounds"
+            )
+        fixture_request_slots = (
+            fixture.input_batch.idx_mapping[:num_reqs].detach().cpu().to(torch.int64)
+        )
+        context_request_slots = fixture_request_slots.index_select(
+            0, context_request_ordinals
+        )
+
+        groups = self.runner.kv_cache_config.kv_cache_groups
+        context_mappings = getattr(speculator, "_context_slot_mappings", ())
+        if len(context_mappings) != len(group_ids):
+            raise RetainedReplayFixtureError(
+                "draft context slot-mapping groups are incomplete"
+            )
+        context_slots_by_layer: dict[str, torch.Tensor] = {}
+        query_slots_by_layer: dict[str, torch.Tensor] = {}
+        num_query_per_req = int(speculator.num_query_per_req)
+        num_query_tokens = num_reqs * num_query_per_req
+        for group_index, group_id in enumerate(group_ids):
+            if not 0 <= group_id < len(groups):
+                raise RetainedReplayFixtureError(
+                    f"draft KV group {group_id} is out of range"
+                )
+            context_slots = context_mappings[group_index]
+            query_slots = speculator.block_tables.slot_mappings[group_id]
+            if (
+                context_slots.numel() < num_target_tokens
+                or query_slots.numel() < num_query_tokens
+            ):
+                raise RetainedReplayFixtureError(
+                    f"draft KV group {group_id} slot mappings are too short"
+                )
+            context_slots = context_slots[:num_target_tokens].detach().cpu()
+            query_slots = query_slots[:num_query_tokens].detach().cpu()
+            for layer_name in groups[group_id].layer_names:
+                context_slots_by_layer[layer_name] = context_slots
+                query_slots_by_layer[layer_name] = query_slots
+
+        draft_request_slots = (
+            speculator.idx_mapping[:num_reqs].detach().cpu().to(torch.int64)
+        )
+        if not torch.equal(draft_request_slots, fixture_request_slots):
+            raise RetainedReplayFixtureError(
+                "draft request-state identity differs from the target fixture"
+            )
+        query_request_ordinals = torch.arange(
+            num_reqs,
+            dtype=torch.int64,
+        ).repeat_interleave(num_query_per_req)
+        query_request_slots = draft_request_slots.repeat_interleave(num_query_per_req)
+        return [
+            _CacheWriter(
+                phase="draft-context",
+                positions=speculator.context_positions[:num_target_tokens]
+                .detach()
+                .cpu(),
+                request_ordinals=context_request_ordinals,
+                request_state_slots=context_request_slots,
+                slots_by_layer=context_slots_by_layer,
+                enforce_committed_extent=False,
+            ),
+            _CacheWriter(
+                phase="draft-query",
+                positions=speculator.input_buffers.positions[:num_query_tokens]
+                .detach()
+                .cpu(),
+                request_ordinals=query_request_ordinals,
+                request_state_slots=query_request_slots,
+                slots_by_layer=query_slots_by_layer,
+                enforce_committed_extent=False,
+            ),
+        ]
+
     def _build_registry(
         self,
         input_batch: InputBatch,
@@ -3307,10 +3597,17 @@ class RetainedReplayFixtureController:
             ):
                 tensor = getattr(draft_model, name, None)
                 if isinstance(tensor, torch.Tensor):
+                    draft_query_tokens = num_reqs * int(
+                        getattr(speculator, "num_query_per_req", 1)
+                    )
+                    retained_rows = min(
+                        max(num_tokens, draft_query_tokens),
+                        tensor.shape[0],
+                    )
                     registry.add_rows(
                         f"speculator:model:{name}",
                         tensor,
-                        token_prefix[: min(num_tokens, tensor.shape[0])],
+                        torch.arange(retained_rows, device=tensor.device),
                     )
             registry.add_attribute(
                 "speculator:draft_max_seq_len", speculator, "draft_max_seq_len"

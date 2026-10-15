@@ -4,6 +4,7 @@
 import hashlib
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,9 +14,12 @@ import torch
 from benchmarks.replayssm.dsv41_retained_control_compare import (
     IDENTITY_NORMALIZATION_VERSION,
     MASKED_NEGATIVE_INFINITY_PATHS,
+    EvidenceRun,
     _canonicalize_rank_local_shared_config,
+    _compare_runs,
     _floating_metrics,
     _identity_normalization_provenance,
+    _validated_scratch_rows,
 )
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
@@ -290,6 +294,59 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         )
 
 
+def test_draft_cache_writers_bind_context_and_query_rows() -> None:
+    speculator = SimpleNamespace(
+        draft_kv_cache_group_ids=(1,),
+        _context_slot_mappings=(torch.tensor([12, -1]),),
+        num_query_per_req=2,
+        idx_mapping=torch.tensor([7]),
+        context_positions=torch.tensor([3, 0]),
+        input_buffers=SimpleNamespace(positions=torch.tensor([4, 5])),
+        block_tables=SimpleNamespace(
+            slot_mappings=torch.tensor(
+                [
+                    [-1, -1],
+                    [16, 17],
+                ]
+            )
+        ),
+    )
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = SimpleNamespace(
+        speculator=speculator,
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["target"]),
+                SimpleNamespace(layer_names=["draft"]),
+            ]
+        ),
+    )
+    fixture = SimpleNamespace(
+        is_dummy=False,
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            num_tokens=2,
+            query_start_loc=torch.tensor([0, 2]),
+            idx_mapping=torch.tensor([7]),
+        ),
+    )
+
+    context, query = controller._draft_cache_writers(fixture)
+
+    assert context.phase == "draft-context"
+    assert context.positions.tolist() == [3, 0]
+    assert context.request_ordinals.tolist() == [0, 0]
+    assert context.request_state_slots.tolist() == [7, 7]
+    assert context.slots_by_layer["draft"].tolist() == [12, -1]
+    assert context.enforce_committed_extent is False
+    assert query.phase == "draft-query"
+    assert query.positions.tolist() == [4, 5]
+    assert query.slots_by_layer["draft"].tolist() == [16, 17]
+    assert query.enforce_committed_extent is False
+
+
 def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     computed = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     temperature = torch.tensor([0.7], dtype=torch.float32)
@@ -324,6 +381,99 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
         if leaf["path"] == "registry/acceptance:features"
     )
     assert features["metadata"]["compare_prefix"] == 1
+
+
+def _scratch_run(
+    values: torch.Tensor,
+    *,
+    comparison: str,
+) -> EvidenceRun:
+    path = "registry/model:candidate_block_buffer"
+    metadata = {
+        "compare_prefix": values.shape[0],
+        "scratch_policy": "candidate_membership_v1",
+        "producer_layer": 20,
+        "cache_owner": "layer.20",
+        "compress_ratio": 2,
+        "row_writer": "target-replay",
+        "row_positions": [15] * values.shape[0],
+        "row_request_ordinals": list(range(values.shape[0])),
+        "row_request_state_slots": list(range(values.shape[0])),
+        "sentinel": -1,
+        "require_unique_valid_ids": True,
+        "require_trailing_sentinels": True,
+        "valid_id_exclusive_bounds": [8] * values.shape[0],
+        "expected_valid_counts": [3] * values.shape[0],
+    }
+    leaf = {
+        "checkpoint": "s1",
+        "path": path,
+        "family": path,
+        "comparison": comparison,
+        "dtype": str(values.dtype),
+        "shape": list(values.shape),
+        "payload_key": "values",
+        "metadata": metadata,
+    }
+    return EvidenceRun(
+        Path("rank-00/a-001.json"),
+        {"dp_rank": 0, "ordinal": 1, "run_kind": "a"},
+        {"values": values},
+        {f"s1:{path}": leaf},
+    )
+
+
+def test_scratch_comparator_canonicalizes_candidates_and_diagnoses_topk() -> None:
+    left = _scratch_run(
+        torch.tensor([[3, 1, 2, -1]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    right = _scratch_run(
+        torch.tensor([[2, 3, 1, -1]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    assert torch.equal(
+        _validated_scratch_rows(left, next(iter(left.leaves.values()))),
+        _validated_scratch_rows(right, next(iter(right.leaves.values()))),
+    )
+    assert _compare_runs(
+        left,
+        right,
+        denominator_floor=1e-12,
+        envelope=None,
+    )["passed"]
+
+    left.leaves["s1:registry/model:candidate_block_buffer"]["comparison"] = (
+        "diagnostic_topk"
+    )
+    right.leaves["s1:registry/model:candidate_block_buffer"]["comparison"] = (
+        "diagnostic_topk"
+    )
+    right.payload["values"] = torch.tensor([[2, 4, 1, -1]], dtype=torch.int32)
+    report = _compare_runs(
+        left,
+        right,
+        denominator_floor=1e-12,
+        envelope=None,
+    )
+    assert report["passed"]
+    assert report["diagnostic"][0]["mismatches"] == 1
+
+
+def test_scratch_comparator_rejects_duplicate_or_out_of_range_ids() -> None:
+    duplicate = _scratch_run(
+        torch.tensor([[1, 1, 2, -1]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    with pytest.raises(ValueError, match="duplicate scratch ID"):
+        _validated_scratch_rows(duplicate, next(iter(duplicate.leaves.values())))
+
+    out_of_range = _scratch_run(
+        torch.tensor([[1, 2, 8, -1]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    with pytest.raises(ValueError, match="exceeds visibility"):
+        _validated_scratch_rows(out_of_range, next(iter(out_of_range.leaves.values())))
 
 
 def test_numeric_comparator_accepts_matching_infinity_masks() -> None:

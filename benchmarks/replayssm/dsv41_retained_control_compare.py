@@ -85,6 +85,8 @@ TRIMMABLE_REGISTRY_NAMES = {
     "speculator:draft_token_confidence_probs",
     "speculator:idx_mapping",
     "speculator:_draft_scatter_buf",
+    "model:candidate_block_buffer",
+    "model:topk_indices_buffer",
 }
 
 
@@ -594,17 +596,51 @@ def _load_run(path: Path) -> EvidenceRun:
         is_logical_raw = path_name.startswith("logical_kv/") and path_name.endswith(
             ("/raw_values", "/raw_scales")
         )
+        is_scratch = comparison in (
+            "canonical_membership",
+            "diagnostic_topk",
+        )
         if (
             is_tensor
             and not is_float
             and comparison != "exact"
             and not (is_logical_raw and comparison == "diagnostic")
+            and not is_scratch
         ):
             raise ValueError(f"{path}: non-floating tensor must be exact: {key}")
         if path_name.startswith("registry/kv-") and comparison != "exact":
             raise ValueError(f"{path}: KV bytes must remain exact: {key}")
         if path_name.startswith("decisions/") and comparison != "exact":
             raise ValueError(f"{path}: decisions must remain exact: {key}")
+        if is_scratch:
+            expected_scratch = {
+                "registry/model:candidate_block_buffer": "canonical_membership",
+                "registry/model:topk_indices_buffer": "diagnostic_topk",
+            }.get(path_name)
+            if expected_scratch != comparison or dtype not in (
+                "torch.int32",
+                "torch.int64",
+            ):
+                raise ValueError(f"{path}: scratch comparison is unsupported: {key}")
+            metadata = leaf.get("metadata", {})
+            required_metadata = {
+                "compare_prefix",
+                "scratch_policy",
+                "producer_layer",
+                "cache_owner",
+                "compress_ratio",
+                "row_writer",
+                "row_positions",
+                "row_request_ordinals",
+                "row_request_state_slots",
+                "sentinel",
+                "require_unique_valid_ids",
+                "require_trailing_sentinels",
+                "valid_id_exclusive_bounds",
+                "expected_valid_counts",
+            }
+            if not required_metadata.issubset(metadata):
+                raise ValueError(f"{path}: scratch metadata is incomplete: {key}")
         if path_name.startswith("logical_kv/"):
             if path_name.endswith("/decoded"):
                 if not (is_tensor and is_float and comparison == "floating"):
@@ -853,6 +889,60 @@ def _meaningful_tensor(
     return tensor
 
 
+def _validated_scratch_rows(
+    run: EvidenceRun,
+    leaf: dict[str, Any],
+) -> torch.Tensor:
+    tensor = _meaningful_tensor(run, leaf)
+    metadata = leaf.get("metadata", {})
+    if tensor.ndim != 2 or tensor.shape[0] <= 0 or tensor.shape[1] <= 0:
+        raise ValueError(f"{leaf['path']}: scratch tensor must be nonempty 2D")
+    rows = tensor.shape[0]
+    row_fields = (
+        "row_positions",
+        "row_request_ordinals",
+        "row_request_state_slots",
+        "valid_id_exclusive_bounds",
+        "expected_valid_counts",
+    )
+    if any(
+        not isinstance(metadata.get(field), list) or len(metadata[field]) != rows
+        for field in row_fields
+    ):
+        raise ValueError(f"{leaf['path']}: scratch row metadata differs")
+    if metadata.get("sentinel") != -1:
+        raise ValueError(f"{leaf['path']}: unsupported scratch sentinel")
+    if metadata.get("require_unique_valid_ids") is not True:
+        raise ValueError(f"{leaf['path']}: scratch uniqueness gate is absent")
+    if metadata.get("require_trailing_sentinels") is not True:
+        raise ValueError(f"{leaf['path']}: scratch sentinel-order gate is absent")
+
+    canonical = torch.full_like(tensor, -1)
+    for row in range(rows):
+        values = tensor[row]
+        invalid = values < 0
+        if bool((values[invalid] != -1).any()):
+            raise ValueError(f"{leaf['path']}: invalid negative scratch ID")
+        invalid_indices = torch.nonzero(invalid, as_tuple=False).flatten()
+        if invalid_indices.numel():
+            first = int(invalid_indices[0])
+            if bool((values[first:] != -1).any()):
+                raise ValueError(f"{leaf['path']}: scratch sentinels are not trailing")
+            valid = values[:first]
+        else:
+            valid = values
+        expected_count = int(metadata["expected_valid_counts"][row])
+        bound = int(metadata["valid_id_exclusive_bounds"][row])
+        if valid.numel() != expected_count:
+            raise ValueError(f"{leaf['path']}: scratch valid count differs")
+        if bound < 0 or bool((valid >= bound).any()):
+            raise ValueError(f"{leaf['path']}: scratch ID exceeds visibility")
+        if torch.unique(valid).numel() != valid.numel():
+            raise ValueError(f"{leaf['path']}: duplicate scratch ID")
+        canonical[row, : valid.numel()] = torch.sort(valid).values
+    return canonical
+
+
 def _floating_metrics(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -976,6 +1066,27 @@ def _compare_runs(
                     "mismatches": mismatches,
                 }
             )
+            continue
+        if left_leaf["comparison"] in (
+            "canonical_membership",
+            "diagnostic_topk",
+        ):
+            left_tensor = _validated_scratch_rows(left, left_leaf)
+            right_tensor = _validated_scratch_rows(right, right_leaf)
+            equal = torch.equal(left_tensor, right_tensor)
+            if left_leaf["comparison"] == "canonical_membership":
+                if not equal:
+                    exact_mismatches.append(key)
+            else:
+                diagnostic.append(
+                    {
+                        "leaf": key,
+                        "elements": left_tensor.numel(),
+                        "mismatches": int(
+                            torch.count_nonzero(left_tensor != right_tensor).item()
+                        ),
+                    }
+                )
             continue
         if left_leaf["comparison"] != "floating":
             raise ValueError(f"{key}: invalid comparison class")
