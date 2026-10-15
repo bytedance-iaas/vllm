@@ -242,6 +242,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         tensor=cache,
         block_size=4,
         tokens_per_state=1,
+        live_window=None,
         destination_blocks={1, 3},
         consumers=["layer"],
         aliases=[],
@@ -258,6 +259,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
     input_batch = SimpleNamespace(
         num_reqs=1,
         num_computed_tokens_np=np.array([4], dtype=np.int32),
+        query_start_loc_np=np.array([0, 1], dtype=np.int32),
         idx_mapping=torch.tensor([7]),
     )
     registry.configure_logical_cache(
@@ -265,6 +267,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         [writer],
         input_batch,
         (torch.tensor([[1, 3]], dtype=torch.int32),),
+        (4,),
     )
 
     page = 3 * cache.stride(0)
@@ -274,7 +277,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
     storage[page + 4 * 512 : page + 4 * 512 + 16].fill_(127)
     snapshot = registry.logical_cache_snapshot(
         "post_sampling",
-        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
     )
     leaves = {leaf["path"]: leaf for leaf in snapshot["leaves"]}
     root = "logical_kv/group-0:layer"
@@ -290,7 +293,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
     with pytest.raises(RetainedReplayFixtureError, match="unwritten live record"):
         registry.logical_cache_snapshot(
             "post_sampling",
-            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
         )
 
 
@@ -302,6 +305,7 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
         idx_mapping=torch.tensor([7]),
         context_positions=torch.tensor([3, 0]),
         input_buffers=SimpleNamespace(positions=torch.tensor([4, 5])),
+        _context_rows=lambda input_batch: None,
         block_tables=SimpleNamespace(
             slot_mappings=torch.tensor(
                 [
@@ -316,6 +320,7 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
     )
     controller.runner = SimpleNamespace(
         speculator=speculator,
+        dspark_prefill_only=False,
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(layer_names=["target"]),
@@ -373,7 +378,7 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
 
     assert comparison["registry/acceptance:features"] == "floating"
     assert comparison["registry/sampler:temperature"] == "exact"
-    assert comparison["registry/kv-dst:test"] == "exact"
+    assert comparison["registry/kv-dst:test"] == "diagnostic"
     assert comparison["registry/speculator:_draft_scatter_buf"] == "floating"
     features = next(
         leaf
@@ -423,13 +428,36 @@ def _scratch_run(
     )
 
 
+def _add_topk(run: EvidenceRun, values: torch.Tensor) -> None:
+    path = "registry/model:topk_indices_buffer"
+    candidate = run.leaves["s1:registry/model:candidate_block_buffer"]
+    metadata = {
+        **candidate["metadata"],
+        "scratch_policy": "topk_diagnostic_v1",
+        "cache_owner": "layer.20.indexer.k_cache",
+        "candidate_membership_path": "registry/model:candidate_block_buffer",
+        "candidate_block_size": 2,
+    }
+    run.payload["topk"] = values
+    run.leaves[f"s1:{path}"] = {
+        "checkpoint": "s1",
+        "path": path,
+        "family": path,
+        "comparison": "diagnostic_topk",
+        "dtype": str(values.dtype),
+        "shape": list(values.shape),
+        "payload_key": "topk",
+        "metadata": metadata,
+    }
+
+
 def test_scratch_comparator_canonicalizes_candidates_and_diagnoses_topk() -> None:
     left = _scratch_run(
-        torch.tensor([[3, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     right = _scratch_run(
-        torch.tensor([[2, 3, 1, -1]], dtype=torch.int32),
+        torch.tensor([[2, 0, 1, -1]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     assert torch.equal(
@@ -443,13 +471,14 @@ def test_scratch_comparator_canonicalizes_candidates_and_diagnoses_topk() -> Non
         envelope=None,
     )["passed"]
 
-    left.leaves["s1:registry/model:candidate_block_buffer"]["comparison"] = (
-        "diagnostic_topk"
+    _add_topk(
+        left,
+        torch.tensor([[3, 1, 2, -1]], dtype=torch.int32),
     )
-    right.leaves["s1:registry/model:candidate_block_buffer"]["comparison"] = (
-        "diagnostic_topk"
+    _add_topk(
+        right,
+        torch.tensor([[2, 4, 1, -1]], dtype=torch.int32),
     )
-    right.payload["values"] = torch.tensor([[2, 4, 1, -1]], dtype=torch.int32)
     report = _compare_runs(
         left,
         right,

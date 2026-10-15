@@ -312,10 +312,113 @@ def _validate_container_children(
             )
 
 
+def _decode_e2m1(codes: torch.Tensor) -> torch.Tensor:
+    codes = codes.to(torch.int64)
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+    )
+    values = magnitudes.index_select(0, (codes & 7).reshape(-1)).reshape(codes.shape)
+    return torch.where(codes >= 8, -values, values)
+
+
+def _decode_logical_raw(
+    raw_values: torch.Tensor,
+    raw_scales: torch.Tensor,
+    view: dict[str, Any],
+) -> torch.Tensor:
+    record_format = view["record_format"]
+    if record_format == "v4_ue8m0_fp8_bf16":
+        fp8 = raw_values[:, :448].view(torch.float8_e4m3fn).float()
+        scales = torch.exp2(raw_scales[:, :7].float() - 127.0)
+        nope = fp8.reshape(-1, 7, 64) * scales[:, :, None]
+        rope = raw_values[:, 448:].contiguous().view(torch.bfloat16).float()
+        if bool((raw_scales[:, 7] != 0).any()):
+            raise ValueError("V4 packed cache padding scale is nonzero")
+        return torch.cat((nope.reshape(-1, 448), rope), dim=1)
+    if record_format == "v41_ue8m0_mxfp8":
+        fp8 = raw_values.view(torch.float8_e4m3fn).float()
+        scales = torch.exp2(raw_scales.float() - 127.0)
+        return (fp8.reshape(-1, 16, 32) * scales[:, :, None]).reshape(-1, 512)
+    if record_format in ("v41_nvfp4", "indexer_mxfp4"):
+        codes = torch.stack((raw_values & 0xF, raw_values >> 4), dim=2).reshape(
+            raw_values.shape[0], -1
+        )
+        block = 16 if record_format == "v41_nvfp4" else 32
+        scales = (
+            raw_scales.view(torch.float8_e4m3fn).float()
+            if record_format == "v41_nvfp4"
+            else torch.exp2(raw_scales.float() - 127.0)
+        )
+        return (
+            _decode_e2m1(codes).reshape(raw_values.shape[0], -1, block)
+            * scales[:, :, None]
+        ).reshape(raw_values.shape[0], -1)
+    if record_format == "indexer_fp8":
+        scales = raw_scales.contiguous().view(torch.float32)
+        return raw_values.view(torch.float8_e4m3fn).float() * scales
+    if record_format == "plain_bf16":
+        return raw_values.contiguous().view(torch.bfloat16).float()
+    if record_format == "plain_fp8":
+        scale = view.get("fp8_scale")
+        if not isinstance(scale, (int, float)):
+            raise ValueError("plain FP8 logical view lacks its scale")
+        return raw_values.view(torch.float8_e4m3fn).float() * float(scale)
+    if record_format == "compressor_ring_fp32":
+        return raw_values.contiguous().view(torch.float32)
+    raise ValueError(f"unsupported logical cache format: {record_format}")
+
+
+def _validate_logical_payload(
+    path: Path,
+    checkpoint: str,
+    view: dict[str, Any],
+    leaves: dict[str, dict[str, Any]],
+    payload: dict[str, torch.Tensor],
+) -> None:
+    root = f"{checkpoint}:logical_kv/{_safe_path_component(view['view_id'])}"
+    descriptors = payload[leaves[f"{root}/descriptors"]["payload_key"]]
+    raw_values = payload[leaves[f"{root}/raw_values"]["payload_key"]]
+    raw_scales = payload[leaves[f"{root}/raw_scales"]["payload_key"]]
+    decoded = payload[leaves[f"{root}/decoded"]["payload_key"]]
+    if descriptors.ndim != 2 or descriptors.shape[1] != 6:
+        raise ValueError(f"{path}: logical descriptors are invalid for {root}")
+    rows = descriptors.shape[0]
+    if any(
+        tensor.shape[0] != rows
+        for tensor in (
+            raw_values,
+            raw_scales,
+            decoded,
+        )
+    ):
+        raise ValueError(f"{path}: logical row cardinality differs for {root}")
+    if rows == 0:
+        if view.get("cache_kind") != "compressor_ring":
+            raise ValueError(f"{path}: logical coverage is empty for {root}")
+        return
+    if torch.unique(descriptors, dim=0).shape[0] != rows:
+        raise ValueError(f"{path}: logical descriptors are duplicated for {root}")
+    block_size = int(view["block_size"])
+    destination_blocks = set(int(value) for value in view["destination_blocks"])
+    if (
+        bool((descriptors[:, :3] < 0).any())
+        or bool((descriptors[:, 3] <= 0).any())
+        or bool((descriptors[:, 4] < 0).any())
+        or bool((descriptors[:, 4] >= block_size).any())
+        or any(int(block) not in destination_blocks for block in descriptors[:, 3])
+    ):
+        raise ValueError(f"{path}: logical descriptor bounds differ for {root}")
+    reconstructed = _decode_logical_raw(raw_values, raw_scales, view)
+    if reconstructed.shape != decoded.shape or not torch.equal(reconstructed, decoded):
+        raise ValueError(f"{path}: logical decoded values do not match raw bytes")
+
+
 def _validate_evidence_contract(
     path: Path,
     manifest: dict[str, Any],
     leaves: dict[str, dict[str, Any]],
+    payload: dict[str, torch.Tensor],
 ) -> None:
     contract = manifest.get("evidence_contract")
     if not isinstance(contract, dict):
@@ -326,6 +429,7 @@ def _validate_evidence_contract(
     meaningful_counts = contract.get("meaningful_counts")
     graph_input_count = contract.get("graph_input_count")
     logical_cache_views = contract.get("logical_cache_views")
+    cache_owner_inventory = contract.get("cache_owner_inventory")
     if not (
         isinstance(checkpoint_paths, dict)
         and isinstance(comparison_classes, dict)
@@ -333,6 +437,7 @@ def _validate_evidence_contract(
         and isinstance(meaningful_counts, dict)
         and isinstance(graph_input_count, int)
         and isinstance(logical_cache_views, list)
+        and isinstance(cache_owner_inventory, list)
     ):
         raise ValueError(f"{path}: evidence contract is incomplete")
 
@@ -401,6 +506,26 @@ def _validate_evidence_contract(
                         f"{path}: logical cache evidence is absent or misclassified: "
                         f"{key}"
                     )
+            _validate_logical_payload(
+                path,
+                checkpoint,
+                view,
+                leaves,
+                payload,
+            )
+    if logical_view_ids != set(cache_owner_inventory):
+        raise ValueError(f"{path}: logical cache owner inventory differs")
+    for view in logical_cache_views:
+        for alias in view["aliases"]:
+            if alias not in logical_view_ids:
+                raise ValueError(f"{path}: logical cache alias is unknown")
+            peer = next(
+                candidate
+                for candidate in logical_cache_views
+                if candidate["view_id"] == alias
+            )
+            if view["view_id"] not in peer["aliases"]:
+                raise ValueError(f"{path}: logical cache alias is not reciprocal")
 
     required_registry = {
         "model:_mtp_hidden_buffer",
@@ -540,7 +665,7 @@ def _load_run(path: Path) -> EvidenceRun:
             if list(tensor.shape) != leaf["shape"]:
                 raise ValueError(f"{path}: payload shape differs for {key}")
         leaves[key] = leaf
-    _validate_evidence_contract(path, manifest, leaves)
+    _validate_evidence_contract(path, manifest, leaves, payload)
     for checkpoint, required_paths in REQUIRED_PATHS.items():
         actual_paths = {
             leaf["path"]
@@ -596,6 +721,7 @@ def _load_run(path: Path) -> EvidenceRun:
         is_logical_raw = path_name.startswith("logical_kv/") and path_name.endswith(
             ("/raw_values", "/raw_scales")
         )
+        is_restoration_raw = path_name.startswith("registry/kv-dst:")
         is_scratch = comparison in (
             "canonical_membership",
             "diagnostic_topk",
@@ -605,11 +731,12 @@ def _load_run(path: Path) -> EvidenceRun:
             and not is_float
             and comparison != "exact"
             and not (is_logical_raw and comparison == "diagnostic")
+            and not (is_restoration_raw and comparison == "diagnostic")
             and not is_scratch
         ):
             raise ValueError(f"{path}: non-floating tensor must be exact: {key}")
-        if path_name.startswith("registry/kv-") and comparison != "exact":
-            raise ValueError(f"{path}: KV bytes must remain exact: {key}")
+        if path_name.startswith("registry/kv-") and comparison != "diagnostic":
+            raise ValueError(f"{path}: restoration KV bytes must be diagnostic: {key}")
         if path_name.startswith("decisions/") and comparison != "exact":
             raise ValueError(f"{path}: decisions must remain exact: {key}")
         if is_scratch:
@@ -641,6 +768,13 @@ def _load_run(path: Path) -> EvidenceRun:
             }
             if not required_metadata.issubset(metadata):
                 raise ValueError(f"{path}: scratch metadata is incomplete: {key}")
+            if comparison == "diagnostic_topk" and not {
+                "candidate_membership_path",
+                "candidate_block_size",
+            }.issubset(metadata):
+                raise ValueError(
+                    f"{path}: top-k candidate binding is incomplete: {key}"
+                )
         if path_name.startswith("logical_kv/"):
             if path_name.endswith("/decoded"):
                 if not (is_tensor and is_float and comparison == "floating"):
@@ -940,6 +1074,41 @@ def _validated_scratch_rows(
         if torch.unique(valid).numel() != valid.numel():
             raise ValueError(f"{leaf['path']}: duplicate scratch ID")
         canonical[row, : valid.numel()] = torch.sort(valid).values
+    if leaf["comparison"] == "diagnostic_topk":
+        candidate_path = metadata["candidate_membership_path"]
+        candidate_key = f"{leaf['checkpoint']}:{candidate_path}"
+        candidate_leaf = run.leaves.get(candidate_key)
+        if (
+            candidate_leaf is None
+            or candidate_leaf.get("comparison") != "canonical_membership"
+        ):
+            raise ValueError(f"{leaf['path']}: candidate membership is absent")
+        candidates = _validated_scratch_rows(run, candidate_leaf)
+        if candidates.shape[0] != rows:
+            raise ValueError(f"{leaf['path']}: candidate row identity differs")
+        candidate_metadata = candidate_leaf["metadata"]
+        for field in (
+            "row_positions",
+            "row_request_ordinals",
+            "row_request_state_slots",
+        ):
+            if candidate_metadata.get(field) != metadata.get(field):
+                raise ValueError(f"{leaf['path']}: candidate ownership differs")
+        block_size = int(metadata["candidate_block_size"])
+        if block_size <= 0:
+            raise ValueError(f"{leaf['path']}: candidate block size is invalid")
+        for row in range(rows):
+            candidate_blocks = {
+                int(value) for value in candidates[row] if int(value) >= 0
+            }
+            selected = canonical[row]
+            if any(
+                int(value) >= 0 and int(value) // block_size not in candidate_blocks
+                for value in selected
+            ):
+                raise ValueError(
+                    f"{leaf['path']}: top-k ID is outside candidate membership"
+                )
     return canonical
 
 
