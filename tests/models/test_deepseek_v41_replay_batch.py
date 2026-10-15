@@ -333,6 +333,7 @@ def test_ordinary_batch_idle_dp_rank_uses_one_all_padding_row(dp_state):
     assert sub.query_start_loc_np.tolist() == [0, 1]
     assert sub.is_padding.all()
     assert ordinary.slot_mappings.eq(PAD_SLOT_ID).all()
+    assert all(table.eq(0).all() for table in ordinary.block_tables)
     assert ordinary.forward_context.dp_metadata is not None
     assert ordinary.forward_context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [
         20,
@@ -408,6 +409,41 @@ def test_mixed_replay_graph_forces_untrimmed_batch_and_clears_next_step(state):
 
     assert _prepare(state, batch, CUDAGraphMode.FULL) == (None, None)
     assert state.decoder_replay_layers.replay_batch is None
+
+
+def test_retained_builder_preserves_installed_mixed_replay_graph(state):
+    manager = _replay_manager()
+    state.replay_cudagraphs = manager
+    state._mixed_replay_graph_enabled = True
+    state._replay_start_np[1] = 50
+    batch = _input_batch([1, 100], [500, 300], [False, True])
+    slots = _slot_mappings(batch.num_tokens_after_padding)
+
+    live, _ = _prepare(state, batch, CUDAGraphMode.NONE)
+    assert live is not None and live.run_graph is manager.run
+    live_rows = live.rows.clone()
+    live_padding = live.forward_context.is_padding.clone()
+    live_slots = {
+        key: value.clone() for key, value in live.forward_context.slot_mapping.items()
+    }
+
+    retained = state.build_retained_replay_batch(
+        batch,
+        BLOCK_TABLES,
+        slots,
+        [],
+        GROUPS,
+    )
+
+    assert retained is not None
+    assert state.decoder_replay_layers.replay_batch is live
+    assert torch.equal(live.rows, live_rows)
+    assert torch.equal(live.forward_context.is_padding, live_padding)
+    assert live.forward_context.batch_descriptor.num_tokens == 256
+    assert all(
+        torch.equal(live.forward_context.slot_mapping[key], value)
+        for key, value in live_slots.items()
+    )
 
 
 @pytest.mark.parametrize("graph_segments", [None, 0])

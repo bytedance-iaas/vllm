@@ -361,8 +361,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._dsv41_retained_fixture_enabled = (
+            os.getenv("VLLM_DSV41_RETAINED_FIXTURE", "0") == "1"
+        )
         self._dsv41_retained_fixture: Any = None
         self._dsv41_retained_fixture_started_at = time.time()
+        self._dsv41_retained_fixture_arm_error: str | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -594,7 +598,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return error
         arm_path = os.getenv("VLLM_DSV41_RETAINED_FIXTURE_ARM_PATH")
         if arm_path:
-            os.makedirs(os.path.dirname(arm_path), exist_ok=True)
+            directory = os.path.dirname(arm_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
             temporary = f"{arm_path}.{os.getpid()}.tmp"
             with open(temporary, "w") as marker:
                 marker.write(f"{time.time_ns()}\n")
@@ -608,7 +614,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return self._arm_dsv41_retained_fixture_local()
 
     def _dsv41_retained_fixture_support_error(self) -> dict[str, Any] | None:
-        if os.getenv("VLLM_DSV41_RETAINED_FIXTURE", "0") != "1":
+        if not self._dsv41_retained_fixture_enabled:
             return {
                 "state": "disabled",
                 "error": "VLLM_DSV41_RETAINED_FIXTURE is not enabled",
@@ -649,19 +655,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return self._dsv41_retained_fixture.status()
 
     def _maybe_arm_dsv41_retained_fixture_from_file(self) -> None:
-        if self._dsv41_retained_fixture is not None:
+        if not self._dsv41_retained_fixture_enabled:
             return
         arm_path = os.getenv("VLLM_DSV41_RETAINED_FIXTURE_ARM_PATH")
         if not arm_path:
             return
+        local_has_controller = self._dsv41_retained_fixture is not None
+        any_controller, all_controllers = self._dsv41_fixture_presence(
+            local_has_controller
+        )
+        if any_controller:
+            if all_controllers:
+                return
+            support_error = self._dsv41_retained_fixture_support_error()
+            if not self._dsv41_fixture_vote(support_error is None):
+                self._dsv41_retained_fixture_arm_error = (
+                    None if support_error is None else str(support_error.get("error"))
+                ) or "a peer cannot arm the retained fixture"
+                return
+            if not local_has_controller:
+                self._arm_dsv41_retained_fixture_local()
+            return
+
+        local_requested = False
         try:
             marker_time = os.path.getmtime(arm_path)
         except FileNotFoundError:
+            marker_time = 0.0
+        if marker_time >= self._dsv41_retained_fixture_started_at:
+            local_requested = True
+        any_requested, _ = self._dsv41_fixture_presence(local_requested)
+        if not any_requested:
             return
-        if marker_time < self._dsv41_retained_fixture_started_at:
+        support_error = self._dsv41_retained_fixture_support_error()
+        if not self._dsv41_fixture_vote(support_error is None):
+            self._dsv41_retained_fixture_arm_error = (
+                None if support_error is None else str(support_error.get("error"))
+            ) or "a peer cannot arm the retained fixture"
             return
-        if self._dsv41_retained_fixture_support_error() is None:
-            self._arm_dsv41_retained_fixture_local()
+        self._arm_dsv41_retained_fixture_local()
 
     def _log_dsv41_retained_fixture_rpc(
         self, event: str, nonce: str, result: dict[str, Any]
@@ -676,7 +708,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def dsv41_retained_fixture_status(self, nonce: str = "") -> dict[str, Any]:
         controller = self._dsv41_retained_fixture
         if controller is None:
-            result = {"state": "unarmed", "error": None, "dp_rank": self.dp_rank}
+            result = {
+                "state": "unarmed",
+                "error": self._dsv41_retained_fixture_arm_error,
+                "dp_rank": self.dp_rank,
+            }
         else:
             result = controller.status()
         return self._log_dsv41_retained_fixture_rpc("STATUS", nonce, result)
@@ -707,17 +743,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def restore_dsv41_retained_fixture(self, epoch: str) -> dict[str, Any]:
         controller = self._dsv41_retained_fixture
-        if controller is None:
+        local_error: BaseException | str | None = None
+        try:
+            if controller is None:
+                raise RuntimeError("fixture is not armed")
+            controller.validate_restore(epoch)
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            if controller is not None:
+                controller.fail(local_error or "a peer failed restore preflight")
+                return controller.status()
             return {
                 "state": "unarmed",
-                "error": "fixture is not armed",
+                "error": str(local_error or "a peer is not armed"),
                 "dp_rank": self.dp_rank,
             }
+
+        assert controller is not None
+        result = None
         try:
-            return {"state": "restored", **controller.restore(epoch)}
+            result = {"state": "restored", **controller.restore(epoch)}
         except Exception as error:
-            controller.fail(error)
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            controller.fail(local_error or "a peer failed retained fixture restore")
             return controller.status()
+        assert result is not None
+        return result
+
+    def _dsv41_fixture_presence(self, local_present: bool) -> tuple[bool, bool]:
+        if self.dp_size == 1:
+            return local_present, local_present
+        present = torch.zeros(self.dp_size, dtype=torch.int32, device="cpu")
+        present[self.dp_rank] = int(local_present)
+        if should_skip_dp_coordination():
+            present.fill_(int(local_present))
+        else:
+            dist.all_reduce(present, group=get_dp_group().cpu_group)
+        return bool(present.any()), bool(present.all())
+
+    def _dsv41_fixture_work(
+        self, local_has_work: bool, local_num_tokens: int
+    ) -> tuple[bool, torch.Tensor | None]:
+        if self.dp_size == 1:
+            return local_has_work, None
+        agreed = torch.zeros(2, self.dp_size, dtype=torch.int32, device="cpu")
+        agreed[:, self.dp_rank] = torch.tensor(
+            [local_has_work, local_num_tokens], dtype=torch.int32
+        )
+        if should_skip_dp_coordination():
+            agreed[:] = agreed[:, self.dp_rank : self.dp_rank + 1]
+        else:
+            dist.all_reduce(agreed, group=get_dp_group().cpu_group)
+        return bool(agreed[0].any()), agreed[1]
 
     def _dsv41_fixture_vote(self, local_ok: bool) -> bool:
         if self.dp_size == 1:
@@ -743,10 +822,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dp_sync: DPSyncState | None,
     ) -> None:
         controller = self._dsv41_retained_fixture
-        if controller is None or controller.state != "armed":
+        local_armed = controller is not None and controller.state == "armed"
+        any_armed, all_armed = self._dsv41_fixture_presence(local_armed)
+        if not any_armed:
             return
-        if batch_desc.cg_mode != CUDAGraphMode.NONE:
+        if not all_armed:
+            if controller is not None:
+                controller.fail("retained fixture arm state differs across DP ranks")
             return
+        assert controller is not None
+        if not self._dsv41_fixture_vote(batch_desc.cg_mode == CUDAGraphMode.NONE):
+            controller.fail("the retained fixture requires an all-rank eager step")
+            return
+
+        local_error: BaseException | str | None = None
+        replay_plan = None
+        try:
+            replay_plan = self.model_state.plan_retained_replay_batch(input_batch)
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            controller.fail(local_error or "a peer failed retained replay planning")
+            return
+        assert replay_plan is not None
+        any_candidate, replay_dp_tokens = self._dsv41_fixture_work(
+            replay_plan.local_candidate,
+            replay_plan.num_tokens,
+        )
+        if not any_candidate:
+            return
+
+        replay_batch = None
         local_error = None
         try:
             replay_batch = self.model_state.build_retained_replay_batch(
@@ -755,16 +861,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings,
                 self.attn_groups,
                 self.kv_cache_config,
+                plan=replay_plan,
+                global_has_candidate=True,
+                agreed_num_tokens_across_dp=replay_dp_tokens,
             )
             if replay_batch is None:
-                return
+                raise RuntimeError("retained replay builder returned no batch")
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            controller.fail(local_error or "a peer failed retained replay construction")
+            return
+        assert replay_batch is not None
+
+        ordinary_plan = None
+        local_error = None
+        try:
+            ordinary_plan = self.model_state.plan_ordinary_decode_batch(input_batch)
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            controller.fail(local_error or "a peer failed ordinary Decode planning")
+            return
+        assert ordinary_plan is not None
+        any_ordinary, ordinary_dp_tokens = self._dsv41_fixture_work(
+            ordinary_plan.has_ordinary,
+            ordinary_plan.num_execution_tokens,
+        )
+        ordinary_batch = None
+        local_error = None
+        try:
             ordinary_batch = self.model_state.build_ordinary_decode_batch(
                 input_batch,
                 block_tables,
                 slot_mappings,
                 self.attn_groups,
                 self.kv_cache_config,
+                plan=ordinary_plan,
+                global_has_ordinary=any_ordinary,
+                agreed_num_tokens_across_dp=ordinary_dp_tokens,
             )
+            if any_ordinary and ordinary_batch is None:
+                raise RuntimeError("ordinary Decode builder returned no batch")
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            controller.fail(local_error or "a peer failed ordinary Decode construction")
+            return
+
+        local_error = None
+        try:
             dp_metadata = None
             if dp_sync is not None:
                 dp_metadata = DPMetadata.make(
@@ -794,12 +940,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 replay_batch=replay_batch,
                 ordinary_batch=ordinary_batch,
             )
-            self.model.set_decoder_boundary_capture(controller.capture_boundary)
         except Exception as error:
             local_error = error
         if not self._dsv41_fixture_vote(local_error is None):
-            self.model.set_decoder_boundary_capture(None)
             controller.fail(local_error or "a peer failed fixture preparation")
+            return
+        self.model.set_decoder_boundary_capture(controller.capture_boundary)
 
     def _maybe_finalize_dsv41_retained_fixture(
         self,
@@ -807,9 +953,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
     ) -> None:
-        controller = self._dsv41_retained_fixture
-        if controller is None or controller.state != "capturing":
+        if not self._dsv41_retained_fixture_enabled:
             return
+        controller = self._dsv41_retained_fixture
+        local_capturing = controller is not None and controller.state == "capturing"
+        any_capturing, all_capturing = self._dsv41_fixture_presence(local_capturing)
+        if not any_capturing:
+            return
+        if not all_capturing:
+            if controller is not None:
+                controller.fail(
+                    "retained fixture capture state differs across DP ranks"
+                )
+            return
+        assert controller is not None
         local_error = None
         try:
             controller.finalize(
@@ -1180,8 +1337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         is_profile=is_profile,
                     )
             self.step_timing.drafter_end()
-            controller = self._dsv41_retained_fixture
-            if controller is not None and controller.state == "capturing":
+            if self._dsv41_retained_fixture_enabled:
                 dummy_sampled_token_ids = (
                     self.req_states.last_sampled_tokens.index_select(
                         0, input_batch.idx_mapping[: input_batch.num_reqs]
@@ -2268,7 +2424,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
-        if self._dsv41_retained_fixture is not None and not skip_attn_for_dummy_run:
+        if self._dsv41_retained_fixture_enabled and not skip_attn_for_dummy_run:
             assert block_tables is not None
             assert slot_mappings is not None
             assert isinstance(attn_metadata, dict)
@@ -2303,60 +2459,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(
-                **connector_kwargs, attn_metadata=attn_metadata
-            )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
-                num_active_loras=batch_desc.num_active_loras,
-            )
+        try:
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Use explicit cudagraph replay for FULL mode.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
+                assert self.cudagraph_manager is not None
+                self.kv_connector.pre_forward(
+                    **connector_kwargs, attn_metadata=attn_metadata
+                )
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            else:
+                # For piecewise and eager mode, just call model().
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                    num_active_loras=batch_desc.num_active_loras,
+                )
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=(
-                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
-                ),
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-                is_padding=input_batch.is_padding,
-                is_profile=is_profile,
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=(
+                        dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                    ),
+                    batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                    is_padding=input_batch.is_padding,
+                    is_profile=is_profile,
+                ):
+                    self.kv_connector.pre_forward(**connector_kwargs)
+                    if ubatch_state is not None:
+                        assert self.ubatch_runner is not None
+                        model_output = self.ubatch_runner.run(
+                            self.model, model_inputs, ubatch_state
+                        )
+                    elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                        # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                        # PIECEWISE after the cudagraph manager exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        # Eager (NONE): call the raw model directly.
+                        model_output = self.model(**model_inputs)
+        finally:
+            if self._dsv41_retained_fixture_enabled and hasattr(
+                self.model, "set_decoder_boundary_capture"
             ):
-                self.kv_connector.pre_forward(**connector_kwargs)
-                if ubatch_state is not None:
-                    assert self.ubatch_runner is not None
-                    model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
-                    )
-                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
-
-        if self._dsv41_retained_fixture is not None and hasattr(
-            self.model, "set_decoder_boundary_capture"
-        ):
-            self.model.set_decoder_boundary_capture(None)
+                self.model.set_decoder_boundary_capture(None)
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:

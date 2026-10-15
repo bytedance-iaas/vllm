@@ -205,6 +205,21 @@ class RetainedReplayBatch:
 
 
 @dataclass
+class OrdinaryDecodePlan:
+    num_ordinary_reqs: int
+    has_ordinary: bool
+    num_ordinary_tokens: int
+    num_execution_tokens: int
+
+
+@dataclass
+class RetainedReplayPlan:
+    kept_lens: np.ndarray
+    local_candidate: bool
+    num_tokens: int
+
+
+@dataclass
 class _ReplayCensus:
     interval: int
     waves: int = 0
@@ -1091,18 +1106,11 @@ class DeepseekV41ModelState(DefaultModelState):
                     "retaining eager prefix and dedicated replay suffix"
                 )
 
-    def build_ordinary_decode_batch(
+    def plan_ordinary_decode_batch(
         self,
         input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        attn_groups: list[list[AttentionGroup]],
-        kv_cache_config: KVCacheConfig,
-        *,
-        pad_to_dp_max: bool = False,
-    ) -> OrdinaryDecodeBatch | None:
-        """Build an independent L0-to-boundary batch for ordinary Decode rows."""
-        assert self.decoder_replay_layers is not None
+    ) -> OrdinaryDecodePlan:
+        """Validate and size an ordinary-only batch without any collective."""
         num_reqs = input_batch.num_reqs
         is_prefilling = input_batch.is_prefilling_np[:num_reqs]
         prefill_indices = np.flatnonzero(is_prefilling)
@@ -1113,7 +1121,6 @@ class DeepseekV41ModelState(DefaultModelState):
             raise ValueError(
                 "ordinary Decode requests must precede every Prefill request"
             )
-
         query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
         seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
         is_idle = not is_prefilling.any() and bool((seq_lens == query_lens).all())
@@ -1123,16 +1130,49 @@ class DeepseekV41ModelState(DefaultModelState):
             if has_ordinary
             else 0
         )
-        num_execution_tokens = num_ordinary_tokens if has_ordinary else 1
+        return OrdinaryDecodePlan(
+            num_ordinary_reqs=num_ordinary_reqs,
+            has_ordinary=has_ordinary,
+            num_ordinary_tokens=num_ordinary_tokens,
+            num_execution_tokens=num_ordinary_tokens if has_ordinary else 1,
+        )
 
-        num_tokens_across_dp = None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+    def build_ordinary_decode_batch(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        *,
+        pad_to_dp_max: bool = False,
+        plan: OrdinaryDecodePlan | None = None,
+        global_has_ordinary: bool | None = None,
+        agreed_num_tokens_across_dp: torch.Tensor | None = None,
+    ) -> OrdinaryDecodeBatch | None:
+        """Build an independent L0-to-boundary batch for ordinary Decode rows."""
+        assert self.decoder_replay_layers is not None
+        plan = plan or self.plan_ordinary_decode_batch(input_batch)
+        num_reqs = input_batch.num_reqs
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        num_ordinary_reqs = plan.num_ordinary_reqs
+        has_ordinary = plan.has_ordinary
+        num_ordinary_tokens = plan.num_ordinary_tokens
+        num_execution_tokens = plan.num_execution_tokens
+
+        num_tokens_across_dp = agreed_num_tokens_across_dp
+        if global_has_ordinary is None and (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+        ):
             any_ordinary, num_tokens_across_dp = self._agree_across_dp(
                 has_ordinary, num_execution_tokens
             )
             if not any_ordinary:
                 return None
-        elif not has_ordinary:
+        elif global_has_ordinary is None:
+            if not has_ordinary:
+                return None
+        elif not global_has_ordinary:
             return None
 
         actual_num_tokens_across_dp = (
@@ -1196,8 +1236,10 @@ class DeepseekV41ModelState(DefaultModelState):
             max_query_len = 1
 
         request_slice = slice(0, ordinary_num_reqs)
-        ordinary_block_tables = tuple(
-            table[:ordinary_num_reqs] for table in block_tables
+        ordinary_block_tables = (
+            tuple(table[:ordinary_num_reqs] for table in block_tables)
+            if has_ordinary
+            else tuple(table[:1].new_zeros(table[:1].shape) for table in block_tables)
         )
         ordinary_input_batch = replace(
             input_batch,
@@ -1278,16 +1320,44 @@ class DeepseekV41ModelState(DefaultModelState):
             num_tokens_across_dp=actual_num_tokens_across_dp,
         )
 
+    def plan_retained_replay_batch(
+        self,
+        input_batch: InputBatch,
+    ) -> RetainedReplayPlan:
+        """Validate and size a retained suffix batch without any collective."""
+        if self.decoder_replay_layers is None:
+            raise RuntimeError("decoder replay layers are unavailable")
+        layers = self.decoder_replay_layers
+        num_reqs = input_batch.num_reqs
+        query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+        kept_lens = np.where(
+            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
+            query_lens,
+            np.minimum(query_lens, layers.window),
+        )
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
+        is_idle = not is_prefilling.any() and bool((seq_lens == query_lens).all())
+        if is_idle:
+            kept_lens = np.zeros_like(kept_lens)
+            kept_lens[0] = 1
+        replay_starts = self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]]
+        local_candidate = bool(
+            is_prefilling.any()
+            and not is_prefilling.all()
+            and (is_prefilling & (replay_starts > 0)).any()
+        )
+        return RetainedReplayPlan(
+            kept_lens=kept_lens,
+            local_candidate=local_candidate,
+            num_tokens=int(kept_lens.sum()),
+        )
+
     def is_retained_replay_candidate(self, input_batch: InputBatch) -> bool:
         """Whether this real step has ordinary Decode plus resumed Prefill work."""
         if self.decoder_replay_layers is None:
             return False
-        num_reqs = input_batch.num_reqs
-        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
-        if not is_prefilling.any() or is_prefilling.all():
-            return False
-        replay_starts = self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]]
-        return bool((is_prefilling & (replay_starts > 0)).any())
+        return self.plan_retained_replay_batch(input_batch).local_candidate
 
     def build_retained_replay_batch(
         self,
@@ -1296,34 +1366,32 @@ class DeepseekV41ModelState(DefaultModelState):
         slot_mappings: torch.Tensor,
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
+        *,
+        plan: RetainedReplayPlan | None = None,
+        global_has_candidate: bool | None = None,
+        agreed_num_tokens_across_dp: torch.Tensor | None = None,
     ) -> RetainedReplayBatch | None:
         """Build an independent eager suffix context without installing it live."""
         layers = self.decoder_replay_layers
         assert layers is not None
+        plan = plan or self.plan_retained_replay_batch(input_batch)
         num_reqs = input_batch.num_reqs
-        query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
-        kept_lens = np.where(
-            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
-            query_lens,
-            np.minimum(query_lens, layers.window),
-        )
-        seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
         is_prefilling = input_batch.is_prefilling_np[:num_reqs]
-        is_idle = not is_prefilling.any() and bool((seq_lens == query_lens).all())
-        if is_idle:
-            kept_lens = np.zeros_like(kept_lens)
-            kept_lens[0] = 1
-
-        local_candidate = self.is_retained_replay_candidate(input_batch)
-        num_tokens = int(kept_lens.sum())
-        num_tokens_across_dp = None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        kept_lens = plan.kept_lens
+        num_tokens = plan.num_tokens
+        num_tokens_across_dp = agreed_num_tokens_across_dp
+        if global_has_candidate is None and (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+        ):
             any_candidate, num_tokens_across_dp = self._agree_across_dp(
-                local_candidate, num_tokens
+                plan.local_candidate, num_tokens
             )
             if not any_candidate:
                 return None
-        elif not local_candidate:
+        elif global_has_candidate is None:
+            if not plan.local_candidate:
+                return None
+        elif not global_has_candidate:
             return None
 
         replay_start_np = np.where(

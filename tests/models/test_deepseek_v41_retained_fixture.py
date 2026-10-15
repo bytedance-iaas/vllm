@@ -10,6 +10,7 @@ import torch
 
 from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureController,
+    RetainedReplayFixtureError,
     TouchedStateRegistry,
     clone_owned,
 )
@@ -70,6 +71,67 @@ def test_touched_registry_restores_epochs_without_restoring_source() -> None:
     source[2].zero_()
     registry.restore("s0")
     assert registry.source_digest() != source_digest
+
+
+def test_restore_rejects_expired_source_before_mutating_destination() -> None:
+    destination = torch.arange(8, dtype=torch.int32)
+    source = torch.arange(8, dtype=torch.int32)
+    registry = TouchedStateRegistry()
+    registry.add_rows("destination", destination, torch.tensor([1, 2]))
+    registry.add_source("source", source, torch.tensor([4, 5]))
+    source_digest = registry.source_capture_digest()
+    destination[1:3].fill_(99)
+    source[4].fill_(-1)
+
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.fixture = SimpleNamespace(
+        registry=registry,
+        source_digest=source_digest,
+    )
+
+    with pytest.raises(
+        RetainedReplayFixtureError,
+        match="source KV lifetime expired before restore",
+    ):
+        controller.restore("s0")
+    assert destination[[1, 2]].tolist() == [99, 99]
+
+
+def test_target_decoder_model_unwraps_vl_language_model() -> None:
+    decoder = object()
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = SimpleNamespace(
+        model=SimpleNamespace(
+            language_model=SimpleNamespace(model=decoder),
+        )
+    )
+
+    assert controller._target_decoder_model() is decoder
+
+
+def test_boundary_capture_defers_clone_failure(monkeypatch) -> None:
+    import vllm.models.deepseek_v41.nvidia.retained_replay_fixture as module
+
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.state = "capturing"
+    controller.fixture = SimpleNamespace(boundary=None)
+    controller.boundary_error = None
+
+    def fail_clone(value):
+        del value
+        raise RuntimeError("clone failed")
+
+    monkeypatch.setattr(module, "clone_owned", fail_clone)
+    controller.capture_boundary(SimpleNamespace())
+
+    assert controller.fixture.boundary is None
+    assert controller.boundary_error == "RuntimeError: clone failed"
 
 
 def test_cache_registry_canonicalizes_aliased_storage_views() -> None:

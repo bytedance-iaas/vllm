@@ -609,6 +609,7 @@ class RetainedReplayFixtureController:
         self.fixture: RetainedFixture | None = None
         self.fixture_id = 0
         self.verify_runs: list[dict[str, Any]] = []
+        self.boundary_error: str | None = None
 
     def status(self) -> dict[str, Any]:
         fixture = self.fixture
@@ -635,6 +636,7 @@ class RetainedReplayFixtureController:
             ),
             "source_digest": (None if fixture is None else fixture.source_digest),
             "fixture_digest": (None if fixture is None else fixture.fixture_digest),
+            "boundary_error": self.boundary_error,
             "verify_runs": self.verify_runs,
         }
 
@@ -711,8 +713,12 @@ class RetainedReplayFixtureController:
         if self.state != "capturing" or self.fixture is None:
             return
         if self.fixture.boundary is not None:
-            raise RetainedReplayFixtureError("the L20 boundary was captured twice")
-        self.fixture.boundary = clone_owned(boundary)
+            self.boundary_error = "the L20 boundary was captured twice"
+            return
+        try:
+            self.fixture.boundary = clone_owned(boundary)
+        except Exception as error:
+            self.boundary_error = f"{type(error).__name__}: {error}"
 
     def finalize(
         self,
@@ -724,6 +730,10 @@ class RetainedReplayFixtureController:
         fixture = self.fixture
         if self.state != "capturing" or fixture is None:
             return
+        if self.boundary_error is not None:
+            raise RetainedReplayFixtureError(
+                f"the L20 boundary capture failed: {self.boundary_error}"
+            )
         if fixture.boundary is None:
             raise RetainedReplayFixtureError("the real L20 boundary was not captured")
         torch.cuda.synchronize(self.runner.device)
@@ -822,19 +832,36 @@ class RetainedReplayFixtureController:
             "live_restored": True,
         }
 
-    def restore(self, epoch: str) -> dict[str, Any]:
+    def validate_restore(self, epoch: str) -> None:
         fixture = self.fixture
         if fixture is None:
             raise RetainedReplayFixtureError("no fixture has been captured")
         if epoch not in ("s0", "s1", "live"):
             raise ValueError(f"invalid restore epoch: {epoch}")
+        source_digest = fixture.registry.source_digest()
+        if source_digest != fixture.source_digest:
+            raise RetainedReplayFixtureError(
+                "source KV lifetime expired before restore"
+            )
+        if any(
+            getattr(entry, epoch) is None
+            for entry in fixture.registry.entries
+            if not isinstance(entry, _ObjectAttribute)
+        ):
+            raise RetainedReplayFixtureError(f"restore epoch {epoch} is absent")
+
+    def restore(self, epoch: str) -> dict[str, Any]:
+        self.validate_restore(epoch)
+        fixture = self.fixture
+        assert fixture is not None
+        source_digest = fixture.source_digest
         fixture.registry.restore(epoch)
         fixture.registry.verify(epoch)
         return {
             "fixture_id": fixture.fixture_id,
             "epoch": epoch,
             "digest": fixture.registry.digest(),
-            "source_digest": fixture.registry.source_digest(),
+            "source_digest": source_digest,
         }
 
     def _build_registry(
@@ -1020,7 +1047,7 @@ class RetainedReplayFixtureController:
         )
         token_rows = torch.arange(num_tokens, device=runner.device)
 
-        model = getattr(runner.model, "model", runner.model)
+        model = self._target_decoder_model()
         for name in (
             "topk_indices_buffer",
             "candidate_block_buffer",
@@ -1256,3 +1283,7 @@ class RetainedReplayFixtureController:
         draft_handler = runner.draft_tokens_handler
         for name in ("req_ids", "draft_tokens_np", "num_draft_tokens"):
             registry.add_attribute(f"draft_handler:{name}", draft_handler, name)
+
+    def _target_decoder_model(self) -> Any:
+        model = getattr(self.runner.model, "language_model", self.runner.model)
+        return getattr(model, "model", model)
