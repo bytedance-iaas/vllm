@@ -11,12 +11,177 @@ import torch
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
-from vllm.forward_context import get_forward_context, override_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    ForwardContext,
+    get_forward_context,
+    override_forward_context,
+)
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
+from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+logger = init_logger(__name__)
+
+
+class DecoderReplayFrontCudaGraphManager(CudaGraphManager):
+    """One breakable graph for the 224-row mixed L0-L19 prefix."""
+
+    NUM_TOKENS = 224
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        run_front: Callable[..., tuple[torch.Tensor, ...]],
+        *,
+        use_inputs_embeds: bool,
+        inputs_embeds_size: int,
+        lookback_depth: int,
+    ) -> None:
+        compilation = copy(vllm_config.compilation_config)
+        compilation.cudagraph_capture_sizes = [self.NUM_TOKENS]
+        compilation.max_cudagraph_capture_size = self.NUM_TOKENS
+        front_config = copy(vllm_config)
+        front_config.compilation_config = compilation
+        super().__init__(front_config, device, CUDAGraphMode.PIECEWISE, 1)
+        self.breakable_cg_runner: BreakableCUDAGraphWrapper = BreakableCUDAGraphWrapper(
+            run_front,
+            front_config,
+            runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+        self.input_buffers = InputBuffers(self.max_num_reqs, self.NUM_TOKENS, device)
+        dtype = vllm_config.model_config.dtype
+        assert isinstance(dtype, torch.dtype)
+        self.inputs_embeds = (
+            torch.zeros(
+                self.NUM_TOKENS,
+                inputs_embeds_size,
+                dtype=dtype,
+                device=device,
+            )
+            if use_inputs_embeds
+            else None
+        )
+        self.lookback_token_ids = (
+            torch.full(
+                (self.max_num_reqs, lookback_depth),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            if lookback_depth > 0
+            else None
+        )
+        self._runtime_context: ForwardContext | None = None
+        self._runtime_num_tokens = 0
+
+    def _inputs(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        return (
+            self.input_buffers.input_ids,
+            self.input_buffers.positions,
+            self.inputs_embeds,
+            self.lookback_token_ids,
+        )
+
+    def capture_front_graphs(
+        self,
+        prepare: Callable[[BatchExecutionDescriptor], ForwardContext],
+    ) -> None:
+        """Capture the single prefix graph after ``prepare`` builds its metadata."""
+
+        def create_forward_fn(desc: BatchExecutionDescriptor, warmup: bool):
+            del warmup
+            context = prepare(desc)
+            inputs = self._inputs()
+
+            def forward_fn(cg_mode: CUDAGraphMode) -> None:
+                with override_forward_context(
+                    replace(context, cudagraph_runtime_mode=cg_mode)
+                ):
+                    self.breakable_cg_runner(*inputs)
+
+            return forward_fn
+
+        self.capture(create_forward_fn, "Capturing decoder replay front CUDA graph")
+        if not self.has_graph():
+            raise RuntimeError(
+                "decoder replay front capture produced no CUDA graph segment"
+            )
+
+    def has_graph(self) -> bool:
+        entry = self.breakable_cg_runner.entries.get(
+            BatchDescriptor(num_tokens=self.NUM_TOKENS)
+        )
+        capture = entry.capture if entry is not None else None
+        return capture is not None and capture.num_graphs >= 1
+
+    def prepare_runtime(self, context: ForwardContext, num_tokens: int) -> None:
+        if not 0 < num_tokens <= self.NUM_TOKENS:
+            raise ValueError(f"invalid decoder replay front rows: {num_tokens}")
+        if self._runtime_context is not None:
+            raise RuntimeError("decoder replay front runtime context is already armed")
+        self._runtime_context = context
+        self._runtime_num_tokens = num_tokens
+
+    def clear_runtime(self) -> None:
+        self._runtime_context = None
+        self._runtime_num_tokens = 0
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        lookback_token_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
+        context = self._runtime_context
+        num_tokens = self._runtime_num_tokens
+        self.clear_runtime()
+        if context is None:
+            raise RuntimeError("decoder replay front graph was not prepared")
+
+        buffers = self.input_buffers
+        buffers.input_ids[:num_tokens].copy_(input_ids[:num_tokens])
+        buffers.input_ids[num_tokens:].zero_()
+        buffers.positions[:num_tokens].copy_(positions[:num_tokens])
+        buffers.positions[num_tokens:].zero_()
+        if self.inputs_embeds is None:
+            if inputs_embeds is not None:
+                raise RuntimeError("decoder replay front graph expected token ids")
+        else:
+            if inputs_embeds is None:
+                raise RuntimeError("decoder replay front graph expected input embeds")
+            self.inputs_embeds[:num_tokens].copy_(inputs_embeds[:num_tokens])
+            self.inputs_embeds[num_tokens:].zero_()
+        if self.lookback_token_ids is not None:
+            if lookback_token_ids is None:
+                raise RuntimeError("decoder replay front graph expected lookback ids")
+            self.lookback_token_ids.copy_(lookback_token_ids)
+
+        with override_forward_context(context):
+            outputs = self.breakable_cg_runner(*self._inputs())
+        if not isinstance(outputs, tuple) or not all(
+            isinstance(output, torch.Tensor) for output in outputs
+        ):
+            raise RuntimeError("decoder replay front graph returned invalid outputs")
+        logger.info_once(
+            "DSV41_REPLAY_FRONT_GRAPH_RUN rows=%d descriptor=%d",
+            num_tokens,
+            self.NUM_TOKENS,
+        )
+        return tuple(output[:num_tokens] for output in outputs)
 
 
 class DecoderReplayCudaGraphManager(CudaGraphManager):

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from functools import partial
 from itertools import islice
 
@@ -117,6 +118,20 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class DecoderBoundaryState:
+    hidden_states: torch.Tensor
+    positions: torch.Tensor
+    input_ids: torch.Tensor | None
+    pre_mix: torch.Tensor
+    post_mix: torch.Tensor
+    res_mix: torch.Tensor
+    residual: torch.Tensor
+    aux_hidden_by_layer: dict[int, torch.Tensor]
+    remote_aux: list[torch.Tensor]
+    full_num_tokens: int
 
 
 def _relay_kv_key(source_layer: int) -> str:
@@ -791,6 +806,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Decoder-side SWA bounded replay: layers past the last KV source
         # prefill only each request's trailing window.
         self.decoder_replay_layers: DecoderReplayLayers | None = None
+        self.decoder_replay_front_graph: Callable[..., tuple[torch.Tensor, ...]] | None
+        self.decoder_replay_front_graph = None
+        self.decoder_replay_front_metadata_prefixes: set[str] = set()
         self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
         if (
@@ -799,6 +817,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
             assert self.layers[cut].attn.compress_ratio <= 1
+            for layer in islice(self.layers, self.start_layer, cut):
+                attn = typing.cast(DeepseekV4DecoderLayer, layer).attn
+                self.decoder_replay_front_metadata_prefixes.add(
+                    attn.swa_cache_layer.prefix
+                )
+                if attn.compressed_cache_prefix is not None:
+                    self.decoder_replay_front_metadata_prefixes.add(
+                        attn.compressed_cache_prefix
+                    )
+                if attn.indexer is not None:
+                    self.decoder_replay_front_metadata_prefixes.add(
+                        attn.indexer.k_cache.prefix
+                    )
+                if (
+                    attn.compressor is not None
+                    and attn.compressor.state_cache is not None
+                ):
+                    self.decoder_replay_front_metadata_prefixes.add(
+                        attn.compressor.state_cache.prefix
+                    )
             # The last KV source writes every row's KV, then replays.
             self.decoder_replay_start = cut
             # The attention metadata keys the replay layers read.
@@ -991,6 +1029,36 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        front_graph = self.decoder_replay_front_graph
+        if front_graph is not None:
+            outputs = front_graph(
+                input_ids,
+                positions,
+                inputs_embeds,
+                lookback_token_ids,
+            )
+            boundary = self._decoder_replay_front_boundary(
+                outputs,
+                positions,
+            )
+        else:
+            boundary = self._run_to_decoder_replay_boundary_from_inputs(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
+            )
+        return self._run_from_decoder_replay_boundary(boundary)
+
+    def _run_to_decoder_replay_boundary_from_inputs(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+        lookback_token_ids: torch.Tensor | None,
+    ) -> DecoderBoundaryState:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1087,13 +1155,95 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 else None,
             )
 
-        residual, post_mix, res_mix = None, None, None
         pre_mix: torch.Tensor | None = None
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        return self._run_to_decoder_replay_boundary(
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            remote_aux,
+            engram_hashes,
+            engram_mask,
+            mega_gate_metadata,
+            full_num_tokens,
+        )
+
+    def _run_decoder_replay_front_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        lookback_token_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
+        boundary = self._run_to_decoder_replay_boundary_from_inputs(
+            input_ids,
+            positions,
+            None,
+            inputs_embeds,
+            lookback_token_ids,
+        )
+        if boundary.remote_aux:
+            raise RuntimeError("decoder replay front graph does not support PP")
+        assert boundary.input_ids is not None
+        outputs = (
+            boundary.hidden_states,
+            boundary.input_ids,
+            boundary.pre_mix,
+            boundary.post_mix,
+            boundary.res_mix,
+            boundary.residual,
+        )
+        return outputs + tuple(
+            boundary.aux_hidden_by_layer[layer_id]
+            for layer_id in self._decoder_replay_front_aux_layer_ids()
+        )
+
+    def _decoder_replay_front_boundary(
+        self,
+        outputs: tuple[torch.Tensor, ...],
+        positions: torch.Tensor,
+    ) -> DecoderBoundaryState:
+        aux_layer_ids = self._decoder_replay_front_aux_layer_ids()
+        if len(outputs) != 6 + len(aux_layer_ids):
+            raise RuntimeError("decoder replay front graph returned the wrong state")
+        return DecoderBoundaryState(
+            hidden_states=outputs[0],
+            positions=positions,
+            input_ids=outputs[1],
+            pre_mix=outputs[2],
+            post_mix=outputs[3],
+            res_mix=outputs[4],
+            residual=outputs[5],
+            aux_hidden_by_layer=dict(zip(aux_layer_ids, outputs[6:])),
+            remote_aux=[],
+            full_num_tokens=positions.shape[0],
+        )
+
+    def _decoder_replay_front_aux_layer_ids(self) -> tuple[int, ...]:
+        return tuple(
+            layer_id
+            for layer_id in self.aux_hidden_state_layers
+            if self.start_layer <= layer_id < self.decoder_replay_start
+        )
+
+    def _run_to_decoder_replay_boundary(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None,
+        remote_aux: list[torch.Tensor],
+        engram_hashes: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+        mega_gate_metadata: MegaGateRoutingMetadata | None,
+        full_num_tokens: int,
+    ) -> DecoderBoundaryState:
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
+        residual, post_mix, res_mix = None, None, None
         layer_stop = self.decoder_replay_start
         if self.encoder_only_prefill:
             assert self.encoder_only_boundary_layer is not None
@@ -1112,6 +1262,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             engram_mask,
             mega_gate_metadata,
         )
+        return DecoderBoundaryState(
+            hidden_states=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            pre_mix=typing.cast(torch.Tensor, pre_mix),
+            post_mix=typing.cast(torch.Tensor, post_mix),
+            res_mix=typing.cast(torch.Tensor, res_mix),
+            residual=typing.cast(torch.Tensor, residual),
+            aux_hidden_by_layer=aux_hidden_by_layer,
+            remote_aux=remote_aux,
+            full_num_tokens=full_num_tokens,
+        )
+
+    def _run_from_decoder_replay_boundary(
+        self, boundary: DecoderBoundaryState
+    ) -> torch.Tensor | IntermediateTensors:
+        hidden_states = boundary.hidden_states
+        positions = boundary.positions
+        input_ids = boundary.input_ids
+        pre_mix = boundary.pre_mix
+        post_mix = boundary.post_mix
+        res_mix = boundary.res_mix
+        residual = boundary.residual
+        aux_hidden_by_layer = boundary.aux_hidden_by_layer
+        full_num_tokens = boundary.full_num_tokens
         if self.encoder_only_prefill:
             assert self.encoder_only_boundary_layer is not None
             assert residual is not None
@@ -1192,7 +1367,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-        aux_hidden_states = remote_aux + aux_hidden_states
+        aux_hidden_states = boundary.remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

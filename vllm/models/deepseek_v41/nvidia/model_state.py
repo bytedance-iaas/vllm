@@ -14,7 +14,12 @@ import torch.nn as nn
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
-from vllm.forward_context import BatchDescriptor, DPMetadata, create_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    DPMetadata,
+    ForwardContext,
+    create_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
@@ -22,6 +27,7 @@ from vllm.models.deepseek_v41.decoder_replay_layers import (
 )
 from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
     DecoderReplayCudaGraphManager,
+    DecoderReplayFrontCudaGraphManager,
 )
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
@@ -298,6 +304,16 @@ class DeepseekV41ModelState(DefaultModelState):
         self._mixed_replay_graph_enabled = (
             os.environ.get("VLLM_DSV41_MIXED_REPLAY_GRAPH", "0") == "1"
         )
+        self._mixed_replay_front_graph_enabled = (
+            os.environ.get("VLLM_DSV41_MIXED_FRONT_GRAPH", "0") == "1"
+        )
+        if (
+            self._mixed_replay_front_graph_enabled
+            and not self._mixed_replay_graph_enabled
+        ):
+            raise ValueError(
+                "VLLM_DSV41_MIXED_FRONT_GRAPH requires VLLM_DSV41_MIXED_REPLAY_GRAPH=1"
+            )
         census_value = os.environ.get("VLLM_DSV41_REPLAY_CENSUS_INTERVAL", "0")
         try:
             census_interval = int(census_value)
@@ -355,9 +371,34 @@ class DeepseekV41ModelState(DefaultModelState):
             self._replay_attn_groups: (
                 tuple[list[list[AttentionGroup]], list[list[AttentionGroup]]] | None
             ) = None
+            if self._mixed_replay_front_graph_enabled:
+                self._front_attn_groups: list[list[AttentionGroup]] | None = None
+                self._front_block_tables: tuple[torch.Tensor, ...] | None = None
+                self._front_slot_mappings: torch.Tensor | None = None
+                self._front_replay_start = torch.zeros(
+                    self.max_num_reqs, dtype=torch.int32, device=device
+                )
+                self._front_idx_mapping = torch.arange(
+                    self.max_num_reqs, dtype=torch.int64, device=device
+                )
+                self._front_idx_mapping_np = np.arange(self.max_num_reqs, dtype=np.intp)
+                self._front_query_start_loc_np = np.zeros(
+                    self.max_num_reqs + 1, dtype=np.int32
+                )
+                self._front_num_scheduled_tokens = np.zeros(
+                    self.max_num_reqs, dtype=np.int32
+                )
+                self._front_is_prefilling_np = np.ones(
+                    self.max_num_reqs, dtype=np.bool_
+                )
+                self._front_seq_lens_cpu = torch.zeros(
+                    self.max_num_reqs, dtype=torch.int32
+                )
         layers = self.decoder_replay_layers
         compilation_config = vllm_config.compilation_config
         self.replay_cudagraphs: DecoderReplayCudaGraphManager | None = None
+        self.replay_front_cudagraph: DecoderReplayFrontCudaGraphManager | None = None
+        self._decoder_model: nn.Module | None = None
         if (
             layers is not None
             and compilation_config.cudagraph_decoder_replay
@@ -393,6 +434,39 @@ class DeepseekV41ModelState(DefaultModelState):
                     "VLLM_DSV41_MIXED_REPLAY_GRAPH cannot be enabled: "
                     + "; ".join(blockers)
                 )
+        if self._mixed_replay_front_graph_enabled:
+            language_model = getattr(model, "language_model", model)
+            decoder_model = getattr(language_model, "model", None)
+            blockers = []
+            if decoder_model is None:
+                blockers.append("decoder language model is unavailable")
+            elif not hasattr(decoder_model, "_run_decoder_replay_front_graph"):
+                blockers.append("decoder front boundary is unavailable")
+            if self.decoder_replay_layers is None:
+                blockers.append("decoder replay layers are unavailable")
+            if self.replay_cudagraphs is None:
+                blockers.append("dedicated replay CUDA graphs are unavailable")
+            if self.max_num_reqs < 2:
+                blockers.append("max_num_seqs must leave one padding request")
+            if blockers:
+                raise ValueError(
+                    "VLLM_DSV41_MIXED_FRONT_GRAPH cannot be enabled: "
+                    + "; ".join(blockers)
+                )
+            assert decoder_model is not None
+            self._decoder_model = decoder_model
+            self.replay_front_cudagraph = DecoderReplayFrontCudaGraphManager(
+                vllm_config,
+                device,
+                decoder_model._run_decoder_replay_front_graph,
+                use_inputs_embeds=(
+                    self.supports_mm_inputs
+                    or vllm_config.model_config.enable_prompt_embeds
+                ),
+                inputs_embeds_size=self.inputs_embeds_size,
+                lookback_depth=depth,
+            )
+            logger.info("DeepSeek V4.1 mixed replay front graph enabled for 224 rows")
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -630,6 +704,7 @@ class DeepseekV41ModelState(DefaultModelState):
         layers = self.decoder_replay_layers
         assert layers is not None
         layers.replay_batch = None
+        self._clear_replay_front_graph()
         force_replay_batch = capture_desc is not None or (
             cudagraph_mode == CUDAGraphMode.PIECEWISE
             and layers.graph_uses_replay_batch(input_batch.num_tokens_after_padding)
@@ -669,21 +744,32 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         num_tokens = int(kept_lens.sum())
         dp_tokens = None
+        front_dp_tokens = None
+        force_front_graph = False
         force_mixed_graph = (
             mixed_graph_coordination and self._is_mixed_replay_candidate(input_batch)
         )
         mixed_graph_eligible = (
             mixed_graph_coordination and self.replay_cudagraphs is not None
         )
+        front_eligible, front_contexts = self._front_graph_shape(input_batch)
+        front_num_tokens = input_batch.num_tokens_after_padding
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             if mixed_graph_coordination:
-                needs_replay_batch, force_mixed_graph, dp_tokens = (
-                    self._agree_mixed_replay_across_dp(
-                        needs_replay_batch,
-                        force_mixed_graph,
-                        mixed_graph_eligible,
-                        num_tokens,
-                    )
+                (
+                    needs_replay_batch,
+                    force_mixed_graph,
+                    dp_tokens,
+                    force_front_graph,
+                    front_dp_tokens,
+                ) = self._agree_mixed_replay_across_dp(
+                    needs_replay_batch,
+                    force_mixed_graph,
+                    mixed_graph_eligible,
+                    num_tokens,
+                    front_eligible,
+                    front_num_tokens,
+                    front_contexts,
                 )
             else:
                 needs_replay_batch, dp_tokens = self._agree_across_dp(
@@ -699,6 +785,14 @@ class DeepseekV41ModelState(DefaultModelState):
                 )
             force_mixed_graph = mixed_graph_eligible
             needs_replay_batch = needs_replay_batch or force_mixed_graph
+            force_front_graph = (
+                force_mixed_graph
+                and front_eligible
+                and front_num_tokens == DecoderReplayFrontCudaGraphManager.NUM_TOKENS
+                and front_contexts == 1
+            )
+            if force_front_graph:
+                front_dp_tokens = torch.tensor([front_num_tokens], dtype=torch.int32)
         if not needs_replay_batch:
             return
 
@@ -724,9 +818,30 @@ class DeepseekV41ModelState(DefaultModelState):
                     dp_tokens.fill_(num_padded)
         if force_mixed_graph:
             local_graph_ready = run_graph is not None
-            graph_ready = local_graph_ready
+            front_context = None
+            local_front_ready = not force_front_graph
+            if force_front_graph:
+                assert front_dp_tokens is not None
+                manager = self.replay_front_cudagraph
+                try:
+                    if manager is not None and manager.has_graph():
+                        front_context = self._prepare_replay_front_batch(
+                            input_batch,
+                            block_tables,
+                            slot_mappings,
+                            attn_groups,
+                            kv_cache_config,
+                            replay_start,
+                            front_dp_tokens,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to prepare DeepSeek V4.1 replay front graph"
+                    )
+                local_front_ready = front_context is not None
+            graph_ready, front_ready = local_graph_ready, local_front_ready
             if self.vllm_config.parallel_config.data_parallel_size > 1:
-                graph_ready = self._all_dp_ranks(graph_ready)
+                graph_ready, front_ready = self._all_dp_flags(graph_ready, front_ready)
             if not graph_ready:
                 if self._replay_census is not None:
                     assert cudagraphs is not None
@@ -742,6 +857,13 @@ class DeepseekV41ModelState(DefaultModelState):
                         descriptor_rows=None,
                     )
                 return
+            if force_front_graph and front_ready:
+                assert front_context is not None
+                manager = self.replay_front_cudagraph
+                decoder_model = self._decoder_model
+                assert manager is not None and decoder_model is not None
+                manager.prepare_runtime(front_context, front_num_tokens)
+                decoder_model.decoder_replay_front_graph = manager.run
             assert desc is not None
             if self._replay_census is not None:
                 self._record_replay_census(
@@ -832,6 +954,229 @@ class DeepseekV41ModelState(DefaultModelState):
             # profile_only captures use pre-KV-cache groups: drop the cache.
             self._replay_attn_groups = None
             self.replay_cudagraphs.capture_replay_graphs(prepare)
+        if self.replay_front_cudagraph is not None:
+            self._front_attn_groups = None
+            self._front_block_tables = None
+            self._front_slot_mappings = None
+
+            def prepare_front(
+                desc: BatchExecutionDescriptor,
+            ) -> ForwardContext:
+                if (
+                    desc.cg_mode != CUDAGraphMode.PIECEWISE
+                    or desc.num_tokens != DecoderReplayFrontCudaGraphManager.NUM_TOKENS
+                ):
+                    raise RuntimeError(
+                        "decoder replay front graph received an invalid descriptor"
+                    )
+                capture_buffers = InputBuffers(
+                    self.max_num_reqs,
+                    DecoderReplayFrontCudaGraphManager.NUM_TOKENS,
+                    self.device,
+                )
+                capture_batch = InputBatch.make_dummy(
+                    17,
+                    DecoderReplayFrontCudaGraphManager.NUM_TOKENS,
+                    capture_buffers,
+                )
+                query_lens = np.array([6] * 16 + [128], dtype=np.int32)
+                query_start_loc_np = np.zeros(18, dtype=np.int32)
+                np.cumsum(query_lens, out=query_start_loc_np[1:])
+                capture_batch = replace(
+                    capture_batch,
+                    num_scheduled_tokens=query_lens,
+                    query_start_loc=torch.tensor(
+                        query_start_loc_np,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    query_start_loc_np=query_start_loc_np,
+                    seq_lens=torch.tensor(
+                        [518] * 16 + [128],
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    seq_lens_cpu_upper_bound=torch.tensor(
+                        [518] * 16 + [128], dtype=torch.int32
+                    ),
+                    is_prefilling_np=np.array([False] * 16 + [True], dtype=np.bool_),
+                    has_prefill=True,
+                    max_query_len=128,
+                )
+                front_dp_tokens = torch.full(
+                    (self.vllm_config.parallel_config.data_parallel_size,),
+                    DecoderReplayFrontCudaGraphManager.NUM_TOKENS,
+                    dtype=torch.int32,
+                )
+                return self._prepare_replay_front_batch(
+                    capture_batch,
+                    block_tables.get_dummy_block_tables(17),
+                    block_tables.get_dummy_slot_mappings(
+                        DecoderReplayFrontCudaGraphManager.NUM_TOKENS
+                    ),
+                    attn_groups,
+                    kv_cache_config,
+                    self._front_replay_start[:17].zero_(),
+                    front_dp_tokens,
+                )
+
+            self.replay_front_cudagraph.capture_front_graphs(prepare_front)
+
+    def _prepare_replay_front_batch(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        replay_start: torch.Tensor,
+        front_dp_tokens: torch.Tensor,
+    ) -> ForwardContext:
+        manager = self.replay_front_cudagraph
+        decoder_model = self._decoder_model
+        if manager is None or decoder_model is None:
+            raise RuntimeError("decoder replay front graph is unavailable")
+
+        capacity = manager.NUM_TOKENS
+        num_reqs = input_batch.num_reqs
+        num_tokens = input_batch.num_tokens_after_padding
+        if num_reqs >= self.max_num_reqs or not 0 < num_tokens <= capacity:
+            raise ValueError(
+                f"invalid replay front shape: reqs={num_reqs}, rows={num_tokens}"
+            )
+        cpu_terminal = int(input_batch.query_start_loc_np[num_reqs])
+        if not 0 < cpu_terminal <= capacity:
+            raise ValueError(
+                f"invalid replay front CPU rows: {cpu_terminal}/{capacity}"
+            )
+
+        buffers = manager.input_buffers
+        buffers.input_ids[:num_tokens].copy_(input_batch.input_ids[:num_tokens])
+        buffers.input_ids[num_tokens:].zero_()
+        buffers.positions[:num_tokens].copy_(input_batch.positions[:num_tokens])
+        buffers.positions[num_tokens:].zero_()
+        buffers.is_padding[:num_tokens].copy_(input_batch.is_padding[:num_tokens])
+        buffers.is_padding[num_tokens:].fill_(True)
+
+        buffers.query_start_loc.fill_(capacity)
+        buffers.query_start_loc[: num_reqs + 1].copy_(
+            input_batch.query_start_loc[: num_reqs + 1]
+        )
+        buffers.seq_lens.zero_()
+        buffers.seq_lens[:num_reqs].copy_(input_batch.seq_lens[:num_reqs])
+        buffers.seq_lens[num_reqs] = capacity - cpu_terminal
+
+        self._front_query_start_loc_np.fill(capacity)
+        self._front_query_start_loc_np[: num_reqs + 1] = input_batch.query_start_loc_np[
+            : num_reqs + 1
+        ]
+        self._front_num_scheduled_tokens.fill(0)
+        self._front_num_scheduled_tokens[:num_reqs] = input_batch.num_scheduled_tokens[
+            :num_reqs
+        ]
+        self._front_num_scheduled_tokens[num_reqs] = capacity - cpu_terminal
+        self._front_is_prefilling_np.fill(True)
+        self._front_is_prefilling_np[:num_reqs] = input_batch.is_prefilling_np[
+            :num_reqs
+        ]
+        self._front_seq_lens_cpu.zero_()
+        self._front_seq_lens_cpu[:num_reqs].copy_(
+            input_batch.seq_lens_cpu_upper_bound[:num_reqs]
+        )
+        self._front_seq_lens_cpu[num_reqs] = capacity - cpu_terminal
+        self._front_replay_start.zero_()
+        self._front_replay_start[:num_reqs].copy_(replay_start[:num_reqs])
+
+        if self._front_block_tables is None:
+            self._front_block_tables = tuple(
+                torch.zeros(
+                    (self.max_num_reqs, *table.shape[1:]),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+                for table in block_tables
+            )
+        if len(self._front_block_tables) != len(block_tables):
+            raise RuntimeError("decoder replay front KV group count changed")
+        for front_table, table in zip(self._front_block_tables, block_tables):
+            front_table[:num_reqs].copy_(table[:num_reqs])
+            front_table[num_reqs].zero_()
+
+        if self._front_slot_mappings is None:
+            self._front_slot_mappings = torch.full(
+                (slot_mappings.shape[0], capacity),
+                PAD_SLOT_ID,
+                dtype=slot_mappings.dtype,
+                device=slot_mappings.device,
+            )
+        front_slot_mappings = self._front_slot_mappings
+        if front_slot_mappings.shape[0] != slot_mappings.shape[0]:
+            raise RuntimeError("decoder replay front slot group count changed")
+        front_slot_mappings.fill_(PAD_SLOT_ID)
+        front_slot_mappings[:, :num_tokens].copy_(slot_mappings[:, :num_tokens])
+
+        padded_reqs = self.max_num_reqs
+        front_batch = replace(
+            input_batch,
+            req_ids=input_batch.req_ids[:num_reqs]
+            + [f"front_padding_{i}" for i in range(padded_reqs - num_reqs)],
+            num_reqs=num_reqs + 1,
+            num_reqs_after_padding=padded_reqs,
+            idx_mapping=self._front_idx_mapping,
+            idx_mapping_np=self._front_idx_mapping_np,
+            num_scheduled_tokens=self._front_num_scheduled_tokens,
+            num_tokens=num_tokens,
+            num_tokens_after_padding=capacity,
+            query_start_loc=buffers.query_start_loc,
+            query_start_loc_np=self._front_query_start_loc_np,
+            seq_lens=buffers.seq_lens,
+            seq_lens_cpu_upper_bound=self._front_seq_lens_cpu,
+            dcp_local_seq_lens=None,
+            dcp_local_seq_lens_cpu_upper_bound=None,
+            is_prefilling_np=self._front_is_prefilling_np,
+            has_prefill=True,
+            input_ids=buffers.input_ids,
+            positions=buffers.positions,
+            is_padding=buffers.is_padding,
+            prompt_lens=None,
+            max_query_len=max(
+                input_batch.max_query_len or 0,
+                int(self._front_num_scheduled_tokens.max()),
+            ),
+            fast_prefill=None,
+        )
+
+        if self._front_attn_groups is None:
+            prefixes = decoder_model.decoder_replay_front_metadata_prefixes
+            if not prefixes:
+                raise RuntimeError("decoder replay front metadata set is empty")
+            self._front_attn_groups = self._copy_attn_groups(attn_groups, prefixes)
+        attn_metadata = super().prepare_attn(
+            front_batch,
+            CUDAGraphMode.FULL,
+            self._front_block_tables,
+            front_slot_mappings,
+            self._front_attn_groups,
+            kv_cache_config,
+            model_specific_attn_metadata=ReplayAttnMetadata(self._front_replay_start),
+        )
+        context_dp_tokens = front_dp_tokens.clone().fill_(capacity)
+        dp_metadata = DPMetadata.make(
+            self.vllm_config.parallel_config,
+            capacity,
+            context_dp_tokens,
+        )
+        return create_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            dp_metadata=dp_metadata,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=BatchDescriptor(num_tokens=capacity),
+            slot_mapping=build_slot_mappings_by_layer(
+                front_slot_mappings, kv_cache_config
+            ),
+            is_padding=buffers.is_padding,
+        )
 
     def _kept_input_batch(
         self,
@@ -916,23 +1261,69 @@ class DeepseekV41ModelState(DefaultModelState):
         replay_starts = self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]]
         return bool((is_prefilling & (replay_starts > 0)).any())
 
+    def _front_graph_shape(self, input_batch: InputBatch) -> tuple[bool, int]:
+        if (
+            not self._mixed_replay_front_graph_enabled
+            or self.replay_front_cudagraph is None
+            or self._decoder_model is None
+        ):
+            return False, 0
+        num_reqs = input_batch.num_reqs
+        num_tokens = input_batch.num_tokens_after_padding
+        if (
+            num_reqs >= self.max_num_reqs
+            or not 0 < num_tokens <= DecoderReplayFrontCudaGraphManager.NUM_TOKENS
+        ):
+            return False, 0
+        query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+        if int(query_lens.sum()) > DecoderReplayFrontCudaGraphManager.NUM_TOKENS:
+            return False, 0
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        replay_starts = self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]]
+        contexts = is_prefilling & (replay_starts > 0)
+        context_count = int(contexts.sum())
+        eligible = (
+            context_count <= 1
+            and int(is_prefilling.sum()) == context_count
+            and bool((query_lens[contexts] == 128).all())
+        )
+        return eligible, context_count
+
+    def _clear_replay_front_graph(self) -> None:
+        if self.replay_front_cudagraph is not None:
+            self.replay_front_cudagraph.clear_runtime()
+        if self._decoder_model is not None:
+            self._decoder_model.decoder_replay_front_graph = None
+
     def _agree_mixed_replay_across_dp(
         self,
         needs_replay_batch: bool,
         force_mixed_graph: bool,
         mixed_graph_eligible: bool,
         num_tokens: int,
-    ) -> tuple[bool, bool, torch.Tensor | None]:
+        front_eligible: bool,
+        front_num_tokens: int,
+        front_contexts: int,
+    ) -> tuple[
+        bool,
+        bool,
+        torch.Tensor | None,
+        bool,
+        torch.Tensor | None,
+    ]:
         """Agree whether an eager mixed step may force the dedicated replay graph."""
         parallel_config = self.vllm_config.parallel_config
         rank = parallel_config.data_parallel_rank
-        agreed = torch.zeros(4, parallel_config.data_parallel_size, dtype=torch.int32)
+        agreed = torch.zeros(7, parallel_config.data_parallel_size, dtype=torch.int32)
         agreed[:, rank] = torch.tensor(
             [
                 needs_replay_batch,
                 force_mixed_graph,
                 mixed_graph_eligible,
                 num_tokens,
+                front_eligible,
+                front_num_tokens,
+                front_contexts,
             ]
         )
         if should_skip_dp_coordination():
@@ -944,12 +1335,21 @@ class DeepseekV41ModelState(DefaultModelState):
                         dp_max_rows=num_tokens,
                         descriptor_rows=None,
                     )
-                return False, False, None
+                return False, False, None, False, None
             needs_replay_batch = needs_replay_batch or force_mixed_graph
+            force_front_graph = (
+                self._mixed_replay_front_graph_enabled
+                and force_mixed_graph
+                and front_eligible
+                and front_num_tokens == DecoderReplayFrontCudaGraphManager.NUM_TOKENS
+                and front_contexts == 1
+            )
             return (
                 needs_replay_batch,
                 force_mixed_graph,
                 agreed[3] if needs_replay_batch else None,
+                force_front_graph,
+                agreed[5] if force_front_graph else None,
             )
         dist.all_reduce(agreed, group=get_dp_group().cpu_group)
         force_requested = bool(agreed[1].any())
@@ -961,23 +1361,38 @@ class DeepseekV41ModelState(DefaultModelState):
                     dp_max_rows=int(agreed[3].max()),
                     descriptor_rows=None,
                 )
-            return False, False, None
+            return False, False, None, False, None
         force_mixed_graph = force_requested
         needs_replay_batch = bool(agreed[0].any()) or force_mixed_graph
+        force_front_graph = (
+            self._mixed_replay_front_graph_enabled
+            and force_mixed_graph
+            and bool(agreed[4].all())
+            and int(agreed[5].max()) == DecoderReplayFrontCudaGraphManager.NUM_TOKENS
+            and int(agreed[6].sum()) == 1
+        )
         return (
             needs_replay_batch,
             force_mixed_graph,
             agreed[3] if needs_replay_batch else None,
+            force_front_graph,
+            agreed[5] if force_front_graph else None,
         )
 
-    def _all_dp_ranks(self, local_ready: bool) -> bool:
+    def _all_dp_flags(self, *local_flags: bool) -> tuple[bool, ...]:
         parallel_config = self.vllm_config.parallel_config
         if should_skip_dp_coordination():
-            return local_ready
-        ready = torch.zeros(parallel_config.data_parallel_size, dtype=torch.int32)
-        ready[parallel_config.data_parallel_rank] = int(local_ready)
+            return tuple(local_flags)
+        ready = torch.zeros(
+            len(local_flags),
+            parallel_config.data_parallel_size,
+            dtype=torch.int32,
+        )
+        ready[:, parallel_config.data_parallel_rank] = torch.tensor(
+            local_flags, dtype=torch.int32
+        )
         dist.all_reduce(ready, group=get_dp_group().cpu_group)
-        return bool(ready.all())
+        return tuple(bool(flag.all()) for flag in ready)
 
     def _record_replay_census(
         self,
