@@ -742,35 +742,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return self._log_dsv41_retained_fixture_rpc("VERIFY", nonce, result)
 
     def restore_dsv41_retained_fixture(self, epoch: str) -> dict[str, Any]:
-        controller = self._dsv41_retained_fixture
-        local_error: BaseException | str | None = None
-        try:
-            if controller is None:
-                raise RuntimeError("fixture is not armed")
-            controller.validate_restore(epoch)
-        except Exception as error:
-            local_error = error
-        if not self._dsv41_fixture_vote(local_error is None):
-            if controller is not None:
-                controller.fail(local_error or "a peer failed restore preflight")
-                return controller.status()
+        if self.dp_size > 1:
             return {
-                "state": "unarmed",
-                "error": str(local_error or "a peer is not armed"),
+                "state": "unsupported",
+                "error": (
+                    "direct restore is disabled for DP>1; use a coordinated "
+                    "fixture step"
+                ),
                 "dp_rank": self.dp_rank,
             }
-
-        assert controller is not None
-        result = None
+        controller = self._dsv41_retained_fixture
+        if controller is None:
+            return {
+                "state": "unarmed",
+                "error": "fixture is not armed",
+                "dp_rank": self.dp_rank,
+            }
         try:
-            result = {"state": "restored", **controller.restore(epoch)}
+            return {"state": "restored", **controller.restore(epoch)}
         except Exception as error:
-            local_error = error
-        if not self._dsv41_fixture_vote(local_error is None):
-            controller.fail(local_error or "a peer failed retained fixture restore")
+            controller.fail(error)
             return controller.status()
-        assert result is not None
-        return result
 
     def _dsv41_fixture_presence(self, local_present: bool) -> tuple[bool, bool]:
         if self.dp_size == 1:
@@ -814,10 +806,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         *,
         input_batch: InputBatch,
         model_inputs: dict[str, Any],
-        block_tables: tuple[torch.Tensor, ...],
-        slot_mappings: torch.Tensor,
-        attn_metadata: dict[str, Any],
-        slot_mappings_by_layer: dict[str, torch.Tensor],
+        block_tables: tuple[torch.Tensor, ...] | None,
+        slot_mappings: torch.Tensor | None,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None,
         batch_desc: BatchExecutionDescriptor,
         dp_sync: DPSyncState | None,
     ) -> None:
@@ -834,6 +826,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not self._dsv41_fixture_vote(batch_desc.cg_mode == CUDAGraphMode.NONE):
             controller.fail("the retained fixture requires an all-rank eager step")
             return
+        local_inputs_ready = (
+            block_tables is not None
+            and slot_mappings is not None
+            and isinstance(attn_metadata, dict)
+            and isinstance(slot_mappings_by_layer, dict)
+        )
+        if not self._dsv41_fixture_vote(local_inputs_ready):
+            controller.fail("a peer lacks non-microbatched fixture inputs after arming")
+            return
+        assert block_tables is not None
+        assert slot_mappings is not None
+        assert isinstance(attn_metadata, dict)
+        assert isinstance(slot_mappings_by_layer, dict)
 
         local_error: BaseException | str | None = None
         replay_plan = None
@@ -2425,10 +2430,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         if self._dsv41_retained_fixture_enabled and not skip_attn_for_dummy_run:
-            assert block_tables is not None
-            assert slot_mappings is not None
-            assert isinstance(attn_metadata, dict)
-            assert isinstance(slot_mappings_by_layer, dict)
             self._maybe_begin_dsv41_retained_fixture(
                 input_batch=input_batch,
                 model_inputs=model_inputs,
