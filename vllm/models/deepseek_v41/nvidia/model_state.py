@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
-from dataclasses import replace
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -13,6 +15,7 @@ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, create_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
     ReplayBatch,
@@ -36,6 +39,8 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -167,6 +172,75 @@ class ReplayAttnMetadata(ModelSpecificAttnMetadata):
         return {}
 
 
+@dataclass
+class _ReplayCensus:
+    interval: int
+    waves: int = 0
+    graph_runs: int = 0
+    rows_513_576: int = 0
+    actual_rows_sum: int = 0
+    descriptor_capacity_sum: int = 0
+    padding_rows_sum: int = 0
+    fallback_reasons: Counter[str] = field(default_factory=Counter)
+    dp_max_actual_rows: Counter[str] = field(default_factory=Counter)
+    selected_descriptor_rows: Counter[str] = field(default_factory=Counter)
+
+    @staticmethod
+    def _row_bin(num_rows: int) -> str:
+        if num_rows <= 0:
+            return "0"
+        start = ((num_rows - 1) // 32) * 32 + 1
+        return f"{start}-{start + 31}"
+
+    def record(
+        self,
+        *,
+        outcome: str,
+        actual_rows: int,
+        dp_max_rows: int,
+        dp_size: int,
+        descriptor_rows: int | None,
+    ) -> None:
+        graph_run = outcome == "graph"
+        capacity = (
+            descriptor_rows * dp_size if descriptor_rows is not None else actual_rows
+        )
+        self.waves += 1
+        self.graph_runs += int(graph_run)
+        self.rows_513_576 += int(513 <= dp_max_rows <= 576)
+        self.actual_rows_sum += actual_rows
+        self.descriptor_capacity_sum += capacity
+        self.padding_rows_sum += capacity - actual_rows
+        self.dp_max_actual_rows[self._row_bin(dp_max_rows)] += 1
+        self.selected_descriptor_rows[
+            str(descriptor_rows) if graph_run else "eager"
+        ] += 1
+        if not graph_run:
+            self.fallback_reasons[outcome] += 1
+        if self.waves % self.interval != 0:
+            return
+        payload = {
+            "schema": 1,
+            "interval": self.interval,
+            "mixed_waves": self.waves,
+            "graph_runs": self.graph_runs,
+            "eager_fallbacks": self.waves - self.graph_runs,
+            "fallback_reasons": dict(sorted(self.fallback_reasons.items())),
+            "dp_max_actual_rows": dict(sorted(self.dp_max_actual_rows.items())),
+            "selected_descriptor_rows": dict(
+                sorted(self.selected_descriptor_rows.items())
+            ),
+            "dp_max_rows_513_576": self.rows_513_576,
+            "actual_rows_sum": self.actual_rows_sum,
+            "descriptor_capacity_sum": self.descriptor_capacity_sum,
+            "padding_rows_sum": self.padding_rows_sum,
+        }
+        logger.info(
+            "DSV41_REPLAY_CENSUS %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+
 class DeepseekV41ModelState(DefaultModelState):
     """DefaultModelState plus the engram lookback window and SWA bounded replay.
 
@@ -224,6 +298,31 @@ class DeepseekV41ModelState(DefaultModelState):
         self._mixed_replay_graph_enabled = (
             os.environ.get("VLLM_DSV41_MIXED_REPLAY_GRAPH", "0") == "1"
         )
+        census_value = os.environ.get("VLLM_DSV41_REPLAY_CENSUS_INTERVAL", "0")
+        try:
+            census_interval = int(census_value)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_DSV41_REPLAY_CENSUS_INTERVAL must be an integer"
+            ) from exc
+        if census_interval < 0:
+            raise ValueError("VLLM_DSV41_REPLAY_CENSUS_INTERVAL must not be negative")
+        if census_interval and not self._mixed_replay_graph_enabled:
+            raise ValueError(
+                "VLLM_DSV41_REPLAY_CENSUS_INTERVAL requires "
+                "VLLM_DSV41_MIXED_REPLAY_GRAPH=1"
+            )
+        parallel_config = vllm_config.parallel_config
+        self._replay_census = (
+            _ReplayCensus(census_interval)
+            if census_interval and parallel_config.data_parallel_rank == 0
+            else None
+        )
+        if self._replay_census is not None:
+            logger.info(
+                "DeepSeek V4.1 replay census enabled every %d mixed waves",
+                census_interval,
+            )
 
         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
             model, "decoder_replay_layers", None
@@ -280,7 +379,6 @@ class DeepseekV41ModelState(DefaultModelState):
             if compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
                 layers.trim_threshold = threshold
         if self._mixed_replay_graph_enabled:
-            parallel_config = vllm_config.parallel_config
             blockers = []
             if compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
                 blockers.append("cudagraph_mode is not FULL_DECODE_ONLY")
@@ -592,6 +690,13 @@ class DeepseekV41ModelState(DefaultModelState):
                     needs_replay_batch, num_tokens
                 )
         elif force_mixed_graph:
+            if not mixed_graph_eligible and self._replay_census is not None:
+                self._record_replay_census(
+                    outcome="peer_ineligible",
+                    actual_rows=num_tokens,
+                    dp_max_rows=num_tokens,
+                    descriptor_rows=None,
+                )
             force_mixed_graph = mixed_graph_eligible
             needs_replay_batch = needs_replay_batch or force_mixed_graph
         if not needs_replay_batch:
@@ -600,9 +705,14 @@ class DeepseekV41ModelState(DefaultModelState):
         cudagraphs, run_graph = self.replay_cudagraphs, None
         num_padded, cg_mode = num_tokens, CUDAGraphMode.NONE
         desc: BatchExecutionDescriptor | None = None
+        dp_max_tokens = num_tokens if dp_tokens is None else int(dp_tokens.max())
+        census_actual_rows = 0
+        if force_mixed_graph and self._replay_census is not None:
+            census_actual_rows = (
+                num_tokens if dp_tokens is None else int(dp_tokens.sum())
+            )
         if cudagraphs is not None:
             # Every rank runs the graph that fits the largest rank's batch.
-            dp_max_tokens = num_tokens if dp_tokens is None else int(dp_tokens.max())
             desc = capture_desc or cudagraphs.dispatch(num_reqs, dp_max_tokens, None, 0)
             if desc.cg_mode == CUDAGraphMode.PIECEWISE and (
                 not force_mixed_graph
@@ -613,11 +723,33 @@ class DeepseekV41ModelState(DefaultModelState):
                 if dp_tokens is not None:
                     dp_tokens.fill_(num_padded)
         if force_mixed_graph:
-            graph_ready = run_graph is not None
+            local_graph_ready = run_graph is not None
+            graph_ready = local_graph_ready
             if self.vllm_config.parallel_config.data_parallel_size > 1:
                 graph_ready = self._all_dp_ranks(graph_ready)
             if not graph_ready:
+                if self._replay_census is not None:
+                    assert cudagraphs is not None
+                    self._record_replay_census(
+                        outcome=self._replay_graph_fallback_reason(
+                            cudagraphs,
+                            desc,
+                            dp_max_tokens,
+                            local_graph_ready,
+                        ),
+                        actual_rows=census_actual_rows,
+                        dp_max_rows=dp_max_tokens,
+                        descriptor_rows=None,
+                    )
                 return
+            assert desc is not None
+            if self._replay_census is not None:
+                self._record_replay_census(
+                    outcome="graph",
+                    actual_rows=census_actual_rows,
+                    dp_max_rows=dp_max_tokens,
+                    descriptor_rows=desc.num_tokens,
+                )
         dp_metadata = None
         if dp_tokens is not None:
             dp_metadata = DPMetadata.make(
@@ -805,6 +937,13 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         if should_skip_dp_coordination():
             if force_mixed_graph and not mixed_graph_eligible:
+                if self._replay_census is not None:
+                    self._record_replay_census(
+                        outcome="peer_ineligible",
+                        actual_rows=num_tokens,
+                        dp_max_rows=num_tokens,
+                        descriptor_rows=None,
+                    )
                 return False, False, None
             needs_replay_batch = needs_replay_batch or force_mixed_graph
             return (
@@ -815,6 +954,13 @@ class DeepseekV41ModelState(DefaultModelState):
         dist.all_reduce(agreed, group=get_dp_group().cpu_group)
         force_requested = bool(agreed[1].any())
         if force_requested and not agreed[2].all():
+            if self._replay_census is not None:
+                self._record_replay_census(
+                    outcome="peer_ineligible",
+                    actual_rows=int(agreed[3].sum()),
+                    dp_max_rows=int(agreed[3].max()),
+                    descriptor_rows=None,
+                )
             return False, False, None
         force_mixed_graph = force_requested
         needs_replay_batch = bool(agreed[0].any()) or force_mixed_graph
@@ -832,6 +978,40 @@ class DeepseekV41ModelState(DefaultModelState):
         ready[parallel_config.data_parallel_rank] = int(local_ready)
         dist.all_reduce(ready, group=get_dp_group().cpu_group)
         return bool(ready.all())
+
+    def _record_replay_census(
+        self,
+        *,
+        outcome: str,
+        actual_rows: int,
+        dp_max_rows: int,
+        descriptor_rows: int | None,
+    ) -> None:
+        census = self._replay_census
+        if census is None:
+            return
+        census.record(
+            outcome=outcome,
+            actual_rows=actual_rows,
+            dp_max_rows=dp_max_rows,
+            dp_size=self.vllm_config.parallel_config.data_parallel_size,
+            descriptor_rows=descriptor_rows,
+        )
+
+    @staticmethod
+    def _replay_graph_fallback_reason(
+        manager: DecoderReplayCudaGraphManager,
+        descriptor: BatchExecutionDescriptor | None,
+        dp_max_tokens: int,
+        local_graph_ready: bool,
+    ) -> str:
+        if local_graph_ready:
+            return "peer_graph_not_ready"
+        if descriptor is not None and descriptor.cg_mode == CUDAGraphMode.PIECEWISE:
+            return "no_graph_segment"
+        if dp_max_tokens > manager.compilation_config.max_cudagraph_capture_size:
+            return "above_capture_ceiling"
+        return "dispatch_incompatible"
 
     @staticmethod
     def _replay_graph_has_segments(
