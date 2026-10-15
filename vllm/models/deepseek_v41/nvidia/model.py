@@ -699,6 +699,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.encoder_only_boundary_layer: int | None = None
         if self.encoder_only_prefill:
             self.encoder_only_boundary_layer = dsv41_encoder_only_boundary_layer(config)
+        self._decoder_boundary_capture: (
+            Callable[[DecoderBoundaryState], None] | None
+        ) = None
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention._run_parallel_input_projections
@@ -1049,7 +1052,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 inputs_embeds,
                 lookback_token_ids,
             )
+        boundary_capture = self._decoder_boundary_capture
+        if boundary_capture is not None:
+            self._decoder_boundary_capture = None
+            boundary_capture(boundary)
         return self._run_from_decoder_replay_boundary(boundary)
+
+    def set_decoder_boundary_capture(
+        self, capture: Callable[[DecoderBoundaryState], None] | None
+    ) -> None:
+        self._decoder_boundary_capture = capture
 
     def _run_to_decoder_replay_boundary_from_inputs(
         self,
@@ -1956,6 +1968,11 @@ class DeepseekV41LLMForCausalLM(
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def set_decoder_boundary_capture(
+        self, capture: Callable[[DecoderBoundaryState], None] | None
+    ) -> None:
+        self.model.set_decoder_boundary_capture(capture)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

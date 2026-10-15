@@ -16,7 +16,7 @@ Thin multimodal wrapper around the text-only ``DeepseekV41LLMForCausalLM``:
   (``requires_raw_input_tokens``).
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Annotated
 
 import torch
@@ -53,6 +53,7 @@ from ..common.mm_preprocess import (
 from ..common.vl_cudagraph import DeepseekV4VLEncoderCudaGraphMixin
 from ..decoder_replay_layers import DecoderReplayLayers
 from .model import (
+    DecoderBoundaryState,
     DeepseekV41LLMForCausalLM,
     _linear_scale_param_name,
     _make_deepseek_v4_weights_mapper,
@@ -315,6 +316,11 @@ class DeepseekV41ForCausalLM(
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
+
+    def set_decoder_boundary_capture(
+        self, capture: Callable[[DecoderBoundaryState], None] | None
+    ) -> None:
+        self.language_model.set_decoder_boundary_capture(capture)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Map HF names into this wrapper's namespace up front and sort, so

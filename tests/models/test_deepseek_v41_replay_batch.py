@@ -18,6 +18,7 @@ from vllm.forward_context import (
 )
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -73,7 +74,9 @@ def state(monkeypatch):
         build = SimpleNamespace(
             batch=input_batch,
             cg_mode=cg_mode,
+            block_tables=block_tables,
             slot_mappings=slot_mappings.clone(),
+            attn_groups=a[0],
             replay_start=kw["model_specific_attn_metadata"].replay_start,
             attn_metadata=object(),
         )
@@ -91,6 +94,7 @@ def _input_batch(
     seq_lens: list[int],
     is_prefilling: list[bool],
     device_query_lens: list[int] | None = None,
+    num_scheduled_tokens: list[int] | None = None,
     num_tokens_after_padding: int | None = None,
     max_query_len: int | None = None,
 ) -> InputBatch:
@@ -101,6 +105,9 @@ def _input_batch(
         batch,
         num_tokens=num_tokens,
         num_tokens_after_padding=num_padded,
+        num_scheduled_tokens=np.array(
+            num_scheduled_tokens or query_lens, dtype=np.int32
+        ),
         query_start_loc=torch.tensor(
             [0, *np.cumsum(device_query_lens or query_lens)],
             dtype=torch.int32,
@@ -110,6 +117,7 @@ def _input_batch(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE),
         seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
         is_prefilling_np=np.array(is_prefilling, dtype=np.bool_),
+        input_ids=torch.arange(num_padded, dtype=torch.int32, device=DEVICE),
         positions=torch.cat(
             [torch.arange(s - q, s) for q, s in zip(query_lens, seq_lens)]
             + [torch.zeros(num_padded - num_tokens, dtype=torch.int64)]
@@ -227,6 +235,109 @@ def test_replay_batch_keeps_adaptive_verification_query_bound(state):
     batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING, max_query_len=200)
     replay, build = _prepare(state, batch, CUDAGraphMode.NONE)
     assert replay is not None and build.batch.max_query_len == 200
+
+
+def _ordinary(state, batch, *, pad_to_dp_max=False):
+    ordinary_groups = [["all-attention-groups"]]
+    state._ordinary_attn_groups = ordinary_groups
+    ordinary = state.build_ordinary_decode_batch(
+        batch,
+        BLOCK_TABLES,
+        _slot_mappings(batch.num_tokens_after_padding),
+        [],
+        GROUPS,
+        pad_to_dp_max=pad_to_dp_max,
+    )
+    return ordinary, ordinary_groups
+
+
+def test_ordinary_batch_preserves_selected_k5_device_boundaries(state):
+    assert state._ordinary_input_buffers is None
+    batch = _input_batch(
+        [5, 5, 4, 300],
+        [500, 500, 500, 300],
+        [False, False, False, True],
+        device_query_lens=[3, 6, 5, 300],
+        num_scheduled_tokens=[6, 6, 6, 300],
+    )
+    ordinary, ordinary_groups = _ordinary(state, batch)
+    assert ordinary is not None
+    assert ordinary.rows.tolist() == list(range(14))
+
+    sub = ordinary.input_batch
+    assert sub.num_reqs == sub.num_reqs_after_padding == 3
+    assert sub.num_tokens == sub.num_tokens_after_padding == 14
+    assert sub.num_scheduled_tokens.tolist() == [6, 6, 6]
+    assert sub.query_start_loc.tolist() == [0, 3, 9, 14]
+    assert sub.query_start_loc_np.tolist() == [0, 5, 10, 14]
+    assert sub.max_query_len == 6
+    assert not sub.has_prefill
+    assert sub.is_prefilling_np.tolist() == [False, False, False]
+    assert torch.equal(sub.input_ids, batch.input_ids[:14])
+    assert torch.equal(sub.positions, batch.positions[:14])
+    assert torch.equal(
+        ordinary.slot_mappings, _slot_mappings(batch.num_tokens_after_padding)[:, :14]
+    )
+    assert all(table.shape[0] == 3 for table in ordinary.block_tables)
+
+    build = state.builds[-1]
+    assert build.batch is sub
+    assert build.cg_mode == CUDAGraphMode.NONE
+    assert build.attn_groups is ordinary_groups
+    assert build.block_tables is ordinary.block_tables
+    assert build.replay_start.tolist() == [0, 0, 0]
+    assert ordinary.forward_context.attn_metadata == {
+        "swa": build.attn_metadata,
+        "swa_first": build.attn_metadata,
+    }
+    assert ordinary.forward_context.dp_metadata is None
+    assert ordinary.num_tokens_across_dp is None
+
+
+def test_ordinary_batch_can_pad_every_dp_rank_to_the_dp_max(dp_state):
+    batch = _input_batch(
+        [5, 5, 4, 300],
+        [500, 500, 500, 300],
+        [False, False, False, True],
+        device_query_lens=[3, 6, 5, 300],
+        num_scheduled_tokens=[6, 6, 6, 300],
+    )
+    dp_state.other = (True, 20)
+    ordinary, _ = _ordinary(dp_state, batch, pad_to_dp_max=True)
+    assert ordinary is not None
+    assert ordinary.num_tokens_across_dp.tolist() == [14, 20]
+    assert ordinary.input_batch.num_tokens == 14
+    assert ordinary.input_batch.num_tokens_after_padding == 20
+    assert ordinary.input_batch.is_padding.tolist() == [False] * 14 + [True] * 6
+    assert ordinary.slot_mappings[:, 14:].eq(PAD_SLOT_ID).all()
+    assert ordinary.forward_context.dp_metadata is not None
+    assert ordinary.forward_context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [
+        20,
+        20,
+    ]
+
+
+def test_ordinary_batch_idle_dp_rank_uses_one_all_padding_row(dp_state):
+    dummy = _input_batch([256, 256], [256, 256], [False, False])
+    dp_state.other = (True, 20)
+    ordinary, _ = _ordinary(dp_state, dummy, pad_to_dp_max=True)
+    assert ordinary is not None
+    assert ordinary.rows.numel() == 0
+    assert ordinary.num_tokens_across_dp.tolist() == [1, 20]
+
+    sub = ordinary.input_batch
+    assert sub.num_reqs == 1
+    assert sub.num_tokens == 1
+    assert sub.num_tokens_after_padding == 20
+    assert sub.query_start_loc.tolist() == [0, 1]
+    assert sub.query_start_loc_np.tolist() == [0, 1]
+    assert sub.is_padding.all()
+    assert ordinary.slot_mappings.eq(PAD_SLOT_ID).all()
+    assert ordinary.forward_context.dp_metadata is not None
+    assert ordinary.forward_context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [
+        20,
+        20,
+    ]
 
 
 def test_graph_steps_trim_only_piecewise_at_threshold(state):

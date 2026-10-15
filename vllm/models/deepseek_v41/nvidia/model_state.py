@@ -180,6 +180,31 @@ class ReplayAttnMetadata(ModelSpecificAttnMetadata):
 
 
 @dataclass
+class OrdinaryDecodeBatch:
+    """Inputs and context for running the ordinary Decode prefix by itself."""
+
+    rows: torch.Tensor
+    input_batch: InputBatch
+    block_tables: tuple[torch.Tensor, ...]
+    slot_mappings: torch.Tensor
+    forward_context: ForwardContext
+    num_tokens_across_dp: torch.Tensor | None
+
+
+@dataclass
+class RetainedReplayBatch:
+    """Owned later by the harness; built from one real scheduled replay step."""
+
+    rows: torch.Tensor
+    replay_start: torch.Tensor
+    input_batch: InputBatch
+    block_tables: tuple[torch.Tensor, ...]
+    slot_mappings: torch.Tensor
+    forward_context: ForwardContext
+    num_tokens_across_dp: torch.Tensor | None
+
+
+@dataclass
 class _ReplayCensus:
     interval: int
     waves: int = 0
@@ -372,6 +397,15 @@ class DeepseekV41ModelState(DefaultModelState):
             self._replay_attn_groups: (
                 tuple[list[list[AttentionGroup]], list[list[AttentionGroup]]] | None
             ) = None
+            self._retained_replay_attn_groups: (
+                tuple[list[list[AttentionGroup]], list[list[AttentionGroup]]] | None
+            ) = None
+            # Harness-only buffers are allocated lazily on explicit use.
+            self._ordinary_input_buffers: InputBuffers | None = None
+            self._ordinary_rows: torch.Tensor | None = None
+            self._ordinary_slot_mappings: torch.Tensor | None = None
+            self._ordinary_replay_start: torch.Tensor | None = None
+            self._ordinary_attn_groups: list[list[AttentionGroup]] | None = None
             if self._mixed_replay_front_graph_enabled:
                 self._front_attn_groups: list[list[AttentionGroup]] | None = None
                 self._front_block_tables: tuple[torch.Tensor, ...] | None = None
@@ -1057,6 +1091,337 @@ class DeepseekV41ModelState(DefaultModelState):
                     "retaining eager prefix and dedicated replay suffix"
                 )
 
+    def build_ordinary_decode_batch(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        *,
+        pad_to_dp_max: bool = False,
+    ) -> OrdinaryDecodeBatch | None:
+        """Build an independent L0-to-boundary batch for ordinary Decode rows."""
+        assert self.decoder_replay_layers is not None
+        num_reqs = input_batch.num_reqs
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        prefill_indices = np.flatnonzero(is_prefilling)
+        num_ordinary_reqs = (
+            int(prefill_indices[0]) if prefill_indices.size else num_reqs
+        )
+        if not is_prefilling[num_ordinary_reqs:].all():
+            raise ValueError(
+                "ordinary Decode requests must precede every Prefill request"
+            )
+
+        query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+        seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
+        is_idle = not is_prefilling.any() and bool((seq_lens == query_lens).all())
+        has_ordinary = num_ordinary_reqs > 0 and not is_idle
+        num_ordinary_tokens = (
+            int(input_batch.query_start_loc_np[num_ordinary_reqs])
+            if has_ordinary
+            else 0
+        )
+        num_execution_tokens = num_ordinary_tokens if has_ordinary else 1
+
+        num_tokens_across_dp = None
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            any_ordinary, num_tokens_across_dp = self._agree_across_dp(
+                has_ordinary, num_execution_tokens
+            )
+            if not any_ordinary:
+                return None
+        elif not has_ordinary:
+            return None
+
+        actual_num_tokens_across_dp = (
+            None if num_tokens_across_dp is None else num_tokens_across_dp.clone()
+        )
+        num_padded = num_execution_tokens
+        context_dp_tokens = num_tokens_across_dp
+        if pad_to_dp_max and num_tokens_across_dp is not None:
+            num_padded = int(num_tokens_across_dp.max())
+            context_dp_tokens = num_tokens_across_dp.clone().fill_(num_padded)
+
+        self._ensure_ordinary_buffers(slot_mappings.shape[0])
+        buffers = self._ordinary_input_buffers
+        rows_buffer = self._ordinary_rows
+        ordinary_slot_mappings_buffer = self._ordinary_slot_mappings
+        replay_start = self._ordinary_replay_start
+        assert buffers is not None
+        assert rows_buffer is not None
+        assert ordinary_slot_mappings_buffer is not None
+        assert replay_start is not None
+        assert num_padded <= self.max_num_tokens
+
+        ordinary_num_reqs = num_ordinary_reqs if has_ordinary else 1
+        query_start_loc = buffers.query_start_loc[: ordinary_num_reqs + 1]
+        input_ids = buffers.input_ids[:num_padded].zero_()
+        positions = buffers.positions[:num_padded].zero_()
+        is_padding = buffers.is_padding[:num_padded].fill_(True)
+        ordinary_slot_mappings = ordinary_slot_mappings_buffer[:, :num_padded]
+        ordinary_slot_mappings.fill_(PAD_SLOT_ID)
+
+        if has_ordinary:
+            query_start_loc.copy_(input_batch.query_start_loc[: num_ordinary_reqs + 1])
+            input_ids[:num_ordinary_tokens].copy_(
+                input_batch.input_ids[:num_ordinary_tokens]
+            )
+            positions[:num_ordinary_tokens].copy_(
+                input_batch.positions[:num_ordinary_tokens]
+            )
+            is_padding[:num_ordinary_tokens].fill_(False)
+            ordinary_slot_mappings[:, :num_ordinary_tokens].copy_(
+                slot_mappings[:, :num_ordinary_tokens]
+            )
+            query_start_loc_np = input_batch.query_start_loc_np[
+                : num_ordinary_reqs + 1
+            ].copy()
+            num_scheduled_tokens = input_batch.num_scheduled_tokens[:num_ordinary_reqs]
+            ordinary_seq_lens = input_batch.seq_lens[:num_ordinary_reqs]
+            ordinary_seq_lens_cpu = input_batch.seq_lens_cpu_upper_bound[
+                :num_ordinary_reqs
+            ]
+            ordinary_is_prefilling = is_prefilling[:num_ordinary_reqs]
+            max_query_len = int(num_scheduled_tokens.max())
+        else:
+            query_start_loc.zero_()
+            query_start_loc[1] = 1
+            query_start_loc_np = np.array([0, 1], dtype=np.int32)
+            num_scheduled_tokens = np.ones(1, dtype=np.int32)
+            ordinary_seq_lens = buffers.seq_lens[:1].fill_(1)
+            ordinary_seq_lens_cpu = torch.ones(1, dtype=torch.int32)
+            ordinary_is_prefilling = np.zeros(1, dtype=np.bool_)
+            max_query_len = 1
+
+        request_slice = slice(0, ordinary_num_reqs)
+        ordinary_block_tables = tuple(
+            table[:ordinary_num_reqs] for table in block_tables
+        )
+        ordinary_input_batch = replace(
+            input_batch,
+            req_ids=input_batch.req_ids[request_slice],
+            num_reqs=ordinary_num_reqs,
+            num_reqs_after_padding=ordinary_num_reqs,
+            idx_mapping=input_batch.idx_mapping[request_slice],
+            idx_mapping_np=input_batch.idx_mapping_np[request_slice],
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_tokens=num_execution_tokens,
+            num_tokens_after_padding=num_padded,
+            num_draft_tokens_per_req=(
+                None
+                if input_batch.num_draft_tokens_per_req is None
+                else input_batch.num_draft_tokens_per_req[request_slice]
+            ),
+            query_start_loc=query_start_loc,
+            query_start_loc_np=query_start_loc_np,
+            seq_lens=ordinary_seq_lens,
+            seq_lens_cpu_upper_bound=ordinary_seq_lens_cpu,
+            dcp_local_seq_lens=(
+                None
+                if input_batch.dcp_local_seq_lens is None
+                else input_batch.dcp_local_seq_lens[request_slice]
+            ),
+            num_computed_tokens_np=input_batch.num_computed_tokens_np[request_slice],
+            prefill_len_np=input_batch.prefill_len_np[request_slice],
+            num_computed_prefill_tokens_np=input_batch.num_computed_prefill_tokens_np[
+                request_slice
+            ],
+            is_prefilling_np=ordinary_is_prefilling,
+            has_prefill=False,
+            input_ids=input_ids,
+            positions=positions,
+            is_padding=is_padding,
+            prompt_lens=(
+                None
+                if input_batch.prompt_lens is None
+                else input_batch.prompt_lens[request_slice]
+            ),
+            max_query_len=max_query_len,
+            fast_prefill=None,
+        )
+
+        if self._ordinary_attn_groups is None:
+            self._ordinary_attn_groups = self._copy_attn_groups(attn_groups, None)
+        attn_metadata = super().prepare_attn(
+            ordinary_input_batch,
+            CUDAGraphMode.NONE,
+            ordinary_block_tables,
+            ordinary_slot_mappings,
+            self._ordinary_attn_groups,
+            kv_cache_config,
+            model_specific_attn_metadata=ReplayAttnMetadata(
+                replay_start[:ordinary_num_reqs]
+            ),
+        )
+        dp_metadata = None
+        if context_dp_tokens is not None:
+            dp_metadata = DPMetadata.make(
+                self.vllm_config.parallel_config, num_padded, context_dp_tokens
+            )
+        return OrdinaryDecodeBatch(
+            rows=rows_buffer[:num_ordinary_tokens],
+            input_batch=ordinary_input_batch,
+            block_tables=ordinary_block_tables,
+            slot_mappings=ordinary_slot_mappings,
+            forward_context=create_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                dp_metadata=dp_metadata,
+                batch_descriptor=BatchDescriptor(num_tokens=num_padded),
+                slot_mapping=build_slot_mappings_by_layer(
+                    ordinary_slot_mappings, kv_cache_config
+                ),
+                is_padding=is_padding,
+            ),
+            num_tokens_across_dp=actual_num_tokens_across_dp,
+        )
+
+    def is_retained_replay_candidate(self, input_batch: InputBatch) -> bool:
+        """Whether this real step has ordinary Decode plus resumed Prefill work."""
+        if self.decoder_replay_layers is None:
+            return False
+        num_reqs = input_batch.num_reqs
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        if not is_prefilling.any() or is_prefilling.all():
+            return False
+        replay_starts = self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]]
+        return bool((is_prefilling & (replay_starts > 0)).any())
+
+    def build_retained_replay_batch(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+    ) -> RetainedReplayBatch | None:
+        """Build an independent eager suffix context without installing it live."""
+        layers = self.decoder_replay_layers
+        assert layers is not None
+        num_reqs = input_batch.num_reqs
+        query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
+        kept_lens = np.where(
+            self._keeps_rows_np[input_batch.idx_mapping_np[:num_reqs]],
+            query_lens,
+            np.minimum(query_lens, layers.window),
+        )
+        seq_lens = input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy()
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        is_idle = not is_prefilling.any() and bool((seq_lens == query_lens).all())
+        if is_idle:
+            kept_lens = np.zeros_like(kept_lens)
+            kept_lens[0] = 1
+
+        local_candidate = self.is_retained_replay_candidate(input_batch)
+        num_tokens = int(kept_lens.sum())
+        num_tokens_across_dp = None
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            any_candidate, num_tokens_across_dp = self._agree_across_dp(
+                local_candidate, num_tokens
+            )
+            if not any_candidate:
+                return None
+        elif not local_candidate:
+            return None
+
+        replay_start_np = np.where(
+            is_prefilling,
+            self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]],
+            0,
+        ).astype(np.int32)
+        replay_start = self._replay_start_staging.copy_to_gpu(
+            replay_start_np, out=self._replay_start[:num_reqs]
+        )
+        kept_batch, kept_slot_mappings = self._kept_input_batch(
+            input_batch,
+            slot_mappings,
+            replay_start,
+            kept_lens,
+            num_tokens,
+        )
+        if self._retained_replay_attn_groups is None:
+            self._retained_replay_attn_groups = (
+                self._copy_attn_groups(attn_groups, layers.metadata_prefixes),
+                self._copy_attn_groups(attn_groups, {layers.first_swa_prefix}),
+            )
+        replay_groups, first_swa_groups = self._retained_replay_attn_groups
+        attn_metadata = super().prepare_attn(
+            kept_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            kept_slot_mappings,
+            replay_groups,
+            kv_cache_config,
+            model_specific_attn_metadata=ReplayAttnMetadata(
+                self._kept_kv_start[:num_reqs]
+            ),
+        )
+        first_swa = layers.first_swa_prefix
+        attn_metadata[first_swa] = super().prepare_attn(
+            kept_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            kept_slot_mappings,
+            first_swa_groups,
+            kv_cache_config,
+            model_specific_attn_metadata=ReplayAttnMetadata(replay_start),
+        )[first_swa]
+        dp_metadata = None
+        if num_tokens_across_dp is not None:
+            dp_metadata = DPMetadata.make(
+                self.vllm_config.parallel_config,
+                num_tokens,
+                num_tokens_across_dp,
+            )
+        is_padding = self._kept_is_padding[:num_tokens].zero_()
+        return RetainedReplayBatch(
+            rows=self._kept_rows[:num_tokens],
+            replay_start=replay_start,
+            input_batch=replace(
+                kept_batch,
+                input_ids=input_batch.input_ids.index_select(
+                    0, self._kept_rows[:num_tokens]
+                ),
+                is_padding=is_padding,
+            ),
+            block_tables=block_tables,
+            slot_mappings=kept_slot_mappings,
+            forward_context=create_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                dp_metadata=dp_metadata,
+                batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+                slot_mapping=build_slot_mappings_by_layer(
+                    kept_slot_mappings, kv_cache_config
+                ),
+                is_padding=is_padding,
+            ),
+            num_tokens_across_dp=num_tokens_across_dp,
+        )
+
+    def _ensure_ordinary_buffers(self, num_kv_groups: int) -> None:
+        if self._ordinary_input_buffers is None:
+            self._ordinary_input_buffers = InputBuffers(
+                self.max_num_reqs, self.max_num_tokens, self.device
+            )
+            self._ordinary_rows = torch.arange(
+                self.max_num_tokens, dtype=torch.int64, device=self.device
+            )
+            self._ordinary_replay_start = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+        if self._ordinary_slot_mappings is None:
+            self._ordinary_slot_mappings = torch.full(
+                (num_kv_groups, self.max_num_tokens),
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            assert self._ordinary_slot_mappings.shape[0] == num_kv_groups
+
     def _prepare_replay_front_batch(
         self,
         input_batch: InputBatch,
@@ -1475,15 +1840,16 @@ class DeepseekV41ModelState(DefaultModelState):
         return capture is not None and capture.num_graphs >= 1
 
     def _copy_attn_groups(
-        self, attn_groups: list[list[AttentionGroup]], prefixes: set[str]
+        self,
+        attn_groups: list[list[AttentionGroup]],
+        prefixes: set[str] | None,
     ) -> list[list[AttentionGroup]]:
-        """Copies of the groups holding any of ``prefixes``, with builders of their
-        own like a microbatch's: a builder keeps the metadata it built."""
+        """Copy matching groups, or every group when ``prefixes`` is None."""
         own_groups = []
         for groups in attn_groups:
             copies = []
             for group in groups:
-                if prefixes.isdisjoint(group.layer_names):
+                if prefixes is not None and prefixes.isdisjoint(group.layer_names):
                     continue
                 copy = replace(group, metadata_builders=[])
                 copy.create_metadata_builders(
