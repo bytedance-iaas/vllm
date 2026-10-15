@@ -157,6 +157,11 @@ def _canonicalize_rank_local_shared_config(
         or any(keyword.arg is None for keyword in call.keywords)
     ):
         raise ValueError(f"rank {rank}: target KV transfer identity is invalid")
+    keyword_names = [keyword.arg for keyword in call.keywords]
+    if len(keyword_names) != len(set(keyword_names)):
+        raise ValueError(
+            f"rank {rank}: target KV transfer identity has duplicate keywords"
+        )
     engine_keywords = [
         (index, keyword)
         for index, keyword in enumerate(call.keywords)

@@ -266,7 +266,28 @@ def test_comparator_normalizes_valid_dp_engine_id_suffixes_only() -> None:
                     "engine_id='duplicate_dp0')"
                 ),
             ),
+            "has duplicate keywords",
+        ),
+        (
+            _ranked_config_manifest(
+                0,
+                "shared-engine_dp0",
+                connector_repr="KVTransferConfig(kv_port=14579)",
+            ),
             "missing or ambiguous",
+        ),
+        (
+            _ranked_config_manifest(
+                0,
+                "shared-engine_dp0",
+                connector_repr=(
+                    "KVTransferConfig("
+                    "engine_id='shared-engine_dp0', "
+                    "kv_port=14579, "
+                    "kv_port=14580)"
+                ),
+            ),
+            "has duplicate keywords",
         ),
         (
             _ranked_config_manifest(
