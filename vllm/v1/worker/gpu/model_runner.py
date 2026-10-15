@@ -893,33 +893,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tensor.copy_(value)
 
     @torch.inference_mode()
-    def _run_dsv41_a_cycle(
+    def _prepare_dsv41_a_cycle(
         self,
         fixture: Any,
         controller: Any,
         *,
         phase: str,
     ) -> dict[str, Any]:
-        from vllm.forward_context import override_forward_context
         from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
             clone_owned,
         )
 
         self._validate_dsv41_a_cycle(fixture)
-        layers = self.model_state.decoder_replay_layers
-        assert layers is not None
-        input_batch = clone_owned(fixture.input_batch)
-        model_inputs = clone_owned(fixture.model_inputs)
         full_context = clone_owned(fixture.full_forward_context)
         full_context.moe_layer_index = 0
-        dp_sync = clone_owned(fixture.dp_sync)
+        if not isinstance(full_context.attn_metadata, dict) or not isinstance(
+            full_context.slot_mapping,
+            dict,
+        ):
+            raise RuntimeError("A-control requires flat attention metadata")
+        return {
+            "input_batch": clone_owned(fixture.input_batch),
+            "model_inputs": clone_owned(fixture.model_inputs),
+            "full_context": full_context,
+            "dp_sync": clone_owned(fixture.dp_sync),
+            "replay_batch": controller.observed_production_replay_batch(
+                fixture.production_replay_batch,
+                phase,
+            ),
+        }
+
+    @torch.inference_mode()
+    def _run_dsv41_a_cycle(
+        self,
+        fixture: Any,
+        controller: Any,
+        *,
+        phase: str,
+        prepared: dict[str, Any],
+    ) -> dict[str, Any]:
+        from vllm.forward_context import override_forward_context
+
+        layers = self.model_state.decoder_replay_layers
+        assert layers is not None
+        input_batch = prepared["input_batch"]
+        model_inputs = prepared["model_inputs"]
+        full_context = prepared["full_context"]
+        dp_sync = prepared["dp_sync"]
         previous_replay_batch = layers.replay_batch
-        working_replay_batch = controller.observed_production_replay_batch(
-            fixture.production_replay_batch,
-            phase,
-        )
         try:
-            layers.replay_batch = working_replay_batch
+            layers.replay_batch = prepared["replay_batch"]
             self.model.set_decoder_boundary_capture(controller.capture_boundary)
             with override_forward_context(full_context):
                 model_output = self.model(**model_inputs)
@@ -935,20 +958,78 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not isinstance(hidden_states, torch.Tensor):
             raise RuntimeError("A-control target did not return hidden states")
         controller.capture_target_output(hidden_states, aux_hidden_states)
+        if not self._dsv41_fixture_vote(controller.active_checkpoints_ready()):
+            raise RuntimeError(
+                controller._active_checkpoint_error
+                or f"{phase}: a peer failed target checkpoint capture"
+            )
+
+        phase_error = None
+        sampled_token_ids = None
+        num_sampled = None
+        num_rejected = None
+        if fixture.is_dummy:
+            try:
+                num_sampled = torch.ones(
+                    input_batch.num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                num_rejected = torch.zeros_like(num_sampled)
+                controller.capture_post_sample(
+                    None,
+                    num_sampled,
+                    num_rejected,
+                    skipped=True,
+                )
+                sampled_token_ids = self.req_states.last_sampled_tokens.index_select(
+                    0,
+                    input_batch.idx_mapping[: input_batch.num_reqs],
+                )
+            except Exception as error:
+                phase_error = error
+        else:
+            try:
+                sampler_output, num_sampled, num_rejected = self.sample(
+                    hidden_states,
+                    input_batch,
+                    None,
+                )
+                sampled_token_ids = sampler_output.sampled_token_ids
+                self.postprocess_sampled(
+                    input_batch.idx_mapping,
+                    sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch.query_start_loc,
+                )
+                controller.capture_post_sample(
+                    sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                )
+            except Exception as error:
+                phase_error = error
+        local_sampling_ready = (
+            phase_error is None
+            and controller.active_checkpoints_ready()
+            and sampled_token_ids is not None
+            and num_sampled is not None
+            and num_rejected is not None
+        )
+        if not self._dsv41_fixture_vote(local_sampling_ready):
+            raise RuntimeError(
+                str(
+                    phase_error
+                    or controller._active_checkpoint_error
+                    or f"{phase}: a peer failed sampling checkpoint capture"
+                )
+            )
+        assert sampled_token_ids is not None
+        assert num_sampled is not None
+        assert num_rejected is not None
 
         if fixture.is_dummy:
-            num_sampled = torch.ones(
-                input_batch.num_reqs,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            num_rejected = torch.zeros_like(num_sampled)
-            controller.capture_post_sample(
-                None,
-                num_sampled,
-                num_rejected,
-                skipped=True,
-            )
             self._finish_dsv41_retained_dummy_cycle(
                 input_batch=input_batch,
                 hidden_states=hidden_states,
@@ -959,17 +1040,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled=num_sampled,
                 num_rejected=num_rejected,
             )
-            sampled_token_ids = self.req_states.last_sampled_tokens.index_select(
-                0,
-                input_batch.idx_mapping[: input_batch.num_reqs],
-            )
         else:
-            sampler_output, num_sampled, num_rejected = self.sample(
-                hidden_states,
-                input_batch,
-                None,
-            )
-            sampled_token_ids = sampler_output.sampled_token_ids
             self._finish_dsv41_retained_cycle(
                 input_batch=input_batch,
                 hidden_states=hidden_states,
@@ -980,8 +1051,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sampled_token_ids=sampled_token_ids,
                 num_sampled=num_sampled,
                 num_rejected=num_rejected,
-                controller=controller,
             )
+        torch.cuda.synchronize(self.device)
         reference = controller.finalize_a_checkpoints(
             sampled_token_ids=sampled_token_ids,
             num_sampled=num_sampled,
@@ -1001,25 +1072,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampled_token_ids: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
-        controller: Any,
     ) -> None:
         if not isinstance(attn_metadata, dict) or not isinstance(
             slot_mappings,
             dict,
         ):
             raise RuntimeError("A-control requires flat attention metadata")
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
-        controller.capture_post_sample(
-            sampled_token_ids,
-            num_sampled,
-            num_rejected,
-        )
         if self.speculator is not None:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):

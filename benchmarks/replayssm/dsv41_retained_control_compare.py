@@ -15,6 +15,36 @@ import torch
 
 SCHEMA = 1
 QUANTILES = (0.5, 0.9, 0.99, 0.999, 1.0)
+REQUIRED_CHECKPOINTS = {"l20", "target", "post_sampling", "s1"}
+REQUIRED_PATHS = {
+    "l20": {
+        "boundary/hidden_states",
+        "boundary/positions",
+        "boundary/input_ids",
+        "boundary/pre_mix",
+        "boundary/post_mix",
+        "boundary/res_mix",
+        "boundary/residual",
+        "boundary/aux_hidden_by_layer/__keys__/__type__",
+        "boundary/remote_aux/__type__",
+        "boundary/full_num_tokens",
+    },
+    "target": {
+        "target/hidden_states",
+        "target/aux_hidden_states/__type__",
+        "target/mtp_pre_collapse",
+    },
+    "post_sampling": {
+        "decisions/skipped",
+        "decisions/num_sampled",
+        "decisions/num_rejected",
+    },
+    "s1": {
+        "decisions/skipped",
+        "decisions/num_sampled",
+        "decisions/num_rejected",
+    },
+}
 
 
 @dataclass
@@ -53,12 +83,95 @@ def _load_run(path: Path) -> EvidenceRun:
     if _sha256(payload_path) != manifest["payload_sha256"]:
         raise ValueError(f"{path}: payload checksum mismatch")
     payload = torch.load(payload_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) and isinstance(value, torch.Tensor)
+        for key, value in payload.items()
+    ):
+        raise ValueError(f"{path}: payload is not tensor-only")
+    if set(manifest.get("checkpoints", ())) != REQUIRED_CHECKPOINTS:
+        raise ValueError(f"{path}: required checkpoints are absent")
     leaves = {}
     for leaf in manifest["leaves"]:
         key = f"{leaf['checkpoint']}:{leaf['path']}"
         if key in leaves:
             raise ValueError(f"{path}: duplicate leaf {key}")
+        payload_key = leaf.get("payload_key")
+        if payload_key is not None:
+            tensor = payload.get(payload_key)
+            if tensor is None:
+                raise ValueError(f"{path}: missing payload tensor {payload_key}")
+            if str(tensor.dtype) != leaf["dtype"]:
+                raise ValueError(f"{path}: payload dtype differs for {key}")
+            if list(tensor.shape) != leaf["shape"]:
+                raise ValueError(f"{path}: payload shape differs for {key}")
         leaves[key] = leaf
+    for checkpoint, required_paths in REQUIRED_PATHS.items():
+        actual_paths = {
+            leaf["path"]
+            for leaf in manifest["leaves"]
+            if leaf["checkpoint"] == checkpoint
+        }
+        missing = required_paths - actual_paths
+        if missing:
+            raise ValueError(
+                f"{path}: {checkpoint} misses required paths {sorted(missing)}"
+            )
+    for checkpoint in ("post_sampling", "s1"):
+        paths = {
+            leaf["path"]
+            for leaf in manifest["leaves"]
+            if leaf["checkpoint"] == checkpoint
+        }
+        if not any(path.startswith("registry/") for path in paths):
+            raise ValueError(f"{path}: {checkpoint} registry evidence is absent")
+        if not (
+            "decisions/sampled_token_ids" in paths
+            or "decisions/sampled_token_ids/__type__" in paths
+        ):
+            raise ValueError(f"{path}: {checkpoint} sampled decisions are absent")
+        mandatory_registry = {
+            "registry/replay_graph:input:0",
+            "registry/model:_mtp_hidden_buffer",
+            "registry/request:last_sampled_tokens",
+            "registry/speculator:draft_tokens",
+            "registry/speculator:draft_token_confidence_probs",
+        }
+        missing_registry = mandatory_registry - paths
+        if missing_registry:
+            raise ValueError(
+                f"{path}: {checkpoint} misses registry families "
+                f"{sorted(missing_registry)}"
+            )
+        if manifest.get("active_role") == "active" and not any(
+            item.startswith("registry/kv-dst:") for item in paths
+        ):
+            raise ValueError(f"{path}: {checkpoint} KV destination evidence is absent")
+    for key, leaf in leaves.items():
+        comparison = leaf["comparison"]
+        path_name = leaf["path"]
+        dtype = str(leaf["dtype"])
+        is_float = dtype.startswith("torch.float") or dtype.startswith("torch.bfloat")
+        if path_name.startswith("registry/kv-") and comparison != "exact":
+            raise ValueError(f"{path}: KV bytes must remain exact: {key}")
+        if path_name.startswith("decisions/") and comparison != "exact":
+            raise ValueError(f"{path}: decisions must remain exact: {key}")
+        if (
+            is_float
+            and (
+                leaf["checkpoint"] in ("l20", "target")
+                or path_name.startswith("registry/replay_graph:input:")
+            )
+            and comparison != "floating"
+        ):
+            raise ValueError(f"{path}: activation must be floating: {key}")
+    target_hidden = leaves["target:target/hidden_states"]
+    if not target_hidden["shape"] or target_hidden["shape"][0] < 1:
+        raise ValueError(f"{path}: target meaningful rows are absent")
+    expected_skipped = manifest.get("active_role") == "idle"
+    for checkpoint in ("post_sampling", "s1"):
+        skipped = leaves[f"{checkpoint}:decisions/skipped"]
+        if skipped.get("value") is not expected_skipped:
+            raise ValueError(f"{path}: {checkpoint} skipped role is inconsistent")
     return EvidenceRun(path, manifest, payload, leaves)
 
 
@@ -108,6 +221,8 @@ def _validate_cohort(
     runs: dict[tuple[str, int, int], EvidenceRun],
     summaries: dict[int, dict[str, Any]],
     ranks: list[int],
+    *,
+    require_complete_files: bool,
 ) -> None:
     if set(summaries) != set(ranks):
         raise ValueError(
@@ -123,7 +238,14 @@ def _validate_cohort(
     dp_size = int(next(iter(dp_sizes)))
     if ranks != list(range(dp_size)):
         raise ValueError(f"expected ranks 0..{dp_size - 1}, found {ranks}")
-    global_fields = ("run_id", "config_digest", "code_hashes", "model", "draft_model")
+    global_fields = (
+        "run_id",
+        "config_digest",
+        "shared_config",
+        "code_hashes",
+        "model",
+        "draft_model",
+    )
     for field in global_fields:
         values = {
             json.dumps(run.manifest.get(field), sort_keys=True) for run in runs.values()
@@ -146,6 +268,11 @@ def _validate_cohort(
             }
             if len(values) != 1:
                 raise ValueError(f"rank {rank}: evidence field changed: {field}")
+        if any(
+            int(run.manifest["rank_config"]["data_parallel_rank"]) != rank
+            for run in rank_runs
+        ):
+            raise ValueError(f"rank {rank}: rank-local configuration is invalid")
         graph_identities = set()
         for run in rank_runs:
             graph = run.manifest["graph"]
@@ -164,10 +291,42 @@ def _validate_cohort(
         if len(graph_identities) != 1:
             raise ValueError(f"rank {rank}: selected graph identity changed")
         summary = summaries[rank]
+        representative = rank_runs[0].manifest
+        for field in (
+            "run_id",
+            "worker_incarnation",
+            "fixture_id",
+            "fixture_digest",
+            "source_digest",
+        ):
+            if summary.get(field) != representative.get(field):
+                raise ValueError(f"rank {rank}: summary binding differs: {field}")
         if not summary.get("live_restored"):
             raise ValueError(f"rank {rank}: LIVE restoration was not proven")
         if int(summary["completed_runs"]) < max(run.ordinal for run in rank_runs):
             raise ValueError(f"rank {rank}: transaction summary is incomplete")
+        summary_files = {
+            (str(item["kind"]), int(item["ordinal"])): item
+            for item in summary.get("files", ())
+        }
+        loaded_files = {(run.kind, run.ordinal): run for run in rank_runs}
+        if require_complete_files and set(summary_files) != set(loaded_files):
+            raise ValueError(f"rank {rank}: summary file set differs")
+        for key, run in loaded_files.items():
+            item = summary_files.get(key)
+            if item is None:
+                raise ValueError(f"rank {rank}: summary misses {key}")
+            if Path(item["manifest_path"]).name != run.manifest_path.name:
+                raise ValueError(
+                    f"rank {rank}: summary manifest path differs for {key}"
+                )
+            if item["manifest_sha256"] != _sha256(run.manifest_path):
+                raise ValueError(
+                    f"rank {rank}: summary manifest hash differs for {key}"
+                )
+            payload_path = run.manifest_path.parent / run.manifest["payload"]
+            if item["payload_sha256"] != _sha256(payload_path):
+                raise ValueError(f"rank {rank}: summary payload hash differs for {key}")
 
 
 def _leaf_schema(leaf: dict[str, Any]) -> dict[str, Any]:
@@ -198,7 +357,22 @@ def _envelope_key(leaf: dict[str, Any]) -> str:
 
 def _exact_value(run: EvidenceRun, leaf: dict[str, Any]) -> Any:
     payload_key = leaf.get("payload_key")
-    return leaf.get("value") if payload_key is None else run.payload[payload_key]
+    if payload_key is None:
+        return leaf.get("value")
+    return _meaningful_tensor(run, leaf)
+
+
+def _meaningful_tensor(
+    run: EvidenceRun,
+    leaf: dict[str, Any],
+) -> torch.Tensor:
+    tensor = run.payload[leaf["payload_key"]]
+    compare_prefix = leaf.get("metadata", {}).get("compare_prefix")
+    if compare_prefix is not None:
+        if tensor.ndim < 1 or not 0 <= int(compare_prefix) <= tensor.shape[0]:
+            raise ValueError(f"{leaf['path']}: invalid meaningful prefix")
+        tensor = tensor[: int(compare_prefix)]
+    return tensor
 
 
 def _floating_metrics(
@@ -290,8 +464,8 @@ def _compare_runs(
             continue
         if left_leaf["comparison"] != "floating":
             raise ValueError(f"{key}: invalid comparison class")
-        left_tensor = left.payload[left_leaf["payload_key"]]
-        right_tensor = right.payload[right_leaf["payload_key"]]
+        left_tensor = _meaningful_tensor(left, left_leaf)
+        right_tensor = _meaningful_tensor(right, right_leaf)
         metrics = _floating_metrics(
             left_tensor,
             right_tensor,
@@ -356,14 +530,61 @@ def _require_matrix(
     return ranks
 
 
+def _calibration_provenance(
+    runs: dict[tuple[str, int, int], EvidenceRun],
+    summaries: dict[int, dict[str, Any]],
+    ranks: list[int],
+) -> dict[str, Any]:
+    representative = runs[("a", ranks[0], 1)].manifest
+    return {
+        "run_id": representative["run_id"],
+        "config_digest": representative["config_digest"],
+        "code_hashes": representative["code_hashes"],
+        "model": representative["model"],
+        "draft_model": representative["draft_model"],
+        "dp_size": representative["dp_size"],
+        "ranks": ranks,
+        "manifests": [
+            {
+                "rank": run.rank,
+                "ordinal": run.ordinal,
+                "sha256": _sha256(run.manifest_path),
+            }
+            for run in sorted(
+                runs.values(),
+                key=lambda item: (item.rank, item.ordinal),
+            )
+        ],
+        "summaries": [
+            {
+                "rank": rank,
+                "run_id": summaries[rank]["run_id"],
+                "fixture_digest": summaries[rank]["fixture_digest"],
+                "worker_incarnation": summaries[rank]["worker_incarnation"],
+            }
+            for rank in ranks
+        ],
+    }
+
+
 def calibrate(args: argparse.Namespace) -> None:
+    if args.calibration_runs != 10:
+        raise ValueError("calibration must use exactly A1-A10")
+    if args.output.exists():
+        raise ValueError(f"refusing to overwrite frozen envelope: {args.output}")
     runs = _load_directory(
         args.input_dir,
         allowed_kinds={"a"},
         max_a_ordinal=args.calibration_runs,
     )
     ranks = _require_matrix(runs, a_runs=args.calibration_runs)
-    _validate_cohort(runs, _load_summaries(args.input_dir), ranks)
+    summaries = _load_summaries(args.input_dir)
+    _validate_cohort(
+        runs,
+        summaries,
+        ranks,
+        require_complete_files=False,
+    )
     envelope: dict[str, dict[str, float]] = {}
     pair_reports = []
     for rank in ranks:
@@ -401,6 +622,7 @@ def calibrate(args: argparse.Namespace) -> None:
             args.calibration_runs * (args.calibration_runs - 1) // 2
         ),
         "ranks": ranks,
+        "provenance": _calibration_provenance(runs, summaries, ranks),
         "denominator_floor": args.denominator_floor,
         "envelope": envelope,
         "pairs": pair_reports,
@@ -422,15 +644,40 @@ def calibrate(args: argparse.Namespace) -> None:
 
 
 def validate(args: argparse.Namespace) -> None:
-    runs = _load_directory(args.input_dir)
+    if args.a_runs != 20:
+        raise ValueError("validation must use exactly 20 A controls")
     envelope_document = json.loads(args.envelope.read_text())
     if envelope_document.get("schema") != SCHEMA:
         raise ValueError("unsupported envelope schema")
     calibration_runs = int(envelope_document["calibration_runs"])
+    if calibration_runs != 10:
+        raise ValueError("frozen envelope was not calibrated from A1-A10")
     denominator_floor = float(envelope_document["denominator_floor"])
     envelope = envelope_document["envelope"]
+    provenance = envelope_document.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("frozen envelope provenance is absent")
+    runs = _load_directory(args.input_dir)
     ranks = _require_matrix(runs, a_runs=args.a_runs)
-    _validate_cohort(runs, _load_summaries(args.input_dir), ranks)
+    summaries = _load_summaries(args.input_dir)
+    _validate_cohort(
+        runs,
+        summaries,
+        ranks,
+        require_complete_files=True,
+    )
+    calibration_subset = {
+        key: run
+        for key, run in runs.items()
+        if run.kind == "a" and 1 <= run.ordinal <= calibration_runs
+    }
+    current_provenance = _calibration_provenance(
+        calibration_subset,
+        summaries,
+        ranks,
+    )
+    if current_provenance != provenance:
+        raise ValueError("frozen envelope provenance does not match evidence")
     reports = []
     failures = []
     for rank in ranks:

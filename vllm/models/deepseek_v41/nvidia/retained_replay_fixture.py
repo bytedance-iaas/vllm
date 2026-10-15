@@ -303,6 +303,7 @@ _TYPED_EVIDENCE_SCHEMA = 1
 _FLOATING_REGISTRY_PREFIXES = (
     "model:_mtp_hidden_buffer",
     "model:candidate_compact_logits_buffer",
+    "replay_graph:input:",
     "speculator:draft_token_confidence_probs",
     "speculator:hidden_states",
     "speculator:draft_logits",
@@ -827,6 +828,7 @@ class TouchedStateRegistry:
         ] = []
         self.sources: list[_SourceRows | _SourceIntervals] = []
         self._names: set[str] = set()
+        self._meaningful_counts: dict[str, int] = {}
 
     def _claim(self, name: str) -> None:
         if name in self._names:
@@ -840,12 +842,19 @@ class TouchedStateRegistry:
         rows: torch.Tensor,
         *,
         dim: int = 0,
+        meaningful_count: int | None = None,
     ) -> None:
         self._claim(name)
         rows = torch.unique(rows.to(device=tensor.device, dtype=torch.int64))
         entry = _TensorSelection(name, tensor, rows, dim)
         entry.capture("s0")
         self.entries.append(entry)
+        if meaningful_count is not None:
+            if dim != 0 or not 0 <= meaningful_count <= rows.numel():
+                raise RetainedReplayFixtureError(
+                    f"{name}: invalid meaningful row prefix"
+                )
+            self._meaningful_counts[name] = meaningful_count
 
     def add_points(
         self, name: str, tensor: torch.Tensor, indices: torch.Tensor
@@ -934,6 +943,8 @@ class TouchedStateRegistry:
                     "dim": entry.dim,
                     "indices": entry.indices.cpu().tolist(),
                 }
+                if entry.name in self._meaningful_counts:
+                    selection["compare_prefix"] = self._meaningful_counts[entry.name]
             elif isinstance(entry, _TensorPoints):
                 value = entry._selected() if epoch is None else getattr(entry, epoch)
                 selection = {
@@ -1042,6 +1053,7 @@ class RetainedReplayFixtureController:
         self.boundary_error: str | None = None
         self.a_control_runs: list[dict[str, Any]] = []
         self._active_checkpoints: dict[str, dict[str, Any]] | None = None
+        self._active_checkpoint_error: str | None = None
         self._graph_observations: dict[str, dict[str, Any]] = {}
         self.worker_incarnation = (
             f"{socket.gethostname()}:{os.getpid()}:{time.time_ns()}"
@@ -1075,6 +1087,7 @@ class RetainedReplayFixtureController:
             "source_digest": (None if fixture is None else fixture.source_digest),
             "fixture_digest": (None if fixture is None else fixture.fixture_digest),
             "boundary_error": self.boundary_error,
+            "checkpoint_error": self._active_checkpoint_error,
             "verify_runs": self.verify_runs,
             "a_control_runs": self.a_control_runs,
         }
@@ -1119,6 +1132,11 @@ class RetainedReplayFixtureController:
             raise RetainedReplayFixtureError(
                 "the capture step did not select a production replay batch"
             )
+        decoder_model = getattr(self.runner.model_state, "_decoder_model", None)
+        if getattr(decoder_model, "decoder_replay_front_graph", None) is not None:
+            raise RetainedReplayFixtureError(
+                "retained A-control does not support a selected front graph"
+            )
         self._production_graph_components(live)
         return ReplayBatch(
             rows=clone_owned(live.rows),
@@ -1144,6 +1162,7 @@ class RetainedReplayFixtureController:
             "num_eager_breaks": capture.num_eager_breaks,
             "callback_calls": 0,
             "capture_replay_calls": 0,
+            "error": None,
         }
         self._graph_observations[phase] = observation
         original_callback = frozen.run_graph
@@ -1153,22 +1172,26 @@ class RetainedReplayFixtureController:
             rows: torch.Tensor,
             inputs: tuple[Any, ...],
         ) -> tuple[torch.Tensor, ...]:
-            current_manager, current_descriptor, current_capture = (
-                self._production_graph_components(frozen)
-            )
-            if (
-                current_manager is not manager
-                or current_descriptor != descriptor
-                or current_capture is not capture
-                or current_capture.num_graphs != observation["num_graphs"]
-            ):
-                raise RetainedReplayFixtureError(
-                    "the selected production replay graph changed"
-                )
             observation["callback_calls"] += 1
-            had_instance_replay = "replay" in capture.__dict__
-            prior_instance_replay = capture.__dict__.get("replay")
-            original_replay = capture.replay
+            try:
+                current_manager, current_descriptor, current_capture = (
+                    self._production_graph_components(frozen)
+                )
+                if (
+                    current_manager is not manager
+                    or current_descriptor != descriptor
+                    or current_capture is not capture
+                    or current_capture.num_graphs != observation["num_graphs"]
+                ):
+                    raise RetainedReplayFixtureError(
+                        "the selected production replay graph changed"
+                    )
+                had_instance_replay = "replay" in capture.__dict__
+                prior_instance_replay = capture.__dict__.get("replay")
+                original_replay = capture.replay
+            except Exception as error:
+                observation["error"] = f"{type(error).__name__}: {error}"
+                return original_callback(rows, inputs)
 
             def observed_replay() -> None:
                 observation["capture_replay_calls"] += 1
@@ -1193,6 +1216,10 @@ class RetainedReplayFixtureController:
         observation = self._graph_observations.get(phase)
         if observation is None:
             raise RetainedReplayFixtureError(f"{phase}: graph observation is absent")
+        if observation["error"] is not None:
+            raise RetainedReplayFixtureError(
+                f"{phase}: graph observer failed: {observation['error']}"
+            )
         if observation["callback_calls"] != 1:
             raise RetainedReplayFixtureError(
                 f"{phase}: expected one replay callback, got "
@@ -1220,6 +1247,7 @@ class RetainedReplayFixtureController:
                 f"replay_graph:input:{index}",
                 tensor,
                 torch.arange(descriptor.num_tokens, device=tensor.device),
+                meaningful_count=int(replay_batch.rows.numel()),
             )
 
     def begin(
@@ -1294,7 +1322,22 @@ class RetainedReplayFixtureController:
             source_digest=source_digest,
             production_checkpoints={},
         )
+        self._active_checkpoint_error = None
         self.state = "capturing"
+
+    def reset_active_checkpoints(self) -> None:
+        self._active_checkpoints = {}
+        self._active_checkpoint_error = None
+        self.boundary_error = None
+
+    def active_checkpoints_ready(self) -> bool:
+        return self._active_checkpoint_error is None
+
+    def _defer_checkpoint_error(self, error: BaseException | str) -> None:
+        if self._active_checkpoint_error is None:
+            self._active_checkpoint_error = (
+                error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+            )
 
     def capture_boundary(self, boundary: DecoderBoundaryState) -> None:
         fixture = self.fixture
@@ -1302,13 +1345,18 @@ class RetainedReplayFixtureController:
             return
         if self.state == "ready" and self._active_checkpoints is not None:
             if "l20" in self._active_checkpoints:
-                self.boundary_error = "the A-control L20 boundary was captured twice"
+                self._defer_checkpoint_error(
+                    "the A-control L20 boundary was captured twice"
+                )
                 return
-            self._active_checkpoints["l20"] = typed_tree_snapshot(
-                "l20",
-                boundary,
-                path="boundary",
-            )
+            try:
+                self._active_checkpoints["l20"] = typed_tree_snapshot(
+                    "l20",
+                    boundary,
+                    path="boundary",
+                )
+            except Exception as error:
+                self._defer_checkpoint_error(error)
             return
         if self.state != "capturing":
             return
@@ -1341,21 +1389,24 @@ class RetainedReplayFixtureController:
         )
         if checkpoints is None:
             return
-        mtp_hidden = None
-        get_mtp = getattr(self.runner.model, "get_mtp_target_hidden_states", None)
-        if callable(get_mtp):
-            mtp_hidden = get_mtp()
-            if mtp_hidden is not None and hidden_states is not None:
-                mtp_hidden = mtp_hidden[: hidden_states.shape[0]]
-        checkpoints["target"] = typed_tree_snapshot(
-            "target",
-            {
-                "hidden_states": hidden_states,
-                "aux_hidden_states": aux_hidden_states,
-                "mtp_pre_collapse": mtp_hidden,
-            },
-            path="target",
-        )
+        try:
+            mtp_hidden = None
+            get_mtp = getattr(self.runner.model, "get_mtp_target_hidden_states", None)
+            if callable(get_mtp):
+                mtp_hidden = get_mtp()
+                if mtp_hidden is not None and hidden_states is not None:
+                    mtp_hidden = mtp_hidden[: hidden_states.shape[0]]
+            checkpoints["target"] = typed_tree_snapshot(
+                "target",
+                {
+                    "hidden_states": hidden_states,
+                    "aux_hidden_states": aux_hidden_states,
+                    "mtp_pre_collapse": mtp_hidden,
+                },
+                path="target",
+            )
+        except Exception as error:
+            self._defer_checkpoint_error(error)
 
     def capture_post_sample(
         self,
@@ -1375,29 +1426,32 @@ class RetainedReplayFixtureController:
         )
         if checkpoints is None:
             return
-        decisions = {
-            "skipped": skipped,
-            "sampled_token_ids": (
-                None
-                if sampled_token_ids is None
-                else canonical_decision_reference(
-                    sampled_token_ids,
-                    num_sampled,
-                    num_rejected,
-                )["sampled_token_ids"]
-            ),
-            "num_sampled": num_sampled,
-            "num_rejected": num_rejected,
-        }
-        checkpoints["post_sampling"] = merge_typed_snapshots(
-            "post_sampling",
-            fixture.registry.typed_snapshot("post_sampling"),
-            typed_tree_snapshot(
+        try:
+            decisions = {
+                "skipped": skipped,
+                "sampled_token_ids": (
+                    None
+                    if sampled_token_ids is None
+                    else canonical_decision_reference(
+                        sampled_token_ids,
+                        num_sampled,
+                        num_rejected,
+                    )["sampled_token_ids"]
+                ),
+                "num_sampled": num_sampled,
+                "num_rejected": num_rejected,
+            }
+            checkpoints["post_sampling"] = merge_typed_snapshots(
                 "post_sampling",
-                decisions,
-                path="decisions",
-            ),
-        )
+                fixture.registry.typed_snapshot("post_sampling"),
+                typed_tree_snapshot(
+                    "post_sampling",
+                    decisions,
+                    path="decisions",
+                ),
+            )
+        except Exception as error:
+            self._defer_checkpoint_error(error)
 
     def finalize(
         self,
@@ -1412,6 +1466,11 @@ class RetainedReplayFixtureController:
         if self.boundary_error is not None:
             raise RetainedReplayFixtureError(
                 f"the L20 boundary capture failed: {self.boundary_error}"
+            )
+        if self._active_checkpoint_error is not None:
+            raise RetainedReplayFixtureError(
+                "the production checkpoint capture failed: "
+                f"{self._active_checkpoint_error}"
             )
         if fixture.boundary is None:
             raise RetainedReplayFixtureError("the real L20 boundary was not captured")
@@ -1480,6 +1539,10 @@ class RetainedReplayFixtureController:
         checkpoints = self._active_checkpoints
         if self.state != "ready" or fixture is None or checkpoints is None:
             raise RetainedReplayFixtureError("no A-control execution is active")
+        if self._active_checkpoint_error is not None:
+            raise RetainedReplayFixtureError(
+                f"A-control checkpoint capture failed: {self._active_checkpoint_error}"
+            )
         missing = {"l20", "target", "post_sampling"} - checkpoints.keys()
         if missing:
             raise RetainedReplayFixtureError(
@@ -1526,6 +1589,49 @@ class RetainedReplayFixtureController:
         )
         runner_module = sys.modules[type(self.runner).__module__]
         runner_path = Path(runner_module.__file__)
+        shared_config = {
+            "model_config": repr(self.runner.model_config),
+            "cache_config": repr(self.runner.cache_config),
+            "scheduler_config": repr(self.runner.scheduler_config),
+            "speculative_config": repr(self.runner.speculative_config),
+            "kernel_config": repr(self.runner.vllm_config.kernel_config),
+            "compilation": {
+                "mode": str(self.runner.compilation_config.mode),
+                "cudagraph_mode": str(self.runner.compilation_config.cudagraph_mode),
+                "decoder_replay_capture_sizes": list(
+                    self.runner.compilation_config.decoder_replay_cudagraph_capture_sizes
+                ),
+            },
+            "parallel": {
+                "data_parallel_size": self.runner.dp_size,
+                "tensor_parallel_size": (
+                    self.runner.parallel_config.tensor_parallel_size
+                ),
+                "pipeline_parallel_size": (
+                    self.runner.parallel_config.pipeline_parallel_size
+                ),
+                "prefill_context_parallel_size": getattr(
+                    self.runner.parallel_config,
+                    "prefill_context_parallel_size",
+                    1,
+                ),
+                "decode_context_parallel_size": getattr(
+                    self.runner.parallel_config,
+                    "decode_context_parallel_size",
+                    1,
+                ),
+            },
+            "features": {
+                "mixed_replay_graph": os.getenv(
+                    "VLLM_DSV41_MIXED_REPLAY_GRAPH",
+                    "0",
+                ),
+                "front_graph": os.getenv(
+                    "VLLM_DSV41_MIXED_FRONT_GRAPH",
+                    "0",
+                ),
+            },
+        }
         return {
             "comparator_schema": 1,
             "run_id": run_id,
@@ -1537,9 +1643,14 @@ class RetainedReplayFixtureController:
             "pp_size": self.runner.parallel_config.pipeline_parallel_size,
             "model": model_name,
             "draft_model": draft_name,
+            "shared_config": shared_config,
             "config_digest": hashlib.sha256(
-                repr(self.runner.vllm_config).encode()
+                json.dumps(shared_config, sort_keys=True).encode()
             ).hexdigest(),
+            "rank_config": {
+                "data_parallel_rank": self.runner.dp_rank,
+                "device": str(self.runner.device),
+            },
             "code_hashes": {
                 "fixture": _sha256_path(Path(__file__)),
                 "model_runner": _sha256_path(runner_path),
@@ -1624,6 +1735,7 @@ class RetainedReplayFixtureController:
 
             for ordinal in range(1, runs + 1):
                 local_error = None
+                prepared_cycle = None
                 try:
                     registry.restore("s0")
                     registry.verify("s0")
@@ -1632,6 +1744,12 @@ class RetainedReplayFixtureController:
                         raise RetainedReplayFixtureError(
                             f"A{ordinal}: source KV changed before execution"
                         )
+                    self.reset_active_checkpoints()
+                    prepared_cycle = self.runner._prepare_dsv41_a_cycle(
+                        fixture,
+                        self,
+                        phase=f"a-{ordinal:03d}",
+                    )
                 except Exception as error:
                     local_error = error
                 if not self.runner._dsv41_fixture_vote(local_error is None):
@@ -1641,16 +1759,17 @@ class RetainedReplayFixtureController:
                             or f"A{ordinal}: a peer failed restore preflight"
                         )
                     )
+                assert prepared_cycle is not None
 
                 local_error = None
                 completed = None
                 try:
-                    self._active_checkpoints = {}
                     phase = f"a-{ordinal:03d}"
                     result = self.runner._run_dsv41_a_cycle(
                         fixture,
                         self,
                         phase=phase,
+                        prepared=prepared_cycle,
                     )
                     torch.cuda.synchronize(self.runner.device)
                     graph = self.graph_observation(phase)
@@ -1699,6 +1818,7 @@ class RetainedReplayFixtureController:
                 self._active_checkpoints = None
         finally:
             self._active_checkpoints = None
+            torch.cuda.synchronize(self.runner.device)
             self.runner._restore_dsv41_retained_block_tables(staged_block_tables)
             if live_digest is not None:
                 registry.restore("live")
@@ -1769,6 +1889,15 @@ class RetainedReplayFixtureController:
         self.runner._validate_dsv41_a_cycle(fixture)
         rank_dir = Path(output_dir) / f"rank-{self.runner.dp_rank:02d}"
         rank_dir.mkdir(parents=True, exist_ok=True)
+        existing = [
+            path
+            for path in rank_dir.iterdir()
+            if not path.name.startswith(".preflight-")
+        ]
+        if existing:
+            raise RetainedReplayFixtureError(
+                f"A-control destination is not empty: {rank_dir}"
+            )
         with tempfile.NamedTemporaryFile(dir=rank_dir, prefix=".preflight-") as probe:
             probe.write(b"ok")
             probe.flush()
@@ -2152,12 +2281,26 @@ class RetainedReplayFixtureController:
                 tensor = getattr(speculator, name, None)
                 if not isinstance(tensor, torch.Tensor):
                     continue
-                rows = (
-                    token_prefix[: min(num_tokens, tensor.shape[0])]
-                    if name in ("hidden_states", "context_positions")
-                    else prefix_rows[: min(num_reqs, tensor.shape[0])]
+                if name in ("hidden_states", "context_positions"):
+                    rows = token_prefix[: min(num_tokens, tensor.shape[0])]
+                    meaningful_count = None
+                elif name in (
+                    "draft_tokens",
+                    "draft_token_confidence_probs",
+                    "idx_mapping",
+                    "_draft_scatter_buf",
+                ):
+                    rows = torch.arange(tensor.shape[0], device=tensor.device)
+                    meaningful_count = min(num_reqs, tensor.shape[0])
+                else:
+                    rows = prefix_rows[: min(num_reqs, tensor.shape[0])]
+                    meaningful_count = None
+                registry.add_rows(
+                    f"speculator:{name}",
+                    tensor,
+                    rows,
+                    meaningful_count=meaningful_count,
                 )
-                registry.add_rows(f"speculator:{name}", tensor, rows)
             for name in ("draft_logits", "temperature", "seeds"):
                 tensor = getattr(speculator, name, None)
                 if isinstance(tensor, torch.Tensor):

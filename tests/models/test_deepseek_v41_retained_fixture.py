@@ -90,11 +90,16 @@ def test_decision_reference_ignores_unused_sample_tail() -> None:
 
 
 def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
-    computed = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+    computed = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     temperature = torch.tensor([0.7], dtype=torch.float32)
     storage = torch.arange(16, dtype=torch.uint8)
     registry = TouchedStateRegistry()
-    registry.add_rows("acceptance:features", computed, torch.tensor([0]))
+    registry.add_rows(
+        "acceptance:features",
+        computed,
+        torch.tensor([0, 1]),
+        meaningful_count=1,
+    )
     registry.add_rows("sampler:temperature", temperature, torch.tensor([0]))
     registry.add_intervals("kv-dst:test", storage, [(2, 6)])
 
@@ -104,6 +109,12 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     assert comparison["registry/acceptance:features"] == "floating"
     assert comparison["registry/sampler:temperature"] == "exact"
     assert comparison["registry/kv-dst:test"] == "exact"
+    features = next(
+        leaf
+        for leaf in snapshot["leaves"]
+        if leaf["path"] == "registry/acceptance:features"
+    )
+    assert features["metadata"]["compare_prefix"] == 1
 
 
 def test_typed_bundle_writes_tensor_only_payload(tmp_path) -> None:
@@ -181,6 +192,47 @@ def test_production_graph_observer_requires_actual_capture_replay() -> None:
     assert capture.calls == 1
     assert observation["callback_calls"] == 1
     assert observation["capture_replay_calls"] == 1
+
+
+def test_a_checkpoint_capture_defers_local_export_failure(monkeypatch) -> None:
+    import vllm.models.deepseek_v41.nvidia.retained_replay_fixture as module
+
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.state = "ready"
+    controller.fixture = SimpleNamespace()
+    controller._active_checkpoints = {}
+    controller._active_checkpoint_error = None
+    controller.boundary_error = None
+
+    def fail_snapshot(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("export failed")
+
+    monkeypatch.setattr(module, "typed_tree_snapshot", fail_snapshot)
+    controller.capture_boundary(SimpleNamespace())
+
+    assert controller.active_checkpoints_ready() is False
+    assert controller._active_checkpoint_error == "RuntimeError: export failed"
+
+
+def test_freeze_rejects_selected_front_graph() -> None:
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = SimpleNamespace(
+        model_state=SimpleNamespace(
+            decoder_replay_layers=SimpleNamespace(replay_batch=object()),
+            _decoder_model=SimpleNamespace(decoder_replay_front_graph=object()),
+        )
+    )
+
+    with pytest.raises(
+        RetainedReplayFixtureError,
+        match="does not support a selected front graph",
+    ):
+        controller.freeze_production_replay_batch()
 
 
 def test_touched_registry_restores_epochs_without_restoring_source() -> None:
