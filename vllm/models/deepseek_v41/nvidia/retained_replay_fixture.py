@@ -305,6 +305,7 @@ _FLOATING_REGISTRY_PREFIXES = (
     "model:candidate_compact_logits_buffer",
     "replay_graph:input:",
     "speculator:draft_token_confidence_probs",
+    "speculator:_draft_scatter_buf",
     "speculator:hidden_states",
     "speculator:draft_logits",
     "speculator:model:_mtp_hidden_buffer",
@@ -348,6 +349,94 @@ def _json_exact(value: Any) -> Any:
         "type": type(value).__qualname__,
         "digest": _tree_digest(value),
     }
+
+
+def _manifest_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return _manifest_value(value.item())
+    if isinstance(value, dict):
+        return {
+            str(key): _manifest_value(item)
+            for key, item in sorted(value.items(), key=lambda item: repr(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_manifest_value(item) for item in value]
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (str, int, float, bool)):
+        return enum_value
+    return repr(value)
+
+
+def _model_config_identity(config: Any) -> Any:
+    if config is None:
+        return None
+    hf_config = getattr(config, "hf_config", None)
+    return {
+        "model": _manifest_value(getattr(config, "model", None)),
+        "revision": _manifest_value(getattr(config, "revision", None)),
+        "code_revision": _manifest_value(getattr(config, "code_revision", None)),
+        "tokenizer_revision": _manifest_value(
+            getattr(config, "tokenizer_revision", None)
+        ),
+        "dtype": str(getattr(config, "dtype", None)),
+        "quantization": _manifest_value(getattr(config, "quantization", None)),
+        "max_model_len": _manifest_value(getattr(config, "max_model_len", None)),
+        "architectures": _manifest_value(getattr(config, "architectures", None)),
+        "compute_hash": (
+            config.compute_hash()
+            if callable(getattr(config, "compute_hash", None))
+            else None
+        ),
+        "hf": {
+            name: _manifest_value(getattr(hf_config, name, None))
+            for name in (
+                "model_type",
+                "architectures",
+                "vocab_size",
+                "draft_vocab_size",
+                "hidden_size",
+                "num_hidden_layers",
+                "dspark_draft_topk",
+                "dspark_target_layer_ids",
+                "eagle_aux_hidden_state_layer_ids",
+                "index_share_for_mtp_iteration",
+            )
+        },
+    }
+
+
+def _parallel_config_identity(config: Any) -> Any:
+    if config is None:
+        return None
+    return {
+        name: _manifest_value(getattr(config, name, None))
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "prefill_context_parallel_size",
+            "decode_context_parallel_size",
+            "expert_parallel_size",
+        )
+    }
+
+
+def _speculative_config_identity(config: Any) -> Any:
+    if config is None:
+        return None
+    identity = {}
+    for field in fields(config):
+        name = field.name
+        value = getattr(config, name)
+        if name in ("target_model_config", "draft_model_config"):
+            identity[name] = _model_config_identity(value)
+        elif name in ("target_parallel_config", "draft_parallel_config"):
+            identity[name] = _parallel_config_identity(value)
+        else:
+            identity[name] = _manifest_value(value)
+    return identity
 
 
 class _TypedSnapshotBuilder:
@@ -1567,6 +1656,33 @@ class RetainedReplayFixtureController:
         )
         return reference
 
+    def _evidence_contract(self) -> dict[str, Any]:
+        fixture = self.fixture
+        assert fixture is not None
+        checkpoints = fixture.production_checkpoints
+        assert checkpoints is not None
+        return {
+            "checkpoint_paths": {
+                checkpoint: sorted(leaf["path"] for leaf in snapshot["leaves"])
+                for checkpoint, snapshot in checkpoints.items()
+            },
+            "comparison_classes": {
+                f"{checkpoint}:{leaf['path']}": leaf["comparison"]
+                for checkpoint, snapshot in checkpoints.items()
+                for leaf in snapshot["leaves"]
+            },
+            "registry_entries": sorted(
+                entry.name for entry in fixture.registry.entries
+            ),
+            "meaningful_counts": dict(
+                sorted(fixture.registry._meaningful_counts.items())
+            ),
+            "graph_input_count": sum(
+                entry.name.startswith("replay_graph:input:")
+                for entry in fixture.registry.entries
+            ),
+        }
+
     def _run_manifest(
         self,
         *,
@@ -1590,10 +1706,12 @@ class RetainedReplayFixtureController:
         runner_module = sys.modules[type(self.runner).__module__]
         runner_path = Path(runner_module.__file__)
         shared_config = {
-            "model_config": repr(self.runner.model_config),
+            "model_config": _model_config_identity(self.runner.model_config),
             "cache_config": repr(self.runner.cache_config),
             "scheduler_config": repr(self.runner.scheduler_config),
-            "speculative_config": repr(self.runner.speculative_config),
+            "speculative_config": _speculative_config_identity(
+                self.runner.speculative_config
+            ),
             "kernel_config": repr(self.runner.vllm_config.kernel_config),
             "compilation": {
                 "mode": str(self.runner.compilation_config.mode),
@@ -1651,6 +1769,7 @@ class RetainedReplayFixtureController:
                 "data_parallel_rank": self.runner.dp_rank,
                 "device": str(self.runner.device),
             },
+            "evidence_contract": self._evidence_contract(),
             "code_hashes": {
                 "fixture": _sha256_path(Path(__file__)),
                 "model_runner": _sha256_path(runner_path),
@@ -1687,11 +1806,6 @@ class RetainedReplayFixtureController:
         output_dir: str,
         run_id: str,
     ) -> dict[str, Any]:
-        self.validate_a_control_preflight(
-            runs=runs,
-            output_dir=output_dir,
-            run_id=run_id,
-        )
         fixture = self.fixture
         assert fixture is not None
         registry = fixture.registry

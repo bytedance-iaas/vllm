@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from benchmarks.replayssm.dsv41_retained_control_compare import _floating_metrics
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
 from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
@@ -15,6 +16,7 @@ from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureController,
     RetainedReplayFixtureError,
     TouchedStateRegistry,
+    _speculative_config_identity,
     canonical_decision_reference,
     clone_owned,
     typed_tree_snapshot,
@@ -93,6 +95,7 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     computed = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     temperature = torch.tensor([0.7], dtype=torch.float32)
     storage = torch.arange(16, dtype=torch.uint8)
+    scatter = torch.tensor([[float("-inf"), 1.0]], dtype=torch.float32)
     registry = TouchedStateRegistry()
     registry.add_rows(
         "acceptance:features",
@@ -102,6 +105,12 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     )
     registry.add_rows("sampler:temperature", temperature, torch.tensor([0]))
     registry.add_intervals("kv-dst:test", storage, [(2, 6)])
+    registry.add_rows(
+        "speculator:_draft_scatter_buf",
+        scatter,
+        torch.tensor([0]),
+        meaningful_count=1,
+    )
 
     snapshot = registry.typed_snapshot("s1")
     comparison = {leaf["path"]: leaf["comparison"] for leaf in snapshot["leaves"]}
@@ -109,12 +118,53 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     assert comparison["registry/acceptance:features"] == "floating"
     assert comparison["registry/sampler:temperature"] == "exact"
     assert comparison["registry/kv-dst:test"] == "exact"
+    assert comparison["registry/speculator:_draft_scatter_buf"] == "floating"
     features = next(
         leaf
         for leaf in snapshot["leaves"]
         if leaf["path"] == "registry/acceptance:features"
     )
     assert features["metadata"]["compare_prefix"] == 1
+
+
+def test_numeric_comparator_accepts_matching_infinity_masks() -> None:
+    metrics = _floating_metrics(
+        torch.tensor([1.0, float("-inf"), 3.0]),
+        torch.tensor([1.25, float("-inf"), 3.0]),
+        denominator_floor=1e-12,
+    )
+
+    assert metrics["negative_infinities"] == 1
+    assert metrics["max_abs"] == 0.25
+
+    with pytest.raises(ValueError, match="negative-infinity masks differ"):
+        _floating_metrics(
+            torch.tensor([1.0, float("-inf")]),
+            torch.tensor([1.0, 0.0]),
+            denominator_floor=1e-12,
+        )
+
+
+def test_speculative_identity_includes_sampling_and_rejection_settings() -> None:
+    @dataclass
+    class SpecConfig:
+        draft_sample_method: str
+        rejection_sample_method: str
+        dspark_draft_topk: int
+        draft_model_config: object = None
+        target_model_config: object = None
+        draft_parallel_config: object = None
+        target_parallel_config: object = None
+
+    greedy = _speculative_config_identity(SpecConfig("greedy", "standard", 8))
+    probabilistic = _speculative_config_identity(
+        SpecConfig("probabilistic", "block", 16)
+    )
+
+    assert greedy != probabilistic
+    assert probabilistic["draft_sample_method"] == "probabilistic"
+    assert probabilistic["rejection_sample_method"] == "block"
+    assert probabilistic["dspark_draft_topk"] == 16
 
 
 def test_typed_bundle_writes_tensor_only_payload(tmp_path) -> None:

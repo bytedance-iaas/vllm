@@ -45,6 +45,37 @@ REQUIRED_PATHS = {
         "decisions/num_rejected",
     },
 }
+NUMERIC_REGISTRY_PREFIXES = (
+    "registry/model:_mtp_hidden_buffer",
+    "registry/model:candidate_compact_logits_buffer",
+    "registry/replay_graph:input:",
+    "registry/speculator:draft_token_confidence_probs",
+    "registry/speculator:_draft_scatter_buf",
+    "registry/speculator:hidden_states",
+    "registry/speculator:draft_logits",
+    "registry/speculator:model:_mtp_hidden_buffer",
+    "registry/acceptance:",
+    "registry/adaptive:confidence_probs",
+    "registry/adaptive:stale_gpu:",
+    "registry/adaptive:stale_cpu:",
+)
+EXACT_FLOAT_REGISTRY_PREFIXES = (
+    "registry/sampler:",
+    "registry/speculator:temperature",
+)
+TRIMMABLE_REGISTRY_NAMES = {
+    "replay_graph:input:0",
+    "replay_graph:input:1",
+    "replay_graph:input:2",
+    "replay_graph:input:3",
+    "replay_graph:input:4",
+    "replay_graph:input:5",
+    "replay_graph:input:6",
+    "speculator:draft_tokens",
+    "speculator:draft_token_confidence_probs",
+    "speculator:idx_mapping",
+    "speculator:_draft_scatter_buf",
+}
 
 
 @dataclass
@@ -73,6 +104,118 @@ def _sha256(path: Path) -> str:
         while chunk := source.read(16 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _safe_path_component(value: Any) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _validate_container_children(
+    path: Path,
+    leaves: dict[str, dict[str, Any]],
+) -> None:
+    for key, leaf in leaves.items():
+        leaf_path = leaf["path"]
+        if not leaf_path.endswith("/__len__"):
+            continue
+        length = leaf.get("value")
+        if not isinstance(length, int) or length < 0:
+            raise ValueError(f"{path}: invalid container length at {key}")
+        if length == 0:
+            continue
+        checkpoint = leaf["checkpoint"]
+        base = leaf_path[: -len("/__len__")]
+        for index in range(length):
+            child = f"{checkpoint}:{base}/{index}"
+            if not any(
+                candidate == child or candidate.startswith(f"{child}/")
+                for candidate in leaves
+            ):
+                raise ValueError(f"{path}: container child is absent: {child}")
+
+        if not base.endswith("/__keys__"):
+            continue
+        mapping_base = base[: -len("/__keys__")]
+        children = {
+            candidate.split(":", 1)[1][len(mapping_base) + 1 :].split("/", 1)[0]
+            for candidate in leaves
+            if candidate.startswith(f"{checkpoint}:{mapping_base}/")
+            and not candidate.startswith(f"{checkpoint}:{mapping_base}/__")
+        }
+        if len(children) < length:
+            raise ValueError(
+                f"{path}: mapping declares {length} keys but has "
+                f"{len(children)} children"
+            )
+
+
+def _validate_evidence_contract(
+    path: Path,
+    manifest: dict[str, Any],
+    leaves: dict[str, dict[str, Any]],
+) -> None:
+    contract = manifest.get("evidence_contract")
+    if not isinstance(contract, dict):
+        raise ValueError(f"{path}: evidence contract is absent")
+    checkpoint_paths = contract.get("checkpoint_paths")
+    comparison_classes = contract.get("comparison_classes")
+    registry_entries = contract.get("registry_entries")
+    meaningful_counts = contract.get("meaningful_counts")
+    graph_input_count = contract.get("graph_input_count")
+    if not (
+        isinstance(checkpoint_paths, dict)
+        and isinstance(comparison_classes, dict)
+        and isinstance(registry_entries, list)
+        and isinstance(meaningful_counts, dict)
+        and isinstance(graph_input_count, int)
+    ):
+        raise ValueError(f"{path}: evidence contract is incomplete")
+
+    for checkpoint in REQUIRED_CHECKPOINTS:
+        actual = sorted(
+            leaf["path"] for leaf in leaves.values() if leaf["checkpoint"] == checkpoint
+        )
+        if actual != checkpoint_paths.get(checkpoint):
+            raise ValueError(f"{path}: {checkpoint} inventory differs from contract")
+    actual_classes = {key: leaf["comparison"] for key, leaf in leaves.items()}
+    if actual_classes != comparison_classes:
+        raise ValueError(f"{path}: comparison classes differ from contract")
+
+    for checkpoint in ("post_sampling", "s1"):
+        checkpoint_leaf_paths = {
+            leaf["path"] for leaf in leaves.values() if leaf["checkpoint"] == checkpoint
+        }
+        for name in registry_entries:
+            root = f"registry/{_safe_path_component(name)}"
+            if not any(
+                candidate == root or candidate.startswith(f"{root}/")
+                for candidate in checkpoint_leaf_paths
+            ):
+                raise ValueError(f"{path}: {checkpoint} misses registry entry {name}")
+
+    graph_names = {
+        name for name in registry_entries if name.startswith("replay_graph:input:")
+    }
+    expected_graph_names = {
+        f"replay_graph:input:{index}" for index in range(graph_input_count)
+    }
+    if graph_names != expected_graph_names:
+        raise ValueError(f"{path}: graph input inventory is incomplete")
+
+    if not set(meaningful_counts).issubset(TRIMMABLE_REGISTRY_NAMES):
+        raise ValueError(f"{path}: unsupported meaningful-row trimming family")
+    if any(
+        not isinstance(count, int) or count <= 0 for count in meaningful_counts.values()
+    ):
+        raise ValueError(f"{path}: meaningful-row counts must be positive")
+    for checkpoint in ("post_sampling", "s1"):
+        for name in registry_entries:
+            leaf = leaves[f"{checkpoint}:registry/{_safe_path_component(name)}"]
+            actual_prefix = leaf.get("metadata", {}).get("compare_prefix")
+            expected_prefix = meaningful_counts.get(name)
+            if actual_prefix != expected_prefix:
+                raise ValueError(f"{path}: meaningful-row prefix differs for {name}")
+    _validate_container_children(path, leaves)
 
 
 def _load_run(path: Path) -> EvidenceRun:
@@ -105,6 +248,7 @@ def _load_run(path: Path) -> EvidenceRun:
             if list(tensor.shape) != leaf["shape"]:
                 raise ValueError(f"{path}: payload shape differs for {key}")
         leaves[key] = leaf
+    _validate_evidence_contract(path, manifest, leaves)
     for checkpoint, required_paths in REQUIRED_PATHS.items():
         actual_paths = {
             leaf["path"]
@@ -149,21 +293,38 @@ def _load_run(path: Path) -> EvidenceRun:
     for key, leaf in leaves.items():
         comparison = leaf["comparison"]
         path_name = leaf["path"]
+        if "compare_prefix" in leaf.get("metadata", {}) and not (
+            leaf["checkpoint"] in ("post_sampling", "s1")
+            and path_name.startswith("registry/")
+        ):
+            raise ValueError(f"{path}: compare_prefix is not allowed for {key}")
         dtype = str(leaf["dtype"])
         is_float = dtype.startswith("torch.float") or dtype.startswith("torch.bfloat")
+        is_tensor = leaf.get("payload_key") is not None
+        if is_tensor and not is_float and comparison != "exact":
+            raise ValueError(f"{path}: non-floating tensor must be exact: {key}")
         if path_name.startswith("registry/kv-") and comparison != "exact":
             raise ValueError(f"{path}: KV bytes must remain exact: {key}")
         if path_name.startswith("decisions/") and comparison != "exact":
             raise ValueError(f"{path}: decisions must remain exact: {key}")
-        if (
-            is_float
-            and (
-                leaf["checkpoint"] in ("l20", "target")
-                or path_name.startswith("registry/replay_graph:input:")
-            )
-            and comparison != "floating"
-        ):
-            raise ValueError(f"{path}: activation must be floating: {key}")
+        if not (is_tensor and is_float):
+            continue
+        expected = None
+        if leaf["checkpoint"] in ("l20", "target"):
+            expected = "floating"
+        elif path_name.startswith("registry/"):
+            if any(
+                path_name.startswith(prefix) for prefix in NUMERIC_REGISTRY_PREFIXES
+            ):
+                expected = "floating"
+            elif any(
+                path_name.startswith(prefix) for prefix in EXACT_FLOAT_REGISTRY_PREFIXES
+            ):
+                expected = "exact"
+        if expected is None:
+            raise ValueError(f"{path}: unclassified floating family: {key}")
+        if comparison != expected:
+            raise ValueError(f"{path}: expected {expected} comparison for {key}")
     target_hidden = leaves["target:target/hidden_states"]
     if not target_hidden["shape"] or target_hidden["shape"][0] < 1:
         raise ValueError(f"{path}: target meaningful rows are absent")
@@ -262,6 +423,7 @@ def _validate_cohort(
             "active_role",
             "s0_digest",
             "source_digest",
+            "evidence_contract",
         ):
             values = {
                 json.dumps(run.manifest.get(field), sort_keys=True) for run in rank_runs
@@ -369,7 +531,7 @@ def _meaningful_tensor(
     tensor = run.payload[leaf["payload_key"]]
     compare_prefix = leaf.get("metadata", {}).get("compare_prefix")
     if compare_prefix is not None:
-        if tensor.ndim < 1 or not 0 <= int(compare_prefix) <= tensor.shape[0]:
+        if tensor.ndim < 1 or not 0 < int(compare_prefix) <= tensor.shape[0]:
             raise ValueError(f"{leaf['path']}: invalid meaningful prefix")
         tensor = tensor[: int(compare_prefix)]
     return tensor
@@ -385,14 +547,29 @@ def _floating_metrics(
         raise ValueError("floating tensor shape or dtype mismatch")
     left64 = left.to(torch.float64)
     right64 = right.to(torch.float64)
+    if bool(torch.isnan(left64).any()) or bool(torch.isnan(right64).any()):
+        raise ValueError("unexpected NaN in floating evidence")
+    for predicate, name in (
+        (torch.isposinf, "positive-infinity"),
+        (torch.isneginf, "negative-infinity"),
+    ):
+        if not torch.equal(predicate(left64), predicate(right64)):
+            raise ValueError(f"{name} masks differ")
     left_finite = torch.isfinite(left64)
     right_finite = torch.isfinite(right64)
-    if not bool(left_finite.all()) or not bool(right_finite.all()):
-        raise ValueError("unexpected nonfinite floating evidence")
-    difference = (left64 - right64).abs().reshape(-1)
+    if not torch.equal(left_finite, right_finite):
+        raise ValueError("finite masks differ")
+    flat_left = left64.reshape(-1)
+    flat_right = right64.reshape(-1)
+    finite_indices = torch.nonzero(left_finite.reshape(-1), as_tuple=False).flatten()
+    finite_left = flat_left.index_select(0, finite_indices)
+    finite_right = flat_right.index_select(0, finite_indices)
+    difference = (finite_left - finite_right).abs()
     if difference.numel() == 0:
         return {
             "elements": 0,
+            "positive_infinities": int(torch.isposinf(left64).sum().item()),
+            "negative_infinities": int(torch.isneginf(left64).sum().item()),
             "max_abs": 0.0,
             "relative_l2": 0.0,
             "abs_quantiles": {str(q): 0.0 for q in QUANTILES},
@@ -402,8 +579,8 @@ def _floating_metrics(
         }
     max_abs, worst_index = difference.max(dim=0)
     denominator = max(
-        float(torch.linalg.vector_norm(left64).item()),
-        float(torch.linalg.vector_norm(right64).item()),
+        float(torch.linalg.vector_norm(finite_left).item()),
+        float(torch.linalg.vector_norm(finite_right).item()),
         denominator_floor,
     )
     relative_l2 = float(torch.linalg.vector_norm(difference).item()) / denominator
@@ -411,11 +588,11 @@ def _floating_metrics(
         difference,
         torch.tensor(QUANTILES, dtype=torch.float64),
     )
-    index = int(worst_index.item())
-    flat_left = left64.reshape(-1)
-    flat_right = right64.reshape(-1)
+    index = int(finite_indices[int(worst_index.item())].item())
     return {
         "elements": difference.numel(),
+        "positive_infinities": int(torch.isposinf(left64).sum().item()),
+        "negative_infinities": int(torch.isneginf(left64).sum().item()),
         "max_abs": float(max_abs.item()),
         "relative_l2": relative_l2,
         "abs_quantiles": {
