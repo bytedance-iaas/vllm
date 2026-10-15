@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import copy
 import hashlib
 import itertools
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +70,16 @@ MASKED_NEGATIVE_INFINITY_PATHS = {
     "registry/speculator:draft_logits",
     "registry/speculator:_draft_scatter_buf",
 }
+IDENTITY_NORMALIZATION_VERSION = 1
+_RANK_LOCAL_ENGINE_ID_PATH = (
+    "shared_config.speculative_config.target_kv_transfer_config.engine_id"
+)
+_ENGINE_ID_FIELD = re.compile(
+    r"(?P<prefix>^|, )engine_id="
+    r"(?P<literal>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
+    r"(?=, |$)"
+)
+_DP_ENGINE_ID = re.compile(r"(?P<stem>.+)_dp(?P<rank>[0-9]+)\Z")
 TRIMMABLE_REGISTRY_NAMES = {
     "replay_graph:input:0",
     "replay_graph:input:1",
@@ -100,6 +113,129 @@ class EvidenceRun:
     @property
     def kind(self) -> str:
         return str(self.manifest["run_kind"])
+
+
+def _config_digest(config: Any) -> str:
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+def _canonicalize_rank_local_shared_config(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    rank = int(manifest["dp_rank"])
+    rank_config = manifest.get("rank_config")
+    if (
+        not isinstance(rank_config, dict)
+        or int(rank_config.get("data_parallel_rank", -1)) != rank
+    ):
+        raise ValueError(f"rank {rank}: rank-local configuration is invalid")
+    shared_config = manifest.get("shared_config")
+    if not isinstance(shared_config, dict):
+        raise ValueError(f"rank {rank}: shared configuration is invalid")
+    original_digest = _config_digest(shared_config)
+    if manifest.get("config_digest") != original_digest:
+        raise ValueError(f"rank {rank}: original configuration digest differs")
+
+    speculative = shared_config.get("speculative_config")
+    connector_repr = (
+        None
+        if not isinstance(speculative, dict)
+        else speculative.get("target_kv_transfer_config")
+    )
+    prefix = "KVTransferConfig("
+    if (
+        not isinstance(connector_repr, str)
+        or not connector_repr.startswith(prefix)
+        or not connector_repr.endswith(")")
+    ):
+        raise ValueError(f"rank {rank}: target KV transfer identity is invalid")
+    body = connector_repr[len(prefix) : -1]
+    matches = list(_ENGINE_ID_FIELD.finditer(body))
+    if len(matches) != 1:
+        raise ValueError(
+            f"rank {rank}: target KV engine identity is missing or ambiguous"
+        )
+    match = matches[0]
+    try:
+        engine_id = ast.literal_eval(match.group("literal"))
+    except (SyntaxError, ValueError) as error:
+        raise ValueError(
+            f"rank {rank}: target KV engine identity literal is invalid"
+        ) from error
+    if not isinstance(engine_id, str):
+        raise ValueError(f"rank {rank}: target KV engine identity is not a string")
+    suffix = _DP_ENGINE_ID.fullmatch(engine_id)
+    if suffix is None or not suffix.group("stem"):
+        raise ValueError(f"rank {rank}: target KV engine identity lacks a DP suffix")
+    suffix_rank = int(suffix.group("rank"))
+    if suffix_rank != rank:
+        raise ValueError(
+            f"rank {rank}: target KV engine identity names DP rank {suffix_rank}"
+        )
+
+    canonical = copy.deepcopy(shared_config)
+    canonical_speculative = canonical["speculative_config"]
+    canonical_body = (
+        body[: match.start("literal")]
+        + repr(f"{suffix.group('stem')}_dp<RANK>")
+        + body[match.end("literal") :]
+    )
+    canonical_speculative["target_kv_transfer_config"] = f"{prefix}{canonical_body})"
+    canonical_digest = _config_digest(canonical)
+    return canonical, {
+        "version": IDENTITY_NORMALIZATION_VERSION,
+        "path": _RANK_LOCAL_ENGINE_ID_PATH,
+        "rank": rank,
+        "engine_id": engine_id,
+        "engine_id_stem": suffix.group("stem"),
+        "original_config_digest": original_digest,
+        "canonical_config_digest": canonical_digest,
+    }
+
+
+def _identity_normalization_provenance(
+    runs: dict[tuple[str, int, int], EvidenceRun],
+) -> dict[str, Any]:
+    canonical_configs: set[str] = set()
+    canonical_digests: set[str] = set()
+    rank_records: dict[int, list[dict[str, Any]]] = {}
+    for run in runs.values():
+        canonical, record = _canonicalize_rank_local_shared_config(run.manifest)
+        canonical_configs.add(json.dumps(canonical, sort_keys=True))
+        canonical_digests.add(record["canonical_config_digest"])
+        rank_records.setdefault(run.rank, []).append(record)
+    if len(canonical_configs) != 1 or len(canonical_digests) != 1:
+        raise ValueError(
+            "evidence shared configuration differs after DP identity normalization"
+        )
+
+    rank_identities = []
+    for rank, records in sorted(rank_records.items()):
+        stable_fields = (
+            "engine_id",
+            "engine_id_stem",
+            "original_config_digest",
+            "canonical_config_digest",
+        )
+        for field in stable_fields:
+            if len({record[field] for record in records}) != 1:
+                raise ValueError(f"rank {rank}: connector identity changed: {field}")
+        representative = records[0]
+        rank_identities.append(
+            {
+                "rank": rank,
+                **{field: representative[field] for field in stable_fields},
+            }
+        )
+    stems = {record["engine_id_stem"] for record in rank_identities}
+    if len(stems) != 1:
+        raise ValueError("target KV engine identity stems differ across DP ranks")
+    return {
+        "version": IDENTITY_NORMALIZATION_VERSION,
+        "path": _RANK_LOCAL_ENGINE_ID_PATH,
+        "canonical_config_digest": next(iter(canonical_digests)),
+        "rank_identities": rank_identities,
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -312,6 +448,14 @@ def _load_run(path: Path) -> EvidenceRun:
     manifest = json.loads(path.read_text())
     if manifest.get("schema") != SCHEMA or not manifest.get("complete"):
         raise ValueError(f"{path}: incomplete or unsupported manifest")
+    try:
+        directory_rank = int(path.parent.name.removeprefix("rank-"))
+    except ValueError as error:
+        raise ValueError(f"{path}: invalid rank directory") from error
+    if path.parent.name != f"rank-{directory_rank:02d}":
+        raise ValueError(f"{path}: noncanonical rank directory")
+    if int(manifest.get("dp_rank", -1)) != directory_rank:
+        raise ValueError(f"{path}: manifest rank differs from directory")
     payload_path = path.parent / manifest["payload"]
     if _sha256(payload_path) != manifest["payload_sha256"]:
         raise ValueError(f"{path}: payload checksum mismatch")
@@ -489,10 +633,9 @@ def _validate_cohort(
     dp_size = int(next(iter(dp_sizes)))
     if ranks != list(range(dp_size)):
         raise ValueError(f"expected ranks 0..{dp_size - 1}, found {ranks}")
+    _identity_normalization_provenance(runs)
     global_fields = (
         "run_id",
-        "config_digest",
-        "shared_config",
         "code_hashes",
         "model",
         "draft_model",
@@ -811,9 +954,11 @@ def _calibration_provenance(
     ranks: list[int],
 ) -> dict[str, Any]:
     representative = runs[("a", ranks[0], 1)].manifest
+    identity_normalization = _identity_normalization_provenance(runs)
     return {
         "run_id": representative["run_id"],
-        "config_digest": representative["config_digest"],
+        "config_digest": identity_normalization["canonical_config_digest"],
+        "identity_normalization": identity_normalization,
         "code_hashes": representative["code_hashes"],
         "model": representative["model"],
         "draft_model": representative["draft_model"],
@@ -892,6 +1037,7 @@ def calibrate(args: argparse.Namespace) -> None:
                 )
     document = {
         "schema": SCHEMA,
+        "comparator_sha256": _sha256(Path(__file__)),
         "calibration_runs": args.calibration_runs,
         "calibration_pairs_per_rank": (
             args.calibration_runs * (args.calibration_runs - 1) // 2
@@ -924,6 +1070,9 @@ def validate(args: argparse.Namespace) -> None:
     envelope_document = json.loads(args.envelope.read_text())
     if envelope_document.get("schema") != SCHEMA:
         raise ValueError("unsupported envelope schema")
+    comparator_sha256 = _sha256(Path(__file__))
+    if envelope_document.get("comparator_sha256") != comparator_sha256:
+        raise ValueError("frozen envelope comparator revision differs")
     calibration_runs = int(envelope_document["calibration_runs"])
     if calibration_runs != 10:
         raise ValueError("frozen envelope was not calibrated from A1-A10")
@@ -983,6 +1132,7 @@ def validate(args: argparse.Namespace) -> None:
     expected_pairs = args.a_runs * (args.a_runs - 1) // 2
     document = {
         "schema": SCHEMA,
+        "comparator_sha256": comparator_sha256,
         "status": "passed" if not failures else "failed",
         "a_runs": args.a_runs,
         "calibration_runs": calibration_runs,

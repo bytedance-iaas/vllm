@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -9,8 +11,11 @@ import pytest
 import torch
 
 from benchmarks.replayssm.dsv41_retained_control_compare import (
+    IDENTITY_NORMALIZATION_VERSION,
     MASKED_NEGATIVE_INFINITY_PATHS,
+    _canonicalize_rank_local_shared_config,
     _floating_metrics,
+    _identity_normalization_provenance,
 )
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
@@ -32,6 +37,37 @@ class _OwnedTree:
     tensor: torch.Tensor
     array: np.ndarray
     children: dict[str, torch.Tensor]
+
+
+def _ranked_config_manifest(
+    rank: int,
+    engine_id: str,
+    *,
+    port: int = 14579,
+    connector_repr: str | None = None,
+) -> dict:
+    connector_repr = connector_repr or (
+        "KVTransferConfig("
+        "kv_connector='MooncakeConnector', "
+        f"engine_id={engine_id!r}, "
+        "kv_role='kv_consumer', "
+        f"kv_port={port})"
+    )
+    shared_config = {
+        "model_config": {"model": "fixture"},
+        "speculative_config": {
+            "method": "dspark",
+            "target_kv_transfer_config": connector_repr,
+        },
+    }
+    return {
+        "dp_rank": rank,
+        "rank_config": {"data_parallel_rank": rank, "device": f"cuda:{rank}"},
+        "shared_config": shared_config,
+        "config_digest": hashlib.sha256(
+            json.dumps(shared_config, sort_keys=True).encode()
+        ).hexdigest(),
+    }
 
 
 def test_retained_fixture_clone_owns_mutable_leaves() -> None:
@@ -182,6 +218,86 @@ def test_speculative_identity_includes_sampling_and_rejection_settings() -> None
     assert probabilistic["draft_sample_method"] == "probabilistic"
     assert probabilistic["rejection_sample_method"] == "block"
     assert probabilistic["dspark_draft_topk"] == 16
+
+
+def test_comparator_normalizes_valid_dp_engine_id_suffixes_only() -> None:
+    manifests = [
+        _ranked_config_manifest(rank, f"shared-engine_dp{rank}") for rank in range(8)
+    ]
+    canonical = [
+        _canonicalize_rank_local_shared_config(manifest) for manifest in manifests
+    ]
+    assert len({json.dumps(config, sort_keys=True) for config, _ in canonical}) == 1
+
+    runs = {
+        ("a", rank, 1): SimpleNamespace(rank=rank, manifest=manifest)
+        for rank, manifest in enumerate(manifests)
+    }
+    provenance = _identity_normalization_provenance(runs)
+    assert provenance["version"] == IDENTITY_NORMALIZATION_VERSION
+    assert len(provenance["rank_identities"]) == 8
+    assert {record["engine_id"] for record in provenance["rank_identities"]} == {
+        f"shared-engine_dp{rank}" for rank in range(8)
+    }
+
+
+@pytest.mark.parametrize(
+    ("manifest", "message"),
+    [
+        (
+            _ranked_config_manifest(0, "shared-engine"),
+            "lacks a DP suffix",
+        ),
+        (
+            _ranked_config_manifest(0, "shared-engine_dp1"),
+            "names DP rank 1",
+        ),
+        (
+            _ranked_config_manifest(
+                0,
+                "shared-engine_dp0",
+                connector_repr=(
+                    "KVTransferConfig("
+                    "engine_id='shared-engine_dp0', "
+                    "engine_id='duplicate_dp0')"
+                ),
+            ),
+            "missing or ambiguous",
+        ),
+    ],
+)
+def test_comparator_rejects_invalid_dp_engine_identity(
+    manifest: dict,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _canonicalize_rank_local_shared_config(manifest)
+
+
+def test_comparator_rejects_config_drift_and_broken_bindings() -> None:
+    rank0 = _ranked_config_manifest(0, "shared-engine_dp0")
+    rank1 = _ranked_config_manifest(1, "shared-engine_dp1", port=14580)
+    runs = {
+        ("a", 0, 1): SimpleNamespace(rank=0, manifest=rank0),
+        ("a", 1, 1): SimpleNamespace(rank=1, manifest=rank1),
+    }
+    with pytest.raises(ValueError, match="differs after DP identity normalization"):
+        _identity_normalization_provenance(runs)
+
+    rank1 = _ranked_config_manifest(1, "other-engine_dp1")
+    runs[("a", 1, 1)] = SimpleNamespace(rank=1, manifest=rank1)
+    with pytest.raises(ValueError, match="differs after DP identity normalization"):
+        _identity_normalization_provenance(runs)
+
+    broken = _ranked_config_manifest(0, "shared-engine_dp0")
+    broken["config_digest"] = "0" * 64
+    with pytest.raises(ValueError, match="original configuration digest differs"):
+        _canonicalize_rank_local_shared_config(broken)
+
+    wrong_rank = _ranked_config_manifest(0, "shared-engine_dp0")
+    wrong_rank["rank_config"]["data_parallel_rank"] = 7
+    with pytest.raises(ValueError, match="rank-local configuration is invalid"):
+        _canonicalize_rank_local_shared_config(wrong_rank)
 
 
 def test_typed_bundle_writes_tensor_only_payload(tmp_path) -> None:
