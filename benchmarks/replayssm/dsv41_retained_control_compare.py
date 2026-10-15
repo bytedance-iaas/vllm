@@ -196,11 +196,59 @@ def _validate_evidence_contract(
     graph_names = {
         name for name in registry_entries if name.startswith("replay_graph:input:")
     }
+    if graph_input_count != 7:
+        raise ValueError(f"{path}: expected seven replay graph inputs")
     expected_graph_names = {
         f"replay_graph:input:{index}" for index in range(graph_input_count)
     }
     if graph_names != expected_graph_names:
         raise ValueError(f"{path}: graph input inventory is incomplete")
+
+    required_registry = {
+        "model:_mtp_hidden_buffer",
+        "request:last_sampled_tokens",
+        "request:draft_tokens",
+        "request:num_computed_tokens",
+        "request:total_len",
+        "request:next_prefill_tokens",
+        "request:all_token_ids",
+        "sampler:output_bin_counts",
+        "sampler:temperature",
+        "sampler:top_k",
+        "sampler:top_p",
+        "sampler:min_p",
+        "sampler:seeds",
+        "speculator:draft_tokens",
+        "speculator:draft_token_confidence_probs",
+        "speculator:hidden_states",
+        "speculator:context_positions",
+        "speculator:idx_mapping",
+    }
+    speculative = manifest.get("shared_config", {}).get("speculative_config", {})
+    if speculative.get("draft_sample_method") == "probabilistic":
+        required_registry.add("speculator:draft_logits")
+    if speculative.get("enable_adaptive_verification") is True:
+        required_registry.update(
+            {
+                "adaptive:confidence_probs",
+                "adaptive:_batch_draft_capacity",
+                "adaptive:_num_non_draft_tokens",
+                "adaptive:cu_num_logits",
+                "adaptive:_stale_idx",
+                "adaptive:_pending_resets",
+                "adaptive:_batch_budget",
+            }
+        )
+        if not any(name.startswith("adaptive:stale_gpu:") for name in registry_entries):
+            raise ValueError(f"{path}: adaptive GPU stale state is absent")
+        if not any(name.startswith("adaptive:stale_cpu:") for name in registry_entries):
+            raise ValueError(f"{path}: adaptive CPU stale state is absent")
+    missing_configured = required_registry - set(registry_entries)
+    if missing_configured:
+        raise ValueError(
+            f"{path}: configured registry entries are absent: "
+            f"{sorted(missing_configured)}"
+        )
 
     if not set(meaningful_counts).issubset(TRIMMABLE_REGISTRY_NAMES):
         raise ValueError(f"{path}: unsupported meaningful-row trimming family")
@@ -209,10 +257,9 @@ def _validate_evidence_contract(
     ):
         raise ValueError(f"{path}: meaningful-row counts must be positive")
     for checkpoint in ("post_sampling", "s1"):
-        for name in registry_entries:
+        for name, expected_prefix in meaningful_counts.items():
             leaf = leaves[f"{checkpoint}:registry/{_safe_path_component(name)}"]
             actual_prefix = leaf.get("metadata", {}).get("compare_prefix")
-            expected_prefix = meaningful_counts.get(name)
             if actual_prefix != expected_prefix:
                 raise ValueError(f"{path}: meaningful-row prefix differs for {name}")
     _validate_container_children(path, leaves)
