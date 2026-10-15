@@ -933,12 +933,12 @@ class RetainedReplayFixtureController:
             None,
         )
         mutable_tokens = max(
-            int(input_batch.max_query_len),
+            int(input_batch.max_query_len or 0),
             int(getattr(replay_layers, "window", 0)),
         )
         continuation_tokens = max(
             1,
-            int(input_batch.max_query_len),
+            int(input_batch.max_query_len or 0),
             int(runner.num_speculative_steps) + 1,
         )
 

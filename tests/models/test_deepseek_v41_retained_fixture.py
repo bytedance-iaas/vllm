@@ -238,7 +238,10 @@ def test_cache_registry_canonicalizes_aliased_storage_views() -> None:
     assert registry.source_digest() != source_digest
 
 
-def test_cache_registry_retains_replay_window_by_logical_block_order() -> None:
+@pytest.mark.parametrize("max_query_len", [4, None])
+def test_cache_registry_retains_replay_window_by_logical_block_order(
+    max_query_len: int | None,
+) -> None:
     cache = torch.arange(48, dtype=torch.uint8).reshape(6, 4, 2)
     layer_name = "layer"
     runner = SimpleNamespace(
@@ -265,7 +268,7 @@ def test_cache_registry_retains_replay_window_by_logical_block_order() -> None:
     input_batch = SimpleNamespace(
         num_reqs=1,
         num_tokens_after_padding=1,
-        max_query_len=4,
+        max_query_len=max_query_len,
         idx_mapping=torch.tensor([0], dtype=torch.int64),
         seq_lens=torch.tensor([12], dtype=torch.int32),
         seq_lens_cpu_upper_bound=torch.tensor([12], dtype=torch.int32),
@@ -362,7 +365,69 @@ def test_cache_registry_retains_pad_only_request_frontier() -> None:
     assert record.source == [(8, 16), (24, 32)]
 
 
-def test_cache_registry_retains_next_verification_across_block_boundary() -> None:
+def test_cache_registry_accepts_idle_none_query_bound() -> None:
+    cache = torch.arange(16, dtype=torch.uint8).reshape(2, 4, 2)
+    layer_name = "layer"
+    runner = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(layer_names=[layer_name])]
+        ),
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                layer_name: SimpleNamespace(kv_cache=cache),
+            }
+        ),
+        block_tables=SimpleNamespace(
+            num_blocks=SimpleNamespace(gpu=torch.zeros((1, 1), dtype=torch.int32)),
+            kernel_block_sizes=[4],
+        ),
+        speculator=None,
+        num_speculative_steps=5,
+        model_state=SimpleNamespace(decoder_replay_layers=SimpleNamespace(window=8)),
+    )
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = runner
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens_after_padding=1,
+        max_query_len=None,
+        idx_mapping=torch.tensor([0], dtype=torch.int64),
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([1], dtype=torch.int32),
+    )
+    context = SimpleNamespace(
+        attn_metadata={
+            layer_name: SimpleNamespace(
+                slot_mapping=torch.tensor([-1], dtype=torch.int64)
+            )
+        }
+    )
+    block_tables = (torch.zeros((1, 1), dtype=torch.int32),)
+
+    idle = controller._collect_cache_intervals(
+        input_batch,
+        block_tables,
+        ((context, 1),),
+    )
+    explicit_zero = controller._collect_cache_intervals(
+        SimpleNamespace(**(vars(input_batch) | {"max_query_len": 0})),
+        block_tables,
+        ((context, 1),),
+    )
+
+    idle_record = next(iter(idle.values()))
+    zero_record = next(iter(explicit_zero.values()))
+    assert idle_record.destination == zero_record.destination == []
+    assert idle_record.source == zero_record.source == []
+    assert input_batch.max_query_len is None
+
+
+@pytest.mark.parametrize("max_query_len", [1, None])
+def test_cache_registry_retains_next_verification_across_block_boundary(
+    max_query_len: int | None,
+) -> None:
     cache = torch.arange(64, dtype=torch.uint8).reshape(8, 4, 2)
     layer_name = "layer"
     runner = SimpleNamespace(
@@ -389,7 +454,7 @@ def test_cache_registry_retains_next_verification_across_block_boundary() -> Non
     input_batch = SimpleNamespace(
         num_reqs=1,
         num_tokens_after_padding=1,
-        max_query_len=1,
+        max_query_len=max_query_len,
         idx_mapping=torch.tensor([0], dtype=torch.int64),
         seq_lens=torch.tensor([15], dtype=torch.int32),
         seq_lens_cpu_upper_bound=torch.tensor([15], dtype=torch.int32),
