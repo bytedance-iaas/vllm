@@ -303,6 +303,15 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + self.window_size, 128)
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
+            query_start = int(
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = int(
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+            if query_start == query_end:
+                continue
+
             local_start = local_end = None
             if cp_plan is not None:
                 local_start = int(cp_plan.local_query_start_loc_cpu[chunk_start].item())
@@ -343,12 +352,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             )
 
             # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
             combined_indices_out = combined_indices_out[: query_end - query_start]
             combined_lens_out = combined_lens_out[: query_end - query_start]
 
