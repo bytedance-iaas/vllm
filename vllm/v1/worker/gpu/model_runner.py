@@ -18,6 +18,8 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import json
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -25,6 +27,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -34,9 +37,15 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_dp_group,
     get_pp_group,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    DPMetadata,
+    create_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -83,6 +92,7 @@ from vllm.v1.watermarking.spec_decode import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncCacheOnlyOutput,
@@ -351,6 +361,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._dsv41_retained_fixture: Any = None
+        self._dsv41_retained_fixture_started_at = time.time()
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -574,6 +586,241 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if encoder_runner is None:
             return {}
         return encoder_runner.get_encoder_timing_stats()
+
+    def arm_dsv41_retained_fixture(self) -> dict[str, Any]:
+        """Arm the one-shot real-step fixture; unavailable unless startup opted in."""
+        error = self._dsv41_retained_fixture_support_error()
+        if error is not None:
+            return error
+        arm_path = os.getenv("VLLM_DSV41_RETAINED_FIXTURE_ARM_PATH")
+        if arm_path:
+            os.makedirs(os.path.dirname(arm_path), exist_ok=True)
+            temporary = f"{arm_path}.{os.getpid()}.tmp"
+            with open(temporary, "w") as marker:
+                marker.write(f"{time.time_ns()}\n")
+            os.replace(temporary, arm_path)
+            return {
+                "state": "arm_requested",
+                "error": None,
+                "dp_rank": self.dp_rank,
+                "arm_path": arm_path,
+            }
+        return self._arm_dsv41_retained_fixture_local()
+
+    def _dsv41_retained_fixture_support_error(self) -> dict[str, Any] | None:
+        if os.getenv("VLLM_DSV41_RETAINED_FIXTURE", "0") != "1":
+            return {
+                "state": "disabled",
+                "error": "VLLM_DSV41_RETAINED_FIXTURE is not enabled",
+                "dp_rank": self.dp_rank,
+            }
+        if self.parallel_config.tensor_parallel_size != 1 or self.use_pp:
+            return {
+                "state": "unsupported",
+                "error": "the retained fixture currently requires TP1 and PP1",
+                "dp_rank": self.dp_rank,
+            }
+        if self.ubatch_runner is not None:
+            return {
+                "state": "unsupported",
+                "error": "the retained fixture does not support microbatching",
+                "dp_rank": self.dp_rank,
+            }
+        if self.speculator is None:
+            return {
+                "state": "unsupported",
+                "error": "the retained fixture requires a speculator",
+                "dp_rank": self.dp_rank,
+            }
+        if not hasattr(self.model_state, "build_retained_replay_batch"):
+            return {
+                "state": "unsupported",
+                "error": "the loaded model has no retained replay fixture support",
+                "dp_rank": self.dp_rank,
+            }
+        return None
+
+    def _arm_dsv41_retained_fixture_local(self) -> dict[str, Any]:
+        from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
+            RetainedReplayFixtureController,
+        )
+
+        self._dsv41_retained_fixture = RetainedReplayFixtureController(self)
+        return self._dsv41_retained_fixture.status()
+
+    def _maybe_arm_dsv41_retained_fixture_from_file(self) -> None:
+        if self._dsv41_retained_fixture is not None:
+            return
+        arm_path = os.getenv("VLLM_DSV41_RETAINED_FIXTURE_ARM_PATH")
+        if not arm_path:
+            return
+        try:
+            marker_time = os.path.getmtime(arm_path)
+        except FileNotFoundError:
+            return
+        if marker_time < self._dsv41_retained_fixture_started_at:
+            return
+        if self._dsv41_retained_fixture_support_error() is None:
+            self._arm_dsv41_retained_fixture_local()
+
+    def _log_dsv41_retained_fixture_rpc(
+        self, event: str, nonce: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        logger.info(
+            "DSV41_RETAINED_FIXTURE_%s %s",
+            event,
+            json.dumps({"nonce": nonce, "result": result}, sort_keys=True),
+        )
+        return result
+
+    def dsv41_retained_fixture_status(self, nonce: str = "") -> dict[str, Any]:
+        controller = self._dsv41_retained_fixture
+        if controller is None:
+            result = {"state": "unarmed", "error": None, "dp_rank": self.dp_rank}
+        else:
+            result = controller.status()
+        return self._log_dsv41_retained_fixture_rpc("STATUS", nonce, result)
+
+    def verify_dsv41_retained_fixture(
+        self, cycles: int = 2, nonce: str = ""
+    ) -> dict[str, Any]:
+        controller = self._dsv41_retained_fixture
+        if controller is None:
+            result = {
+                "state": "unarmed",
+                "error": "fixture is not armed",
+                "dp_rank": self.dp_rank,
+            }
+        else:
+            try:
+                verify_result = controller.verify_restore_cycles(int(cycles))
+            except Exception as error:
+                controller.fail(error)
+                result = controller.status()
+            else:
+                result = {
+                    "state": "passed",
+                    "dp_rank": self.dp_rank,
+                    **verify_result,
+                }
+        return self._log_dsv41_retained_fixture_rpc("VERIFY", nonce, result)
+
+    def restore_dsv41_retained_fixture(self, epoch: str) -> dict[str, Any]:
+        controller = self._dsv41_retained_fixture
+        if controller is None:
+            return {
+                "state": "unarmed",
+                "error": "fixture is not armed",
+                "dp_rank": self.dp_rank,
+            }
+        try:
+            return {"state": "restored", **controller.restore(epoch)}
+        except Exception as error:
+            controller.fail(error)
+            return controller.status()
+
+    def _dsv41_fixture_vote(self, local_ok: bool) -> bool:
+        if self.dp_size == 1:
+            return local_ok
+        votes = torch.zeros(self.dp_size, dtype=torch.int32, device="cpu")
+        votes[self.dp_rank] = int(local_ok)
+        if should_skip_dp_coordination():
+            votes.fill_(int(local_ok))
+        else:
+            dist.all_reduce(votes, group=get_dp_group().cpu_group)
+        return bool(votes.all())
+
+    def _maybe_begin_dsv41_retained_fixture(
+        self,
+        *,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_metadata: dict[str, Any],
+        slot_mappings_by_layer: dict[str, torch.Tensor],
+        batch_desc: BatchExecutionDescriptor,
+        dp_sync: DPSyncState | None,
+    ) -> None:
+        controller = self._dsv41_retained_fixture
+        if controller is None or controller.state != "armed":
+            return
+        if batch_desc.cg_mode != CUDAGraphMode.NONE:
+            return
+        local_error = None
+        try:
+            replay_batch = self.model_state.build_retained_replay_batch(
+                input_batch,
+                block_tables,
+                slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+            )
+            if replay_batch is None:
+                return
+            ordinary_batch = self.model_state.build_ordinary_decode_batch(
+                input_batch,
+                block_tables,
+                slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+            )
+            dp_metadata = None
+            if dp_sync is not None:
+                dp_metadata = DPMetadata.make(
+                    self.parallel_config,
+                    input_batch.num_tokens_after_padding,
+                    dp_sync.num_tokens_across_dp,
+                )
+            full_context = create_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                dp_metadata=dp_metadata,
+                cudagraph_runtime_mode=batch_desc.cg_mode,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                    num_active_loras=batch_desc.num_active_loras,
+                ),
+                slot_mapping=slot_mappings_by_layer,
+                is_padding=input_batch.is_padding,
+            )
+            controller.begin(
+                input_batch=input_batch,
+                model_inputs=model_inputs,
+                block_tables=block_tables,
+                slot_mappings=slot_mappings,
+                full_forward_context=full_context,
+                replay_batch=replay_batch,
+                ordinary_batch=ordinary_batch,
+            )
+            self.model.set_decoder_boundary_capture(controller.capture_boundary)
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            self.model.set_decoder_boundary_capture(None)
+            controller.fail(local_error or "a peer failed fixture preparation")
+
+    def _maybe_finalize_dsv41_retained_fixture(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        controller = self._dsv41_retained_fixture
+        if controller is None or controller.state != "capturing":
+            return
+        local_error = None
+        try:
+            controller.finalize(
+                sampled_token_ids=sampled_token_ids,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            controller.fail(local_error or "a peer failed fixture finalization")
 
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
@@ -933,6 +1180,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         is_profile=is_profile,
                     )
             self.step_timing.drafter_end()
+            controller = self._dsv41_retained_fixture
+            if controller is not None and controller.state == "capturing":
+                dummy_sampled_token_ids = (
+                    self.req_states.last_sampled_tokens.index_select(
+                        0, input_batch.idx_mapping[: input_batch.num_reqs]
+                    )
+                )
+                self._maybe_finalize_dsv41_retained_fixture(
+                    dummy_sampled_token_ids, num_sampled, num_rejected
+                )
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
@@ -1774,6 +2031,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        self._maybe_arm_dsv41_retained_fixture_from_file()
+        fixture_capture_armed = (
+            self._dsv41_retained_fixture is not None
+            and self._dsv41_retained_fixture.state == "armed"
+        )
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1783,7 +2045,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             max_query_len=max_query_len,
             has_prefill=has_prefill,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or fixture_capture_armed,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
@@ -1806,17 +2068,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             dp_num_reqs_unpadded = (
                 dp_sync.num_reqs_unpadded if dp_sync is not None else num_reqs
             )
-            refilled_num_toks = (
-                self.adaptive_verification.maybe_refill_post_dp_budget(
-                    local_dispatch_tokens=num_toks,
-                    graph_mode=batch_desc.cg_mode,
-                    graph_num_tokens=batch_desc.num_tokens,
-                    graph_num_reqs=batch_desc.num_reqs,
-                    graph_max_query_len=batch_desc.max_query_len,
-                    dp_eager=dp_eager,
-                    dp_has_prefill=dp_has_prefill,
-                    dp_num_reqs_unpadded=dp_num_reqs_unpadded,
-                )
+            refilled_num_toks = self.adaptive_verification.maybe_refill_post_dp_budget(
+                local_dispatch_tokens=num_toks,
+                graph_mode=batch_desc.cg_mode,
+                graph_num_tokens=batch_desc.num_tokens,
+                graph_num_reqs=batch_desc.num_reqs,
+                graph_max_query_len=batch_desc.max_query_len,
+                dp_eager=dp_eager,
+                dp_has_prefill=dp_has_prefill,
+                dp_num_reqs_unpadded=dp_num_reqs_unpadded,
             )
             batch_req_state, num_toks = _apply_post_dp_refill_num_tokens(
                 batch_req_state,
@@ -2008,6 +2268,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 
+        if self._dsv41_retained_fixture is not None and not skip_attn_for_dummy_run:
+            assert block_tables is not None
+            assert slot_mappings is not None
+            assert isinstance(attn_metadata, dict)
+            assert isinstance(slot_mappings_by_layer, dict)
+            self._maybe_begin_dsv41_retained_fixture(
+                input_batch=input_batch,
+                model_inputs=model_inputs,
+                block_tables=block_tables,
+                slot_mappings=slot_mappings,
+                attn_metadata=attn_metadata,
+                slot_mappings_by_layer=slot_mappings_by_layer,
+                batch_desc=batch_desc,
+                dp_sync=dp_sync,
+            )
+
         # Update the EPLB meta.
         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
         self.eplb.prepare_forward(
@@ -2077,6 +2353,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if self._dsv41_retained_fixture is not None and hasattr(
+            self.model, "set_decoder_boundary_capture"
+        ):
+            self.model.set_decoder_boundary_capture(None)
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2356,6 +2636,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
+
+        self._maybe_finalize_dsv41_retained_fixture(
+            sampler_output.sampled_token_ids, num_sampled, num_rejected
+        )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

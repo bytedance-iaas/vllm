@@ -997,6 +997,28 @@ class Worker(WorkerBase):
     def get_draft_model(self) -> nn.Module | None:
         return self.model_runner.get_draft_model()
 
+    def arm_dsv41_retained_fixture(self) -> dict[str, Any]:
+        if not self.use_v2_model_runner:
+            return {"state": "unsupported", "error": "V2 model runner is required"}
+        return self.model_runner.arm_dsv41_retained_fixture()
+
+    def dsv41_retained_fixture_status(self, nonce: str = "") -> dict[str, Any]:
+        if not self.use_v2_model_runner:
+            return {"state": "unsupported", "error": "V2 model runner is required"}
+        return self.model_runner.dsv41_retained_fixture_status(nonce)
+
+    def verify_dsv41_retained_fixture(
+        self, cycles: str = "2", nonce: str = ""
+    ) -> dict[str, Any]:
+        if not self.use_v2_model_runner:
+            return {"state": "unsupported", "error": "V2 model runner is required"}
+        return self.model_runner.verify_dsv41_retained_fixture(int(cycles), nonce)
+
+    def restore_dsv41_retained_fixture(self, epoch: str) -> dict[str, Any]:
+        if not self.use_v2_model_runner:
+            return {"state": "unsupported", "error": "V2 model runner is required"}
+        return self.model_runner.restore_dsv41_retained_fixture(epoch)
+
     def supports_draft_weight_updates(self) -> bool:
         engine = self.weight_transfer_engine
         speculative_config = self.speculative_config
