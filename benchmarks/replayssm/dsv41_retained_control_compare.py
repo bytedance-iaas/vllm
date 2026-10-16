@@ -369,6 +369,186 @@ def _decode_logical_raw(
     raise ValueError(f"unsupported logical cache format: {record_format}")
 
 
+def _validate_view_layout(path: Path, view: dict[str, Any]) -> int:
+    dtype_sizes = {
+        "torch.uint8": 1,
+        "torch.bfloat16": 2,
+        "torch.float8_e4m3fn": 1,
+        "torch.float32": 4,
+    }
+    shape = view.get("shape")
+    strides = view.get("strides_bytes")
+    dtype = view.get("dtype")
+    if (
+        dtype not in dtype_sizes
+        or not isinstance(shape, list)
+        or len(shape) != 3
+        or any(not isinstance(value, int) or value <= 0 for value in shape)
+        or not isinstance(strides, list)
+        or len(strides) != 3
+    ):
+        raise ValueError(f"{path}: logical cache tensor layout is invalid")
+    element_size = dtype_sizes[dtype]
+    if (
+        shape[1] != int(view["block_size"])
+        or strides[2] != element_size
+        or strides[1] != shape[2] * element_size
+        or strides[0] < shape[1] * strides[1]
+    ):
+        raise ValueError(f"{path}: logical cache strides differ")
+    expected_formats = {
+        ("torch.uint8", 584): "v4_ue8m0_fp8_bf16",
+        ("torch.uint8", 528): "v41_ue8m0_mxfp8",
+        ("torch.uint8", 288): "v41_nvfp4",
+        ("torch.uint8", 132): "indexer_fp8",
+        ("torch.uint8", 68): "indexer_mxfp4",
+        ("torch.bfloat16", 1024): "plain_bf16",
+        ("torch.float8_e4m3fn", 512): "plain_fp8",
+        ("torch.float32", 4096): "compressor_ring_fp32",
+    }
+    record_bytes = shape[2] * element_size
+    if expected_formats.get((dtype, record_bytes)) != view.get("record_format"):
+        raise ValueError(f"{path}: logical record format differs from tensor layout")
+
+    spec = view.get("spec_metadata")
+    if not isinstance(spec, dict):
+        raise ValueError(f"{path}: logical cache spec is absent")
+    spec_tokens = spec.get("tokens_per_state")
+    logical_tokens = int(view["tokens_per_state"])
+    if (
+        spec.get("type") != view.get("spec_type")
+        or spec.get("dtype") != dtype
+        or int(spec.get("block_size", -1)) <= 0
+        or int(spec.get("num_states", -1)) != shape[1]
+        or int(spec.get("state_content_size_bytes", -1)) != record_bytes
+    ):
+        raise ValueError(f"{path}: logical spec/layout agreement differs")
+    if view.get("cache_kind") == "compressor_ring":
+        if (
+            view.get("spec_type") != "CircularBufferSpec"
+            or int(spec_tokens) != 1
+            or view.get("record_format") != "compressor_ring_fp32"
+        ):
+            raise ValueError(f"{path}: compressor-ring spec/layout differs")
+    elif int(spec_tokens) != logical_tokens:
+        raise ValueError(f"{path}: logical spec compression ratio differs")
+    if int(spec["block_size"]) // int(spec_tokens) != shape[1]:
+        raise ValueError(f"{path}: logical spec state cardinality differs")
+    return element_size
+
+
+def _validate_s0_authority(
+    path: Path,
+    view: dict[str, Any],
+    leaves: dict[str, dict[str, Any]],
+    payload: dict[str, torch.Tensor],
+    logical_mapping: dict[str, Any],
+) -> tuple[int, ...]:
+    request_slots = logical_mapping["request_state_slots"]
+    authority = logical_mapping.get("s0_authority")
+    if not isinstance(authority, dict):
+        raise ValueError(f"{path}: S0 cache authority is absent")
+    evidence_fields = (
+        "computed_extents",
+        "total_lengths",
+        "is_prefilling",
+        "replay_start",
+        "replay_window",
+        "speculative_group_ids",
+        "query_start_loc",
+    )
+    for field in evidence_fields:
+        leaf = leaves.get(f"l20:s0_cache_authority/{field}")
+        if leaf is None:
+            raise ValueError(f"{path}: S0 cache authority evidence is absent")
+        payload_key = leaf.get("payload_key")
+        value = (
+            leaf.get("value")
+            if payload_key is None
+            else payload[payload_key].detach().cpu().tolist()
+        )
+        if field == "is_prefilling":
+            value = [bool(item) for item in value]
+        if value != authority.get(field):
+            raise ValueError(f"{path}: S0 cache authority evidence differs")
+    fields = (
+        "computed_extents",
+        "total_lengths",
+        "is_prefilling",
+        "replay_start",
+    )
+    if any(
+        not isinstance(authority.get(field), list)
+        or len(authority[field]) != len(request_slots)
+        for field in fields
+    ):
+        raise ValueError(f"{path}: S0 cache authority cardinality differs")
+    query_start = authority.get("query_start_loc")
+    if (
+        query_start != logical_mapping.get("query_start_loc")
+        or not isinstance(query_start, list)
+        or len(query_start) != len(request_slots) + 1
+        or query_start[0] != 0
+        or any(not isinstance(value, int) or value < 0 for value in query_start)
+        or any(left > right for left, right in zip(query_start, query_start[1:]))
+    ):
+        raise ValueError(f"{path}: S0 query boundaries differ")
+
+    post_computed = leaves.get("post_sampling:registry/request:num_computed_tokens")
+    rejected = leaves.get("post_sampling:decisions/num_rejected")
+    if post_computed is None or rejected is None:
+        raise ValueError(f"{path}: S0 checkpoint binding is absent")
+    computed_values = payload[post_computed["payload_key"]].reshape(-1).tolist()
+    computed_slots = post_computed.get("metadata", {}).get("indices")
+    rejected_values = payload[rejected["payload_key"]].reshape(-1).tolist()
+    if (
+        not isinstance(computed_slots, list)
+        or len(computed_slots) != len(computed_values)
+        or len(rejected_values) != len(request_slots)
+    ):
+        raise ValueError(f"{path}: S0 checkpoint binding cardinality differs")
+    post_by_slot = dict(zip(map(int, computed_slots), map(int, computed_values)))
+    for request, slot in enumerate(request_slots):
+        query_len = int(query_start[request + 1]) - int(query_start[request])
+        expected_post = (
+            int(authority["computed_extents"][request])
+            + query_len
+            - int(rejected_values[request])
+        )
+        if post_by_slot.get(int(slot)) != expected_post:
+            raise ValueError(f"{path}: S0 computed extent differs from GPU state")
+
+    replay_window = authority.get("replay_window")
+    speculative_groups = authority.get("speculative_group_ids")
+    if (
+        not isinstance(replay_window, int)
+        or replay_window <= 0
+        or not isinstance(speculative_groups, list)
+        or any(not isinstance(group, int) or group < 0 for group in speculative_groups)
+    ):
+        raise ValueError(f"{path}: S0 replay authority is invalid")
+    expected = []
+    prefix_cacheable = view["spec_metadata"].get("prefix_cacheable")
+    if not isinstance(prefix_cacheable, bool):
+        raise ValueError(f"{path}: cache prefix policy is absent")
+    for request, computed in enumerate(authority["computed_extents"]):
+        computed = int(computed)
+        total = int(authority["total_lengths"][request])
+        replay = int(authority["replay_start"][request])
+        if not 0 <= replay <= total or not 0 <= computed <= total:
+            raise ValueError(f"{path}: S0 request extent is invalid")
+        extent = computed
+        if bool(authority["is_prefilling"][request]):
+            if int(view["group_id"]) in speculative_groups:
+                extent = 0
+            elif replay > 0:
+                extent = min(total, replay + replay_window) if prefix_cacheable else 0
+        expected.append(extent)
+    if view.get("s0_extents") != expected:
+        raise ValueError(f"{path}: owner-specific S0 extent differs")
+    return tuple(expected)
+
+
 def _validate_logical_payload(
     path: Path,
     checkpoint: str,
@@ -403,6 +583,14 @@ def _validate_logical_payload(
         raise ValueError(f"{path}: committed extents differ from GPU state")
     if descriptors.ndim != 2 or descriptors.shape[1] != 6:
         raise ValueError(f"{path}: logical descriptors are invalid for {root}")
+    element_size = _validate_view_layout(path, view)
+    s0_extents = _validate_s0_authority(
+        path,
+        view,
+        leaves,
+        payload,
+        logical_mapping,
+    )
     rows = descriptors.shape[0]
     if any(
         tensor.shape[0] != rows
@@ -413,35 +601,57 @@ def _validate_logical_payload(
         )
     ):
         raise ValueError(f"{path}: logical row cardinality differs for {root}")
-    if rows == 0:
-        if not view.get("destination_blocks"):
-            return
-        if view.get("cache_kind") != "compressor_ring":
-            raise ValueError(f"{path}: logical coverage is empty for {root}")
-        ratio = int(view["tokens_per_state"])
-        if any(int(extent) % ratio for extent in extents):
-            raise ValueError(f"{path}: empty ring has an open committed group")
-        return
     if torch.unique(descriptors, dim=0).shape[0] != rows:
         raise ValueError(f"{path}: logical descriptors are duplicated for {root}")
     block_size = int(view["block_size"])
-    destination_blocks = set(int(value) for value in view["destination_blocks"])
-    if (
-        bool((descriptors[:, :3] < 0).any())
-        or bool((descriptors[:, 3] <= 0).any())
-        or bool((descriptors[:, 4] < 0).any())
-        or bool((descriptors[:, 4] >= block_size).any())
-        or any(int(block) not in destination_blocks for block in descriptors[:, 3])
-    ):
-        raise ValueError(f"{path}: logical descriptor bounds differ for {root}")
     block_tables = logical_mapping["block_tables"]
     group_id = int(view["group_id"])
     if not 0 <= group_id < len(block_tables):
         raise ValueError(f"{path}: logical group mapping is absent for {root}")
     table = block_tables[group_id]
     ratio = int(view["tokens_per_state"])
+
+    restoration_entry = view.get("restoration_entry")
+    restoration_key = f"{checkpoint}:registry/{_safe_path_component(restoration_entry)}"
+    restoration_leaf = leaves.get(restoration_key)
+    intervals = (
+        []
+        if restoration_leaf is None
+        else restoration_leaf.get("metadata", {}).get("intervals")
+    )
+    if not isinstance(intervals, list):
+        raise ValueError(f"{path}: restoration binding is invalid for {root}")
+    intervals = [(int(begin), int(end)) for begin, end in intervals]
+
+    def covered(begin: int, end: int) -> bool:
+        return any(lo <= begin and end <= hi for lo, hi in intervals)
+
+    storage_offset = int(view["storage_offset_bytes"])
+    stride0, stride1, _ = map(int, view["strides_bytes"])
+    page_content_bytes = int(view["shape"][1]) * int(view["shape"][2]) * element_size
+    candidate_blocks = {
+        int(block)
+        for request_table in table
+        for block in request_table
+        if int(block) > 0
+    }
+    bound_destination_blocks = {
+        block
+        for block in candidate_blocks
+        if covered(
+            storage_offset + block * stride0,
+            storage_offset + block * stride0 + page_content_bytes,
+        )
+    }
+    destination_blocks = set(int(value) for value in view["destination_blocks"])
+    if destination_blocks != bound_destination_blocks:
+        raise ValueError(f"{path}: logical destination coverage differs for {root}")
+
     writer_count = descriptor_metadata.get("writer_count")
     writer_phases = descriptor_metadata.get("writer_phases")
+    writer_records = descriptor_metadata.get("writer_records")
+    writer_sources = descriptor_metadata.get("writer_sources")
+    writer_enforce = descriptor_metadata.get("writer_enforce_committed")
     expected_phases = (
         ["target-full", "target-replay"]
         if checkpoint == "post_sampling"
@@ -458,16 +668,37 @@ def _validate_logical_payload(
         or writer_phases
         not in [expected_phases[:end] for end in range(2, len(expected_phases) + 1)]
         or writer_count != len(writer_phases)
+        or not isinstance(writer_records, dict)
+        or set(writer_records) != set(writer_phases)
+        or not isinstance(writer_sources, dict)
+        or set(writer_sources) != set(writer_phases)
+        or not isinstance(writer_enforce, dict)
+        or set(writer_enforce) != set(writer_phases)
+        or any(
+            writer_enforce[phase] != (not phase.startswith("draft-"))
+            for phase in writer_phases
+        )
     ):
         raise ValueError(f"{path}: logical writer inventory is absent for {root}")
-    for descriptor in descriptors.tolist():
-        request, request_slot, position, block, row, writer = map(int, descriptor)
+
+    def validate_identity(identity: Any, *, committed: bool) -> tuple[int, ...]:
+        if (
+            not isinstance(identity, list)
+            or len(identity) != 5
+            or any(not isinstance(value, int) for value in identity)
+        ):
+            raise ValueError(f"{path}: logical writer record is invalid")
+        request, request_slot, position, block, row = identity
         if (
             not 0 <= request < len(request_slots)
             or request_slot != int(request_slots[request])
-            or not -1 <= writer < writer_count
+            or position < 0
+            or block <= 0
+            or not 0 <= row < block_size
+            or block not in destination_blocks
+            or (committed and position >= int(extents[request]))
         ):
-            raise ValueError(f"{path}: logical request/writer identity differs")
+            raise ValueError(f"{path}: logical writer identity differs")
         if view["cache_kind"] == "compressor_ring":
             expected_block = int(table[request][0])
             expected_row = position % block_size
@@ -482,21 +713,188 @@ def _validate_logical_payload(
             expected_row = state % block_size
         if (block, row) != (expected_block, expected_row):
             raise ValueError(f"{path}: descriptor does not match block tables")
+        return tuple(identity)
 
-    restoration_entry = view.get("restoration_entry")
-    restoration_key = f"{checkpoint}:registry/{_safe_path_component(restoration_entry)}"
-    restoration_leaf = leaves.get(restoration_key)
-    intervals = (
-        None
-        if restoration_leaf is None
-        else restoration_leaf.get("metadata", {}).get("intervals")
-    )
-    if not isinstance(intervals, list):
-        raise ValueError(f"{path}: restoration binding is absent for {root}")
-    intervals = [(int(begin), int(end)) for begin, end in intervals]
+    final_writer_records: dict[tuple[int, ...], int] = {}
+    for writer_index, phase in enumerate(writer_phases):
+        source = writer_sources[phase]
+        if not isinstance(source, dict):
+            raise ValueError(f"{path}: logical writer source is invalid")
+        position_path = source.get("position_path")
+        source_rows = source.get("source_rows")
+        positions = source.get("positions")
+        request_ordinals = source.get("request_ordinals")
+        request_state_slots = source.get("request_state_slots")
+        slots = source.get("slots")
+        source_leaf = (
+            None if not isinstance(position_path, str) else leaves.get(position_path)
+        )
+        if (
+            source_leaf is None
+            or not all(
+                isinstance(values, list)
+                for values in (
+                    source_rows,
+                    positions,
+                    request_ordinals,
+                    request_state_slots,
+                    slots,
+                )
+            )
+            or len(
+                {
+                    len(source_rows),
+                    len(positions),
+                    len(request_ordinals),
+                    len(request_state_slots),
+                }
+            )
+            != 1
+        ):
+            raise ValueError(f"{path}: logical writer source is incomplete")
+        source_positions = payload[source_leaf["payload_key"]].reshape(-1)
+        if (
+            any(
+                not isinstance(row, int) or not 0 <= row < source_positions.numel()
+                for row in source_rows
+            )
+            or list(map(int, positions))
+            != source_positions[torch.tensor(source_rows, dtype=torch.int64)].tolist()
+        ):
+            raise ValueError(f"{path}: logical writer positions differ")
+        if position_path in (
+            "l20:boundary/positions",
+            "s1:registry/speculator:context_positions",
+        ):
+            expected_requests = [
+                next(
+                    (
+                        request
+                        for request in range(len(request_slots))
+                        if int(logical_mapping["query_start_loc"][request])
+                        <= row
+                        < int(logical_mapping["query_start_loc"][request + 1])
+                    ),
+                    -1,
+                )
+                for row in source_rows
+            ]
+            if expected_requests != list(map(int, request_ordinals)):
+                raise ValueError(f"{path}: logical writer request rows differ")
+        if [
+            int(request_slots[int(request)])
+            if 0 <= int(request) < len(request_slots)
+            else -1
+            for request in request_ordinals
+        ] != list(map(int, request_state_slots)):
+            raise ValueError(f"{path}: logical writer request slots differ")
+        if not slots:
+            continue
+        if len(slots) != len(positions):
+            raise ValueError(f"{path}: logical writer slot rows differ")
+        for position, request, request_slot, slot in zip(
+            positions,
+            request_ordinals,
+            request_state_slots,
+            slots,
+        ):
+            slot = int(slot)
+            if slot < 0:
+                continue
+            identity = [
+                int(request),
+                int(request_slot),
+                int(position),
+                slot // block_size,
+                slot % block_size,
+            ]
+            final_writer_records[
+                validate_identity(
+                    identity,
+                    committed=bool(writer_enforce[phase]),
+                )
+            ] = writer_index
 
-    def covered(begin: int, end: int) -> bool:
-        return any(lo <= begin and end <= hi for lo, hi in intervals)
+    declared_writer_records = {phase: [] for phase in writer_phases}
+    for identity, writer_index in final_writer_records.items():
+        declared_writer_records[writer_phases[writer_index]].append(list(identity))
+    for records in declared_writer_records.values():
+        records.sort()
+    if declared_writer_records != writer_records:
+        raise ValueError(f"{path}: logical writer records differ from sources")
+
+    expected_records: dict[tuple[int, ...], int] = {}
+    for request, extent in enumerate(s0_extents):
+        request_slot = int(request_slots[request])
+        if view["cache_kind"] == "compressor_ring":
+            block = int(table[request][0])
+            if block <= 0 or block not in destination_blocks:
+                continue
+            for position in range(extent - extent % ratio, extent):
+                identity = (
+                    request,
+                    request_slot,
+                    position,
+                    block,
+                    position % block_size,
+                )
+                expected_records[identity] = -1
+            continue
+        for logical_block, block_value in enumerate(table[request]):
+            block = int(block_value)
+            if block <= 0 or block not in destination_blocks:
+                continue
+            for row in range(block_size):
+                state = logical_block * block_size + row
+                position = state * ratio + ratio - 1
+                if position >= extent:
+                    break
+                live_window = view.get("live_window")
+                if live_window is not None and position < max(
+                    0, extent - int(live_window)
+                ):
+                    continue
+                expected_records[(request, request_slot, position, block, row)] = -1
+
+    for identity, writer_index in final_writer_records.items():
+        if view["cache_kind"] == "compressor_ring":
+            request, _, _, block, row = identity
+            stale = [
+                current
+                for current in expected_records
+                if current[0] == request and current[3] == block and current[4] == row
+            ]
+            for current in stale:
+                del expected_records[current]
+        expected_records[identity] = writer_index
+    if view["cache_kind"] == "compressor_ring":
+        ephemeral = {
+            index
+            for index, phase in enumerate(writer_phases)
+            if not bool(writer_enforce[phase])
+        }
+        expected_records = {
+            identity: writer
+            for identity, writer in expected_records.items()
+            if (
+                writer in ephemeral
+                or identity[2]
+                >= int(extents[identity[0]]) - int(extents[identity[0]]) % ratio
+            )
+        }
+        for request, extent in enumerate(extents):
+            block = int(table[request][0])
+            if (
+                extent % ratio
+                and block in destination_blocks
+                and not any(identity[0] == request for identity in expected_records)
+            ):
+                raise ValueError(f"{path}: empty ring has an open committed group")
+    expected_descriptors = [
+        [*identity, writer] for identity, writer in sorted(expected_records.items())
+    ]
+    if descriptors.tolist() != expected_descriptors:
+        raise ValueError(f"{path}: logical writer/S0 descriptors differ for {root}")
 
     format_layout = {
         "v4_ue8m0_fp8_bf16": (576, 8),
@@ -508,7 +906,13 @@ def _validate_logical_payload(
     storage_offset = int(view["storage_offset_bytes"])
     stride0, stride1, _ = map(int, view["strides_bytes"])
     record_format = view["record_format"]
-    restoration_payload = payload[restoration_leaf["payload_key"]]
+    if rows and restoration_leaf is None:
+        raise ValueError(f"{path}: restoration binding is absent for {root}")
+    restoration_payload = (
+        torch.empty(0, dtype=torch.uint8)
+        if restoration_leaf is None
+        else payload[restoration_leaf["payload_key"]]
+    )
 
     def restoration_bytes(begin: int, end: int) -> torch.Tensor:
         cursor = 0
@@ -546,11 +950,6 @@ def _validate_logical_payload(
         ):
             raise ValueError(f"{path}: logical scales differ from restoration bytes")
 
-    spec = view["spec_metadata"]
-    if int(spec.get("tokens_per_state", view["tokens_per_state"])) != int(
-        view["tokens_per_state"]
-    ) or int(spec.get("num_states", view["block_size"])) != int(view["block_size"]):
-        raise ValueError(f"{path}: logical spec/layout agreement differs")
     reconstructed = _decode_logical_raw(raw_values, raw_scales, view)
     if reconstructed.shape != decoded.shape or not torch.equal(reconstructed, decoded):
         raise ValueError(f"{path}: logical decoded values do not match raw bytes")
@@ -922,6 +1321,7 @@ def _load_run(path: Path) -> EvidenceRun:
                 "cache_owner",
                 "compress_ratio",
                 "row_writer",
+                "row_input_indices",
                 "row_positions",
                 "row_request_ordinals",
                 "row_request_state_slots",
@@ -1198,6 +1598,7 @@ def _validated_scratch_rows(
         raise ValueError(f"{leaf['path']}: scratch tensor must be nonempty 2D")
     rows = tensor.shape[0]
     row_fields = (
+        "row_input_indices",
         "row_positions",
         "row_request_ordinals",
         "row_request_state_slots",
@@ -1215,6 +1616,91 @@ def _validated_scratch_rows(
         raise ValueError(f"{leaf['path']}: scratch uniqueness gate is absent")
     if metadata.get("require_trailing_sentinels") is not True:
         raise ValueError(f"{leaf['path']}: scratch sentinel-order gate is absent")
+
+    contract = run.manifest.get("evidence_contract")
+    logical_mapping = (
+        None if not isinstance(contract, dict) else contract.get("logical_mapping")
+    )
+    views = (
+        None if not isinstance(contract, dict) else contract.get("logical_cache_views")
+    )
+    boundary_leaf = run.leaves.get("l20:boundary/positions")
+    if (
+        not isinstance(logical_mapping, dict)
+        or not isinstance(views, list)
+        or boundary_leaf is None
+    ):
+        raise ValueError(f"{leaf['path']}: scratch authority is absent")
+    boundary_positions = _meaningful_tensor(run, boundary_leaf).reshape(-1)
+    input_rows = metadata["row_input_indices"]
+    if any(
+        not isinstance(index, int) or not 0 <= index < boundary_positions.numel()
+        for index in input_rows
+    ):
+        raise ValueError(f"{leaf['path']}: scratch input row is invalid")
+    authoritative_positions = boundary_positions[
+        torch.tensor(input_rows, dtype=torch.int64)
+    ].tolist()
+    if list(map(int, metadata["row_positions"])) != list(
+        map(int, authoritative_positions)
+    ):
+        raise ValueError(f"{leaf['path']}: scratch positions differ from L20")
+    query_start = logical_mapping.get("query_start_loc")
+    request_slots = logical_mapping.get("request_state_slots")
+    if (
+        not isinstance(query_start, list)
+        or not isinstance(request_slots, list)
+        or len(query_start) != len(request_slots) + 1
+    ):
+        raise ValueError(f"{leaf['path']}: scratch request mapping is absent")
+    expected_requests = [
+        next(
+            (
+                request
+                for request in range(len(request_slots))
+                if int(query_start[request]) <= index < int(query_start[request + 1])
+            ),
+            -1,
+        )
+        for index in input_rows
+    ]
+    if expected_requests != list(map(int, metadata["row_request_ordinals"])) or [
+        int(request_slots[request]) if request >= 0 else -1
+        for request in expected_requests
+    ] != list(map(int, metadata["row_request_state_slots"])):
+        raise ValueError(f"{leaf['path']}: scratch request ownership differs")
+
+    cache_owner = metadata.get("cache_owner")
+    producer_layer = metadata.get("producer_layer")
+    matching_views = [
+        view
+        for view in views
+        if isinstance(view, dict) and view.get("layer_name") == cache_owner
+    ]
+    if (
+        not isinstance(cache_owner, str)
+        or not isinstance(producer_layer, int)
+        or len(matching_views) != 1
+        or int(matching_views[0].get("tokens_per_state", -1))
+        != int(metadata.get("compress_ratio", -1))
+    ):
+        raise ValueError(f"{leaf['path']}: scratch cache ownership differs")
+
+    def layer_id(name: Any) -> int | None:
+        if not isinstance(name, str):
+            return None
+        parts = name.split(".")
+        for index, part in enumerate(parts[:-1]):
+            if part == "layers" and parts[index + 1].isdigit():
+                return int(parts[index + 1])
+        return None
+
+    owner_view = matching_views[0]
+    if producer_layer not in {
+        layer_id(name)
+        for name in [owner_view.get("layer_name"), *owner_view.get("consumers", [])]
+    }:
+        raise ValueError(f"{leaf['path']}: scratch producer ownership differs")
 
     canonical = torch.full_like(tensor, -1)
     for row in range(rows):

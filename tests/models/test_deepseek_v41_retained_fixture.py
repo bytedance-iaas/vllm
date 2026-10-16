@@ -19,6 +19,8 @@ from benchmarks.replayssm.dsv41_retained_control_compare import (
     _compare_runs,
     _floating_metrics,
     _identity_normalization_provenance,
+    _validate_logical_payload,
+    _validate_view_layout,
     _validated_scratch_rows,
 )
 from vllm.config import CUDAGraphMode
@@ -35,6 +37,7 @@ from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     _speculative_config_identity,
     canonical_decision_reference,
     clone_owned,
+    merge_typed_snapshots,
     typed_tree_snapshot,
     write_typed_run_bundle,
 )
@@ -242,6 +245,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         tensor=cache,
         block_size=4,
         tokens_per_state=1,
+        s0_extents=(),
         live_window=None,
         destination_blocks={1, 3},
         consumers=["layer"],
@@ -255,6 +259,8 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         request_ordinals=torch.tensor([0]),
         request_state_slots=torch.tensor([7]),
         slots_by_layer={"layer": torch.tensor([12])},
+        position_path="l20:boundary/positions",
+        source_rows=torch.tensor([0]),
     )
     registry = TouchedStateRegistry()
     input_batch = SimpleNamespace(
@@ -268,7 +274,16 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         [writer],
         input_batch,
         (torch.tensor([[1, 3]], dtype=torch.int32),),
-        (4,),
+        {"group-0:layer": (4,)},
+        {
+            "computed_extents": [4],
+            "total_lengths": [4],
+            "is_prefilling": [False],
+            "replay_start": [0],
+            "replay_window": 128,
+            "speculative_group_ids": [],
+            "query_start_loc": [0, 1],
+        },
         [
             {
                 "view_id": "group-0:layer",
@@ -304,6 +319,457 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
             "post_sampling",
             torch.tensor([5], dtype=torch.int32),
         )
+
+
+def _logical_evidence_bundle():
+    cache = torch.zeros((4, 4, 512), dtype=torch.bfloat16)
+    view = _LogicalCacheView(
+        view_id="group-0:model.layers.20.self_attn",
+        storage_id="storage-000",
+        group_id=0,
+        layer_name="model.layers.20.self_attn",
+        owner_type="Owner",
+        spec_type="MLAAttentionSpec",
+        spec_metadata={
+            "type": "MLAAttentionSpec",
+            "block_size": 4,
+            "head_size": 512,
+            "head_size_v": 0,
+            "num_kv_heads": 1,
+            "dtype": "torch.bfloat16",
+            "tokens_per_state": 1,
+            "state_content_size_bytes": 1024,
+            "num_states": 4,
+            "prefix_cacheable": True,
+            "prefix_replay_tokens": 0,
+        },
+        cache_kind="compressed_main",
+        record_format="plain_bf16",
+        tensor=cache,
+        block_size=4,
+        tokens_per_state=1,
+        s0_extents=(),
+        live_window=None,
+        destination_blocks={1, 3},
+        consumers=["model.layers.20.self_attn"],
+        aliases=[],
+        fp8_scale=None,
+        restoration_entry="kv-dst:model.layers.20.self_attn",
+    )
+    writers = [
+        _CacheWriter(
+            phase="target-full",
+            positions=torch.tensor([4]),
+            request_ordinals=torch.tensor([0]),
+            request_state_slots=torch.tensor([7]),
+            slots_by_layer={"model.layers.20.self_attn": torch.tensor([12])},
+            position_path="l20:boundary/positions",
+            source_rows=torch.tensor([0]),
+        ),
+        _CacheWriter(
+            phase="target-replay",
+            positions=torch.empty(0, dtype=torch.int64),
+            request_ordinals=torch.empty(0, dtype=torch.int64),
+            request_state_slots=torch.empty(0, dtype=torch.int64),
+            slots_by_layer={},
+            position_path="l20:boundary/positions",
+            source_rows=torch.empty(0, dtype=torch.int64),
+        ),
+    ]
+    authority = {
+        "computed_extents": [4],
+        "total_lengths": [4],
+        "is_prefilling": [False],
+        "replay_start": [0],
+        "replay_window": 128,
+        "speculative_group_ids": [],
+        "query_start_loc": [0, 1],
+    }
+    registry = TouchedStateRegistry()
+    storage = cache.view(torch.uint8).reshape(-1)
+    page_bytes = cache.stride(0) * cache.element_size()
+    registry.add_intervals(
+        "kv-dst:model.layers.20.self_attn",
+        storage,
+        [(page_bytes, 2 * page_bytes), (3 * page_bytes, 4 * page_bytes)],
+    )
+    computed_state = torch.zeros(8, dtype=torch.int32)
+    computed_state[7] = 5
+    registry.add_rows(
+        "request:num_computed_tokens",
+        computed_state,
+        torch.tensor([7]),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=torch.tensor([7]),
+    )
+    registry.configure_logical_cache(
+        [view],
+        writers,
+        input_batch,
+        (torch.tensor([[1, 3]], dtype=torch.int32),),
+        {view.view_id: (4,)},
+        authority,
+        [
+            {
+                "view_id": view.view_id,
+                "owner_type": "Owner",
+                "coverage": "logical",
+                "exclusion_reason": None,
+            }
+        ],
+    )
+    cache[3, 0].fill_(1)
+    snapshot = merge_typed_snapshots(
+        "post_sampling",
+        registry.typed_snapshot("post_sampling"),
+        registry.logical_cache_snapshot(
+            "post_sampling",
+            torch.tensor([5], dtype=torch.int32),
+        ),
+        typed_tree_snapshot(
+            "post_sampling",
+            {"num_rejected": torch.tensor([0], dtype=torch.int32)},
+            path="decisions",
+        ),
+    )
+    leaves = {f"post_sampling:{leaf['path']}": leaf for leaf in snapshot["leaves"]}
+    authority_snapshot = typed_tree_snapshot(
+        "l20",
+        {
+            "computed_extents": torch.tensor([4], dtype=torch.int64),
+            "total_lengths": torch.tensor([4], dtype=torch.int64),
+            "is_prefilling": torch.tensor([False]),
+            "replay_start": torch.tensor([0], dtype=torch.int64),
+            "replay_window": 128,
+            "speculative_group_ids": torch.empty(0, dtype=torch.int64),
+            "query_start_loc": torch.tensor([0, 1], dtype=torch.int64),
+        },
+        path="s0_cache_authority",
+    )
+    for leaf in authority_snapshot["leaves"]:
+        payload_key = leaf.get("payload_key")
+        if payload_key is not None:
+            new_key = f"authority-{payload_key}"
+            snapshot["tensors"][new_key] = authority_snapshot["tensors"][payload_key]
+            leaf["payload_key"] = new_key
+        leaves[f"l20:{leaf['path']}"] = leaf
+    snapshot["tensors"]["boundary-positions"] = torch.tensor([4], dtype=torch.int64)
+    leaves["l20:boundary/positions"] = {
+        "checkpoint": "l20",
+        "path": "boundary/positions",
+        "family": "boundary/positions",
+        "comparison": "exact",
+        "dtype": "torch.int64",
+        "shape": [1],
+        "payload_key": "boundary-positions",
+    }
+    mapping = {
+        "request_state_slots": [7],
+        "block_tables": [[[1, 3]]],
+        "query_start_loc": [0, 1],
+        "s0_authority": authority,
+    }
+    return view.metadata(), leaves, snapshot["tensors"], mapping
+
+
+def test_logical_comparator_binds_writer_destination_and_spec() -> None:
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    _validate_logical_payload(
+        Path("in-memory"),
+        "post_sampling",
+        view,
+        leaves,
+        payload,
+        mapping,
+    )
+
+    root = "post_sampling:logical_kv/group-0:model.layers.20.self_attn"
+    descriptors = payload[leaves[f"{root}/descriptors"]["payload_key"]]
+    descriptors[-1, 5] = 1
+    with pytest.raises(ValueError, match="writer/S0 descriptors differ"):
+        _validate_logical_payload(
+            Path("in-memory"),
+            "post_sampling",
+            view,
+            leaves,
+            payload,
+            mapping,
+        )
+    descriptors[-1, 5] = 0
+    descriptor_metadata = leaves[f"{root}/descriptors"]["metadata"]
+    identity = descriptors[-1, :5].tolist()
+    descriptor_metadata["writer_records"]["target-full"] = []
+    descriptor_metadata["writer_records"]["target-replay"] = [identity]
+    descriptors[-1, 5] = 1
+    with pytest.raises(ValueError, match="writer records differ from sources"):
+        _validate_logical_payload(
+            Path("in-memory"),
+            "post_sampling",
+            view,
+            leaves,
+            payload,
+            mapping,
+        )
+    descriptor_metadata["writer_records"]["target-full"] = [identity]
+    descriptor_metadata["writer_records"]["target-replay"] = []
+    descriptors[-1, 5] = 0
+
+    erased = dict(view)
+    erased["destination_blocks"] = []
+    with pytest.raises(ValueError, match="destination coverage differs"):
+        _validate_logical_payload(
+            Path("in-memory"),
+            "post_sampling",
+            erased,
+            leaves,
+            payload,
+            mapping,
+        )
+
+    forged = dict(view)
+    forged["spec_metadata"] = dict(view["spec_metadata"])
+    forged["spec_metadata"].update(
+        {
+            "dtype": "torch.int32",
+            "head_size": 7,
+            "state_content_size_bytes": 28,
+        }
+    )
+    with pytest.raises(ValueError, match="spec/layout agreement differs"):
+        _validate_logical_payload(
+            Path("in-memory"),
+            "post_sampling",
+            forged,
+            leaves,
+            payload,
+            mapping,
+        )
+
+    forged_s0 = dict(view)
+    forged_s0["s0_extents"] = [5]
+    with pytest.raises(ValueError, match="owner-specific S0 extent differs"):
+        _validate_logical_payload(
+            Path("in-memory"),
+            "post_sampling",
+            forged_s0,
+            leaves,
+            payload,
+            mapping,
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype,width,record_format,cache_kind,spec_type,spec_tokens,logical_tokens",
+    [
+        (
+            "torch.uint8",
+            584,
+            "v4_ue8m0_fp8_bf16",
+            "compressed_main",
+            "MLAAttentionSpec",
+            2,
+            2,
+        ),
+        (
+            "torch.uint8",
+            528,
+            "v41_ue8m0_mxfp8",
+            "swa",
+            "SlidingWindowMLASpec",
+            1,
+            1,
+        ),
+        (
+            "torch.uint8",
+            288,
+            "v41_nvfp4",
+            "compressed_main",
+            "MLAAttentionSpec",
+            2,
+            2,
+        ),
+        (
+            "torch.uint8",
+            132,
+            "indexer_fp8",
+            "indexer",
+            "MLAAttentionSpec",
+            2,
+            2,
+        ),
+        (
+            "torch.uint8",
+            68,
+            "indexer_mxfp4",
+            "indexer",
+            "MLAAttentionSpec",
+            2,
+            2,
+        ),
+        (
+            "torch.bfloat16",
+            512,
+            "plain_bf16",
+            "compressed_main",
+            "MLAAttentionSpec",
+            1,
+            1,
+        ),
+        (
+            "torch.float8_e4m3fn",
+            512,
+            "plain_fp8",
+            "compressed_main",
+            "MLAAttentionSpec",
+            1,
+            1,
+        ),
+        (
+            "torch.float32",
+            1024,
+            "compressor_ring_fp32",
+            "compressor_ring",
+            "CircularBufferSpec",
+            1,
+            2,
+        ),
+    ],
+)
+def test_logical_comparator_accepts_live_storage_layouts(
+    dtype,
+    width,
+    record_format,
+    cache_kind,
+    spec_type,
+    spec_tokens,
+    logical_tokens,
+) -> None:
+    element_size = {
+        "torch.uint8": 1,
+        "torch.bfloat16": 2,
+        "torch.float8_e4m3fn": 1,
+        "torch.float32": 4,
+    }[dtype]
+    block_size = 8
+    record_bytes = width * element_size
+    _validate_view_layout(
+        Path("in-memory"),
+        {
+            "dtype": dtype,
+            "shape": [2, block_size, width],
+            "strides_bytes": [
+                block_size * record_bytes,
+                record_bytes,
+                element_size,
+            ],
+            "block_size": block_size,
+            "tokens_per_state": logical_tokens,
+            "record_format": record_format,
+            "cache_kind": cache_kind,
+            "spec_type": spec_type,
+            "spec_metadata": {
+                "type": spec_type,
+                "dtype": dtype,
+                "block_size": block_size * spec_tokens,
+                "num_states": block_size,
+                "tokens_per_state": spec_tokens,
+                "state_content_size_bytes": record_bytes,
+            },
+        },
+    )
+
+
+def test_registry_builds_owner_specific_replay_s0_domains() -> None:
+    layer_names = (
+        "model.layers.20.self_attn",
+        "model.layers.20.self_attn.swa_cache",
+        "draft.layers.0.self_attn",
+    )
+    caches = {
+        name: torch.zeros((3, 4, 512), dtype=torch.bfloat16) for name in layer_names
+    }
+
+    def view(group_id: int, layer_name: str, prefix_cacheable: bool):
+        return _LogicalCacheView(
+            view_id=f"group-{group_id}:{layer_name}",
+            storage_id=f"storage-{group_id:03d}",
+            group_id=group_id,
+            layer_name=layer_name,
+            owner_type="Owner",
+            spec_type="MLAAttentionSpec",
+            spec_metadata={
+                "type": "MLAAttentionSpec",
+                "prefix_cacheable": prefix_cacheable,
+            },
+            cache_kind="compressed_main",
+            record_format="plain_bf16",
+            tensor=caches[layer_name],
+            block_size=4,
+            tokens_per_state=1,
+            s0_extents=(),
+            live_window=None,
+            destination_blocks={1, 2},
+            consumers=[layer_name],
+            aliases=[],
+            fp8_scale=None,
+            restoration_entry=f"kv-dst:{layer_name}",
+        )
+
+    views = [
+        view(0, layer_names[0], True),
+        view(1, layer_names[1], False),
+        view(2, layer_names[2], True),
+    ]
+    groups = [SimpleNamespace(layer_names=[name]) for name in layer_names]
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = SimpleNamespace(
+        req_states=SimpleNamespace(
+            total_len=SimpleNamespace(gpu=torch.tensor([8], dtype=torch.int32)),
+            num_computed_tokens=SimpleNamespace(
+                gpu=torch.tensor([4], dtype=torch.int32)
+            ),
+        ),
+        speculator=SimpleNamespace(draft_kv_cache_group_ids=(2,)),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                name: SimpleNamespace(kv_cache=caches[name]) for name in layer_names
+            }
+        ),
+    )
+    controller._collect_cache_intervals = lambda *args, **kwargs: {
+        ("cuda", group_id, 0, 0): SimpleNamespace(
+            views=[cache_view],
+            destination=[],
+            source=[],
+        )
+        for group_id, cache_view in enumerate(views)
+    }
+    controller._register_runtime_state = lambda *args, **kwargs: None
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping=torch.tensor([0], dtype=torch.int64),
+        is_prefilling_np=np.array([True]),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    registry = controller._build_registry(
+        input_batch,
+        tuple(torch.tensor([[1, 2]], dtype=torch.int32) for _ in layer_names),
+        (),
+        [],
+        torch.tensor([4], dtype=torch.int32),
+        4,
+    )
+
+    assert registry._cache_s0_extents == {
+        f"group-0:{layer_names[0]}": (8,),
+        f"group-1:{layer_names[1]}": (0,),
+        f"group-2:{layer_names[2]}": (0,),
+    }
 
 
 def test_draft_cache_writers_bind_context_and_query_rows() -> None:
@@ -407,10 +873,11 @@ def _scratch_run(
         "compare_prefix": values.shape[0],
         "scratch_policy": "candidate_membership_v1",
         "producer_layer": 20,
-        "cache_owner": "layer.20",
+        "cache_owner": "model.layers.20.self_attn",
         "compress_ratio": 2,
         "candidate_block_size": 2,
         "row_writer": "target-replay",
+        "row_input_indices": list(range(values.shape[0])),
         "row_positions": [15] * values.shape[0],
         "row_request_ordinals": list(range(values.shape[0])),
         "row_request_state_slots": list(range(values.shape[0])),
@@ -430,11 +897,49 @@ def _scratch_run(
         "payload_key": "values",
         "metadata": metadata,
     }
+    boundary = {
+        "checkpoint": "l20",
+        "path": "boundary/positions",
+        "family": "boundary/positions",
+        "comparison": "exact",
+        "dtype": "torch.int64",
+        "shape": [values.shape[0]],
+        "payload_key": "positions",
+    }
+    views = [
+        {
+            "layer_name": "model.layers.20.self_attn",
+            "tokens_per_state": 2,
+            "consumers": ["model.layers.20.self_attn"],
+        },
+        {
+            "layer_name": "model.layers.20.self_attn.indexer.k_cache",
+            "tokens_per_state": 2,
+            "consumers": ["model.layers.20.self_attn.indexer.k_cache"],
+        },
+    ]
     return EvidenceRun(
         Path("rank-00/a-001.json"),
-        {"dp_rank": 0, "ordinal": 1, "run_kind": "a"},
-        {"values": values},
-        {f"s1:{path}": leaf},
+        {
+            "dp_rank": 0,
+            "ordinal": 1,
+            "run_kind": "a",
+            "evidence_contract": {
+                "logical_mapping": {
+                    "request_state_slots": list(range(values.shape[0])),
+                    "query_start_loc": list(range(values.shape[0] + 1)),
+                },
+                "logical_cache_views": views,
+            },
+        },
+        {
+            "values": values,
+            "positions": torch.full((values.shape[0],), 15, dtype=torch.int64),
+        },
+        {
+            f"s1:{path}": leaf,
+            "l20:boundary/positions": boundary,
+        },
     )
 
 
@@ -444,7 +949,7 @@ def _add_topk(run: EvidenceRun, values: torch.Tensor) -> None:
     metadata = {
         **candidate["metadata"],
         "scratch_policy": "topk_diagnostic_v1",
-        "cache_owner": "layer.20.indexer.k_cache",
+        "cache_owner": "model.layers.20.self_attn.indexer.k_cache",
         "candidate_membership_path": "registry/model:candidate_block_buffer",
         "candidate_block_size": 2,
         "valid_id_exclusive_bounds": [8] * values.shape[0],
@@ -515,6 +1020,22 @@ def test_scratch_comparator_rejects_duplicate_or_out_of_range_ids() -> None:
     )
     with pytest.raises(ValueError, match="exceeds visibility"):
         _validated_scratch_rows(out_of_range, next(iter(out_of_range.leaves.values())))
+
+
+def test_scratch_comparator_binds_boundary_and_cache_owner() -> None:
+    run = _scratch_run(
+        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    leaf = run.leaves["s1:registry/model:candidate_block_buffer"]
+    leaf["metadata"]["row_positions"] = [199]
+    with pytest.raises(ValueError, match="positions differ from L20"):
+        _validated_scratch_rows(run, leaf)
+
+    leaf["metadata"]["row_positions"] = [15]
+    leaf["metadata"]["cache_owner"] = "model.layers.999.self_attn"
+    with pytest.raises(ValueError, match="cache ownership differs"):
+        _validated_scratch_rows(run, leaf)
 
 
 def test_numeric_comparator_accepts_matching_infinity_masks() -> None:
