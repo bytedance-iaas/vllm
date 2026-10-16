@@ -318,6 +318,10 @@ class DecoderReplayCudaGraphManager(CudaGraphManager):
                 f"decoder replay graph has no captured context for {descriptor}"
             ) from error
 
+    def clear_captured_forward_contexts(self) -> None:
+        """Release contexts belonging to discarded profiling graphs."""
+        self._captured_forward_contexts.clear()
+
     def run(self, rows: torch.Tensor, inputs: tuple) -> tuple[torch.Tensor, ...]:
         """Replay the forward context's graph on ``rows`` of ``inputs``."""
         num_rows = rows.shape[0]

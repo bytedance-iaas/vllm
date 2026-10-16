@@ -1948,6 +1948,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.cudagraph_manager.needs_capture()
         )
 
+    def _clear_profile_replay_graph_contexts(self) -> None:
+        replay_graphs = getattr(self.model_state, "replay_cudagraphs", None)
+        if replay_graphs is not None:
+            replay_graphs.clear_captured_forward_contexts()
+
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
         assert self.cudagraph_manager is not None
@@ -2013,6 +2018,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_connector.reset_capture_state()
 
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            if profile_only:
+                self._clear_profile_replay_graph_contexts()
 
         if not profile_only:
             # Lock workspace to prevent resizing during execution. A resize after
