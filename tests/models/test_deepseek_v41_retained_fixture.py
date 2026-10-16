@@ -21,11 +21,13 @@ from benchmarks.replayssm.dsv41_retained_control_compare import (
     _decode_logical_raw,
     _floating_metrics,
     _identity_normalization_provenance,
+    _shared_config_dspark_prefill_only,
     _validate_cache_view_overlays,
     _validate_draft_writer_runtime_authority,
     _validate_logical_payload,
     _validate_s0_authority,
     _validate_view_layout,
+    _validated_draft_phase_policy,
     _validated_scratch_rows,
 )
 from vllm.config import CUDAGraphMode
@@ -1122,6 +1124,42 @@ def test_logical_comparator_rejects_forged_s0_runtime_authority() -> None:
             mapping,
         )
 
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    mapping["s0_authority"].update(
+        {
+            "speculative_group_ids": [0],
+            "draft_layer_names": [view["layer_name"]],
+            "draft_layer_group_ids": [0],
+            "draft_layer_group_indices": [0],
+        }
+    )
+    forged = typed_tree_snapshot(
+        "l20",
+        {
+            "speculative_group_ids": torch.tensor([0], dtype=torch.int64),
+            "draft_layer_names": [view["layer_name"]],
+            "draft_layer_group_ids": torch.tensor([0], dtype=torch.int64),
+            "draft_layer_group_indices": torch.tensor([0], dtype=torch.int64),
+        },
+        path="s0_cache_authority",
+    )
+    for leaf in forged["leaves"]:
+        payload_key = leaf.get("payload_key")
+        if payload_key is not None:
+            new_key = f"forged-{payload_key}"
+            payload[new_key] = forged["tensors"][payload_key]
+            leaf["payload_key"] = new_key
+        leaves[f"l20:{leaf['path']}"] = leaf
+    with pytest.raises(ValueError, match="runtime S0 authority differs"):
+        _validate_logical_payload(
+            Path("in-memory"),
+            "post_sampling",
+            view,
+            leaves,
+            payload,
+            mapping,
+        )
+
 
 def test_logical_comparator_rejects_writer_phase_relabeling() -> None:
     view, leaves, payload, mapping = _logical_evidence_bundle()
@@ -1664,9 +1702,16 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
             ]
         ),
     )
+    registry = TouchedStateRegistry()
+    registry._cache_runtime_authority["draft_phase_policy"] = {
+        "is_dummy": False,
+        "dspark_prefill_only": False,
+        "context_expected": True,
+        "query_expected": True,
+    }
     fixture = SimpleNamespace(
         is_dummy=False,
-        registry=TouchedStateRegistry(),
+        registry=registry,
         input_batch=SimpleNamespace(
             num_reqs=1,
             num_tokens=2,
@@ -1814,6 +1859,78 @@ def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
             payload,
             inconsistent,
         )
+
+
+def test_draft_phase_policy_rejects_active_self_disable() -> None:
+    policy = {
+        "is_dummy": False,
+        "dspark_prefill_only": False,
+        "context_expected": True,
+        "query_expected": True,
+    }
+    snapshot = typed_tree_snapshot(
+        "l20",
+        {"draft_phase_policy": policy},
+        path="cache_runtime_authority",
+    )
+    leaves = {f"l20:{leaf['path']}": leaf for leaf in snapshot["leaves"]}
+    mapping = {
+        "draft_phase_policy": dict(policy),
+        "s0_authority": {
+            "speculative_group_ids": [2],
+            "draft_layer_names": ["draft"],
+            "draft_layer_group_ids": [2],
+            "draft_layer_group_indices": [0],
+        },
+    }
+
+    assert (
+        _validated_draft_phase_policy(
+            Path("in-memory"),
+            leaves,
+            snapshot["tensors"],
+            mapping,
+        )
+        == policy
+    )
+    mapping["draft_phase_policy"]["query_expected"] = False
+    with pytest.raises(ValueError, match="draft runtime phase policy differs"):
+        _validated_draft_phase_policy(
+            Path("in-memory"),
+            leaves,
+            snapshot["tensors"],
+            mapping,
+        )
+
+
+def test_shared_config_derives_dspark_prefill_only_policy() -> None:
+    manifest = {
+        "shared_config": {
+            "speculative_config": {
+                "method": "dspark",
+                "target_parallel_config": {"pipeline_parallel_size": 1},
+                "target_kv_transfer_config": (
+                    "KVTransferConfig(kv_connector='MooncakeConnector', "
+                    "engine_id='decode_dp0', kv_role='kv_consumer')"
+                ),
+            }
+        }
+    }
+    assert _shared_config_dspark_prefill_only(Path("in-memory"), manifest) is False
+
+    speculative = manifest["shared_config"]["speculative_config"]
+    speculative["target_parallel_config"]["pipeline_parallel_size"] = 2
+    speculative["target_kv_transfer_config"] = (
+        "KVTransferConfig(kv_connector='MooncakeConnector', "
+        "engine_id='prefill_dp0', kv_role='kv_producer')"
+    )
+    assert _shared_config_dspark_prefill_only(Path("in-memory"), manifest) is True
+
+    speculative["target_kv_transfer_config"] = (
+        "KVTransferConfig(kv_connector='MooncakeConnector', engine_id='prefill_dp0')"
+    )
+    with pytest.raises(ValueError, match="target KV role is missing"):
+        _shared_config_dspark_prefill_only(Path("in-memory"), manifest)
 
 
 def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:

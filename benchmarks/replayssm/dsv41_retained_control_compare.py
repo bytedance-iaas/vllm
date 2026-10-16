@@ -797,6 +797,93 @@ def _validated_draft_layer_mapping(
     }
 
 
+def _validated_draft_phase_policy(
+    path: Path,
+    leaves: dict[str, dict[str, Any]],
+    payload: dict[str, torch.Tensor],
+    logical_mapping: dict[str, Any],
+) -> dict[str, bool]:
+    declared = logical_mapping.get("draft_phase_policy")
+    fields = (
+        "is_dummy",
+        "dspark_prefill_only",
+        "context_expected",
+        "query_expected",
+    )
+    runtime = {}
+    for field in fields:
+        leaf = leaves.get(f"l20:cache_runtime_authority/draft_phase_policy/{field}")
+        if leaf is None or not isinstance(leaf.get("value"), bool):
+            raise ValueError(f"{path}: draft runtime phase policy is absent")
+        runtime[field] = leaf["value"]
+    draft_layers = _validated_draft_layer_mapping(path, logical_mapping)
+    expected = {
+        "is_dummy": runtime["is_dummy"],
+        "dspark_prefill_only": runtime["dspark_prefill_only"],
+        "context_expected": bool(draft_layers) and not runtime["is_dummy"],
+        "query_expected": (
+            bool(draft_layers)
+            and not runtime["is_dummy"]
+            and not runtime["dspark_prefill_only"]
+        ),
+    }
+    if declared != runtime or runtime != expected:
+        raise ValueError(f"{path}: draft runtime phase policy differs")
+    return runtime
+
+
+def _shared_config_dspark_prefill_only(
+    path: Path,
+    manifest: dict[str, Any],
+) -> bool:
+    shared = manifest.get("shared_config")
+    speculative = (
+        None if not isinstance(shared, dict) else shared.get("speculative_config")
+    )
+    if (
+        not isinstance(speculative, dict)
+        or speculative.get("method") != "dspark"
+        or not isinstance(speculative.get("target_parallel_config"), dict)
+    ):
+        raise ValueError(f"{path}: DSpark shared configuration is invalid")
+    pipeline_parallel_size = speculative["target_parallel_config"].get(
+        "pipeline_parallel_size"
+    )
+    if not isinstance(pipeline_parallel_size, int) or pipeline_parallel_size < 1:
+        raise ValueError(f"{path}: DSpark target PP configuration is invalid")
+
+    connector_repr = speculative.get("target_kv_transfer_config")
+    role = None
+    if connector_repr is not None:
+        if not isinstance(connector_repr, str):
+            raise ValueError(f"{path}: target KV transfer configuration is invalid")
+        try:
+            expression = ast.parse(connector_repr, mode="eval")
+        except SyntaxError as error:
+            raise ValueError(
+                f"{path}: target KV transfer configuration is malformed"
+            ) from error
+        call = expression.body
+        if (
+            not isinstance(call, ast.Call)
+            or not isinstance(call.func, ast.Name)
+            or call.func.id != "KVTransferConfig"
+            or call.args
+            or any(keyword.arg is None for keyword in call.keywords)
+        ):
+            raise ValueError(f"{path}: target KV transfer configuration is invalid")
+        role_keywords = [
+            keyword for keyword in call.keywords if keyword.arg == "kv_role"
+        ]
+        if len(role_keywords) != 1 or not (
+            isinstance(role_keywords[0].value, ast.Constant)
+            and isinstance(role_keywords[0].value.value, str)
+        ):
+            raise ValueError(f"{path}: target KV role is missing or ambiguous")
+        role = role_keywords[0].value.value
+    return pipeline_parallel_size > 1 and role == "kv_producer"
+
+
 def _validate_s0_authority(
     path: Path,
     view: dict[str, Any],
@@ -816,6 +903,10 @@ def _validate_s0_authority(
         "total_lengths",
         "is_prefilling",
         "replay_start",
+        "speculative_group_ids",
+        "draft_layer_names",
+        "draft_layer_group_ids",
+        "draft_layer_group_indices",
         "allocated_block_counts",
         "block_table_widths",
         "block_table_witness",
@@ -824,10 +915,14 @@ def _validate_s0_authority(
     )
     runtime: dict[str, Any] = {}
     for field in runtime_fields:
-        leaf = leaves.get(f"l20:cache_runtime_authority/{field}")
-        if leaf is None or leaf.get("payload_key") is None:
-            raise ValueError(f"{path}: cache runtime authority is absent: {field}")
-        runtime[field] = payload[leaf["payload_key"]].detach().cpu().tolist()
+        root = f"l20:cache_runtime_authority/{field}"
+        if field == "draft_layer_names":
+            runtime[field] = _typed_flat_sequence_value(path, root, leaves, payload)
+        else:
+            leaf = leaves.get(root)
+            if leaf is None or leaf.get("payload_key") is None:
+                raise ValueError(f"{path}: cache runtime authority is absent: {field}")
+            runtime[field] = payload[leaf["payload_key"]].detach().cpu().tolist()
     runtime["is_prefilling"] = [bool(value) for value in runtime["is_prefilling"]]
     if runtime["request_state_slots"] != request_slots:
         raise ValueError(f"{path}: runtime request-state mapping differs")
@@ -897,6 +992,10 @@ def _validate_s0_authority(
         "is_prefilling",
         "replay_start",
         "query_start_loc",
+        "speculative_group_ids",
+        "draft_layer_names",
+        "draft_layer_group_ids",
+        "draft_layer_group_indices",
     ):
         if runtime[field] != authority.get(field):
             raise ValueError(f"{path}: runtime S0 authority differs: {field}")
@@ -1289,6 +1388,18 @@ def _validate_logical_payload(
             "layer_group_ids": layer_group_ids,
             "layer_group_indices": layer_group_indices,
         }
+        phase_policy = _validated_draft_phase_policy(
+            path,
+            leaves,
+            payload,
+            logical_mapping,
+        )
+        s0_authority = logical_mapping.get("s0_authority")
+        identity_fields = (
+            "draft_layer_names",
+            "draft_layer_group_ids",
+            "draft_layer_group_indices",
+        )
         if (
             not isinstance(context_enabled, bool)
             or not isinstance(query_enabled, bool)
@@ -1298,15 +1409,22 @@ def _validate_logical_payload(
             or (not context_enabled and context_rows)
             or (not query_enabled and query_rows)
             or draft_writer_authority != runtime_authority
+            or not isinstance(s0_authority, dict)
+            or any(
+                runtime_authority[field] != s0_authority.get(field)
+                for field in identity_fields
+            )
+            or context_enabled != phase_policy["context_expected"]
+            or query_enabled != phase_policy["query_expected"]
         ):
             raise ValueError(
                 f"{path}: draft writer runtime policy is invalid for {root}"
             )
         expected_phases = ["target-full", "target-replay"]
-        if context_enabled:
+        if phase_policy["context_expected"]:
             expected_phases.append("draft-context")
             draft_source_rows["draft-context"] = context_rows
-        if query_enabled:
+        if phase_policy["query_expected"]:
             expected_phases.append("draft-query")
             draft_source_rows["draft-query"] = query_rows
     if (
@@ -1787,6 +1905,21 @@ def _validate_evidence_contract(
                 logical_mapping,
             )
     draft_layers = _validated_draft_layer_mapping(path, logical_mapping)
+    phase_policy = _validated_draft_phase_policy(
+        path,
+        leaves,
+        payload,
+        logical_mapping,
+    )
+    role = manifest.get("active_role")
+    if (
+        role not in ("active", "idle")
+        or phase_policy["is_dummy"] != (role == "idle")
+        or phase_policy["dspark_prefill_only"]
+        != _shared_config_dspark_prefill_only(path, manifest)
+        or (role == "active" and not draft_layers)
+    ):
+        raise ValueError(f"{path}: draft phase policy differs from runtime role")
     view_pairs = [
         (view.get("layer_name"), int(view.get("group_id", -1)))
         for view in logical_cache_views

@@ -1333,6 +1333,19 @@ class TouchedStateRegistry:
                 s0_authority["replay_start"],
                 dtype=torch.int64,
             ),
+            "speculative_group_ids": torch.tensor(
+                s0_authority["speculative_group_ids"],
+                dtype=torch.int64,
+            ),
+            "draft_layer_names": tuple(s0_authority["draft_layer_names"]),
+            "draft_layer_group_ids": torch.tensor(
+                s0_authority["draft_layer_group_ids"],
+                dtype=torch.int64,
+            ),
+            "draft_layer_group_indices": torch.tensor(
+                s0_authority["draft_layer_group_indices"],
+                dtype=torch.int64,
+            ),
             "allocated_block_counts": torch.tensor(
                 self._cache_allocated_blocks,
                 dtype=torch.int64,
@@ -2538,6 +2551,20 @@ class RetainedReplayFixtureController:
             int(replay_layers.window),
             production_replay_batch.rows,
         )
+        draft_layer_names = registry._cache_s0_authority["draft_layer_names"]
+        if not is_dummy and not draft_layer_names:
+            raise RetainedReplayFixtureError(
+                "active retained fixture lacks draft layer authority"
+            )
+        dspark_prefill_only = bool(getattr(self.runner, "dspark_prefill_only", False))
+        registry._cache_runtime_authority["draft_phase_policy"] = {
+            "is_dummy": bool(is_dummy),
+            "dspark_prefill_only": dspark_prefill_only,
+            "context_expected": bool(draft_layer_names) and not is_dummy,
+            "query_expected": (
+                bool(draft_layer_names) and not is_dummy and not dspark_prefill_only
+            ),
+        }
         self._register_production_graph_inputs(
             registry,
             production_replay_batch,
@@ -2983,6 +3010,12 @@ class RetainedReplayFixtureController:
                     "layer_group_indices": draft_authority[
                         "layer_group_indices"
                     ].tolist(),
+                },
+                "draft_phase_policy": {
+                    name: bool(value)
+                    for name, value in fixture.registry._cache_runtime_authority[
+                        "draft_phase_policy"
+                    ].items()
                 },
                 "s0_authority": fixture.registry._cache_s0_authority,
             },
@@ -3832,7 +3865,26 @@ class RetainedReplayFixtureController:
                 dtype=torch.int64,
             ),
         }
-        if fixture.is_dummy or speculator is None or not layer_names:
+        phase_policy = fixture.registry._cache_runtime_authority.get(
+            "draft_phase_policy"
+        )
+        expected_policy = {
+            "is_dummy": bool(fixture.is_dummy),
+            "dspark_prefill_only": bool(
+                getattr(self.runner, "dspark_prefill_only", False)
+            ),
+            "context_expected": bool(layer_names) and not fixture.is_dummy,
+            "query_expected": (
+                bool(layer_names)
+                and not fixture.is_dummy
+                and not getattr(self.runner, "dspark_prefill_only", False)
+            ),
+        }
+        if phase_policy != expected_policy:
+            raise RetainedReplayFixtureError(
+                "draft writer runtime phase policy differs"
+            )
+        if not phase_policy["context_expected"]:
             fixture.registry._cache_draft_writer_authority = {
                 "context_enabled": False,
                 "query_enabled": False,
@@ -3841,6 +3893,10 @@ class RetainedReplayFixtureController:
                 **authority_identity,
             }
             return []
+        if speculator is None or not layer_names:
+            raise RetainedReplayFixtureError(
+                "active retained fixture lacks draft writer authority"
+            )
         num_reqs = int(fixture.input_batch.num_reqs)
         num_target_tokens = int(fixture.input_batch.num_tokens)
         query_ends = (
@@ -3926,7 +3982,7 @@ class RetainedReplayFixtureController:
                 enforce_committed_extent=False,
             )
         ]
-        if getattr(self.runner, "dspark_prefill_only", False):
+        if not phase_policy["query_expected"]:
             fixture.registry._cache_draft_writer_authority = {
                 "context_enabled": True,
                 "query_enabled": False,
