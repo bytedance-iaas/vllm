@@ -1283,12 +1283,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 assert ordinary is not None
                 assert ordinary_inputs is not None
-                with override_forward_context(ordinary.forward_context):
-                    ordinary_boundary = (
-                        decoder_model._run_to_decoder_replay_boundary_from_inputs(
-                            **ordinary_inputs
+                ordinary_boundary = None
+                local_error = None
+                try:
+                    with override_forward_context(ordinary.forward_context):
+                        ordinary_boundary = (
+                            decoder_model._run_to_decoder_replay_boundary_from_inputs(
+                                **ordinary_inputs
+                            )
                         )
-                    )
+                except Exception as error:
+                    local_error = error
+                self._dsv41_feature_agree(
+                    local_error,
+                    f"{phase}: a peer failed B ordinary prefix",
+                )
+                assert ordinary_boundary is not None
                 local_error = None
                 try:
                     boundary = self._merge_dsv41_boundary_rows(

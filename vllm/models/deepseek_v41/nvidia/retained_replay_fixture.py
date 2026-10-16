@@ -4228,7 +4228,6 @@ class RetainedReplayFixtureController:
         warmups: int,
         blocks: int,
     ) -> dict[str, Any]:
-        self.validate_feature_benchmark_preflight()
         fixture = self.fixture
         assert fixture is not None
         registry = fixture.registry
