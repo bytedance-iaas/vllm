@@ -1035,6 +1035,20 @@ class Worker(WorkerBase):
             nonce,
         )
 
+    def run_dsv41_feature_benchmark(
+        self,
+        warmups: str = "2",
+        blocks: str = "5",
+        nonce: str = "",
+    ) -> dict[str, Any]:
+        if not self.use_v2_model_runner:
+            return {"state": "unsupported", "error": "V2 model runner is required"}
+        return self.model_runner.run_dsv41_feature_benchmark(
+            warmups,
+            blocks,
+            nonce,
+        )
+
     def supports_draft_weight_updates(self) -> bool:
         engine = self.weight_transfer_engine
         speculative_config = self.speculative_config

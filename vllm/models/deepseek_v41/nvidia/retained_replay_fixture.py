@@ -558,6 +558,63 @@ def _cache_block_byte_intervals(
     return _merge_byte_intervals(intervals)
 
 
+def _cache_record_byte_intervals(
+    name: str,
+    cache: torch.Tensor,
+    block: int,
+    row: int,
+) -> list[_ByteInterval]:
+    if cache.ndim != 3:
+        raise RetainedReplayFixtureError(
+            f"{name}: unsupported bound KV shape {tuple(cache.shape)}"
+        )
+    if not 0 <= block < cache.shape[0] or not 0 <= row < cache.shape[1]:
+        raise RetainedReplayFixtureError(
+            f"{name}: KV record ({block}, {row}) exceeds {tuple(cache.shape[:2])}"
+        )
+    record_format = _cache_record_format(cache)
+    value_bytes, scale_bytes, _ = _CACHE_RECORD_LAYOUTS[record_format]
+    page = (cache.storage_offset() + block * cache.stride(0)) * cache.element_size()
+    if record_format in _PACKED_CACHE_FORMATS.values():
+        value_begin = page + row * value_bytes
+        scale_begin = page + cache.shape[1] * value_bytes + row * scale_bytes
+        return [
+            (value_begin, value_begin + value_bytes),
+            (scale_begin, scale_begin + scale_bytes),
+        ]
+    row_view = cache[block, row]
+    if not row_view.is_contiguous():
+        raise RetainedReplayFixtureError(f"{name}: KV record row is not contiguous")
+    actual_bytes = row_view.numel() * row_view.element_size()
+    if actual_bytes != value_bytes or scale_bytes:
+        raise RetainedReplayFixtureError(
+            f"{name}: KV record byte layout differs for {record_format}"
+        )
+    begin = (
+        cache.storage_offset() + block * cache.stride(0) + row * cache.stride(1)
+    ) * cache.element_size()
+    return [(begin, begin + actual_bytes)]
+
+
+def _byte_intervals_overlap(
+    left: list[_ByteInterval],
+    right: list[_ByteInterval],
+) -> bool:
+    left = _merge_byte_intervals(left)
+    right = _merge_byte_intervals(right)
+    left_index = right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        left_begin, left_end = left[left_index]
+        right_begin, right_end = right[right_index]
+        if max(left_begin, right_begin) < min(left_end, right_end):
+            return True
+        if left_end <= right_end:
+            left_index += 1
+        else:
+            right_index += 1
+    return False
+
+
 def _update_tensor_hash(digest: Any, tensor: torch.Tensor) -> None:
     digest.update(str(tensor.dtype).encode())
     digest.update(str(tuple(tensor.shape)).encode())
@@ -2174,10 +2231,80 @@ class _ReplayGraphRuntimeState:
 
 
 @dataclass
+class _L20PrefixStorage:
+    name: str
+    ordinary: _TensorSelection | _TensorIntervals | None
+    retained: _TensorSelection | _TensorIntervals | None
+
+    def capture_s0(self) -> None:
+        for entry in (self.ordinary, self.retained):
+            if entry is not None:
+                entry.capture("s0")
+
+    def capture_l20(self) -> None:
+        for entry in (self.ordinary, self.retained):
+            if entry is not None:
+                entry.capture("l20")
+
+    def verify_s0(self) -> None:
+        for entry in (self.ordinary, self.retained):
+            if entry is not None and entry.current_digest() != entry.epoch_digest("s0"):
+                raise RetainedReplayFixtureError(
+                    f"{entry.name}: prefix state differs before ordinary execution"
+                )
+
+    def restore_retained_l20(self) -> None:
+        if self.retained is not None:
+            self.retained.restore("l20")
+
+    def verify_retained_l20(self) -> None:
+        entry = self.retained
+        if entry is not None and entry.current_digest() != entry.epoch_digest("l20"):
+            raise RetainedReplayFixtureError(
+                f"{entry.name}: retained L20 state was not installed"
+            )
+
+
+@dataclass
+class L20PrefixPartition:
+    ordinary_rows: torch.Tensor
+    retained_rows: torch.Tensor
+    storages: list[_L20PrefixStorage]
+
+    def capture_s0(self) -> None:
+        for storage in self.storages:
+            storage.capture_s0()
+
+    def capture_l20(self) -> None:
+        for storage in self.storages:
+            storage.capture_l20()
+
+    def verify_s0(self) -> None:
+        for storage in self.storages:
+            storage.verify_s0()
+
+    def restore_retained_l20(self) -> None:
+        for storage in self.storages:
+            storage.restore_retained_l20()
+
+    def verify_retained_l20(self) -> None:
+        for storage in self.storages:
+            storage.verify_retained_l20()
+
+    @property
+    def retained_bytes(self) -> int:
+        return sum(
+            0 if storage.retained is None else storage.retained.bytes
+            for storage in self.storages
+        )
+
+
+@dataclass
 class L20ContinuationCapsule:
     boundary: DecoderBoundaryState
     ordinary_rows: torch.Tensor
     retained_rows: torch.Tensor
+    prefix_partition: L20PrefixPartition
 
 
 @dataclass
@@ -2196,6 +2323,7 @@ class RetainedFixture:
     registry: TouchedStateRegistry
     source_digest: str
     boundary: DecoderBoundaryState | None = None
+    prefix_partition: L20PrefixPartition | None = None
     continuation: L20ContinuationCapsule | None = None
     production_checkpoints: dict[str, dict[str, Any]] | None = None
     production_graph: dict[str, Any] | None = None
@@ -2352,6 +2480,11 @@ class RetainedReplayFixtureController:
                 None
                 if fixture is None or fixture.continuation is None
                 else int(fixture.continuation.boundary.hidden_states.shape[0])
+            ),
+            "continuation_retained_bytes": (
+                None
+                if fixture is None or fixture.continuation is None
+                else fixture.continuation.prefix_partition.retained_bytes
             ),
             "boundary_error": self.boundary_error,
             "checkpoint_error": self._active_checkpoint_error,
@@ -2941,6 +3074,184 @@ class RetainedReplayFixtureController:
             }
         registry._cache_runtime_authority["scratch_producers"] = scratch_producers
 
+    @staticmethod
+    def _build_l20_prefix_partition(
+        registry: TouchedStateRegistry,
+        input_batch: InputBatch,
+        ordinary_batch: OrdinaryDecodeBatch | None,
+    ) -> L20PrefixPartition:
+        device = input_batch.input_ids.device
+        ordinary_rows = (
+            torch.empty(0, dtype=torch.int64, device=device)
+            if ordinary_batch is None
+            else clone_owned(ordinary_batch.rows).to(device=device)
+        )
+        if bool(
+            (ordinary_rows < 0).any()
+            or (ordinary_rows >= input_batch.num_tokens_after_padding).any()
+        ):
+            raise RetainedReplayFixtureError(
+                "ordinary prefix rows exceed the full batch"
+            )
+        retained_mask = torch.ones(
+            input_batch.num_tokens_after_padding,
+            dtype=torch.bool,
+            device=device,
+        )
+        retained_mask[ordinary_rows] = False
+        retained_rows = torch.nonzero(retained_mask, as_tuple=False).flatten()
+        storages: list[_L20PrefixStorage] = []
+
+        row_state_names = {
+            "model:topk_indices_buffer",
+            "model:candidate_block_buffer",
+            "model:_mtp_hidden_buffer",
+        }
+        for entry in registry.entries:
+            if not entry.name.startswith("model:"):
+                continue
+            if entry.name not in row_state_names:
+                raise RetainedReplayFixtureError(
+                    f"{entry.name}: L20 prefix ownership is not row-addressable"
+                )
+            if not isinstance(entry, _TensorSelection) or entry.dim != 0:
+                raise RetainedReplayFixtureError(
+                    f"{entry.name}: L20 prefix state is not a row selection"
+                )
+            entry_ordinary_rows = ordinary_rows.to(entry.indices.device)
+            ordinary_mask = torch.isin(entry.indices, entry_ordinary_rows)
+            ordinary_indices = entry.indices[ordinary_mask]
+            retained_indices = entry.indices[~ordinary_mask]
+            ordinary = (
+                None
+                if ordinary_indices.numel() == 0
+                else _TensorSelection(
+                    f"l20-prefix:{entry.name}:ordinary",
+                    entry.tensor,
+                    ordinary_indices,
+                    entry.dim,
+                )
+            )
+            retained = (
+                None
+                if retained_indices.numel() == 0
+                else _TensorSelection(
+                    f"l20-prefix:{entry.name}:retained",
+                    entry.tensor,
+                    retained_indices,
+                    entry.dim,
+                )
+            )
+            storages.append(_L20PrefixStorage(entry.name, ordinary, retained))
+
+        target_writers = [
+            writer
+            for writer in registry._cache_writers
+            if writer.phase == "target-full"
+        ]
+        if len(target_writers) != 1:
+            raise RetainedReplayFixtureError(
+                "L20 target-full cache writer is absent or ambiguous"
+            )
+        writer = target_writers[0]
+        ordinary_request_count = (
+            0
+            if ordinary_batch is None or ordinary_rows.numel() == 0
+            else ordinary_batch.input_batch.num_reqs
+        )
+        intervals_by_entry: dict[str, dict[str, list[_ByteInterval]]] = {}
+        for view in registry._cache_views:
+            slots = writer.slots_by_layer.get(view.layer_name)
+            if slots is None:
+                continue
+            if slots.numel() != writer.request_ordinals.numel():
+                raise RetainedReplayFixtureError(
+                    f"{view.view_id}: target-full writer cardinality differs"
+                )
+            storage = intervals_by_entry.setdefault(
+                view.restoration_entry,
+                {"ordinary": [], "retained": []},
+            )
+            for request_ordinal, slot in zip(
+                writer.request_ordinals.tolist(),
+                slots.tolist(),
+            ):
+                slot = int(slot)
+                if slot < 0:
+                    continue
+                block = slot // view.block_size
+                row = slot % view.block_size
+                if block not in view.destination_blocks:
+                    raise RetainedReplayFixtureError(
+                        f"{view.view_id}: L20 writer escaped destination coverage"
+                    )
+                owner = (
+                    "ordinary"
+                    if int(request_ordinal) < ordinary_request_count
+                    else "retained"
+                )
+                storage[owner].extend(
+                    _cache_record_byte_intervals(
+                        view.view_id,
+                        view.tensor,
+                        block,
+                        row,
+                    )
+                )
+
+        restoration_entries = {
+            entry.name: entry
+            for entry in registry.entries
+            if isinstance(entry, _TensorIntervals)
+        }
+        for name, ownership in sorted(intervals_by_entry.items()):
+            entry = restoration_entries.get(name)
+            if entry is None:
+                raise RetainedReplayFixtureError(
+                    f"{name}: L20 restoration storage is absent"
+                )
+            ordinary_intervals = _merge_byte_intervals(ownership["ordinary"])
+            retained_intervals = _merge_byte_intervals(ownership["retained"])
+            if _byte_intervals_overlap(ordinary_intervals, retained_intervals):
+                raise RetainedReplayFixtureError(
+                    f"{name}: ordinary and retained L20 destinations overlap"
+                )
+            for begin, end in (*ordinary_intervals, *retained_intervals):
+                if not any(
+                    owner_begin <= begin and end <= owner_end
+                    for owner_begin, owner_end in entry.intervals
+                ):
+                    raise RetainedReplayFixtureError(
+                        f"{name}: L20 destination escapes registry coverage"
+                    )
+            ordinary = (
+                None
+                if not ordinary_intervals
+                else _TensorIntervals(
+                    f"l20-prefix:{name}:ordinary",
+                    entry.tensor,
+                    ordinary_intervals,
+                )
+            )
+            retained = (
+                None
+                if not retained_intervals
+                else _TensorIntervals(
+                    f"l20-prefix:{name}:retained",
+                    entry.tensor,
+                    retained_intervals,
+                )
+            )
+            storages.append(_L20PrefixStorage(name, ordinary, retained))
+
+        partition = L20PrefixPartition(
+            ordinary_rows=ordinary_rows,
+            retained_rows=retained_rows,
+            storages=storages,
+        )
+        partition.capture_s0()
+        return partition
+
     def begin(
         self,
         *,
@@ -3065,6 +3376,11 @@ class RetainedReplayFixtureController:
             input_batch,
             production_replay_batch,
         )
+        prefix_partition = self._build_l20_prefix_partition(
+            registry,
+            input_batch,
+            ordinary_batch,
+        )
         source_digest = registry.source_capture_digest()
         self.fixture_id += 1
         self.fixture = RetainedFixture(
@@ -3081,6 +3397,7 @@ class RetainedReplayFixtureController:
             is_dummy=is_dummy,
             registry=registry,
             source_digest=source_digest,
+            prefix_partition=prefix_partition,
             production_checkpoints={},
         )
         self._active_checkpoint_error = None
@@ -3199,26 +3516,24 @@ class RetainedReplayFixtureController:
         try:
             owned_boundary = clone_owned(boundary)
             fixture.registry.capture_epoch("l20")
-            ordinary_rows = (
-                torch.empty(0, dtype=torch.int64, device=boundary.hidden_states.device)
-                if fixture.ordinary_batch is None
-                else clone_owned(fixture.ordinary_batch.rows)
+            prefix_partition = fixture.prefix_partition
+            if prefix_partition is None:
+                raise RetainedReplayFixtureError("L20 prefix partition is absent")
+            expected_rows = (
+                prefix_partition.ordinary_rows.numel()
+                + prefix_partition.retained_rows.numel()
             )
-            retained_mask = torch.ones(
-                boundary.hidden_states.shape[0],
-                dtype=torch.bool,
-                device=boundary.hidden_states.device,
-            )
-            retained_mask[ordinary_rows] = False
-            retained_rows = torch.nonzero(
-                retained_mask,
-                as_tuple=False,
-            ).flatten()
+            if expected_rows != boundary.hidden_states.shape[0]:
+                raise RetainedReplayFixtureError(
+                    "L20 prefix partition cardinality differs from the boundary"
+                )
+            prefix_partition.capture_l20()
             fixture.boundary = owned_boundary
             fixture.continuation = L20ContinuationCapsule(
                 boundary=owned_boundary,
-                ordinary_rows=ordinary_rows,
-                retained_rows=retained_rows,
+                ordinary_rows=prefix_partition.ordinary_rows,
+                retained_rows=prefix_partition.retained_rows,
+                prefix_partition=prefix_partition,
             )
             assert fixture.production_checkpoints is not None
             fixture.production_checkpoints["l20"] = merge_typed_snapshots(
@@ -3923,25 +4238,40 @@ class RetainedReplayFixtureController:
         warmup_rows = []
         timed_rows = []
 
-        def restore_s0() -> None:
-            self.runner._install_dsv41_retained_block_tables(fixture)
-            registry.restore("s0")
-            registry.verify("s0")
-            if registry.source_digest() != fixture.source_digest:
-                raise RetainedReplayFixtureError(
-                    "source KV changed before feature cycle"
-                )
+        def agree(local_error: BaseException | None, message: str) -> None:
+            if not self.runner._dsv41_fixture_vote(local_error is None):
+                raise RetainedReplayFixtureError(str(local_error or message))
 
+        def restore_s0(phase: str) -> None:
+            local_error = None
+            try:
+                registry.restore("s0")
+                registry.verify("s0")
+                if registry.source_digest() != fixture.source_digest:
+                    raise RetainedReplayFixtureError(
+                        f"{phase}: source KV changed before feature cycle"
+                    )
+            except Exception as error:
+                local_error = error
+            agree(local_error, f"{phase}: a peer failed S0 restoration")
+
+        benchmark_error = None
         try:
-            registry.capture_epoch("live", cpu=True)
-            live_digest = registry.digest("live")
-            staged_block_tables = self.runner._prepare_dsv41_retained_block_tables(
-                fixture
-            )
+            local_error = None
+            try:
+                registry.capture_epoch("live", cpu=True)
+                live_digest = registry.digest("live")
+                staged_block_tables = self.runner._prepare_dsv41_retained_block_tables(
+                    fixture
+                )
+            except Exception as error:
+                local_error = error
+            agree(local_error, "a peer failed feature benchmark setup")
+
             for iteration in range(warmups):
                 for arm in ("a", "a_prime", "b"):
-                    restore_s0()
                     phase = f"feature-warmup-{iteration:02d}-{arm}"
+                    restore_s0(phase)
                     row = self.runner._run_dsv41_feature_cycle(
                         fixture,
                         self,
@@ -3951,8 +4281,15 @@ class RetainedReplayFixtureController:
                     )
                     row["iteration"] = iteration
                     warmup_rows.append(row)
-                    if registry.source_digest() != fixture.source_digest:
-                        raise RetainedReplayFixtureError(f"{phase}: source KV changed")
+                    local_error = None
+                    try:
+                        if registry.source_digest() != fixture.source_digest:
+                            raise RetainedReplayFixtureError(
+                                f"{phase}: source KV changed"
+                            )
+                    except Exception as error:
+                        local_error = error
+                    agree(local_error, f"{phase}: a peer changed source KV")
 
             for block in range(blocks):
                 schedule = (
@@ -3962,8 +4299,8 @@ class RetainedReplayFixtureController:
                     ("a", "a_after"),
                 )
                 for arm, slot in schedule:
-                    restore_s0()
                     phase = f"feature-block-{block:02d}-{slot}"
+                    restore_s0(phase)
                     row = self.runner._run_dsv41_feature_cycle(
                         fixture,
                         self,
@@ -3974,22 +4311,45 @@ class RetainedReplayFixtureController:
                     row.update({"block": block, "slot": slot})
                     timed_rows.append(row)
                     self.feature_benchmark_runs = timed_rows
-                    if registry.source_digest() != fixture.source_digest:
-                        raise RetainedReplayFixtureError(f"{phase}: source KV changed")
+                    local_error = None
+                    try:
+                        if registry.source_digest() != fixture.source_digest:
+                            raise RetainedReplayFixtureError(
+                                f"{phase}: source KV changed"
+                            )
+                    except Exception as error:
+                        local_error = error
+                    agree(local_error, f"{phase}: a peer changed source KV")
+        except BaseException as error:
+            benchmark_error = error
         finally:
-            torch.cuda.synchronize(self.runner.device)
-            self.runner._restore_dsv41_retained_block_tables(staged_block_tables)
-            if live_digest is not None:
+            rollback_error = None
+            try:
+                torch.cuda.synchronize(self.runner.device)
+                self.runner._restore_dsv41_retained_block_tables(staged_block_tables)
+                if live_digest is None:
+                    raise RetainedReplayFixtureError(
+                        "feature LIVE state was not captured"
+                    )
                 registry.restore("live")
                 registry.verify("live")
-        if live_digest is None:
-            raise RetainedReplayFixtureError("feature LIVE state was not captured")
-        if registry.digest() != live_digest:
-            raise RetainedReplayFixtureError("feature LIVE state was not restored")
-        if registry.source_digest() != fixture.source_digest:
-            raise RetainedReplayFixtureError(
-                "source KV changed during feature benchmark"
-            )
+                if registry.digest() != live_digest:
+                    raise RetainedReplayFixtureError(
+                        "feature LIVE state was not restored"
+                    )
+                if registry.source_digest() != fixture.source_digest:
+                    raise RetainedReplayFixtureError(
+                        "source KV changed during feature benchmark"
+                    )
+            except Exception as error:
+                rollback_error = error
+            if not self.runner._dsv41_fixture_vote(rollback_error is None):
+                raise RetainedReplayFixtureError(
+                    str(rollback_error or "a peer failed feature LIVE rollback")
+                )
+        if benchmark_error is not None:
+            raise benchmark_error
+        assert live_digest is not None
         return {
             "fixture_id": fixture.fixture_id,
             "fixture_digest": fixture.fixture_digest,
@@ -5140,6 +5500,13 @@ class RetainedReplayFixtureController:
                     tensor,
                     torch.arange(tensor.shape[0], device=tensor.device),
                 )
+        lookback = getattr(runner.model_state, "lookback_token_ids", None)
+        if isinstance(lookback, torch.Tensor):
+            registry.add_rows(
+                "model_state:lookback_token_ids",
+                lookback,
+                torch.arange(lookback.shape[0], device=lookback.device),
+            )
 
         req_states = runner.req_states
         for name, tensor in (

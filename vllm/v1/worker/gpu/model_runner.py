@@ -99,6 +99,8 @@ from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
     AsyncPoolingOutput,
     StepTimingCollector,
+    async_copy_to_np,
+    stream,
 )
 from vllm.v1.worker.gpu.attn_utils import (
     FastPrefillHelper,
@@ -857,11 +859,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             }
         else:
             assert controller is not None
+            local_error = None
+            benchmark = None
             try:
                 warmup_count = int(warmups)
                 block_count = int(blocks)
                 if warmup_count < 1 or block_count < 1:
                     raise ValueError("warmups and blocks must be positive")
+                controller.validate_feature_benchmark_preflight()
+            except Exception as error:
+                local_error = error
+            if not self._dsv41_fixture_vote(local_error is None):
+                result = {
+                    "state": "error",
+                    "error": str(
+                        local_error or "a peer failed feature benchmark preflight"
+                    ),
+                    "dp_rank": self.dp_rank,
+                }
+                return self._log_dsv41_retained_fixture_rpc(
+                    "FEATURE_BENCHMARK",
+                    nonce,
+                    result,
+                )
+            try:
                 benchmark = controller.run_feature_benchmark(
                     warmups=warmup_count,
                     blocks=block_count,
@@ -1167,6 +1188,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise RuntimeError("B boundary merge does not support PP auxiliary state")
         return full_boundary
 
+    def _dsv41_feature_agree(
+        self,
+        local_error: BaseException | None,
+        message: str,
+    ) -> None:
+        if not self._dsv41_fixture_vote(local_error is None):
+            raise RuntimeError(str(local_error or message))
+
     @torch.inference_mode()
     def _run_dsv41_feature_target(
         self,
@@ -1174,7 +1203,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         controller: Any,
         *,
         arm: str,
+        phase: str,
         prepared: dict[str, Any],
+        verify_state: bool,
     ) -> tuple[
         InputBatch,
         torch.Tensor,
@@ -1194,54 +1225,101 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         full_context = prepared["full_context"]
         previous_replay_batch = layers.replay_batch
         decoder_model = controller._target_decoder_model()
+        model_output = None
         try:
             layers.replay_batch = prepared["replay_batch"]
+            boundary = None
+            ordinary = None
+            ordinary_inputs = None
+            local_error = None
+            try:
+                if arm == "a":
+                    pass
+                elif arm == "a_prime":
+                    fixture.registry.restore("l20")
+                    fixture.registry.restore_prefix(
+                        "s0",
+                        "replay_graph:runtime:",
+                    )
+                    boundary = clone_owned(fixture.continuation.boundary)
+                elif arm == "b":
+                    ordinary = clone_owned(fixture.ordinary_batch)
+                    if ordinary is None:
+                        raise RuntimeError("B ordinary Decode batch is absent")
+                    ordinary.forward_context.moe_layer_index = 0
+                    lookback = fixture.model_inputs.get("lookback_token_ids")
+                    ordinary_inputs = {
+                        "input_ids": ordinary.input_batch.input_ids,
+                        "positions": ordinary.input_batch.positions,
+                        "intermediate_tensors": None,
+                        "inputs_embeds": None,
+                        "lookback_token_ids": clone_owned(lookback),
+                    }
+                    if verify_state:
+                        fixture.continuation.prefix_partition.verify_s0()
+                        if lookback is not None:
+                            fixture.registry.verify_prefix(
+                                "s0",
+                                "model_state:lookback_token_ids",
+                            )
+                else:
+                    raise ValueError(f"unknown DSV41 feature arm: {arm}")
+            except Exception as error:
+                local_error = error
+            self._dsv41_feature_agree(
+                local_error,
+                f"{phase}: a peer failed feature target setup",
+            )
+
             if arm == "a":
                 with override_forward_context(full_context):
                     model_output = self.model(**prepared["model_inputs"])
             elif arm == "a_prime":
-                fixture.registry.restore("l20")
-                fixture.registry.restore_prefix("s0", "replay_graph:runtime:")
-                boundary = clone_owned(fixture.continuation.boundary)
-                with override_forward_context(full_context):
-                    model_output = decoder_model._run_from_decoder_replay_boundary(
-                        boundary
-                    )
-            elif arm == "b":
-                fixture.registry.restore("l20")
-                ordinary = clone_owned(fixture.ordinary_batch)
-                if ordinary is None:
-                    raise RuntimeError("B ordinary Decode batch is absent")
-                ordinary_context = ordinary.forward_context
-                ordinary_context.moe_layer_index = 0
-                ordinary_inputs = {
-                    "input_ids": ordinary.input_batch.input_ids,
-                    "positions": ordinary.input_batch.positions,
-                    "intermediate_tensors": None,
-                    "inputs_embeds": None,
-                    **self.model_state.prepare_inputs(
-                        ordinary.input_batch,
-                        self.req_states,
-                    ),
-                }
-                with override_forward_context(ordinary_context):
-                    ordinary_boundary = (
-                        decoder_model._run_to_decoder_replay_boundary_from_inputs(
-                            **ordinary_inputs
-                        )
-                    )
-                boundary = self._merge_dsv41_boundary_rows(
-                    clone_owned(fixture.continuation.boundary),
-                    ordinary_boundary,
-                    ordinary.rows,
-                )
-                fixture.registry.restore_prefix("s0", "replay_graph:runtime:")
+                assert boundary is not None
                 with override_forward_context(full_context):
                     model_output = decoder_model._run_from_decoder_replay_boundary(
                         boundary
                     )
             else:
-                raise ValueError(f"unknown DSV41 feature arm: {arm}")
+                assert ordinary is not None
+                assert ordinary_inputs is not None
+                with override_forward_context(ordinary.forward_context):
+                    ordinary_boundary = (
+                        decoder_model._run_to_decoder_replay_boundary_from_inputs(
+                            **ordinary_inputs
+                        )
+                    )
+                local_error = None
+                try:
+                    boundary = self._merge_dsv41_boundary_rows(
+                        clone_owned(fixture.continuation.boundary),
+                        ordinary_boundary,
+                        ordinary.rows,
+                    )
+                    prefix = fixture.continuation.prefix_partition
+                    prefix.restore_retained_l20()
+                    fixture.registry.restore_prefix(
+                        "s0",
+                        "replay_graph:runtime:",
+                    )
+                    if verify_state:
+                        prefix.verify_retained_l20()
+                        if fixture.model_inputs.get("lookback_token_ids") is not None:
+                            fixture.registry.verify_prefix(
+                                "s0",
+                                "model_state:lookback_token_ids",
+                            )
+                except Exception as error:
+                    local_error = error
+                self._dsv41_feature_agree(
+                    local_error,
+                    f"{phase}: a peer failed B boundary assembly",
+                )
+                assert boundary is not None
+                with override_forward_context(full_context):
+                    model_output = decoder_model._run_from_decoder_replay_boundary(
+                        boundary
+                    )
         finally:
             layers.replay_batch = previous_replay_batch
 
@@ -1272,55 +1350,97 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         attn_metadata: Any,
         slot_mappings: Any,
         dp_sync: DPSyncState | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if fixture.is_dummy:
-            num_sampled = torch.ones(
-                input_batch.num_reqs,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            num_rejected = torch.zeros_like(num_sampled)
-            sampled_token_ids = self.req_states.last_sampled_tokens.index_select(
-                0,
-                input_batch.idx_mapping[: input_batch.num_reqs],
-            )
-            self._finish_dsv41_retained_dummy_cycle(
-                input_batch=input_batch,
-                hidden_states=hidden_states,
-                aux_hidden_states=aux_hidden_states,
-                attn_metadata=attn_metadata,
-                slot_mappings=slot_mappings,
-                dp_sync=dp_sync,
-                num_sampled=num_sampled,
-                num_rejected=num_rejected,
-            )
-            return sampled_token_ids, num_sampled, num_rejected
+        phase: str,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[np.ndarray, np.ndarray, torch.cuda.Event] | None,
+    ]:
+        local_error = None
+        sampled_token_ids = None
+        num_sampled = None
+        num_rejected = None
+        output_copy = None
+        try:
+            if fixture.is_dummy:
+                num_sampled = torch.ones(
+                    input_batch.num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                num_rejected = torch.zeros_like(num_sampled)
+                sampled_token_ids = self.req_states.last_sampled_tokens.index_select(
+                    0,
+                    input_batch.idx_mapping[: input_batch.num_reqs],
+                )
+            else:
+                sampler_output, num_sampled, num_rejected = self.sample(
+                    hidden_states,
+                    input_batch,
+                    None,
+                )
+                sampled_token_ids = sampler_output.sampled_token_ids
+                output_ready = torch.cuda.Event(blocking=True)
+                with stream(self.output_copy_stream, self.main_stream):
+                    self.output_copy_stream.wait_stream(self.main_stream)
+                    sampled_token_ids_cpu = async_copy_to_np(sampled_token_ids)
+                    num_sampled_cpu = async_copy_to_np(num_sampled)
+                    output_ready.record(self.output_copy_stream)
+                output_copy = (
+                    sampled_token_ids_cpu,
+                    num_sampled_cpu,
+                    output_ready,
+                )
+                self.postprocess_sampled(
+                    input_batch.idx_mapping,
+                    sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch.query_start_loc,
+                )
+        except Exception as error:
+            local_error = error
+        self._dsv41_feature_agree(
+            local_error,
+            f"{phase}: a peer failed feature sampling",
+        )
+        assert sampled_token_ids is not None
+        assert num_sampled is not None
+        assert num_rejected is not None
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states,
-            input_batch,
-            None,
+        local_error = None
+        try:
+            if fixture.is_dummy:
+                self._finish_dsv41_retained_dummy_cycle(
+                    input_batch=input_batch,
+                    hidden_states=hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings,
+                    dp_sync=dp_sync,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                )
+            else:
+                self._finish_dsv41_retained_cycle(
+                    input_batch=input_batch,
+                    hidden_states=hidden_states,
+                    aux_hidden_states=aux_hidden_states,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings,
+                    dp_sync=dp_sync,
+                    sampled_token_ids=sampled_token_ids,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                )
+        except Exception as error:
+            local_error = error
+        self._dsv41_feature_agree(
+            local_error,
+            f"{phase}: a peer failed feature completion",
         )
-        sampled_token_ids = sampler_output.sampled_token_ids
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
-        self._finish_dsv41_retained_cycle(
-            input_batch=input_batch,
-            hidden_states=hidden_states,
-            aux_hidden_states=aux_hidden_states,
-            attn_metadata=attn_metadata,
-            slot_mappings=slot_mappings,
-            dp_sync=dp_sync,
-            sampled_token_ids=sampled_token_ids,
-            num_sampled=num_sampled,
-            num_rejected=num_rejected,
-        )
-        return sampled_token_ids, num_sampled, num_rejected
+        return sampled_token_ids, num_sampled, num_rejected, output_copy
 
     def _dsv41_feature_max_elapsed_ns(self, elapsed_ns: int) -> int:
         if self.dp_size == 1 or should_skip_dp_coordination():
@@ -1357,14 +1477,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         torch.cuda.synchronize(self.device)
         started_ns = time.perf_counter_ns()
-        if not self._dsv41_fixture_vote(True):
-            raise RuntimeError(f"{phase}: a peer rejected feature-cycle entry")
-        prepared = self._prepare_dsv41_a_cycle(
-            fixture,
-            controller,
-            phase=phase,
-            observe_graph=observe_graph,
+        local_error = None
+        prepared = None
+        try:
+            self._install_dsv41_retained_block_tables(fixture)
+            prepared = self._prepare_dsv41_a_cycle(
+                fixture,
+                controller,
+                phase=phase,
+                observe_graph=observe_graph,
+            )
+        except Exception as error:
+            local_error = error
+        self._dsv41_feature_agree(
+            local_error,
+            f"{phase}: a peer failed timed cycle setup",
         )
+        assert prepared is not None
+
+        local_error = None
+        target = None
+        try:
+            target = self._run_dsv41_feature_target(
+                fixture,
+                controller,
+                arm=arm,
+                phase=phase,
+                prepared=prepared,
+                verify_state=observe_graph,
+            )
+        except Exception as error:
+            local_error = error
+        self._dsv41_feature_agree(
+            local_error,
+            f"{phase}: a peer failed feature target",
+        )
+        assert target is not None
         (
             input_batch,
             hidden_states,
@@ -1372,13 +1520,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_metadata,
             slot_mappings,
             dp_sync,
-        ) = self._run_dsv41_feature_target(
-            fixture,
-            controller,
-            arm=arm,
-            prepared=prepared,
-        )
-        sampled_token_ids, num_sampled, num_rejected = (
+        ) = target
+
+        sampled_token_ids, num_sampled, num_rejected, output_copy = (
             self._complete_dsv41_feature_cycle(
                 fixture,
                 input_batch=input_batch,
@@ -1387,33 +1531,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 attn_metadata=attn_metadata,
                 slot_mappings=slot_mappings,
                 dp_sync=dp_sync,
+                phase=phase,
             )
         )
-        torch.cuda.synchronize(self.device)
+        local_error = None
+        try:
+            torch.cuda.synchronize(self.device)
+            if output_copy is not None:
+                output_copy[2].synchronize()
+        except Exception as error:
+            local_error = error
+        self._dsv41_feature_agree(
+            local_error,
+            f"{phase}: a peer failed output readiness",
+        )
         local_elapsed_ns = time.perf_counter_ns() - started_ns
         max_elapsed_ns = self._dsv41_feature_max_elapsed_ns(local_elapsed_ns)
-        reference = canonical_decision_reference(
-            sampled_token_ids,
-            num_sampled,
-            num_rejected,
-        )
-        accepted_tokens = int(num_sampled.sum().item())
+        accepted_tokens = 0 if fixture.is_dummy else int(num_sampled.sum().item())
         global_accepted_tokens = self._dsv41_feature_sum_int(accepted_tokens)
-        result = {
-            "phase": phase,
-            "arm": arm,
-            "local_elapsed_ns": local_elapsed_ns,
-            "max_elapsed_ns": max_elapsed_ns,
-            "accepted_tokens": accepted_tokens,
-            "global_accepted_tokens": global_accepted_tokens,
-            "accepted_tokens_per_second": (
-                global_accepted_tokens * 1e9 / max_elapsed_ns
-            ),
-            "rejected_tokens": int(num_rejected.sum().item()),
-            "decision_digest": _tree_digest(reference),
-        }
-        if observe_graph:
-            result["graph"] = controller.graph_observation(phase)
+        local_error = None
+        result = None
+        try:
+            reference = canonical_decision_reference(
+                sampled_token_ids,
+                num_sampled,
+                num_rejected,
+            )
+            result = {
+                "phase": phase,
+                "arm": arm,
+                "local_elapsed_ns": local_elapsed_ns,
+                "max_elapsed_ns": max_elapsed_ns,
+                "accepted_tokens": accepted_tokens,
+                "global_accepted_tokens": global_accepted_tokens,
+                "accepted_tokens_per_second": (
+                    global_accepted_tokens * 1e9 / max_elapsed_ns
+                ),
+                "rejected_tokens": int(num_rejected.sum().item()),
+                "decision_digest": _tree_digest(reference),
+                "block_table_install_timed": True,
+                "output_copy_ready": output_copy is not None,
+            }
+            if observe_graph:
+                result["graph"] = controller.graph_observation(phase)
+        except Exception as error:
+            local_error = error
+        self._dsv41_feature_agree(
+            local_error,
+            f"{phase}: a peer failed feature result validation",
+        )
+        assert result is not None
         return result
 
     def _finish_dsv41_retained_cycle(

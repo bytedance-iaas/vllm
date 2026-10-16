@@ -35,16 +35,22 @@ from vllm.forward_context import BatchDescriptor, ForwardContext
 from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
 from vllm.models.deepseek_v41.nvidia.model import DecoderBoundaryState
 from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
+    L20PrefixPartition,
     RetainedReplayFixtureController,
     RetainedReplayFixtureError,
     TouchedStateRegistry,
+    _byte_intervals_overlap,
+    _cache_record_byte_intervals,
     _cache_record_format,
     _CacheIntervals,
     _CacheWriter,
     _decode_cache_record_cpu,
     _decode_cache_records_cpu,
+    _L20PrefixStorage,
     _LogicalCacheView,
     _speculative_config_identity,
+    _TensorIntervals,
+    _TensorSelection,
     canonical_decision_reference,
     clone_owned,
     merge_typed_snapshots,
@@ -2240,6 +2246,67 @@ def test_registry_restores_only_matching_l20_prefix() -> None:
 
     assert runtime.tolist() == [11, 12]
     assert request.tolist() == [0, 0]
+
+
+def test_l20_prefix_partition_restores_only_retained_ownership() -> None:
+    rows = torch.arange(6, dtype=torch.int32)
+    storage = torch.arange(12, dtype=torch.uint8)
+    row_ordinary = _TensorSelection(
+        "rows:ordinary",
+        rows,
+        torch.tensor([0, 1]),
+    )
+    row_retained = _TensorSelection(
+        "rows:retained",
+        rows,
+        torch.tensor([2, 3, 4, 5]),
+    )
+    cache_ordinary = _TensorIntervals(
+        "cache:ordinary",
+        storage,
+        [(0, 2)],
+    )
+    cache_retained = _TensorIntervals(
+        "cache:retained",
+        storage,
+        [(4, 8)],
+    )
+    partition = L20PrefixPartition(
+        ordinary_rows=torch.tensor([0, 1]),
+        retained_rows=torch.tensor([2, 3, 4, 5]),
+        storages=[
+            _L20PrefixStorage("rows", row_ordinary, row_retained),
+            _L20PrefixStorage("cache", cache_ordinary, cache_retained),
+        ],
+    )
+    partition.capture_s0()
+    rows.add_(10)
+    storage.add_(10)
+    partition.capture_l20()
+
+    rows.zero_()
+    storage.zero_()
+    rows[:2].copy_(torch.tensor([70, 71]))
+    storage[:2].copy_(torch.tensor([80, 81]))
+    partition.restore_retained_l20()
+
+    assert rows.tolist() == [70, 71, 12, 13, 14, 15]
+    assert storage[:2].tolist() == [80, 81]
+    assert storage[4:8].tolist() == [14, 15, 16, 17]
+    partition.verify_retained_l20()
+
+
+def test_cache_record_intervals_follow_page_segregated_layout() -> None:
+    packed = torch.zeros((2, 2, 528), dtype=torch.uint8)
+    assert _cache_record_byte_intervals("packed", packed, 1, 1) == [
+        (1568, 2080),
+        (2096, 2112),
+    ]
+
+    plain = torch.zeros((2, 4, 512), dtype=torch.bfloat16)
+    assert _cache_record_byte_intervals("plain", plain, 1, 2) == [(6144, 7168)]
+    assert _byte_intervals_overlap([(0, 4)], [(3, 6)])
+    assert not _byte_intervals_overlap([(0, 4)], [(4, 6)])
 
 
 def test_feature_b_merges_every_boundary_field_by_original_row() -> None:
