@@ -1037,6 +1037,7 @@ class _TensorSelection:
     indices: torch.Tensor
     dim: int = 0
     s0: torch.Tensor | None = None
+    l20: torch.Tensor | None = None
     s1: torch.Tensor | None = None
     live: torch.Tensor | None = None
 
@@ -1080,6 +1081,7 @@ class _TensorPoints:
     tensor: torch.Tensor
     indices: torch.Tensor
     s0: torch.Tensor | None = None
+    l20: torch.Tensor | None = None
     s1: torch.Tensor | None = None
     live: torch.Tensor | None = None
 
@@ -1128,6 +1130,7 @@ class _TensorIntervals:
     tensor: torch.Tensor
     intervals: list[_ByteInterval]
     s0: torch.Tensor | None = None
+    l20: torch.Tensor | None = None
     s1: torch.Tensor | None = None
     live: torch.Tensor | None = None
 
@@ -1175,6 +1178,7 @@ class _ObjectAttribute:
     owner: Any
     attribute: str
     s0: Any = None
+    l20: Any = None
     s1: Any = None
     live: Any = None
 
@@ -1968,6 +1972,16 @@ class TouchedStateRegistry:
         for entry in self.entries:
             entry.restore(epoch)
 
+    @torch.inference_mode()
+    def restore_prefix(self, epoch: str, prefix: str) -> None:
+        matching = [entry for entry in self.entries if entry.name.startswith(prefix)]
+        if not matching:
+            raise RetainedReplayFixtureError(
+                f"{epoch}: no registered state matches {prefix}"
+            )
+        for entry in matching:
+            entry.restore(epoch)
+
     def verify(self, epoch: str) -> None:
         mismatches = [
             entry.name
@@ -2160,6 +2174,13 @@ class _ReplayGraphRuntimeState:
 
 
 @dataclass
+class L20ContinuationCapsule:
+    boundary: DecoderBoundaryState
+    ordinary_rows: torch.Tensor
+    retained_rows: torch.Tensor
+
+
+@dataclass
 class RetainedFixture:
     fixture_id: int
     input_batch: InputBatch
@@ -2175,6 +2196,7 @@ class RetainedFixture:
     registry: TouchedStateRegistry
     source_digest: str
     boundary: DecoderBoundaryState | None = None
+    continuation: L20ContinuationCapsule | None = None
     production_checkpoints: dict[str, dict[str, Any]] | None = None
     production_graph: dict[str, Any] | None = None
     reference: Any = None
@@ -2290,6 +2312,7 @@ class RetainedReplayFixtureController:
         self.verify_runs: list[dict[str, Any]] = []
         self.boundary_error: str | None = None
         self.a_control_runs: list[dict[str, Any]] = []
+        self.feature_benchmark_runs: list[dict[str, Any]] = []
         self._active_checkpoints: dict[str, dict[str, Any]] | None = None
         self._active_checkpoint_error: str | None = None
         self._graph_observations: dict[str, dict[str, Any]] = {}
@@ -2325,10 +2348,16 @@ class RetainedReplayFixtureController:
             ),
             "source_digest": (None if fixture is None else fixture.source_digest),
             "fixture_digest": (None if fixture is None else fixture.fixture_digest),
+            "continuation_tokens": (
+                None
+                if fixture is None or fixture.continuation is None
+                else int(fixture.continuation.boundary.hidden_states.shape[0])
+            ),
             "boundary_error": self.boundary_error,
             "checkpoint_error": self._active_checkpoint_error,
             "verify_runs": self.verify_runs,
             "a_control_runs": self.a_control_runs,
+            "feature_benchmark_runs": self.feature_benchmark_runs,
         }
 
     def fail(self, error: BaseException | str) -> None:
@@ -3168,7 +3197,29 @@ class RetainedReplayFixtureController:
             self.boundary_error = "the L20 boundary was captured twice"
             return
         try:
-            fixture.boundary = clone_owned(boundary)
+            owned_boundary = clone_owned(boundary)
+            fixture.registry.capture_epoch("l20")
+            ordinary_rows = (
+                torch.empty(0, dtype=torch.int64, device=boundary.hidden_states.device)
+                if fixture.ordinary_batch is None
+                else clone_owned(fixture.ordinary_batch.rows)
+            )
+            retained_mask = torch.ones(
+                boundary.hidden_states.shape[0],
+                dtype=torch.bool,
+                device=boundary.hidden_states.device,
+            )
+            retained_mask[ordinary_rows] = False
+            retained_rows = torch.nonzero(
+                retained_mask,
+                as_tuple=False,
+            ).flatten()
+            fixture.boundary = owned_boundary
+            fixture.continuation = L20ContinuationCapsule(
+                boundary=owned_boundary,
+                ordinary_rows=ordinary_rows,
+                retained_rows=retained_rows,
+            )
             assert fixture.production_checkpoints is not None
             fixture.production_checkpoints["l20"] = merge_typed_snapshots(
                 "l20",
@@ -3303,6 +3354,8 @@ class RetainedReplayFixtureController:
             )
         if fixture.boundary is None:
             raise RetainedReplayFixtureError("the real L20 boundary was not captured")
+        if fixture.continuation is None:
+            raise RetainedReplayFixtureError("the L20 continuation capsule is absent")
         checkpoints = fixture.production_checkpoints
         if checkpoints is None or "target" not in checkpoints:
             raise RetainedReplayFixtureError("the production target was not captured")
@@ -3770,6 +3823,184 @@ class RetainedReplayFixtureController:
             **summary,
             "live_digest": live_digest,
             "live_restored": True,
+        }
+
+    def validate_feature_benchmark_preflight(self) -> None:
+        fixture = self.fixture
+        if self.state != "ready" or fixture is None:
+            raise RetainedReplayFixtureError(
+                f"fixture is not ready: state={self.state}"
+            )
+        self.runner._validate_dsv41_a_cycle(fixture)
+        if fixture.continuation is None or fixture.boundary is None:
+            raise RetainedReplayFixtureError("L20 continuation capsule is absent")
+        if fixture.ordinary_batch is None:
+            raise RetainedReplayFixtureError("ordinary Decode batch is absent")
+        if fixture.registry.source_digest() != fixture.source_digest:
+            raise RetainedReplayFixtureError(
+                "source KV lifetime expired before feature benchmark"
+            )
+        self._production_graph_components(fixture.production_replay_batch)
+        missing_l20 = [
+            entry.name
+            for entry in fixture.registry.entries
+            if not isinstance(entry, _ObjectAttribute) and entry.l20 is None
+        ]
+        if missing_l20:
+            raise RetainedReplayFixtureError(
+                f"L20 continuation state is incomplete: {missing_l20[:8]}"
+            )
+        capsule = fixture.continuation
+        rows = torch.cat((capsule.ordinary_rows, capsule.retained_rows)).sort().values
+        expected = torch.arange(
+            capsule.boundary.hidden_states.shape[0],
+            dtype=torch.int64,
+            device=rows.device,
+        )
+        if not torch.equal(rows, expected):
+            raise RetainedReplayFixtureError(
+                "L20 continuation row ownership is incomplete"
+            )
+
+    @staticmethod
+    def _feature_timing_summary(
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        by_arm = {}
+        for arm in ("a", "a_prime", "b"):
+            arm_rows = [row for row in rows if row["arm"] == arm]
+            elapsed = sorted(int(row["max_elapsed_ns"]) for row in arm_rows)
+            throughput = [float(row["accepted_tokens_per_second"]) for row in arm_rows]
+            by_arm[arm] = {
+                "cycles": len(arm_rows),
+                "mean_ms": sum(elapsed) / len(elapsed) / 1e6,
+                "median_ms": elapsed[len(elapsed) // 2] / 1e6,
+                "min_ms": elapsed[0] / 1e6,
+                "max_ms": elapsed[-1] / 1e6,
+                "mean_accepted_tokens_per_second": (sum(throughput) / len(throughput)),
+            }
+        paired = []
+        for block in sorted({int(row["block"]) for row in rows}):
+            block_rows = [row for row in rows if int(row["block"]) == block]
+            ordered = {row["slot"]: row for row in block_rows}
+            baseline_ns = (
+                int(ordered["a_before"]["max_elapsed_ns"])
+                + int(ordered["a_after"]["max_elapsed_ns"])
+            ) / 2
+            baseline_tps = (
+                float(ordered["a_before"]["accepted_tokens_per_second"])
+                + float(ordered["a_after"]["accepted_tokens_per_second"])
+            ) / 2
+            pair = {"block": block, "baseline_ms": baseline_ns / 1e6}
+            for arm, slot in (("a_prime", "a_prime"), ("b", "b")):
+                elapsed_ns = int(ordered[slot]["max_elapsed_ns"])
+                throughput = float(ordered[slot]["accepted_tokens_per_second"])
+                pair[f"{arm}_ms"] = elapsed_ns / 1e6
+                pair[f"{arm}_latency_delta_pct"] = (
+                    (elapsed_ns - baseline_ns) / baseline_ns * 100
+                )
+                pair[f"{arm}_accepted_tps_delta_pct"] = (
+                    (throughput - baseline_tps) / baseline_tps * 100
+                    if baseline_tps
+                    else 0.0
+                )
+            paired.append(pair)
+        return {"by_arm": by_arm, "paired_blocks": paired}
+
+    def run_feature_benchmark(
+        self,
+        *,
+        warmups: int,
+        blocks: int,
+    ) -> dict[str, Any]:
+        self.validate_feature_benchmark_preflight()
+        fixture = self.fixture
+        assert fixture is not None
+        registry = fixture.registry
+        torch.cuda.synchronize(self.runner.device)
+        live_digest = None
+        staged_block_tables = None
+        warmup_rows = []
+        timed_rows = []
+
+        def restore_s0() -> None:
+            self.runner._install_dsv41_retained_block_tables(fixture)
+            registry.restore("s0")
+            registry.verify("s0")
+            if registry.source_digest() != fixture.source_digest:
+                raise RetainedReplayFixtureError(
+                    "source KV changed before feature cycle"
+                )
+
+        try:
+            registry.capture_epoch("live", cpu=True)
+            live_digest = registry.digest("live")
+            staged_block_tables = self.runner._prepare_dsv41_retained_block_tables(
+                fixture
+            )
+            for iteration in range(warmups):
+                for arm in ("a", "a_prime", "b"):
+                    restore_s0()
+                    phase = f"feature-warmup-{iteration:02d}-{arm}"
+                    row = self.runner._run_dsv41_feature_cycle(
+                        fixture,
+                        self,
+                        arm=arm,
+                        phase=phase,
+                        observe_graph=True,
+                    )
+                    row["iteration"] = iteration
+                    warmup_rows.append(row)
+                    if registry.source_digest() != fixture.source_digest:
+                        raise RetainedReplayFixtureError(f"{phase}: source KV changed")
+
+            for block in range(blocks):
+                schedule = (
+                    ("a", "a_before"),
+                    ("a_prime", "a_prime"),
+                    ("b", "b"),
+                    ("a", "a_after"),
+                )
+                for arm, slot in schedule:
+                    restore_s0()
+                    phase = f"feature-block-{block:02d}-{slot}"
+                    row = self.runner._run_dsv41_feature_cycle(
+                        fixture,
+                        self,
+                        arm=arm,
+                        phase=phase,
+                        observe_graph=False,
+                    )
+                    row.update({"block": block, "slot": slot})
+                    timed_rows.append(row)
+                    self.feature_benchmark_runs = timed_rows
+                    if registry.source_digest() != fixture.source_digest:
+                        raise RetainedReplayFixtureError(f"{phase}: source KV changed")
+        finally:
+            torch.cuda.synchronize(self.runner.device)
+            self.runner._restore_dsv41_retained_block_tables(staged_block_tables)
+            if live_digest is not None:
+                registry.restore("live")
+                registry.verify("live")
+        if live_digest is None:
+            raise RetainedReplayFixtureError("feature LIVE state was not captured")
+        if registry.digest() != live_digest:
+            raise RetainedReplayFixtureError("feature LIVE state was not restored")
+        if registry.source_digest() != fixture.source_digest:
+            raise RetainedReplayFixtureError(
+                "source KV changed during feature benchmark"
+            )
+        return {
+            "fixture_id": fixture.fixture_id,
+            "fixture_digest": fixture.fixture_digest,
+            "warmups": warmups,
+            "blocks": blocks,
+            "warmup_cycles": warmup_rows,
+            "timed_cycles": timed_rows,
+            "summary": self._feature_timing_summary(timed_rows),
+            "live_digest": live_digest,
+            "live_restored": True,
+            "accuracy_validated": False,
         }
 
     def validate_a_control_preflight(

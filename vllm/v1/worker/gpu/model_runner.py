@@ -831,6 +831,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             result,
         )
 
+    def run_dsv41_feature_benchmark(
+        self,
+        warmups: str = "2",
+        blocks: str = "5",
+        nonce: str = "",
+    ) -> dict[str, Any]:
+        controller = self._dsv41_retained_fixture
+        fixture = None if controller is None else controller.fixture
+        local_ready = (
+            controller is not None
+            and controller.state == "ready"
+            and fixture is not None
+            and fixture.continuation is not None
+        )
+        if not self._dsv41_fixture_vote(local_ready):
+            result = {
+                "state": "error",
+                "error": (
+                    "fixture continuation is not ready"
+                    if not local_ready
+                    else "a peer fixture continuation is not ready"
+                ),
+                "dp_rank": self.dp_rank,
+            }
+        else:
+            assert controller is not None
+            try:
+                warmup_count = int(warmups)
+                block_count = int(blocks)
+                if warmup_count < 1 or block_count < 1:
+                    raise ValueError("warmups and blocks must be positive")
+                benchmark = controller.run_feature_benchmark(
+                    warmups=warmup_count,
+                    blocks=block_count,
+                )
+            except Exception as error:
+                controller.fail(error)
+                result = controller.status()
+            else:
+                result = {
+                    "state": "passed",
+                    "dp_rank": self.dp_rank,
+                    **benchmark,
+                }
+        return self._log_dsv41_retained_fixture_rpc(
+            "FEATURE_BENCHMARK",
+            nonce,
+            result,
+        )
+
     def _validate_dsv41_a_cycle(self, fixture: Any) -> None:
         if fixture.input_batch.has_structured_output_reqs:
             raise RuntimeError("A-control does not support structured outputs")
@@ -899,7 +949,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         controller: Any,
         *,
         phase: str,
+        observe_graph: bool = True,
     ) -> dict[str, Any]:
+        from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
         from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
             clone_owned,
         )
@@ -912,15 +964,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             dict,
         ):
             raise RuntimeError("A-control requires flat attention metadata")
+        frozen_replay = fixture.production_replay_batch
+        replay_batch = (
+            controller.observed_production_replay_batch(
+                frozen_replay,
+                phase,
+            )
+            if observe_graph
+            else ReplayBatch(
+                rows=clone_owned(frozen_replay.rows),
+                forward_context=clone_owned(frozen_replay.forward_context),
+                run_graph=frozen_replay.run_graph,
+            )
+        )
         return {
             "input_batch": clone_owned(fixture.input_batch),
             "model_inputs": clone_owned(fixture.model_inputs),
             "full_context": full_context,
             "dp_sync": clone_owned(fixture.dp_sync),
-            "replay_batch": controller.observed_production_replay_batch(
-                fixture.production_replay_batch,
-                phase,
-            ),
+            "replay_batch": replay_batch,
         }
 
     @torch.inference_mode()
@@ -1059,6 +1121,300 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected=num_rejected,
         )
         return {"reference": reference}
+
+    @staticmethod
+    def _merge_dsv41_boundary_rows(
+        full_boundary: Any,
+        ordinary_boundary: Any,
+        rows: torch.Tensor,
+    ) -> Any:
+        if rows.numel() == 0:
+            return full_boundary
+        source_rows = torch.arange(rows.numel(), device=rows.device)
+        for name in (
+            "hidden_states",
+            "positions",
+            "input_ids",
+            "pre_mix",
+            "post_mix",
+            "res_mix",
+            "residual",
+        ):
+            destination = getattr(full_boundary, name)
+            source = getattr(ordinary_boundary, name)
+            if destination is None or source is None:
+                if destination is not source:
+                    raise RuntimeError(f"B boundary field {name} differs")
+                continue
+            destination.index_copy_(
+                0,
+                rows,
+                source.index_select(0, source_rows),
+            )
+        if set(full_boundary.aux_hidden_by_layer) != set(
+            ordinary_boundary.aux_hidden_by_layer
+        ):
+            raise RuntimeError("B boundary auxiliary layer inventory differs")
+        for layer_id, destination in full_boundary.aux_hidden_by_layer.items():
+            destination.index_copy_(
+                0,
+                rows,
+                ordinary_boundary.aux_hidden_by_layer[layer_id].index_select(
+                    0, source_rows
+                ),
+            )
+        if full_boundary.remote_aux or ordinary_boundary.remote_aux:
+            raise RuntimeError("B boundary merge does not support PP auxiliary state")
+        return full_boundary
+
+    @torch.inference_mode()
+    def _run_dsv41_feature_target(
+        self,
+        fixture: Any,
+        controller: Any,
+        *,
+        arm: str,
+        prepared: dict[str, Any],
+    ) -> tuple[
+        InputBatch,
+        torch.Tensor,
+        list[torch.Tensor] | None,
+        Any,
+        Any,
+        DPSyncState | None,
+    ]:
+        from vllm.forward_context import override_forward_context
+        from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
+            clone_owned,
+        )
+
+        layers = self.model_state.decoder_replay_layers
+        assert layers is not None
+        input_batch = prepared["input_batch"]
+        full_context = prepared["full_context"]
+        previous_replay_batch = layers.replay_batch
+        decoder_model = controller._target_decoder_model()
+        try:
+            layers.replay_batch = prepared["replay_batch"]
+            if arm == "a":
+                with override_forward_context(full_context):
+                    model_output = self.model(**prepared["model_inputs"])
+            elif arm == "a_prime":
+                fixture.registry.restore("l20")
+                fixture.registry.restore_prefix("s0", "replay_graph:runtime:")
+                boundary = clone_owned(fixture.continuation.boundary)
+                with override_forward_context(full_context):
+                    model_output = decoder_model._run_from_decoder_replay_boundary(
+                        boundary
+                    )
+            elif arm == "b":
+                fixture.registry.restore("l20")
+                ordinary = clone_owned(fixture.ordinary_batch)
+                if ordinary is None:
+                    raise RuntimeError("B ordinary Decode batch is absent")
+                ordinary_context = ordinary.forward_context
+                ordinary_context.moe_layer_index = 0
+                ordinary_inputs = {
+                    "input_ids": ordinary.input_batch.input_ids,
+                    "positions": ordinary.input_batch.positions,
+                    "intermediate_tensors": None,
+                    "inputs_embeds": None,
+                    **self.model_state.prepare_inputs(
+                        ordinary.input_batch,
+                        self.req_states,
+                    ),
+                }
+                with override_forward_context(ordinary_context):
+                    ordinary_boundary = (
+                        decoder_model._run_to_decoder_replay_boundary_from_inputs(
+                            **ordinary_inputs
+                        )
+                    )
+                boundary = self._merge_dsv41_boundary_rows(
+                    clone_owned(fixture.continuation.boundary),
+                    ordinary_boundary,
+                    ordinary.rows,
+                )
+                fixture.registry.restore_prefix("s0", "replay_graph:runtime:")
+                with override_forward_context(full_context):
+                    model_output = decoder_model._run_from_decoder_replay_boundary(
+                        boundary
+                    )
+            else:
+                raise ValueError(f"unknown DSV41 feature arm: {arm}")
+        finally:
+            layers.replay_batch = previous_replay_batch
+
+        if isinstance(model_output, tuple):
+            hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
+            aux_hidden_states = None
+        if not isinstance(hidden_states, torch.Tensor):
+            raise RuntimeError(f"{arm}: target did not return hidden states")
+        return (
+            input_batch,
+            hidden_states,
+            aux_hidden_states,
+            full_context.attn_metadata,
+            full_context.slot_mapping,
+            prepared["dp_sync"],
+        )
+
+    @torch.inference_mode()
+    def _complete_dsv41_feature_cycle(
+        self,
+        fixture: Any,
+        *,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        attn_metadata: Any,
+        slot_mappings: Any,
+        dp_sync: DPSyncState | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if fixture.is_dummy:
+            num_sampled = torch.ones(
+                input_batch.num_reqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            num_rejected = torch.zeros_like(num_sampled)
+            sampled_token_ids = self.req_states.last_sampled_tokens.index_select(
+                0,
+                input_batch.idx_mapping[: input_batch.num_reqs],
+            )
+            self._finish_dsv41_retained_dummy_cycle(
+                input_batch=input_batch,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                attn_metadata=attn_metadata,
+                slot_mappings=slot_mappings,
+                dp_sync=dp_sync,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
+            return sampled_token_ids, num_sampled, num_rejected
+
+        sampler_output, num_sampled, num_rejected = self.sample(
+            hidden_states,
+            input_batch,
+            None,
+        )
+        sampled_token_ids = sampler_output.sampled_token_ids
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
+            sampled_token_ids,
+            num_sampled,
+            num_rejected,
+            input_batch.query_start_loc,
+        )
+        self._finish_dsv41_retained_cycle(
+            input_batch=input_batch,
+            hidden_states=hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            attn_metadata=attn_metadata,
+            slot_mappings=slot_mappings,
+            dp_sync=dp_sync,
+            sampled_token_ids=sampled_token_ids,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+        return sampled_token_ids, num_sampled, num_rejected
+
+    def _dsv41_feature_max_elapsed_ns(self, elapsed_ns: int) -> int:
+        if self.dp_size == 1 or should_skip_dp_coordination():
+            return elapsed_ns
+        maximum = torch.tensor(elapsed_ns, dtype=torch.int64, device="cpu")
+        dist.all_reduce(
+            maximum,
+            op=dist.ReduceOp.MAX,
+            group=get_dp_group().cpu_group,
+        )
+        return int(maximum.item())
+
+    def _dsv41_feature_sum_int(self, value: int) -> int:
+        if self.dp_size == 1 or should_skip_dp_coordination():
+            return value
+        total = torch.tensor(value, dtype=torch.int64, device="cpu")
+        dist.all_reduce(total, group=get_dp_group().cpu_group)
+        return int(total.item())
+
+    @torch.inference_mode()
+    def _run_dsv41_feature_cycle(
+        self,
+        fixture: Any,
+        controller: Any,
+        *,
+        arm: str,
+        phase: str,
+        observe_graph: bool,
+    ) -> dict[str, Any]:
+        from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
+            _tree_digest,
+            canonical_decision_reference,
+        )
+
+        torch.cuda.synchronize(self.device)
+        started_ns = time.perf_counter_ns()
+        if not self._dsv41_fixture_vote(True):
+            raise RuntimeError(f"{phase}: a peer rejected feature-cycle entry")
+        prepared = self._prepare_dsv41_a_cycle(
+            fixture,
+            controller,
+            phase=phase,
+            observe_graph=observe_graph,
+        )
+        (
+            input_batch,
+            hidden_states,
+            aux_hidden_states,
+            attn_metadata,
+            slot_mappings,
+            dp_sync,
+        ) = self._run_dsv41_feature_target(
+            fixture,
+            controller,
+            arm=arm,
+            prepared=prepared,
+        )
+        sampled_token_ids, num_sampled, num_rejected = (
+            self._complete_dsv41_feature_cycle(
+                fixture,
+                input_batch=input_batch,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                attn_metadata=attn_metadata,
+                slot_mappings=slot_mappings,
+                dp_sync=dp_sync,
+            )
+        )
+        torch.cuda.synchronize(self.device)
+        local_elapsed_ns = time.perf_counter_ns() - started_ns
+        max_elapsed_ns = self._dsv41_feature_max_elapsed_ns(local_elapsed_ns)
+        reference = canonical_decision_reference(
+            sampled_token_ids,
+            num_sampled,
+            num_rejected,
+        )
+        accepted_tokens = int(num_sampled.sum().item())
+        global_accepted_tokens = self._dsv41_feature_sum_int(accepted_tokens)
+        result = {
+            "phase": phase,
+            "arm": arm,
+            "local_elapsed_ns": local_elapsed_ns,
+            "max_elapsed_ns": max_elapsed_ns,
+            "accepted_tokens": accepted_tokens,
+            "global_accepted_tokens": global_accepted_tokens,
+            "accepted_tokens_per_second": (
+                global_accepted_tokens * 1e9 / max_elapsed_ns
+            ),
+            "rejected_tokens": int(num_rejected.sum().item()),
+            "decision_digest": _tree_digest(reference),
+        }
+        if observe_graph:
+            result["graph"] = controller.graph_observation(phase)
+        return result
 
     def _finish_dsv41_retained_cycle(
         self,

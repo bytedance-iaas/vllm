@@ -33,6 +33,7 @@ from benchmarks.replayssm.dsv41_retained_control_compare import (
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, ForwardContext
 from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
+from vllm.models.deepseek_v41.nvidia.model import DecoderBoundaryState
 from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureController,
     RetainedReplayFixtureError,
@@ -2213,6 +2214,125 @@ def test_post_sampling_dspark_workspace_preserves_nan_bytes_exactly() -> None:
             s1_value,
             denominator_floor=1e-12,
         )
+
+
+def test_registry_restores_only_matching_l20_prefix() -> None:
+    runtime = torch.tensor([1, 2], dtype=torch.int32)
+    request = torch.tensor([3, 4], dtype=torch.int32)
+    registry = TouchedStateRegistry()
+    registry.add_rows(
+        "replay_graph:runtime:0",
+        runtime,
+        torch.tensor([0, 1]),
+    )
+    registry.add_rows(
+        "request:last_sampled_tokens",
+        request,
+        torch.tensor([0, 1]),
+    )
+    runtime.add_(10)
+    request.add_(20)
+    registry.capture_epoch("l20")
+    runtime.zero_()
+    request.zero_()
+
+    registry.restore_prefix("l20", "replay_graph:runtime:")
+
+    assert runtime.tolist() == [11, 12]
+    assert request.tolist() == [0, 0]
+
+
+def test_feature_b_merges_every_boundary_field_by_original_row() -> None:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    def boundary(rows: int, offset: int) -> DecoderBoundaryState:
+        values = torch.arange(rows * 2).reshape(rows, 2) + offset
+        return DecoderBoundaryState(
+            hidden_states=values.clone(),
+            positions=torch.arange(rows) + offset,
+            input_ids=torch.arange(rows, dtype=torch.int32) + offset,
+            pre_mix=values.clone() + 10,
+            post_mix=values.clone() + 20,
+            res_mix=values.clone() + 30,
+            residual=values.clone() + 40,
+            aux_hidden_by_layer={7: values.clone() + 50},
+            remote_aux=[],
+            full_num_tokens=rows,
+        )
+
+    full = boundary(4, 0)
+    original = clone_owned(full)
+    ordinary = boundary(2, 100)
+    rows = torch.tensor([1, 3], dtype=torch.int64)
+
+    merged = GPUModelRunner._merge_dsv41_boundary_rows(
+        full,
+        ordinary,
+        rows,
+    )
+
+    for name in (
+        "hidden_states",
+        "positions",
+        "input_ids",
+        "pre_mix",
+        "post_mix",
+        "res_mix",
+        "residual",
+    ):
+        value = getattr(merged, name)
+        source = getattr(ordinary, name)
+        assert torch.equal(value.index_select(0, rows), source)
+        assert torch.equal(
+            value.index_select(0, torch.tensor([0, 2])),
+            getattr(original, name).index_select(0, torch.tensor([0, 2])),
+        )
+    assert torch.equal(
+        merged.aux_hidden_by_layer[7].index_select(0, rows),
+        ordinary.aux_hidden_by_layer[7],
+    )
+    assert merged.full_num_tokens == 4
+
+
+def test_feature_timing_summary_pairs_surrounding_a_cycles() -> None:
+    rows = [
+        {
+            "arm": "a",
+            "block": 0,
+            "slot": "a_before",
+            "max_elapsed_ns": 100,
+            "accepted_tokens_per_second": 10.0,
+        },
+        {
+            "arm": "a_prime",
+            "block": 0,
+            "slot": "a_prime",
+            "max_elapsed_ns": 50,
+            "accepted_tokens_per_second": 20.0,
+        },
+        {
+            "arm": "b",
+            "block": 0,
+            "slot": "b",
+            "max_elapsed_ns": 80,
+            "accepted_tokens_per_second": 12.5,
+        },
+        {
+            "arm": "a",
+            "block": 0,
+            "slot": "a_after",
+            "max_elapsed_ns": 120,
+            "accepted_tokens_per_second": 10.0,
+        },
+    ]
+
+    summary = RetainedReplayFixtureController._feature_timing_summary(rows)
+    paired = summary["paired_blocks"][0]
+
+    assert paired["baseline_ms"] == 0.00011
+    assert paired["a_prime_latency_delta_pct"] == pytest.approx(-54.5454545)
+    assert paired["b_latency_delta_pct"] == pytest.approx(-27.2727273)
+    assert paired["b_accepted_tps_delta_pct"] == 25.0
 
 
 def _scratch_run(
