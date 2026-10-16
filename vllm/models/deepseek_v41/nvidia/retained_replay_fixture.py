@@ -4244,6 +4244,9 @@ class RetainedReplayFixtureController:
         def restore_s0(phase: str) -> None:
             local_error = None
             try:
+                # Reestablish block-table aliases before restoring overlapping
+                # graph runtime views. The measured install still runs in-cycle.
+                self.runner._install_dsv41_retained_block_tables(fixture)
                 registry.restore("s0")
                 registry.verify("s0")
                 if registry.source_digest() != fixture.source_digest:
