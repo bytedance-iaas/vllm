@@ -65,6 +65,11 @@ class _GraphRuntimeMetadata:
     is_valid_token: torch.Tensor
 
 
+@dataclass
+class _GraphRuntimeBlockTable:
+    block_table: torch.Tensor
+
+
 def _ranked_config_manifest(
     rank: int,
     engine_id: str,
@@ -2731,11 +2736,16 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     slots = torch.tensor([3, 4, 5, -1, -1, -1, -1, -1], dtype=torch.int64)
     valid = slots >= 0
     padding = ~valid
+    block_table = torch.tensor(
+        [[11, 12], [21, 22], [31, 32]],
+        dtype=torch.int32,
+    )
     capture = Capture()
     capture_context = ForwardContext(
         no_compile_layers={},
         attn_metadata={
             "layer": _GraphRuntimeMetadata(slots[:], valid[:]),
+            "block_table": _GraphRuntimeBlockTable(block_table),
         },
         slot_mapping={"layer": slots[:]},
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
@@ -2764,6 +2774,7 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     expected_slots = slots.clone()
     expected_valid = valid.clone()
     expected_padding = padding.clone()
+    expected_block_table = block_table.clone()
 
     slots.fill_(-1)
     valid.zero_()
@@ -2776,7 +2787,7 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     assert torch.equal(slots, expected_slots)
     assert torch.equal(valid, expected_valid)
     assert torch.equal(padding, expected_padding)
-    assert registry._graph_runtime_contract["storage_count"] == 3
+    assert registry._graph_runtime_contract["storage_count"] == 4
     assert registry._graph_runtime_contract["slot_mapping_paths"] == [
         "forward_context/slot_mapping/layer"
     ]
@@ -2791,9 +2802,11 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     slots.fill_(6)
     valid.zero_()
     padding.fill_(True)
+    block_table.fill_(77)
     live_slots = slots.clone()
     live_valid = valid.clone()
     live_padding = padding.clone()
+    live_block_table = block_table.clone()
     registry.capture_epoch("live", cpu=True)
     controller.fixture = SimpleNamespace(registry=registry)
     working = controller.observed_production_replay_batch(frozen, "a-001")
@@ -2815,6 +2828,7 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     assert torch.equal(slots, live_slots)
     assert torch.equal(valid, live_valid)
     assert torch.equal(padding, live_padding)
+    assert torch.equal(block_table, live_block_table)
     assert capture.calls == 1
     assert controller.graph_observation("a-001")["capture_replay_calls"] == 1
 
@@ -2823,6 +2837,17 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     corrupted = controller.observed_production_replay_batch(frozen, "a-corrupt")
     with pytest.raises(RetainedReplayFixtureError, match="restore mismatches"):
         corrupted.run_graph(torch.tensor([0]), (torch.tensor([9]),))
+    assert capture.calls == 1
+    registry.restore("live")
+    registry.verify("live")
+
+    registry.restore("s0")
+    block_table[-1, -1] = 999
+    corrupted_table = controller.observed_production_replay_batch(
+        frozen, "a-corrupt-block-table"
+    )
+    with pytest.raises(RetainedReplayFixtureError, match="restore mismatches"):
+        corrupted_table.run_graph(torch.tensor([0]), (torch.tensor([9]),))
     assert capture.calls == 1
     registry.restore("live")
     registry.verify("live")
@@ -2864,12 +2889,147 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     slots.fill_(-1)
     valid.zero_()
     padding.fill_(True)
+    block_table.fill_(-1)
     runner.model_state.decoder_replay_layers.replay_batch = working
     controller.rollback_production_graph_runtime()
     assert runner.model_state.decoder_replay_layers.replay_batch is live
     assert torch.equal(slots, expected_slots)
     assert torch.equal(valid, expected_valid)
     assert torch.equal(padding, expected_padding)
+    assert torch.equal(block_table, expected_block_table)
+
+
+def test_a_control_restores_aliased_block_tables_after_install(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import vllm.models.deepseek_v41.nvidia.retained_replay_fixture as module
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runtime_table = torch.tensor(
+        [[11, 12], [21, 22], [31, 32]],
+        dtype=torch.int32,
+    )
+    outside_table = torch.tensor(
+        [[41, 42], [51, 52], [61, 62]],
+        dtype=torch.int32,
+    )
+    expected_runtime = runtime_table.clone()
+    expected_outside = outside_table.clone()
+    retained_runtime = runtime_table[:1].clone()
+    retained_outside = torch.tensor([[71, 72]], dtype=torch.int32)
+
+    registry = TouchedStateRegistry()
+    runtime_bytes = module._storage_bytes_view(runtime_table)
+    registry.add_intervals(
+        "replay_graph:runtime:0",
+        runtime_bytes,
+        [(0, runtime_bytes.numel())],
+    )
+    registry.capture_epoch("s1")
+    source_digest = registry.source_capture_digest()
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dp_rank = 0
+    runner.block_tables = SimpleNamespace(
+        input_block_tables=[runtime_table, outside_table]
+    )
+    runner._dsv41_fixture_vote = lambda ready: ready
+    prepared_states = []
+    replay_calls = []
+
+    fixture = SimpleNamespace(
+        registry=registry,
+        source_digest=source_digest,
+        production_checkpoints={},
+        production_graph={},
+        fixture_id=1,
+        fixture_digest="fixture",
+        block_tables=(retained_runtime, retained_outside),
+    )
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = runner
+    controller.fixture = fixture
+    controller.worker_incarnation = "worker"
+    controller.a_control_runs = []
+    controller._active_checkpoints = None
+    controller._run_manifest = lambda **kwargs: kwargs
+    controller.graph_observation = lambda phase: {
+        "phase": phase,
+        "callback_calls": 1,
+        "capture_replay_calls": 1,
+        "error": None,
+    }
+
+    def prepare_cycle(fixture, controller, *, phase):
+        del controller
+        fixture.registry.verify_prefix("s0", "replay_graph:runtime:")
+        prepared_states.append(
+            (
+                phase,
+                runtime_table.clone(),
+                outside_table.clone(),
+            )
+        )
+        return {"phase": phase}
+
+    def run_cycle(fixture, controller, *, phase, prepared):
+        assert prepared == {"phase": phase}
+        fixture.registry.verify_prefix("s0", "replay_graph:runtime:")
+        replay_calls.append(phase)
+        runtime_table.add_(1)
+        controller._active_checkpoints = {}
+        return {"reference": {"phase": phase}}
+
+    runner._prepare_dsv41_a_cycle = prepare_cycle
+    runner._run_dsv41_a_cycle = run_cycle
+
+    def write_bundle(
+        output_dir,
+        *,
+        dp_rank,
+        run_kind,
+        ordinal,
+        checkpoints,
+        manifest,
+    ):
+        del output_dir, dp_rank, checkpoints, manifest
+        return {
+            "manifest_path": f"{run_kind}-{ordinal}.json",
+            "manifest_sha256": "manifest",
+            "payload_path": f"{run_kind}-{ordinal}.pt",
+            "payload_sha256": "payload",
+        }
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "write_typed_run_bundle", write_bundle)
+    monkeypatch.setattr(
+        module,
+        "write_typed_rank_summary",
+        lambda *args, **kwargs: {
+            "summary_path": "summary.json",
+            "summary_sha256": "summary",
+        },
+    )
+
+    result = controller.run_a_control(
+        runs=2,
+        output_dir=str(tmp_path),
+        run_id="aliased-block-table",
+    )
+
+    assert result["completed_runs"] == 2
+    assert replay_calls == ["a-001", "a-002"]
+    assert runtime_table.data_ptr() == runtime_bytes.data_ptr()
+    assert torch.equal(runtime_table, expected_runtime)
+    assert torch.equal(outside_table, expected_outside)
+    for _, restored_runtime, installed_outside in prepared_states:
+        assert torch.equal(restored_runtime, expected_runtime)
+        assert torch.equal(installed_outside[0], retained_outside[0])
+        assert torch.count_nonzero(installed_outside[1:]) == 0
 
 
 def test_fixture_preparation_rollback_aborts_on_restore_failure() -> None:

@@ -3624,9 +3624,9 @@ class RetainedReplayFixtureController:
                 local_error = None
                 prepared_cycle = None
                 try:
+                    self.runner._install_dsv41_retained_block_tables(fixture)
                     registry.restore("s0")
                     registry.verify("s0")
-                    self.runner._install_dsv41_retained_block_tables(fixture)
                     if registry.source_digest() != fixture.source_digest:
                         raise RetainedReplayFixtureError(
                             f"A{ordinal}: source KV changed before execution"
