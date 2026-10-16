@@ -1141,6 +1141,9 @@ class TouchedStateRegistry:
             "query_enabled": False,
             "context_source_rows": torch.empty(0, dtype=torch.int64),
             "query_source_rows": torch.empty(0, dtype=torch.int64),
+            "layer_names": (),
+            "layer_group_ids": torch.empty(0, dtype=torch.int64),
+            "layer_group_indices": torch.empty(0, dtype=torch.int64),
         }
         self._cache_request_slots: tuple[int, ...] = ()
         self._cache_s0_records: dict[
@@ -2604,6 +2607,13 @@ class RetainedReplayFixtureController:
                 "speculative_group_ids": torch.tensor(
                     authority["speculative_group_ids"], dtype=torch.int64
                 ),
+                "draft_layer_names": list(authority["draft_layer_names"]),
+                "draft_layer_group_ids": torch.tensor(
+                    authority["draft_layer_group_ids"], dtype=torch.int64
+                ),
+                "draft_layer_group_indices": torch.tensor(
+                    authority["draft_layer_group_indices"], dtype=torch.int64
+                ),
                 "query_start_loc": torch.tensor(
                     authority["query_start_loc"], dtype=torch.int64
                 ),
@@ -2968,6 +2978,11 @@ class RetainedReplayFixtureController:
                         "context_source_rows"
                     ].tolist(),
                     "query_source_rows": draft_authority["query_source_rows"].tolist(),
+                    "layer_names": list(draft_authority["layer_names"]),
+                    "layer_group_ids": draft_authority["layer_group_ids"].tolist(),
+                    "layer_group_indices": draft_authority[
+                        "layer_group_indices"
+                    ].tolist(),
                 },
                 "s0_authority": fixture.registry._cache_s0_authority,
             },
@@ -3743,18 +3758,87 @@ class RetainedReplayFixtureController:
             source_rows=rows.detach().cpu(),
         )
 
+    def _draft_layer_authority(
+        self,
+    ) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+        speculator = self.runner.speculator
+        if speculator is None:
+            return (), (), ()
+        group_ids = tuple(
+            int(value) for value in getattr(speculator, "draft_kv_cache_group_ids", ())
+        )
+        if not group_ids:
+            return (), (), ()
+        groups = self.runner.kv_cache_config.kv_cache_groups
+        if len(set(group_ids)) != len(group_ids) or any(
+            group_id < 0 or group_id >= len(groups) for group_id in group_ids
+        ):
+            raise RetainedReplayFixtureError("draft KV group identity is invalid")
+
+        model = getattr(speculator, "model", None)
+        layer_names_getter = getattr(model, "get_draft_kv_cache_layer_names", None)
+        if not callable(layer_names_getter):
+            raise RetainedReplayFixtureError("draft KV layer ownership is unavailable")
+        layer_names = tuple(layer_names_getter())
+        if (
+            not layer_names
+            or any(not isinstance(name, str) or not name for name in layer_names)
+            or len(set(layer_names)) != len(layer_names)
+        ):
+            raise RetainedReplayFixtureError("draft KV layer identity is invalid")
+
+        layer_group_ids = []
+        for layer_name in layer_names:
+            memberships = [
+                group_id
+                for group_id, group in enumerate(groups)
+                if layer_name in group.layer_names
+            ]
+            if len(memberships) != 1 or memberships[0] not in group_ids:
+                raise RetainedReplayFixtureError(
+                    f"{layer_name}: draft KV group membership is invalid"
+                )
+            layer_group_ids.append(memberships[0])
+        layer_group_indices = tuple(
+            group_ids.index(group_id) for group_id in layer_group_ids
+        )
+        runtime_indices = getattr(speculator, "_layer_group_idx", None)
+        if (
+            not isinstance(runtime_indices, (list, tuple))
+            or any(not isinstance(index, int) for index in runtime_indices)
+            or tuple(runtime_indices) != layer_group_indices
+        ):
+            raise RetainedReplayFixtureError(
+                "draft layer-to-group runtime mapping differs"
+            )
+        return layer_names, tuple(layer_group_ids), layer_group_indices
+
     def _draft_cache_writers(
         self,
         fixture: RetainedFixture,
     ) -> list[_CacheWriter]:
         speculator = self.runner.speculator
-        group_ids = tuple(getattr(speculator, "draft_kv_cache_group_ids", ()))
-        if fixture.is_dummy or speculator is None or not group_ids:
+        layer_names, layer_group_ids, layer_group_indices = (
+            self._draft_layer_authority()
+        )
+        authority_identity = {
+            "layer_names": layer_names,
+            "layer_group_ids": torch.tensor(
+                layer_group_ids,
+                dtype=torch.int64,
+            ),
+            "layer_group_indices": torch.tensor(
+                layer_group_indices,
+                dtype=torch.int64,
+            ),
+        }
+        if fixture.is_dummy or speculator is None or not layer_names:
             fixture.registry._cache_draft_writer_authority = {
                 "context_enabled": False,
                 "query_enabled": False,
                 "context_source_rows": torch.empty(0, dtype=torch.int64),
                 "query_source_rows": torch.empty(0, dtype=torch.int64),
+                **authority_identity,
             }
             return []
         num_reqs = int(fixture.input_batch.num_reqs)
@@ -3789,8 +3873,10 @@ class RetainedReplayFixtureController:
             0, context_request_ordinals
         )
 
-        groups = self.runner.kv_cache_config.kv_cache_groups
         context_mappings = getattr(speculator, "_context_slot_mappings", ())
+        group_ids = tuple(
+            int(value) for value in getattr(speculator, "draft_kv_cache_group_ids", ())
+        )
         if len(context_mappings) != len(group_ids):
             raise RetainedReplayFixtureError(
                 "draft context slot-mapping groups are incomplete"
@@ -3799,11 +3885,11 @@ class RetainedReplayFixtureController:
         query_slots_by_layer: dict[str, torch.Tensor] = {}
         num_query_per_req = int(speculator.num_query_per_req)
         num_query_tokens = num_reqs * num_query_per_req
-        for group_index, group_id in enumerate(group_ids):
-            if not 0 <= group_id < len(groups):
-                raise RetainedReplayFixtureError(
-                    f"draft KV group {group_id} is out of range"
-                )
+        for layer_name, group_id, group_index in zip(
+            layer_names,
+            layer_group_ids,
+            layer_group_indices,
+        ):
             context_slots = context_mappings[group_index]
             query_slots = speculator.block_tables.slot_mappings[group_id]
             if (
@@ -3817,9 +3903,8 @@ class RetainedReplayFixtureController:
             if selected_context_rows is not None:
                 context_slots = context_slots.index_select(0, selected_context_rows)
             query_slots = query_slots[:num_query_tokens].detach().cpu()
-            for layer_name in groups[group_id].layer_names:
-                context_slots_by_layer[layer_name] = context_slots
-                query_slots_by_layer[layer_name] = query_slots
+            context_slots_by_layer[layer_name] = context_slots
+            query_slots_by_layer[layer_name] = query_slots
 
         query_request_ordinals = torch.arange(
             num_reqs,
@@ -3847,6 +3932,7 @@ class RetainedReplayFixtureController:
                 "query_enabled": False,
                 "context_source_rows": writers[0].source_rows.clone(),
                 "query_source_rows": torch.empty(0, dtype=torch.int64),
+                **authority_identity,
             }
             return writers
         writers.append(
@@ -3868,6 +3954,7 @@ class RetainedReplayFixtureController:
             "query_enabled": True,
             "context_source_rows": writers[0].source_rows.clone(),
             "query_source_rows": writers[1].source_rows.clone(),
+            **authority_identity,
         }
         return writers
 
@@ -3974,9 +4061,18 @@ class RetainedReplayFixtureController:
         replay_values = tuple(
             int(value) for value in replay_start.detach().cpu().tolist()
         )
-        speculative_groups = set(
-            getattr(self.runner.speculator, "draft_kv_cache_group_ids", ())
+        draft_layer_names, draft_layer_group_ids, draft_layer_group_indices = (
+            self._draft_layer_authority()
         )
+        speculative_group_ids = tuple(
+            int(value)
+            for value in getattr(
+                self.runner.speculator,
+                "draft_kv_cache_group_ids",
+                (),
+            )
+        )
+        draft_layer_set = set(draft_layer_names)
         s0_extents = {}
         for view in logical_views:
             extents = []
@@ -3985,7 +4081,7 @@ class RetainedReplayFixtureController:
                 extent = computed_extent
                 if prefill_values[request]:
                     replay = replay_values[request]
-                    if view.group_id in speculative_groups:
+                    if view.layer_name in draft_layer_set:
                         extent = 0
                     elif replay > 0:
                         extent = (
@@ -4001,7 +4097,10 @@ class RetainedReplayFixtureController:
             "is_prefilling": list(prefill_values),
             "replay_start": list(replay_values),
             "replay_window": replay_window,
-            "speculative_group_ids": sorted(int(value) for value in speculative_groups),
+            "speculative_group_ids": list(speculative_group_ids),
+            "draft_layer_names": list(draft_layer_names),
+            "draft_layer_group_ids": list(draft_layer_group_ids),
+            "draft_layer_group_indices": list(draft_layer_group_indices),
             "query_start_loc": (
                 input_batch.query_start_loc[: input_batch.num_reqs + 1]
                 .detach()

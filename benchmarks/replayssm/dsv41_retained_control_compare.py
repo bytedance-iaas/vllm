@@ -723,6 +723,80 @@ def _validate_cache_view_overlays(
                     )
 
 
+def _typed_flat_sequence_value(
+    path: Path,
+    root: str,
+    leaves: dict[str, dict[str, Any]],
+    payload: dict[str, torch.Tensor],
+) -> list[Any]:
+    type_leaf = leaves.get(f"{root}/__type__")
+    length_leaf = leaves.get(f"{root}/__len__")
+    if (
+        type_leaf is None
+        or type_leaf.get("value") not in ("list", "tuple")
+        or length_leaf is None
+        or not isinstance(length_leaf.get("value"), int)
+        or length_leaf["value"] < 0
+    ):
+        raise ValueError(f"{path}: typed sequence authority is absent: {root}")
+    values = []
+    for index in range(length_leaf["value"]):
+        leaf = leaves.get(f"{root}/{index}")
+        if leaf is None:
+            raise ValueError(f"{path}: typed sequence child is absent: {root}/{index}")
+        payload_key = leaf.get("payload_key")
+        value = (
+            leaf.get("value")
+            if payload_key is None
+            else payload[payload_key].reshape(-1).tolist()
+        )
+        values.append(value)
+    return values
+
+
+def _validated_draft_layer_mapping(
+    path: Path,
+    logical_mapping: dict[str, Any],
+) -> dict[str, tuple[int, int]]:
+    authority = logical_mapping.get("s0_authority")
+    if not isinstance(authority, dict):
+        raise ValueError(f"{path}: S0 cache authority is absent")
+    speculative_groups = authority.get("speculative_group_ids")
+    layer_names = authority.get("draft_layer_names")
+    layer_group_ids = authority.get("draft_layer_group_ids")
+    layer_group_indices = authority.get("draft_layer_group_indices")
+    if (
+        not isinstance(speculative_groups, list)
+        or any(not isinstance(group, int) or group < 0 for group in speculative_groups)
+        or len(set(speculative_groups)) != len(speculative_groups)
+        or not isinstance(layer_names, list)
+        or not isinstance(layer_group_ids, list)
+        or not isinstance(layer_group_indices, list)
+        or len({len(layer_names), len(layer_group_ids), len(layer_group_indices)}) != 1
+        or any(not isinstance(name, str) or not name for name in layer_names)
+        or len(set(layer_names)) != len(layer_names)
+        or any(not isinstance(group, int) or group < 0 for group in layer_group_ids)
+        or any(
+            not isinstance(index, int) or not 0 <= index < len(speculative_groups)
+            for index in layer_group_indices
+        )
+        or any(
+            layer_group_ids[offset] != speculative_groups[group_index]
+            for offset, group_index in enumerate(layer_group_indices)
+        )
+        or (bool(speculative_groups) != bool(layer_names))
+    ):
+        raise ValueError(f"{path}: draft layer-to-group authority is invalid")
+    return {
+        name: (int(group_id), int(group_index))
+        for name, group_id, group_index in zip(
+            layer_names,
+            layer_group_ids,
+            layer_group_indices,
+        )
+    }
+
+
 def _validate_s0_authority(
     path: Path,
     view: dict[str, Any],
@@ -834,18 +908,25 @@ def _validate_s0_authority(
         "replay_start",
         "replay_window",
         "speculative_group_ids",
+        "draft_layer_names",
+        "draft_layer_group_ids",
+        "draft_layer_group_indices",
         "query_start_loc",
     )
     for field in evidence_fields:
-        leaf = leaves.get(f"l20:s0_cache_authority/{field}")
-        if leaf is None:
-            raise ValueError(f"{path}: S0 cache authority evidence is absent")
-        payload_key = leaf.get("payload_key")
-        value = (
-            leaf.get("value")
-            if payload_key is None
-            else payload[payload_key].detach().cpu().tolist()
-        )
+        root = f"l20:s0_cache_authority/{field}"
+        if field == "draft_layer_names":
+            value = _typed_flat_sequence_value(path, root, leaves, payload)
+        else:
+            leaf = leaves.get(root)
+            if leaf is None:
+                raise ValueError(f"{path}: S0 cache authority evidence is absent")
+            payload_key = leaf.get("payload_key")
+            value = (
+                leaf.get("value")
+                if payload_key is None
+                else payload[payload_key].detach().cpu().tolist()
+            )
         if field == "is_prefilling":
             value = [bool(item) for item in value]
         if value != authority.get(field):
@@ -921,6 +1002,7 @@ def _validate_s0_authority(
 
     replay_window = authority.get("replay_window")
     speculative_groups = authority.get("speculative_group_ids")
+    draft_layers = _validated_draft_layer_mapping(path, logical_mapping)
     if (
         not isinstance(replay_window, int)
         or replay_window <= 0
@@ -940,7 +1022,10 @@ def _validate_s0_authority(
             raise ValueError(f"{path}: S0 request extent is invalid")
         extent = computed
         if bool(authority["is_prefilling"][request]):
-            if int(view["group_id"]) in speculative_groups:
+            draft_identity = draft_layers.get(view.get("layer_name"))
+            if draft_identity is not None:
+                if draft_identity[0] != int(view["group_id"]):
+                    raise ValueError(f"{path}: draft view group authority differs")
                 extent = 0
             elif replay > 0:
                 extent = min(total, replay + replay_window) if prefix_cacheable else 0
@@ -953,6 +1038,7 @@ def _validate_s0_authority(
 def _validate_draft_writer_runtime_authority(
     path: Path,
     phase: str,
+    layer_name: str,
     group_id: int,
     source_rows: list[int],
     slots: list[int],
@@ -960,15 +1046,14 @@ def _validate_draft_writer_runtime_authority(
     payload: dict[str, torch.Tensor],
     logical_mapping: dict[str, Any],
 ) -> None:
-    speculative_groups = logical_mapping["s0_authority"].get("speculative_group_ids")
-    if not isinstance(speculative_groups, list):
-        raise ValueError(f"{path}: draft writer group authority is absent")
-    if group_id not in speculative_groups:
+    draft_layers = _validated_draft_layer_mapping(path, logical_mapping)
+    draft_identity = draft_layers.get(layer_name)
+    if draft_identity is None:
         if slots:
-            raise ValueError(
-                f"{path}: draft writer escaped its cache group for {phase}"
-            )
+            raise ValueError(f"{path}: non-draft view has draft slots for {phase}")
         return
+    if draft_identity[0] != group_id:
+        raise ValueError(f"{path}: draft writer layer/group authority differs")
     if phase == "draft-context":
         runtime_slots_leaf = leaves.get(
             f"s1:registry/speculator:context_slots:{group_id}"
@@ -1187,11 +1272,22 @@ def _validate_logical_payload(
         query_enabled = runtime_value("query_enabled")
         context_rows = runtime_value("context_source_rows")
         query_rows = runtime_value("query_source_rows")
+        layer_names = _typed_flat_sequence_value(
+            path,
+            f"{runtime_root}/layer_names",
+            leaves,
+            payload,
+        )
+        layer_group_ids = runtime_value("layer_group_ids")
+        layer_group_indices = runtime_value("layer_group_indices")
         runtime_authority = {
             "context_enabled": context_enabled,
             "query_enabled": query_enabled,
             "context_source_rows": context_rows,
             "query_source_rows": query_rows,
+            "layer_names": layer_names,
+            "layer_group_ids": layer_group_ids,
+            "layer_group_indices": layer_group_indices,
         }
         if (
             not isinstance(context_enabled, bool)
@@ -1326,6 +1422,7 @@ def _validate_logical_payload(
             _validate_draft_writer_runtime_authority(
                 path,
                 phase,
+                str(view["layer_name"]),
                 group_id,
                 source_rows,
                 slots,
@@ -1689,6 +1786,14 @@ def _validate_evidence_contract(
                 payload,
                 logical_mapping,
             )
+    draft_layers = _validated_draft_layer_mapping(path, logical_mapping)
+    view_pairs = [
+        (view.get("layer_name"), int(view.get("group_id", -1)))
+        for view in logical_cache_views
+    ]
+    for layer_name, (group_id, _) in draft_layers.items():
+        if view_pairs.count((layer_name, group_id)) != 1:
+            raise ValueError(f"{path}: draft logical view coverage differs")
     inventory_ids = set()
     covered_ids = set()
     for item in cache_owner_inventory:

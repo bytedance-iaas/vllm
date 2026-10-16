@@ -461,6 +461,9 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
             "replay_start": [0],
             "replay_window": 128,
             "speculative_group_ids": [],
+            "draft_layer_names": [],
+            "draft_layer_group_ids": [],
+            "draft_layer_group_indices": [],
             "query_start_loc": [0, 1],
         },
         torch.tensor([0], dtype=torch.int64),
@@ -556,6 +559,9 @@ def test_logical_cache_snapshot_skips_unallocated_stale_table_blocks() -> None:
             "replay_start": [0],
             "replay_window": 128,
             "speculative_group_ids": [],
+            "draft_layer_names": [],
+            "draft_layer_group_ids": [],
+            "draft_layer_group_indices": [],
             "query_start_loc": [0, 0],
         },
         torch.empty(0, dtype=torch.int64),
@@ -649,6 +655,9 @@ def _logical_evidence_bundle():
         "replay_start": [0],
         "replay_window": 128,
         "speculative_group_ids": [],
+        "draft_layer_names": [],
+        "draft_layer_group_ids": [],
+        "draft_layer_group_indices": [],
         "query_start_loc": [0, 1],
     }
     registry = TouchedStateRegistry()
@@ -724,6 +733,9 @@ def _logical_evidence_bundle():
             "replay_start": torch.tensor([0], dtype=torch.int64),
             "replay_window": 128,
             "speculative_group_ids": torch.empty(0, dtype=torch.int64),
+            "draft_layer_names": [],
+            "draft_layer_group_ids": torch.empty(0, dtype=torch.int64),
+            "draft_layer_group_indices": torch.empty(0, dtype=torch.int64),
             "query_start_loc": torch.tensor([0, 1], dtype=torch.int64),
         },
         path="s0_cache_authority",
@@ -1532,10 +1544,16 @@ def test_registry_builds_owner_specific_replay_s0_domains() -> None:
 
     views = [
         view(0, layer_names[0], True),
-        view(1, layer_names[1], False),
-        view(2, layer_names[2], True),
+        view(1, layer_names[1], True),
+        view(1, layer_names[2], True),
     ]
-    groups = [SimpleNamespace(layer_names=[name]) for name in layer_names]
+    groups = [
+        SimpleNamespace(layer_names=[layer_names[0]]),
+        SimpleNamespace(layer_names=[layer_names[1], layer_names[2]]),
+    ]
+    draft_model = SimpleNamespace(
+        get_draft_kv_cache_layer_names=lambda: [layer_names[2]]
+    )
     controller = RetainedReplayFixtureController.__new__(
         RetainedReplayFixtureController
     )
@@ -1546,12 +1564,14 @@ def test_registry_builds_owner_specific_replay_s0_domains() -> None:
                 gpu=torch.tensor([4], dtype=torch.int32)
             ),
         ),
-        speculator=SimpleNamespace(draft_kv_cache_group_ids=(2,)),
+        speculator=SimpleNamespace(
+            draft_kv_cache_group_ids=(1,),
+            _layer_group_idx=[0],
+            model=draft_model,
+        ),
         kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
         block_tables=SimpleNamespace(
-            num_blocks=SimpleNamespace(
-                gpu=torch.tensor([[2], [2], [2]], dtype=torch.int32)
-            )
+            num_blocks=SimpleNamespace(gpu=torch.tensor([[2], [2]], dtype=torch.int32))
         ),
         compilation_config=SimpleNamespace(
             static_forward_context={
@@ -1590,7 +1610,7 @@ def test_registry_builds_owner_specific_replay_s0_domains() -> None:
     ]
     registry = controller._build_registry(
         input_batch,
-        tuple(torch.tensor([[1, 2]], dtype=torch.int32) for _ in layer_names),
+        tuple(torch.tensor([[1, 2]], dtype=torch.int32) for _ in groups),
         (),
         target_writers,
         torch.tensor([4], dtype=torch.int32),
@@ -1600,15 +1620,23 @@ def test_registry_builds_owner_specific_replay_s0_domains() -> None:
 
     assert registry._cache_s0_extents == {
         f"group-0:{layer_names[0]}": (8,),
-        f"group-1:{layer_names[1]}": (0,),
-        f"group-2:{layer_names[2]}": (0,),
+        f"group-1:{layer_names[1]}": (8,),
+        f"group-1:{layer_names[2]}": (0,),
     }
 
 
 def test_draft_cache_writers_bind_context_and_query_rows() -> None:
+    draft_layers = ("d0", "d1", "d2")
     speculator = SimpleNamespace(
-        draft_kv_cache_group_ids=(1,),
-        _context_slot_mappings=(torch.tensor([12, -1]),),
+        draft_kv_cache_group_ids=(0, 1),
+        _layer_group_idx=[1, 0, 1],
+        model=SimpleNamespace(
+            get_draft_kv_cache_layer_names=lambda: list(draft_layers)
+        ),
+        _context_slot_mappings=(
+            torch.tensor([10, 11]),
+            torch.tensor([20, 21]),
+        ),
         num_query_per_req=2,
         idx_mapping=torch.tensor([7]),
         context_positions=torch.tensor([3, 0]),
@@ -1617,8 +1645,8 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
         block_tables=SimpleNamespace(
             slot_mappings=torch.tensor(
                 [
-                    [-1, -1],
-                    [16, 17],
+                    [30, 31],
+                    [40, 41],
                 ]
             )
         ),
@@ -1631,8 +1659,8 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
         dspark_prefill_only=False,
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
-                SimpleNamespace(layer_names=["target"]),
-                SimpleNamespace(layer_names=["draft"]),
+                SimpleNamespace(layer_names=["target24", "d1"]),
+                SimpleNamespace(layer_names=["target1", "d0", "d2"]),
             ]
         ),
     )
@@ -1653,17 +1681,30 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
     assert context.positions.tolist() == [3, 0]
     assert context.request_ordinals.tolist() == [0, 0]
     assert context.request_state_slots.tolist() == [7, 7]
-    assert context.slots_by_layer["draft"].tolist() == [12, -1]
+    assert set(context.slots_by_layer) == set(draft_layers)
+    assert context.slots_by_layer["d0"].tolist() == [20, 21]
+    assert context.slots_by_layer["d1"].tolist() == [10, 11]
+    assert context.slots_by_layer["d2"].tolist() == [20, 21]
+    assert "target1" not in context.slots_by_layer
+    assert "target24" not in context.slots_by_layer
     assert context.enforce_committed_extent is False
     assert query.phase == "draft-query"
     assert query.positions.tolist() == [4, 5]
-    assert query.slots_by_layer["draft"].tolist() == [16, 17]
+    assert set(query.slots_by_layer) == set(draft_layers)
+    assert query.slots_by_layer["d0"].tolist() == [40, 41]
+    assert query.slots_by_layer["d1"].tolist() == [30, 31]
+    assert query.slots_by_layer["d2"].tolist() == [40, 41]
+    assert "target1" not in query.slots_by_layer
+    assert "target24" not in query.slots_by_layer
     assert query.enforce_committed_extent is False
     authority = fixture.registry._cache_draft_writer_authority
     assert authority["context_enabled"] is True
     assert authority["query_enabled"] is True
     assert authority["context_source_rows"].tolist() == [0, 1]
     assert authority["query_source_rows"].tolist() == [0, 1]
+    assert authority["layer_names"] == draft_layers
+    assert authority["layer_group_ids"].tolist() == [1, 0, 1]
+    assert authority["layer_group_indices"].tolist() == [1, 0, 1]
 
 
 def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
@@ -1681,11 +1722,19 @@ def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
         "context": torch.tensor([12, 15], dtype=torch.int64),
         "query": torch.tensor([[16, 17]], dtype=torch.int64),
     }
-    mapping = {"s0_authority": {"speculative_group_ids": [2]}}
+    mapping = {
+        "s0_authority": {
+            "speculative_group_ids": [2],
+            "draft_layer_names": ["draft"],
+            "draft_layer_group_ids": [2],
+            "draft_layer_group_indices": [0],
+        }
+    }
 
     _validate_draft_writer_runtime_authority(
         Path("in-memory"),
         "draft-context",
+        "draft",
         2,
         [1],
         [15],
@@ -1696,6 +1745,7 @@ def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
     _validate_draft_writer_runtime_authority(
         Path("in-memory"),
         "draft-query",
+        "draft",
         2,
         [0, 1],
         [16, 17],
@@ -1707,6 +1757,7 @@ def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
         _validate_draft_writer_runtime_authority(
             Path("in-memory"),
             "draft-context",
+            "draft",
             2,
             [1],
             [-1],
@@ -1718,12 +1769,50 @@ def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
         _validate_draft_writer_runtime_authority(
             Path("in-memory"),
             "draft-query",
+            "draft",
             2,
             [0, 1],
             [-1, -1],
             leaves,
             payload,
             mapping,
+        )
+    with pytest.raises(ValueError, match="non-draft view has draft slots"):
+        _validate_draft_writer_runtime_authority(
+            Path("in-memory"),
+            "draft-query",
+            "target",
+            2,
+            [0, 1],
+            [16, 17],
+            leaves,
+            payload,
+            mapping,
+        )
+    _validate_draft_writer_runtime_authority(
+        Path("in-memory"),
+        "draft-query",
+        "target",
+        2,
+        [0, 1],
+        [],
+        leaves,
+        payload,
+        mapping,
+    )
+    inconsistent = copy.deepcopy(mapping)
+    inconsistent["s0_authority"]["draft_layer_group_indices"] = [1]
+    with pytest.raises(ValueError, match="draft layer-to-group authority is invalid"):
+        _validate_draft_writer_runtime_authority(
+            Path("in-memory"),
+            "draft-query",
+            "draft",
+            2,
+            [0, 1],
+            [16, 17],
+            leaves,
+            payload,
+            inconsistent,
         )
 
 
