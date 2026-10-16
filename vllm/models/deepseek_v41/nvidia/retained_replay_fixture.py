@@ -3753,12 +3753,26 @@ class RetainedReplayFixtureController:
                     raise RetainedReplayFixtureError(
                         f"{view_id}: logical owner view is absent"
                     )
+                view_metadata = view.metadata()
                 owner_inventory.append(
                     {
                         "view_id": view_id,
                         "owner_type": type(owner).__qualname__,
                         "storage_id": view.storage_id,
                         "restoration_entry": view.restoration_entry,
+                        "geometry": {
+                            name: view_metadata[name]
+                            for name in (
+                                "cache_kind",
+                                "record_format",
+                                "dtype",
+                                "shape",
+                                "strides_bytes",
+                                "storage_offset_bytes",
+                                "storage_nbytes",
+                                "block_size",
+                            )
+                        },
                         "coverage": "logical",
                         "exclusion_reason": None,
                     }

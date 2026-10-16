@@ -1451,6 +1451,20 @@ def _validate_evidence_contract(
                 or item.get("owner_type") != view.get("owner_type")
                 or item.get("storage_id") != view.get("storage_id")
                 or item.get("restoration_entry") != view.get("restoration_entry")
+                or item.get("geometry")
+                != {
+                    name: view.get(name)
+                    for name in (
+                        "cache_kind",
+                        "record_format",
+                        "dtype",
+                        "shape",
+                        "strides_bytes",
+                        "storage_offset_bytes",
+                        "storage_nbytes",
+                        "block_size",
+                    )
+                }
             ):
                 raise ValueError(f"{path}: logical owner storage binding differs")
             covered_ids.add(view_id)
