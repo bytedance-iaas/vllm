@@ -362,16 +362,22 @@ def _decode_cache_records_cpu(
     scale = (
         None if fp8_scale is None else torch.as_tensor(fp8_scale).detach().float().cpu()
     )
-    return [
-        _decode_cache_record_cpu(
-            copied,
-            block_rows[block],
-            row,
-            record_format=record_format,
-            fp8_scale=scale,
-        )
-        for block, row in coordinates
-    ]
+    decoded = []
+    for block, row in coordinates:
+        try:
+            record = _decode_cache_record_cpu(
+                copied,
+                block_rows[block],
+                row,
+                record_format=record_format,
+                fp8_scale=scale,
+            )
+        except RetainedReplayFixtureError as error:
+            raise RetainedReplayFixtureError(
+                f"{record_format} cache record ({block}, {row}) decode failed: {error}"
+            ) from error
+        decoded.append(record)
+    return decoded
 
 
 def _cache_block_byte_intervals(
@@ -1397,12 +1403,20 @@ class TouchedStateRegistry:
             self._cache_s0_records[view.view_id] = {
                 record.identity: record for record in records
             }
-            decoded_records = _decode_cache_records_cpu(
-                view.tensor,
-                [(record.physical_block, record.physical_row) for record in records],
-                record_format=view.record_format,
-                fp8_scale=view.fp8_scale,
-            )
+            try:
+                decoded_records = _decode_cache_records_cpu(
+                    view.tensor,
+                    [
+                        (record.physical_block, record.physical_row)
+                        for record in records
+                    ],
+                    record_format=view.record_format,
+                    fp8_scale=view.fp8_scale,
+                )
+            except RetainedReplayFixtureError as error:
+                raise RetainedReplayFixtureError(
+                    f"{view.view_id}: S0 logical cache decode failed: {error}"
+                ) from error
             for record, (raw_values, raw_scales, _) in zip(
                 records,
                 decoded_records,
@@ -1660,12 +1674,20 @@ class TouchedStateRegistry:
             raw_scales = []
             decoded = []
             written_identities = {record.identity for record in written}
-            decoded_records = _decode_cache_records_cpu(
-                view.tensor,
-                [(record.physical_block, record.physical_row) for record in ordered],
-                record_format=view.record_format,
-                fp8_scale=view.fp8_scale,
-            )
+            try:
+                decoded_records = _decode_cache_records_cpu(
+                    view.tensor,
+                    [
+                        (record.physical_block, record.physical_row)
+                        for record in ordered
+                    ],
+                    record_format=view.record_format,
+                    fp8_scale=view.fp8_scale,
+                )
+            except RetainedReplayFixtureError as error:
+                raise RetainedReplayFixtureError(
+                    f"{checkpoint}: {view.view_id} logical cache decode failed: {error}"
+                ) from error
             for record, (raw_value, raw_scale, value) in zip(
                 ordered,
                 decoded_records,

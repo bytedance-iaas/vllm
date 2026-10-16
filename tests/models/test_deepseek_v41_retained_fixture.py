@@ -39,6 +39,7 @@ from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     _CacheIntervals,
     _CacheWriter,
     _decode_cache_record_cpu,
+    _decode_cache_records_cpu,
     _LogicalCacheView,
     _speculative_config_identity,
     canonical_decision_reference,
@@ -230,6 +231,22 @@ def test_cache_record_decoder_rejects_unknown_or_nonfinite_layout() -> None:
         _decode_cache_record_cpu(plain, 0, 0)
     with pytest.raises(RetainedReplayFixtureError, match="finite scalar"):
         _decode_cache_record_cpu(plain, 0, 0, fp8_scale=float("inf"))
+
+
+def test_batched_cache_decoder_reports_physical_record() -> None:
+    cache = torch.zeros((1, 1, 584), dtype=torch.uint8)
+    cache.view(-1)[576 + 7] = 165
+
+    with pytest.raises(
+        RetainedReplayFixtureError,
+        match=r"cache record \(0, 0\) decode failed",
+    ):
+        _decode_cache_records_cpu(
+            cache,
+            [(0, 0)],
+            record_format="v4_ue8m0_fp8_bf16",
+            fp8_scale=None,
+        )
 
 
 def _storage_overlay_view(
