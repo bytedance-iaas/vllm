@@ -247,6 +247,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         consumers=["layer"],
         aliases=[],
         fp8_scale=None,
+        restoration_entry="kv-dst:layer",
     )
     writer = _CacheWriter(
         phase="target-full",
@@ -268,6 +269,14 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         input_batch,
         (torch.tensor([[1, 3]], dtype=torch.int32),),
         (4,),
+        [
+            {
+                "view_id": "group-0:layer",
+                "owner_type": "Owner",
+                "coverage": "logical",
+                "exclusion_reason": None,
+            }
+        ],
     )
 
     page = 3 * cache.stride(0)
@@ -277,7 +286,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
     storage[page + 4 * 512 : page + 4 * 512 + 16].fill_(127)
     snapshot = registry.logical_cache_snapshot(
         "post_sampling",
-        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([5], dtype=torch.int32),
     )
     leaves = {leaf["path"]: leaf for leaf in snapshot["leaves"]}
     root = "logical_kv/group-0:layer"
@@ -293,7 +302,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
     with pytest.raises(RetainedReplayFixtureError, match="unwritten live record"):
         registry.logical_cache_snapshot(
             "post_sampling",
-            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([5], dtype=torch.int32),
         )
 
 
@@ -473,11 +482,11 @@ def test_scratch_comparator_canonicalizes_candidates_and_diagnoses_topk() -> Non
 
     _add_topk(
         left,
-        torch.tensor([[3, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[3, 1, 2]], dtype=torch.int32),
     )
     _add_topk(
         right,
-        torch.tensor([[2, 4, 1, -1]], dtype=torch.int32),
+        torch.tensor([[2, 4, 1]], dtype=torch.int32),
     )
     report = _compare_runs(
         left,

@@ -1127,7 +1127,6 @@ class TouchedStateRegistry:
         self._cache_writers: list[_CacheWriter] = []
         self._cache_block_tables: tuple[torch.Tensor, ...] = ()
         self._cache_base_extents: tuple[int, ...] = ()
-        self._cache_query_lens: tuple[int, ...] = ()
         self._cache_request_slots: tuple[int, ...] = ()
         self._cache_s0_records: dict[
             str, dict[tuple[int, int, int, int, int], _LogicalCacheRecord]
@@ -1135,6 +1134,7 @@ class TouchedStateRegistry:
         self._cache_s0_raw_digests: dict[
             tuple[str, tuple[int, int, int, int, int]], str
         ] = {}
+        self._cache_owner_inventory: list[dict[str, Any]] = []
 
     def _claim(self, name: str) -> None:
         if name in self._names:
@@ -1241,6 +1241,7 @@ class TouchedStateRegistry:
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         base_extents: tuple[int, ...],
+        owner_inventory: list[dict[str, Any]],
     ) -> None:
         if self._cache_views:
             raise RetainedReplayFixtureError(
@@ -1249,6 +1250,7 @@ class TouchedStateRegistry:
         num_reqs = int(input_batch.num_reqs)
         self._cache_views = sorted(views, key=lambda view: view.view_id)
         self._cache_writers = writers
+        self._cache_owner_inventory = owner_inventory
         self._cache_block_tables = tuple(
             table[:num_reqs].detach().cpu().clone() for table in block_tables
         )
@@ -1257,12 +1259,6 @@ class TouchedStateRegistry:
                 "logical cache S0 extent cardinality differs"
             )
         self._cache_base_extents = base_extents
-        self._cache_query_lens = tuple(
-            int(value)
-            for value in np.diff(
-                input_batch.query_start_loc_np[: num_reqs + 1]
-            ).tolist()
-        )
         self._cache_request_slots = tuple(
             int(value)
             for value in input_batch.idx_mapping[:num_reqs].detach().cpu().tolist()
@@ -1437,23 +1433,21 @@ class TouchedStateRegistry:
     def logical_cache_snapshot(
         self,
         checkpoint: str,
-        num_rejected: torch.Tensor,
+        committed_extents: torch.Tensor,
         *,
         extra_writers: list[_CacheWriter] | None = None,
     ) -> dict[str, Any]:
-        rejected = tuple(int(value) for value in num_rejected.detach().cpu().tolist())
-        if len(rejected) != len(self._cache_base_extents):
-            raise RetainedReplayFixtureError(
-                f"{checkpoint}: rejected-count request cardinality differs"
-            )
         extents = tuple(
-            base + query_len - rejected_count
-            for base, query_len, rejected_count in zip(
-                self._cache_base_extents,
-                self._cache_query_lens,
-                rejected,
-            )
+            int(value) for value in committed_extents.detach().cpu().tolist()
         )
+        if len(extents) != len(self._cache_base_extents):
+            raise RetainedReplayFixtureError(
+                f"{checkpoint}: committed extent cardinality differs"
+            )
+        if any(extent < 0 for extent in extents):
+            raise RetainedReplayFixtureError(
+                f"{checkpoint}: committed extent is negative"
+            )
         writers = [*self._cache_writers, *(extra_writers or ())]
         writer_indices = {writer.phase: index for index, writer in enumerate(writers)}
         if len(writer_indices) != len(writers):
@@ -1567,6 +1561,10 @@ class TouchedStateRegistry:
                 descriptors,
                 f"{root}/descriptors",
                 comparison="exact",
+                metadata={
+                    "committed_extents": list(extents),
+                    "writer_count": len(writers),
+                },
             )
             raw_width, scale_width, decoded_width = _CACHE_RECORD_LAYOUTS[
                 view.record_format
@@ -1656,6 +1654,36 @@ class TouchedStateRegistry:
                 if entry.name in self._meaningful_counts:
                     selection["compare_prefix"] = self._meaningful_counts[entry.name]
                 selection.update(self._selection_metadata.get(entry.name, {}))
+                if entry.name == "model:topk_indices_buffer":
+                    candidate_entry = next(
+                        candidate
+                        for candidate in self.entries
+                        if isinstance(candidate, _TensorSelection)
+                        and candidate.name == "model:candidate_block_buffer"
+                    )
+                    candidates = (
+                        candidate_entry._selected()
+                        if epoch is None
+                        else getattr(candidate_entry, epoch)
+                    )
+                    assert candidates is not None
+                    prefix = int(selection["compare_prefix"])
+                    candidates = candidates[:prefix].detach().cpu()
+                    bounds = selection["valid_id_exclusive_bounds"]
+                    block_size = int(selection["candidate_block_size"])
+                    width = value.shape[1]
+                    expected_counts = []
+                    for row, bound_value in enumerate(bounds):
+                        bound = int(bound_value)
+                        legal = set()
+                        for candidate_block in candidates[row].tolist():
+                            if candidate_block < 0:
+                                continue
+                            begin = int(candidate_block) * block_size
+                            end = min(begin + block_size, bound)
+                            legal.update(range(begin, max(begin, end)))
+                        expected_counts.append(min(width, len(legal)))
+                    selection["expected_valid_counts"] = expected_counts
             elif isinstance(entry, _TensorPoints):
                 value = entry._selected() if epoch is None else getattr(entry, epoch)
                 selection = {
@@ -1775,6 +1803,7 @@ class _LogicalCacheView:
     consumers: list[str]
     aliases: list[str]
     fp8_scale: torch.Tensor | None
+    restoration_entry: str
 
     def metadata(self) -> dict[str, Any]:
         element_size = self.tensor.element_size()
@@ -1807,6 +1836,7 @@ class _LogicalCacheView:
                 if self.fp8_scale is None
                 else float(self.fp8_scale.detach().float().cpu().reshape(-1).item())
             ),
+            "restoration_entry": self.restoration_entry,
         }
 
 
@@ -2408,6 +2438,16 @@ class RetainedReplayFixtureController:
         except Exception as error:
             self._defer_checkpoint_error(error)
 
+    def _current_committed_extents(
+        self,
+        fixture: RetainedFixture,
+    ) -> torch.Tensor:
+        request_slots = fixture.input_batch.idx_mapping[: fixture.input_batch.num_reqs]
+        return self.runner.req_states.num_computed_tokens.gpu.index_select(
+            0,
+            request_slots,
+        )
+
     def capture_post_sample(
         self,
         sampled_token_ids: torch.Tensor | None,
@@ -2446,7 +2486,7 @@ class RetainedReplayFixtureController:
                 fixture.registry.typed_snapshot("post_sampling"),
                 fixture.registry.logical_cache_snapshot(
                     "post_sampling",
-                    num_rejected,
+                    self._current_committed_extents(fixture),
                 ),
                 typed_tree_snapshot(
                     "post_sampling",
@@ -2503,7 +2543,7 @@ class RetainedReplayFixtureController:
             fixture.registry.typed_snapshot("s1", epoch="s1"),
             fixture.registry.logical_cache_snapshot(
                 "s1",
-                num_rejected,
+                self._current_committed_extents(fixture),
                 extra_writers=draft_writers,
             ),
             typed_tree_snapshot(
@@ -2569,7 +2609,7 @@ class RetainedReplayFixtureController:
             fixture.registry.typed_snapshot("s1"),
             fixture.registry.logical_cache_snapshot(
                 "s1",
-                num_rejected,
+                self._current_committed_extents(fixture),
                 extra_writers=draft_writers,
             ),
             typed_tree_snapshot(
@@ -2611,9 +2651,13 @@ class RetainedReplayFixtureController:
             "logical_cache_views": [
                 view.metadata() for view in fixture.registry._cache_views
             ],
-            "cache_owner_inventory": [
-                view.view_id for view in fixture.registry._cache_views
-            ],
+            "cache_owner_inventory": fixture.registry._cache_owner_inventory,
+            "logical_mapping": {
+                "request_state_slots": list(fixture.registry._cache_request_slots),
+                "block_tables": [
+                    table.tolist() for table in fixture.registry._cache_block_tables
+                ],
+            },
         }
 
     def _run_manifest(
@@ -3396,8 +3440,32 @@ class RetainedReplayFixtureController:
                 registry.add_source_intervals(
                     f"kv-src:{cache.name}", cache.tensor, cache.source
                 )
-        computed_tokens = self.runner.req_states.num_computed_tokens.gpu
-        base_extents = computed_tokens.index_select(
+        logical_ids = {view.view_id for view in logical_views}
+        owner_inventory = []
+        static_context = self.runner.compilation_config.static_forward_context
+        for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                owner = static_context.get(layer_name)
+                cache = getattr(owner, "kv_cache", None)
+                if not isinstance(cache, torch.Tensor) or cache.numel() == 0:
+                    raise RetainedReplayFixtureError(
+                        f"{layer_name}: bound owner inventory is incomplete"
+                    )
+                view_id = f"group-{group_id}:{layer_name}"
+                owner_inventory.append(
+                    {
+                        "view_id": view_id,
+                        "owner_type": type(owner).__qualname__,
+                        "coverage": (
+                            "logical" if view_id in logical_ids else "source_only"
+                        ),
+                        "exclusion_reason": (
+                            None if view_id in logical_ids else "no_destination_blocks"
+                        ),
+                    }
+                )
+        total_lengths = self.runner.req_states.total_len.gpu
+        base_extents = total_lengths.index_select(
             0,
             input_batch.idx_mapping[: input_batch.num_reqs],
         )
@@ -3407,6 +3475,7 @@ class RetainedReplayFixtureController:
             input_batch,
             block_tables,
             tuple(int(value) for value in base_extents.detach().cpu().tolist()),
+            owner_inventory,
         )
         self._register_runtime_state(registry, input_batch)
         return registry
@@ -3611,6 +3680,7 @@ class RetainedReplayFixtureController:
                             consumers=consumers,
                             aliases=[],
                             fp8_scale=fp8_scale,
+                            restoration_entry=f"kv-dst:{record.name}",
                         )
                     )
         if not intervals_by_storage:
