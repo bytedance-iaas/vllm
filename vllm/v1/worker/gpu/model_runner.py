@@ -1491,6 +1491,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         prepared = None
         try:
             self._install_dsv41_retained_block_tables(fixture)
+            fixture.registry.restore_prefix("s0", "replay_graph:runtime:")
+            if observe_graph:
+                fixture.registry.verify_prefix("s0", "replay_graph:runtime:")
             prepared = self._prepare_dsv41_a_cycle(
                 fixture,
                 controller,
