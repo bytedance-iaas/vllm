@@ -1126,8 +1126,10 @@ class TouchedStateRegistry:
         self._cache_views: list[_LogicalCacheView] = []
         self._cache_writers: list[_CacheWriter] = []
         self._cache_block_tables: tuple[torch.Tensor, ...] = ()
+        self._cache_allocated_blocks: tuple[tuple[int, ...], ...] = ()
         self._cache_s0_extents: dict[str, tuple[int, ...]] = {}
         self._cache_s0_authority: dict[str, Any] = {}
+        self._cache_runtime_authority: dict[str, Any] = {}
         self._cache_request_slots: tuple[int, ...] = ()
         self._cache_s0_records: dict[
             str, dict[tuple[int, int, int, int, int], _LogicalCacheRecord]
@@ -1241,8 +1243,10 @@ class TouchedStateRegistry:
         writers: list[_CacheWriter],
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
+        allocated_blocks: tuple[tuple[int, ...], ...],
         s0_extents: dict[str, tuple[int, ...]],
         s0_authority: dict[str, Any],
+        replay_rows: torch.Tensor,
         owner_inventory: list[dict[str, Any]],
     ) -> None:
         if self._cache_views:
@@ -1257,10 +1261,89 @@ class TouchedStateRegistry:
         self._cache_block_tables = tuple(
             table[:num_reqs].detach().cpu().clone() for table in block_tables
         )
+        if len(allocated_blocks) != len(self._cache_block_tables) or any(
+            len(counts) != num_reqs for counts in allocated_blocks
+        ):
+            raise RetainedReplayFixtureError(
+                "logical cache allocated-block cardinality differs"
+            )
+        self._cache_allocated_blocks = tuple(
+            tuple(int(value) for value in counts) for counts in allocated_blocks
+        )
+        for table, counts in zip(
+            self._cache_block_tables,
+            self._cache_allocated_blocks,
+        ):
+            if any(count < 0 or count > table.shape[1] for count in counts):
+                raise RetainedReplayFixtureError(
+                    "logical cache allocated-block count is invalid"
+                )
         self._cache_request_slots = tuple(
             int(value)
             for value in input_batch.idx_mapping[:num_reqs].detach().cpu().tolist()
         )
+        query_start_loc = (
+            input_batch.query_start_loc[: num_reqs + 1].detach().cpu().to(torch.int64)
+        )
+        replay_rows = replay_rows.detach().cpu().to(torch.int64)
+        if (
+            query_start_loc.numel() != num_reqs + 1
+            or int(query_start_loc[0]) != 0
+            or bool((query_start_loc[1:] < query_start_loc[:-1]).any())
+            or bool((replay_rows < 0).any())
+            or bool((replay_rows >= int(query_start_loc[-1])).any())
+        ):
+            raise RetainedReplayFixtureError(
+                "logical cache runtime row authority is invalid"
+            )
+        self._cache_runtime_authority = {
+            "request_state_slots": torch.tensor(
+                self._cache_request_slots,
+                dtype=torch.int64,
+            ),
+            "query_start_loc": query_start_loc.clone(),
+            "computed_extents": torch.tensor(
+                s0_authority["computed_extents"],
+                dtype=torch.int64,
+            ),
+            "total_lengths": torch.tensor(
+                s0_authority["total_lengths"],
+                dtype=torch.int64,
+            ),
+            "is_prefilling": torch.tensor(
+                s0_authority["is_prefilling"],
+                dtype=torch.bool,
+            ),
+            "replay_start": torch.tensor(
+                s0_authority["replay_start"],
+                dtype=torch.int64,
+            ),
+            "allocated_block_counts": torch.tensor(
+                self._cache_allocated_blocks,
+                dtype=torch.int64,
+            ),
+            "replay_rows": replay_rows.clone(),
+        }
+        target_writers: dict[str, Any] = {}
+        for writer in writers:
+            if writer.phase not in ("target-full", "target-replay"):
+                continue
+            target_writers[writer.phase] = {
+                "source_rows": writer.source_rows.clone(),
+                "slots_by_view": {
+                    view.view_id: (
+                        torch.empty(0, dtype=torch.int64)
+                        if writer.slots_by_layer.get(view.layer_name) is None
+                        else writer.slots_by_layer[view.layer_name].clone()
+                    )
+                    for view in self._cache_views
+                },
+            }
+        if set(target_writers) != {"target-full", "target-replay"}:
+            raise RetainedReplayFixtureError(
+                "target logical writer runtime authority is incomplete"
+            )
+        self._cache_runtime_authority["target_writers"] = target_writers
         for view in self._cache_views:
             extents = s0_extents.get(view.view_id)
             if extents is None or len(extents) != num_reqs:
@@ -1299,12 +1382,15 @@ class TouchedStateRegistry:
         writer: str,
     ) -> list[_LogicalCacheRecord]:
         table = self._cache_block_tables[view.group_id]
+        allocated = self._cache_allocated_blocks[view.group_id]
         records: list[_LogicalCacheRecord] = []
         for request_ordinal, extent in enumerate(extents):
             if extent <= 0:
                 continue
             request_slot = self._cache_request_slots[request_ordinal]
             if view.cache_kind == "compressor_ring":
+                if allocated[request_ordinal] < 1:
+                    continue
                 physical_block = int(table[request_ordinal, 0])
                 if physical_block <= 0 or physical_block not in view.destination_blocks:
                     continue
@@ -1329,7 +1415,7 @@ class TouchedStateRegistry:
                     f"{view.view_id}: invalid tokens_per_state={ratio}"
                 )
             for logical_block, physical_value in enumerate(
-                table[request_ordinal].tolist()
+                table[request_ordinal, : allocated[request_ordinal]].tolist()
             ):
                 physical_block = int(physical_value)
                 if physical_block <= 0 or physical_block not in view.destination_blocks:
@@ -1362,17 +1448,24 @@ class TouchedStateRegistry:
         writers: list[_CacheWriter],
     ) -> list[_LogicalCacheRecord]:
         table = self._cache_block_tables[view.group_id]
+        allocated = self._cache_allocated_blocks[view.group_id]
         records: dict[tuple[int, int, int, int, int], _LogicalCacheRecord] = {}
         for writer in writers:
             slots = writer.slots_by_layer.get(view.layer_name)
             if slots is None:
                 continue
-            count = min(
+            cardinalities = {
+                writer.source_rows.numel(),
                 writer.positions.numel(),
                 writer.request_ordinals.numel(),
                 writer.request_state_slots.numel(),
                 slots.numel(),
-            )
+            }
+            if len(cardinalities) != 1:
+                raise RetainedReplayFixtureError(
+                    f"{writer.phase}: {view.view_id} writer cardinality differs"
+                )
+            count = writer.positions.numel()
             for row in range(count):
                 slot = int(slots[row])
                 if slot < 0:
@@ -1399,13 +1492,17 @@ class TouchedStateRegistry:
                         continue
                     state_index = position // ratio
                     logical_block = state_index // view.block_size
-                    if logical_block >= table.shape[1]:
+                    if logical_block >= allocated[request_ordinal]:
                         raise RetainedReplayFixtureError(
                             f"{writer.phase}: logical cache block is out of range"
                         )
                     expected_block = int(table[request_ordinal, logical_block])
                     expected_row = state_index % view.block_size
                 else:
+                    if allocated[request_ordinal] < 1:
+                        raise RetainedReplayFixtureError(
+                            f"{writer.phase}: compressor ring block is absent"
+                        )
                     expected_block = int(table[request_ordinal, 0])
                     expected_row = position % view.block_size
                 physical_block = slot // view.block_size
@@ -1468,17 +1565,6 @@ class TouchedStateRegistry:
                 writer_records[record.writer].append(list(record.identity))
             for records_by_phase in writer_records.values():
                 records_by_phase.sort()
-            writer_sources = {}
-            for writer in writers:
-                slots = writer.slots_by_layer.get(view.layer_name)
-                writer_sources[writer.phase] = {
-                    "position_path": writer.position_path,
-                    "source_rows": writer.source_rows.tolist(),
-                    "positions": writer.positions.tolist(),
-                    "request_ordinals": writer.request_ordinals.tolist(),
-                    "request_state_slots": writer.request_state_slots.tolist(),
-                    "slots": [] if slots is None else slots.tolist(),
-                }
             for record in written:
                 if view.cache_kind == "compressor_ring":
                     stale = [
@@ -1574,6 +1660,26 @@ class TouchedStateRegistry:
                 "writers": [writer.phase for writer in writers],
             }
             builder.add(metadata, f"{root}/metadata", comparison="exact")
+            for writer in writers:
+                authority_root = (
+                    f"{root}/writer_authority/{_safe_path_component(writer.phase)}"
+                )
+                slots = writer.slots_by_layer.get(view.layer_name)
+                writer_authority = {
+                    "position_path": writer.position_path,
+                    "source_rows": writer.source_rows,
+                    "positions": writer.positions,
+                    "request_ordinals": writer.request_ordinals,
+                    "request_state_slots": writer.request_state_slots,
+                    "slots": (
+                        torch.empty(0, dtype=torch.int64) if slots is None else slots
+                    ),
+                }
+                builder.add(
+                    writer_authority,
+                    authority_root,
+                    comparison="exact",
+                )
             builder.add(
                 descriptors,
                 f"{root}/descriptors",
@@ -1583,7 +1689,6 @@ class TouchedStateRegistry:
                     "writer_count": len(writers),
                     "writer_phases": [writer.phase for writer in writers],
                     "writer_records": writer_records,
-                    "writer_sources": writer_sources,
                     "writer_enforce_committed": {
                         writer.phase: writer.enforce_committed_extent
                         for writer in writers
@@ -2355,6 +2460,7 @@ class RetainedReplayFixtureController:
             logical_writers,
             replay_batch.replay_start,
             int(replay_layers.window),
+            production_replay_batch.rows,
         )
         self._register_production_graph_inputs(
             registry,
@@ -2432,6 +2538,17 @@ class RetainedReplayFixtureController:
             path="s0_cache_authority",
         )
 
+    @staticmethod
+    def _cache_runtime_authority_snapshot(
+        checkpoint: str,
+        registry: TouchedStateRegistry,
+    ) -> dict[str, Any]:
+        return typed_tree_snapshot(
+            checkpoint,
+            registry._cache_runtime_authority,
+            path="cache_runtime_authority",
+        )
+
     def capture_boundary(self, boundary: DecoderBoundaryState) -> None:
         fixture = self.fixture
         if fixture is None:
@@ -2451,6 +2568,10 @@ class RetainedReplayFixtureController:
                         path="boundary",
                     ),
                     self._s0_cache_authority_snapshot(
+                        "l20",
+                        fixture.registry,
+                    ),
+                    self._cache_runtime_authority_snapshot(
                         "l20",
                         fixture.registry,
                     ),
@@ -2474,6 +2595,10 @@ class RetainedReplayFixtureController:
                     path="boundary",
                 ),
                 self._s0_cache_authority_snapshot(
+                    "l20",
+                    fixture.registry,
+                ),
+                self._cache_runtime_authority_snapshot(
                     "l20",
                     fixture.registry,
                 ),
@@ -2734,9 +2859,15 @@ class RetainedReplayFixtureController:
                 "block_tables": [
                     table.tolist() for table in fixture.registry._cache_block_tables
                 ],
+                "allocated_block_counts": [
+                    list(counts) for counts in fixture.registry._cache_allocated_blocks
+                ],
                 "query_start_loc": fixture.registry._cache_s0_authority[
                     "query_start_loc"
                 ],
+                "replay_rows": fixture.registry._cache_runtime_authority[
+                    "replay_rows"
+                ].tolist(),
                 "s0_authority": fixture.registry._cache_s0_authority,
             },
         }
@@ -3190,9 +3321,11 @@ class RetainedReplayFixtureController:
             "head_size",
             "head_size_v",
             "num_kv_heads",
+            "num_head_slots",
             "dtype",
             "tokens_per_state",
             "state_content_bytes",
+            "page_size_padded",
             "alignment",
             "block_stride_alignment",
             "cache_dtype_str",
@@ -3206,7 +3339,13 @@ class RetainedReplayFixtureController:
         for name in names:
             if hasattr(spec, name):
                 metadata[name] = _manifest_value(getattr(spec, name))
-        for name in ("state_content_size_bytes", "page_size_bytes", "num_states"):
+        for name in (
+            "num_heads",
+            "state_content_size_bytes",
+            "page_size_bytes",
+            "real_page_size_bytes",
+            "num_states",
+        ):
             try:
                 metadata[name] = _manifest_value(getattr(spec, name))
             except (AssertionError, NotImplementedError):
@@ -3511,6 +3650,7 @@ class RetainedReplayFixtureController:
         logical_writers: list[_CacheWriter],
         replay_start: torch.Tensor,
         replay_window: int,
+        replay_rows: torch.Tensor,
     ) -> TouchedStateRegistry:
         registry = TouchedStateRegistry()
         cache_intervals = self._collect_cache_intervals(
@@ -3523,10 +3663,9 @@ class RetainedReplayFixtureController:
         for key, cache in cache_intervals.items():
             del key
             logical_views.extend(cache.views)
-            if cache.destination:
-                registry.add_intervals(
-                    f"kv-dst:{cache.name}", cache.tensor, cache.destination
-                )
+            registry.add_intervals(
+                f"kv-dst:{cache.name}", cache.tensor, cache.destination
+            )
             if cache.source:
                 registry.add_source_intervals(
                     f"kv-src:{cache.name}", cache.tensor, cache.source
@@ -3551,6 +3690,17 @@ class RetainedReplayFixtureController:
                     }
                 )
         request_slots = input_batch.idx_mapping[: input_batch.num_reqs]
+        allocated_blocks = tuple(
+            tuple(
+                int(value)
+                for value in self.runner.block_tables.num_blocks.gpu[group_id]
+                .index_select(0, request_slots)
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            for group_id in range(len(self.runner.kv_cache_config.kv_cache_groups))
+        )
         total_lengths = self.runner.req_states.total_len.gpu.index_select(
             0,
             request_slots,
@@ -3613,8 +3763,10 @@ class RetainedReplayFixtureController:
             logical_writers,
             input_batch,
             block_tables,
+            allocated_blocks,
             s0_extents,
             s0_authority,
+            replay_rows,
             owner_inventory,
         )
         self._register_runtime_state(registry, input_batch)

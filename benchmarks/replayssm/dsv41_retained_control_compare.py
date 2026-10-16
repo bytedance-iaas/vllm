@@ -17,6 +17,16 @@ import torch
 
 SCHEMA = 2
 QUANTILES = (0.5, 0.9, 0.99, 0.999, 1.0)
+DECODED_RECORD_WIDTHS = {
+    "v4_ue8m0_fp8_bf16": 512,
+    "v41_ue8m0_mxfp8": 512,
+    "v41_nvfp4": 512,
+    "indexer_fp8": 128,
+    "indexer_mxfp4": 128,
+    "plain_bf16": 512,
+    "plain_fp8": 512,
+    "compressor_ring_fp32": 1024,
+}
 REQUIRED_CHECKPOINTS = {"l20", "target", "post_sampling", "s1"}
 REQUIRED_PATHS = {
     "l20": {
@@ -328,6 +338,14 @@ def _decode_logical_raw(
     view: dict[str, Any],
 ) -> torch.Tensor:
     record_format = view["record_format"]
+    if raw_values.shape[0] == 0:
+        try:
+            width = DECODED_RECORD_WIDTHS[record_format]
+        except KeyError as error:
+            raise ValueError(
+                f"unsupported logical cache format: {record_format}"
+            ) from error
+        return torch.empty((0, width), dtype=torch.float32)
     if record_format == "v4_ue8m0_fp8_bf16":
         fp8 = raw_values[:, :448].view(torch.float8_e4m3fn).float()
         scales = torch.exp2(raw_scales[:, :7].float() - 127.0)
@@ -415,12 +433,26 @@ def _validate_view_layout(path: Path, view: dict[str, Any]) -> int:
         raise ValueError(f"{path}: logical cache spec is absent")
     spec_tokens = spec.get("tokens_per_state")
     logical_tokens = int(view["tokens_per_state"])
+    expected_head_size = {
+        "v4_ue8m0_fp8_bf16": 512,
+        "v41_ue8m0_mxfp8": 512,
+        "v41_nvfp4": 512,
+        "indexer_fp8": 132,
+        "indexer_mxfp4": 68,
+        "plain_bf16": 512,
+        "plain_fp8": 512,
+        "compressor_ring_fp32": 1024,
+    }[view["record_format"]]
     if (
         spec.get("type") != view.get("spec_type")
         or spec.get("dtype") != dtype
         or int(spec.get("block_size", -1)) <= 0
         or int(spec.get("num_states", -1)) != shape[1]
         or int(spec.get("state_content_size_bytes", -1)) != record_bytes
+        or int(spec.get("head_size", -1)) != expected_head_size
+        or int(spec.get("head_size_v", -1)) != 0
+        or int(spec.get("num_kv_heads", -1)) != 1
+        or int(spec.get("num_heads", -1)) != 1
     ):
         raise ValueError(f"{path}: logical spec/layout agreement differs")
     if view.get("cache_kind") == "compressor_ring":
@@ -434,6 +466,25 @@ def _validate_view_layout(path: Path, view: dict[str, Any]) -> int:
         raise ValueError(f"{path}: logical spec compression ratio differs")
     if int(spec["block_size"]) // int(spec_tokens) != shape[1]:
         raise ValueError(f"{path}: logical spec state cardinality differs")
+    unpadded_page_bytes = shape[1] * record_bytes
+    alignment = spec.get("alignment")
+    if alignment is None:
+        expected_page_bytes = unpadded_page_bytes
+    elif not isinstance(alignment, int) or alignment <= 0:
+        raise ValueError(f"{path}: logical spec page alignment is invalid")
+    else:
+        expected_page_bytes = (
+            (unpadded_page_bytes + alignment - 1) // alignment
+        ) * alignment
+    expected_padding = (
+        expected_page_bytes if expected_page_bytes != unpadded_page_bytes else None
+    )
+    if (
+        int(spec.get("real_page_size_bytes", -1)) != unpadded_page_bytes
+        or int(spec.get("page_size_bytes", -1)) != expected_page_bytes
+        or spec.get("page_size_padded") != expected_padding
+    ):
+        raise ValueError(f"{path}: logical spec page geometry differs")
     return element_size
 
 
@@ -448,6 +499,44 @@ def _validate_s0_authority(
     authority = logical_mapping.get("s0_authority")
     if not isinstance(authority, dict):
         raise ValueError(f"{path}: S0 cache authority is absent")
+
+    runtime_fields = (
+        "request_state_slots",
+        "query_start_loc",
+        "computed_extents",
+        "total_lengths",
+        "is_prefilling",
+        "replay_start",
+        "allocated_block_counts",
+        "replay_rows",
+    )
+    runtime: dict[str, Any] = {}
+    for field in runtime_fields:
+        leaf = leaves.get(f"l20:cache_runtime_authority/{field}")
+        if leaf is None or leaf.get("payload_key") is None:
+            raise ValueError(f"{path}: cache runtime authority is absent: {field}")
+        runtime[field] = payload[leaf["payload_key"]].detach().cpu().tolist()
+    runtime["is_prefilling"] = [bool(value) for value in runtime["is_prefilling"]]
+    if runtime["request_state_slots"] != request_slots:
+        raise ValueError(f"{path}: runtime request-state mapping differs")
+    if runtime["query_start_loc"] != logical_mapping.get("query_start_loc"):
+        raise ValueError(f"{path}: runtime query boundaries differ")
+    if runtime["allocated_block_counts"] != logical_mapping.get(
+        "allocated_block_counts"
+    ):
+        raise ValueError(f"{path}: runtime allocated-block counts differ")
+    if runtime["replay_rows"] != logical_mapping.get("replay_rows"):
+        raise ValueError(f"{path}: runtime replay rows differ")
+    for field in (
+        "computed_extents",
+        "total_lengths",
+        "is_prefilling",
+        "replay_start",
+        "query_start_loc",
+    ):
+        if runtime[field] != authority.get(field):
+            raise ValueError(f"{path}: runtime S0 authority differs: {field}")
+
     evidence_fields = (
         "computed_extents",
         "total_lengths",
@@ -495,19 +584,25 @@ def _validate_s0_authority(
         raise ValueError(f"{path}: S0 query boundaries differ")
 
     post_computed = leaves.get("post_sampling:registry/request:num_computed_tokens")
+    post_total = leaves.get("post_sampling:registry/request:total_len")
     rejected = leaves.get("post_sampling:decisions/num_rejected")
-    if post_computed is None or rejected is None:
+    if post_computed is None or post_total is None or rejected is None:
         raise ValueError(f"{path}: S0 checkpoint binding is absent")
     computed_values = payload[post_computed["payload_key"]].reshape(-1).tolist()
     computed_slots = post_computed.get("metadata", {}).get("indices")
+    total_values = payload[post_total["payload_key"]].reshape(-1).tolist()
+    total_slots = post_total.get("metadata", {}).get("indices")
     rejected_values = payload[rejected["payload_key"]].reshape(-1).tolist()
     if (
         not isinstance(computed_slots, list)
         or len(computed_slots) != len(computed_values)
+        or not isinstance(total_slots, list)
+        or len(total_slots) != len(total_values)
         or len(rejected_values) != len(request_slots)
     ):
         raise ValueError(f"{path}: S0 checkpoint binding cardinality differs")
     post_by_slot = dict(zip(map(int, computed_slots), map(int, computed_values)))
+    total_by_slot = dict(zip(map(int, total_slots), map(int, total_values)))
     for request, slot in enumerate(request_slots):
         query_len = int(query_start[request + 1]) - int(query_start[request])
         expected_post = (
@@ -517,6 +612,8 @@ def _validate_s0_authority(
         )
         if post_by_slot.get(int(slot)) != expected_post:
             raise ValueError(f"{path}: S0 computed extent differs from GPU state")
+        if total_by_slot.get(int(slot)) != int(authority["total_lengths"][request]):
+            raise ValueError(f"{path}: S0 total length differs from GPU state")
 
     replay_window = authority.get("replay_window")
     speculative_groups = authority.get("speculative_group_ids")
@@ -605,23 +702,60 @@ def _validate_logical_payload(
         raise ValueError(f"{path}: logical descriptors are duplicated for {root}")
     block_size = int(view["block_size"])
     block_tables = logical_mapping["block_tables"]
+    allocated_block_counts = logical_mapping.get("allocated_block_counts")
     group_id = int(view["group_id"])
-    if not 0 <= group_id < len(block_tables):
+    if (
+        not isinstance(allocated_block_counts, list)
+        or len(allocated_block_counts) != len(block_tables)
+        or not 0 <= group_id < len(block_tables)
+    ):
         raise ValueError(f"{path}: logical group mapping is absent for {root}")
     table = block_tables[group_id]
+    allocated = allocated_block_counts[group_id]
+    if (
+        not isinstance(table, list)
+        or not isinstance(allocated, list)
+        or len(table) != len(request_slots)
+        or len(allocated) != len(request_slots)
+        or any(
+            not isinstance(count, int)
+            or count < 0
+            or not isinstance(row, list)
+            or count > len(row)
+            for row, count in zip(table, allocated)
+        )
+    ):
+        raise ValueError(f"{path}: allocated block-table mapping differs for {root}")
     ratio = int(view["tokens_per_state"])
 
     restoration_entry = view.get("restoration_entry")
+    if not isinstance(restoration_entry, str) or not restoration_entry:
+        raise ValueError(f"{path}: restoration identity is invalid for {root}")
     restoration_key = f"{checkpoint}:registry/{_safe_path_component(restoration_entry)}"
     restoration_leaf = leaves.get(restoration_key)
-    intervals = (
-        []
-        if restoration_leaf is None
-        else restoration_leaf.get("metadata", {}).get("intervals")
-    )
-    if not isinstance(intervals, list):
+    if (
+        restoration_leaf is None
+        or restoration_leaf.get("payload_key") is None
+        or restoration_leaf.get("metadata", {}).get("kind") != "byte_intervals"
+    ):
+        raise ValueError(f"{path}: restoration entry is absent for {root}")
+    intervals = restoration_leaf.get("metadata", {}).get("intervals")
+    if not isinstance(intervals, list) or any(
+        not isinstance(interval, (list, tuple))
+        or len(interval) != 2
+        or any(not isinstance(value, int) for value in interval)
+        for interval in intervals
+    ):
         raise ValueError(f"{path}: restoration binding is invalid for {root}")
     intervals = [(int(begin), int(end)) for begin, end in intervals]
+    if any(
+        begin < 0 or begin >= end or (index and intervals[index - 1][1] >= begin)
+        for index, (begin, end) in enumerate(intervals)
+    ):
+        raise ValueError(f"{path}: restoration intervals are invalid for {root}")
+    restoration_payload = payload[restoration_leaf["payload_key"]]
+    if restoration_payload.numel() != sum(end - begin for begin, end in intervals):
+        raise ValueError(f"{path}: restoration payload size differs for {root}")
 
     def covered(begin: int, end: int) -> bool:
         return any(lo <= begin and end <= hi for lo, hi in intervals)
@@ -631,8 +765,8 @@ def _validate_logical_payload(
     page_content_bytes = int(view["shape"][1]) * int(view["shape"][2]) * element_size
     candidate_blocks = {
         int(block)
-        for request_table in table
-        for block in request_table
+        for request_table, count in zip(table, allocated)
+        for block in request_table[:count]
         if int(block) > 0
     }
     bound_destination_blocks = {
@@ -650,7 +784,6 @@ def _validate_logical_payload(
     writer_count = descriptor_metadata.get("writer_count")
     writer_phases = descriptor_metadata.get("writer_phases")
     writer_records = descriptor_metadata.get("writer_records")
-    writer_sources = descriptor_metadata.get("writer_sources")
     writer_enforce = descriptor_metadata.get("writer_enforce_committed")
     expected_phases = (
         ["target-full", "target-replay"]
@@ -670,8 +803,6 @@ def _validate_logical_payload(
         or writer_count != len(writer_phases)
         or not isinstance(writer_records, dict)
         or set(writer_records) != set(writer_phases)
-        or not isinstance(writer_sources, dict)
-        or set(writer_sources) != set(writer_phases)
         or not isinstance(writer_enforce, dict)
         or set(writer_enforce) != set(writer_phases)
         or any(
@@ -700,6 +831,8 @@ def _validate_logical_payload(
         ):
             raise ValueError(f"{path}: logical writer identity differs")
         if view["cache_kind"] == "compressor_ring":
+            if allocated[request] < 1:
+                raise ValueError(f"{path}: compressor ring block is absent")
             expected_block = int(table[request][0])
             expected_row = position % block_size
         else:
@@ -707,7 +840,7 @@ def _validate_logical_payload(
                 raise ValueError(f"{path}: logical compression boundary differs")
             state = position // ratio
             logical_block = state // block_size
-            if logical_block >= len(table[request]):
+            if logical_block >= allocated[request]:
                 raise ValueError(f"{path}: logical block-table index is invalid")
             expected_block = int(table[request][logical_block])
             expected_row = state % block_size
@@ -717,15 +850,55 @@ def _validate_logical_payload(
 
     final_writer_records: dict[tuple[int, ...], int] = {}
     for writer_index, phase in enumerate(writer_phases):
-        source = writer_sources[phase]
-        if not isinstance(source, dict):
-            raise ValueError(f"{path}: logical writer source is invalid")
-        position_path = source.get("position_path")
-        source_rows = source.get("source_rows")
-        positions = source.get("positions")
-        request_ordinals = source.get("request_ordinals")
-        request_state_slots = source.get("request_state_slots")
-        slots = source.get("slots")
+        authority_root = f"{root}/writer_authority/{_safe_path_component(phase)}"
+
+        def authority_value(
+            field: str,
+            *,
+            authority_root: str = authority_root,
+            phase: str = phase,
+        ) -> Any:
+            leaf = leaves.get(f"{authority_root}/{field}")
+            if leaf is None:
+                raise ValueError(
+                    f"{path}: logical writer authority is absent: {phase}/{field}"
+                )
+            payload_key = leaf.get("payload_key")
+            return (
+                leaf.get("value")
+                if payload_key is None
+                else payload[payload_key].reshape(-1).tolist()
+            )
+
+        position_path = authority_value("position_path")
+        source_rows = authority_value("source_rows")
+        positions = authority_value("positions")
+        request_ordinals = authority_value("request_ordinals")
+        request_state_slots = authority_value("request_state_slots")
+        slots = authority_value("slots")
+        if phase.startswith("target-"):
+            runtime_writer_root = (
+                "l20:cache_runtime_authority/target_writers/"
+                f"{_safe_path_component(phase)}"
+            )
+            runtime_source_leaf = leaves.get(f"{runtime_writer_root}/source_rows")
+            runtime_slots_leaf = leaves.get(
+                f"{runtime_writer_root}/slots_by_view/"
+                f"{_safe_path_component(view['view_id'])}"
+            )
+            if (
+                runtime_source_leaf is None
+                or runtime_source_leaf.get("payload_key") is None
+                or runtime_slots_leaf is None
+                or runtime_slots_leaf.get("payload_key") is None
+                or source_rows
+                != payload[runtime_source_leaf["payload_key"]].reshape(-1).tolist()
+                or slots
+                != payload[runtime_slots_leaf["payload_key"]].reshape(-1).tolist()
+            ):
+                raise ValueError(
+                    f"{path}: target writer runtime authority differs for {phase}"
+                )
         source_leaf = (
             None if not isinstance(position_path, str) else leaves.get(position_path)
         )
@@ -750,9 +923,28 @@ def _validate_logical_payload(
                 }
             )
             != 1
+            or (slots and len(slots) != len(positions))
         ):
             raise ValueError(f"{path}: logical writer source is incomplete")
         source_positions = payload[source_leaf["payload_key"]].reshape(-1)
+        expected_position_paths = {
+            "target-full": "l20:boundary/positions",
+            "target-replay": "l20:boundary/positions",
+            "draft-context": "s1:registry/speculator:context_positions",
+            "draft-query": "s1:registry/speculator:input:positions",
+        }
+        if position_path != expected_position_paths[phase]:
+            raise ValueError(f"{path}: logical writer phase binding differs")
+        if phase == "target-full" and source_rows != list(
+            range(int(logical_mapping["query_start_loc"][-1]))
+        ):
+            raise ValueError(f"{path}: target-full source rows are not canonical")
+        if phase == "target-replay" and source_rows != logical_mapping.get(
+            "replay_rows"
+        ):
+            raise ValueError(f"{path}: target-replay rows differ from runtime")
+        if phase == "draft-query" and source_rows != list(range(len(source_rows))):
+            raise ValueError(f"{path}: draft-query source rows are not canonical")
         if (
             any(
                 not isinstance(row, int) or not 0 <= row < source_positions.numel()
@@ -798,13 +990,22 @@ def _validate_logical_payload(
             request_state_slots,
             slots,
         ):
+            request = int(request)
+            request_slot = int(request_slot)
+            position = int(position)
+            if not 0 <= request < len(request_slots) or request_slot != int(
+                request_slots[request]
+            ):
+                raise ValueError(f"{path}: logical writer request identity differs")
+            if bool(writer_enforce[phase]) and position >= int(extents[request]):
+                continue
             slot = int(slot)
             if slot < 0:
                 continue
             identity = [
-                int(request),
-                int(request_slot),
-                int(position),
+                request,
+                request_slot,
+                position,
                 slot // block_size,
                 slot % block_size,
             ]
@@ -827,6 +1028,8 @@ def _validate_logical_payload(
     for request, extent in enumerate(s0_extents):
         request_slot = int(request_slots[request])
         if view["cache_kind"] == "compressor_ring":
+            if allocated[request] < 1:
+                continue
             block = int(table[request][0])
             if block <= 0 or block not in destination_blocks:
                 continue
@@ -840,7 +1043,9 @@ def _validate_logical_payload(
                 )
                 expected_records[identity] = -1
             continue
-        for logical_block, block_value in enumerate(table[request]):
+        for logical_block, block_value in enumerate(
+            table[request][: allocated[request]]
+        ):
             block = int(block_value)
             if block <= 0 or block not in destination_blocks:
                 continue
@@ -883,7 +1088,7 @@ def _validate_logical_payload(
             )
         }
         for request, extent in enumerate(extents):
-            block = int(table[request][0])
+            block = int(table[request][0]) if allocated[request] else -1
             if (
                 extent % ratio
                 and block in destination_blocks
@@ -906,13 +1111,6 @@ def _validate_logical_payload(
     storage_offset = int(view["storage_offset_bytes"])
     stride0, stride1, _ = map(int, view["strides_bytes"])
     record_format = view["record_format"]
-    if rows and restoration_leaf is None:
-        raise ValueError(f"{path}: restoration binding is absent for {root}")
-    restoration_payload = (
-        torch.empty(0, dtype=torch.uint8)
-        if restoration_leaf is None
-        else payload[restoration_leaf["payload_key"]]
-    )
 
     def restoration_bytes(begin: int, end: int) -> torch.Tensor:
         cursor = 0
@@ -1625,14 +1823,26 @@ def _validated_scratch_rows(
         None if not isinstance(contract, dict) else contract.get("logical_cache_views")
     )
     boundary_leaf = run.leaves.get("l20:boundary/positions")
+    replay_rows_leaf = run.leaves.get("l20:cache_runtime_authority/replay_rows")
     if (
         not isinstance(logical_mapping, dict)
         or not isinstance(views, list)
         or boundary_leaf is None
+        or replay_rows_leaf is None
+        or replay_rows_leaf.get("payload_key") is None
     ):
         raise ValueError(f"{leaf['path']}: scratch authority is absent")
     boundary_positions = _meaningful_tensor(run, boundary_leaf).reshape(-1)
     input_rows = metadata["row_input_indices"]
+    runtime_replay_rows = (
+        run.payload[replay_rows_leaf["payload_key"]].reshape(-1).tolist()
+    )
+    if (
+        metadata.get("row_writer") != "target-replay"
+        or input_rows != runtime_replay_rows
+        or input_rows != logical_mapping.get("replay_rows")
+    ):
+        raise ValueError(f"{leaf['path']}: scratch replay rows differ")
     if any(
         not isinstance(index, int) or not 0 <= index < boundary_positions.numel()
         for index in input_rows
