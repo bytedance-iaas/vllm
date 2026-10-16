@@ -1489,7 +1489,11 @@ class TouchedStateRegistry:
                     )
                 }
             ordered = sorted(records.values(), key=lambda record: record.identity)
-            if not ordered and view.cache_kind != "compressor_ring":
+            if (
+                not ordered
+                and view.destination_blocks
+                and view.cache_kind != "compressor_ring"
+            ):
                 raise RetainedReplayFixtureError(
                     f"{view.view_id}: logical destination coverage is empty"
                 )
@@ -1564,6 +1568,7 @@ class TouchedStateRegistry:
                 metadata={
                     "committed_extents": list(extents),
                     "writer_count": len(writers),
+                    "writer_phases": [writer.phase for writer in writers],
                 },
             )
             raw_width, scale_width, decoded_width = _CACHE_RECORD_LAYOUTS[
@@ -3440,7 +3445,6 @@ class RetainedReplayFixtureController:
                 registry.add_source_intervals(
                     f"kv-src:{cache.name}", cache.tensor, cache.source
                 )
-        logical_ids = {view.view_id for view in logical_views}
         owner_inventory = []
         static_context = self.runner.compilation_config.static_forward_context
         for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
@@ -3456,19 +3460,23 @@ class RetainedReplayFixtureController:
                     {
                         "view_id": view_id,
                         "owner_type": type(owner).__qualname__,
-                        "coverage": (
-                            "logical" if view_id in logical_ids else "source_only"
-                        ),
-                        "exclusion_reason": (
-                            None if view_id in logical_ids else "no_destination_blocks"
-                        ),
+                        "coverage": "logical",
+                        "exclusion_reason": None,
                     }
                 )
-        total_lengths = self.runner.req_states.total_len.gpu
-        base_extents = total_lengths.index_select(
+        request_slots = input_batch.idx_mapping[: input_batch.num_reqs]
+        total_lengths = self.runner.req_states.total_len.gpu.index_select(
             0,
-            input_batch.idx_mapping[: input_batch.num_reqs],
+            request_slots,
         )
+        computed = self.runner.req_states.num_computed_tokens.gpu.index_select(
+            0,
+            request_slots,
+        )
+        prefill = torch.from_numpy(
+            input_batch.is_prefilling_np[: input_batch.num_reqs]
+        ).to(device=computed.device)
+        base_extents = torch.where(prefill, computed, total_lengths)
         registry.configure_logical_cache(
             logical_views,
             logical_writers,
@@ -3632,7 +3640,7 @@ class RetainedReplayFixtureController:
                 record.source.extend(
                     _cache_block_byte_intervals(layer_name, cache, group_blocks)
                 )
-                if collect_logical and logical_destination_blocks:
+                if collect_logical:
                     spec = self._effective_layer_spec(group, layer_name)
                     consumers, fp8_scale = self._cache_consumers_and_scale(
                         layer_name,

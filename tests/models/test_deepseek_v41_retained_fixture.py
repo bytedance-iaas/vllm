@@ -409,6 +409,7 @@ def _scratch_run(
         "producer_layer": 20,
         "cache_owner": "layer.20",
         "compress_ratio": 2,
+        "candidate_block_size": 2,
         "row_writer": "target-replay",
         "row_positions": [15] * values.shape[0],
         "row_request_ordinals": list(range(values.shape[0])),
@@ -416,7 +417,7 @@ def _scratch_run(
         "sentinel": -1,
         "require_unique_valid_ids": True,
         "require_trailing_sentinels": True,
-        "valid_id_exclusive_bounds": [8] * values.shape[0],
+        "valid_id_exclusive_bounds": [4] * values.shape[0],
         "expected_valid_counts": [3] * values.shape[0],
     }
     leaf = {
@@ -446,6 +447,8 @@ def _add_topk(run: EvidenceRun, values: torch.Tensor) -> None:
         "cache_owner": "layer.20.indexer.k_cache",
         "candidate_membership_path": "registry/model:candidate_block_buffer",
         "candidate_block_size": 2,
+        "valid_id_exclusive_bounds": [8] * values.shape[0],
+        "expected_valid_counts": [3] * values.shape[0],
     }
     run.payload["topk"] = values
     run.leaves[f"s1:{path}"] = {

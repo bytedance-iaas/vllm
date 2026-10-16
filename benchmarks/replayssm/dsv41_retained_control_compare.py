@@ -383,6 +383,24 @@ def _validate_logical_payload(
     raw_scales = payload[leaves[f"{root}/raw_scales"]["payload_key"]]
     decoded = payload[leaves[f"{root}/decoded"]["payload_key"]]
     descriptor_metadata = leaves[f"{root}/descriptors"].get("metadata", {})
+    request_slots = logical_mapping["request_state_slots"]
+    extents = descriptor_metadata.get("committed_extents")
+    computed_key = f"{checkpoint}:registry/request:num_computed_tokens"
+    computed_leaf = leaves.get(computed_key)
+    if computed_leaf is None or not isinstance(extents, list):
+        raise ValueError(f"{path}: checkpoint extent evidence is absent for {root}")
+    computed_values = payload[computed_leaf["payload_key"]].reshape(-1).tolist()
+    computed_slots = computed_leaf.get("metadata", {}).get("indices")
+    if not isinstance(computed_slots, list) or len(computed_slots) != len(
+        computed_values
+    ):
+        raise ValueError(f"{path}: checkpoint computed-state mapping differs")
+    computed_by_slot = dict(zip(map(int, computed_slots), map(int, computed_values)))
+    if len(extents) != len(request_slots) or any(
+        int(extent) != computed_by_slot.get(int(slot))
+        for extent, slot in zip(extents, request_slots)
+    ):
+        raise ValueError(f"{path}: committed extents differ from GPU state")
     if descriptors.ndim != 2 or descriptors.shape[1] != 6:
         raise ValueError(f"{path}: logical descriptors are invalid for {root}")
     rows = descriptors.shape[0]
@@ -396,13 +414,12 @@ def _validate_logical_payload(
     ):
         raise ValueError(f"{path}: logical row cardinality differs for {root}")
     if rows == 0:
+        if not view.get("destination_blocks"):
+            return
         if view.get("cache_kind") != "compressor_ring":
             raise ValueError(f"{path}: logical coverage is empty for {root}")
-        extents = descriptor_metadata.get("committed_extents")
         ratio = int(view["tokens_per_state"])
-        if not isinstance(extents, list) or any(
-            int(extent) % ratio for extent in extents
-        ):
+        if any(int(extent) % ratio for extent in extents):
             raise ValueError(f"{path}: empty ring has an open committed group")
         return
     if torch.unique(descriptors, dim=0).shape[0] != rows:
@@ -417,7 +434,6 @@ def _validate_logical_payload(
         or any(int(block) not in destination_blocks for block in descriptors[:, 3])
     ):
         raise ValueError(f"{path}: logical descriptor bounds differ for {root}")
-    request_slots = logical_mapping["request_state_slots"]
     block_tables = logical_mapping["block_tables"]
     group_id = int(view["group_id"])
     if not 0 <= group_id < len(block_tables):
@@ -425,7 +441,24 @@ def _validate_logical_payload(
     table = block_tables[group_id]
     ratio = int(view["tokens_per_state"])
     writer_count = descriptor_metadata.get("writer_count")
-    if not isinstance(writer_count, int) or writer_count < 1:
+    writer_phases = descriptor_metadata.get("writer_phases")
+    expected_phases = (
+        ["target-full", "target-replay"]
+        if checkpoint == "post_sampling"
+        else [
+            "target-full",
+            "target-replay",
+            "draft-context",
+            "draft-query",
+        ]
+    )
+    if (
+        not isinstance(writer_count, int)
+        or writer_count < 1
+        or writer_phases
+        not in [expected_phases[:end] for end in range(2, len(expected_phases) + 1)]
+        or writer_count != len(writer_phases)
+    ):
         raise ValueError(f"{path}: logical writer inventory is absent for {root}")
     for descriptor in descriptors.tolist():
         request, request_slot, position, block, row, writer = map(int, descriptor)
@@ -475,7 +508,19 @@ def _validate_logical_payload(
     storage_offset = int(view["storage_offset_bytes"])
     stride0, stride1, _ = map(int, view["strides_bytes"])
     record_format = view["record_format"]
-    for _, _, _, block, row, _ in descriptors.tolist():
+    restoration_payload = payload[restoration_leaf["payload_key"]]
+
+    def restoration_bytes(begin: int, end: int) -> torch.Tensor:
+        cursor = 0
+        for lo, hi in intervals:
+            length = hi - lo
+            if lo <= begin and end <= hi:
+                offset = cursor + begin - lo
+                return restoration_payload[offset : offset + end - begin]
+            cursor += length
+        raise ValueError(f"{path}: logical raw span escapes restoration bytes")
+
+    for record_index, (_, _, _, block, row, _) in enumerate(descriptors.tolist()):
         page = storage_offset + int(block) * stride0
         if record_format in format_layout:
             value_bytes, scale_bytes = format_layout[record_format]
@@ -490,6 +535,22 @@ def _validate_logical_payload(
             spans = ((value_begin, value_begin + raw_values.shape[1]),)
         if any(not covered(begin, end) for begin, end in spans):
             raise ValueError(f"{path}: logical raw span escapes restoration bytes")
+        if not torch.equal(
+            restoration_bytes(*spans[0]),
+            raw_values[record_index],
+        ):
+            raise ValueError(f"{path}: logical values differ from restoration bytes")
+        if len(spans) == 2 and not torch.equal(
+            restoration_bytes(*spans[1]),
+            raw_scales[record_index],
+        ):
+            raise ValueError(f"{path}: logical scales differ from restoration bytes")
+
+    spec = view["spec_metadata"]
+    if int(spec.get("tokens_per_state", view["tokens_per_state"])) != int(
+        view["tokens_per_state"]
+    ) or int(spec.get("num_states", view["block_size"])) != int(view["block_size"]):
+        raise ValueError(f"{path}: logical spec/layout agreement differs")
     reconstructed = _decode_logical_raw(raw_values, raw_scales, view)
     if reconstructed.shape != decoded.shape or not torch.equal(reconstructed, decoded):
         raise ValueError(f"{path}: logical decoded values do not match raw bytes")
@@ -615,8 +676,8 @@ def _validate_evidence_contract(
             if item.get("exclusion_reason") is not None:
                 raise ValueError(f"{path}: logical owner has an exclusion reason")
             covered_ids.add(view_id)
-        elif item.get("exclusion_reason") != "no_destination_blocks":
-            raise ValueError(f"{path}: source-only owner reason differs")
+        else:
+            raise ValueError(f"{path}: bound cache owner lacks a logical view")
     if logical_view_ids != covered_ids or not logical_view_ids.issubset(inventory_ids):
         raise ValueError(f"{path}: logical cache owner inventory differs")
     for view in logical_cache_views:
@@ -1171,6 +1232,17 @@ def _validated_scratch_rows(
             valid = values
         expected_count = int(metadata["expected_valid_counts"][row])
         bound = int(metadata["valid_id_exclusive_bounds"][row])
+        position = int(metadata["row_positions"][row])
+        ratio = int(metadata["compress_ratio"])
+        visible_states = (position + 1) // ratio
+        expected_bound = (
+            (visible_states + int(metadata["candidate_block_size"]) - 1)
+            // int(metadata["candidate_block_size"])
+            if leaf["comparison"] == "canonical_membership"
+            else visible_states
+        )
+        if bound != expected_bound:
+            raise ValueError(f"{leaf['path']}: scratch visibility bound differs")
         if leaf["comparison"] != "diagnostic_topk" and valid.numel() != expected_count:
             raise ValueError(f"{leaf['path']}: scratch valid count differs")
         if bound < 0 or bool((valid >= bound).any()):
