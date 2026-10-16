@@ -1130,6 +1130,12 @@ class TouchedStateRegistry:
         self._cache_s0_extents: dict[str, tuple[int, ...]] = {}
         self._cache_s0_authority: dict[str, Any] = {}
         self._cache_runtime_authority: dict[str, Any] = {}
+        self._cache_draft_writer_authority: dict[str, Any] = {
+            "context_enabled": False,
+            "query_enabled": False,
+            "context_source_rows": torch.empty(0, dtype=torch.int64),
+            "query_source_rows": torch.empty(0, dtype=torch.int64),
+        }
         self._cache_request_slots: tuple[int, ...] = ()
         self._cache_s0_records: dict[
             str, dict[tuple[int, int, int, int, int], _LogicalCacheRecord]
@@ -2563,6 +2569,17 @@ class RetainedReplayFixtureController:
             path="cache_runtime_authority",
         )
 
+    @staticmethod
+    def _draft_writer_authority_snapshot(
+        checkpoint: str,
+        registry: TouchedStateRegistry,
+    ) -> dict[str, Any]:
+        return typed_tree_snapshot(
+            checkpoint,
+            registry._cache_draft_writer_authority,
+            path="draft_writer_runtime_authority",
+        )
+
     def capture_boundary(self, boundary: DecoderBoundaryState) -> None:
         fixture = self.fixture
         if fixture is None:
@@ -2762,6 +2779,10 @@ class RetainedReplayFixtureController:
                 self._current_committed_extents(fixture),
                 extra_writers=draft_writers,
             ),
+            self._draft_writer_authority_snapshot(
+                "s1",
+                fixture.registry,
+            ),
             typed_tree_snapshot(
                 "s1",
                 {
@@ -2828,6 +2849,10 @@ class RetainedReplayFixtureController:
                 self._current_committed_extents(fixture),
                 extra_writers=draft_writers,
             ),
+            self._draft_writer_authority_snapshot(
+                "s1",
+                fixture.registry,
+            ),
             typed_tree_snapshot(
                 "s1",
                 {
@@ -2844,6 +2869,7 @@ class RetainedReplayFixtureController:
         assert fixture is not None
         checkpoints = fixture.production_checkpoints
         assert checkpoints is not None
+        draft_authority = fixture.registry._cache_draft_writer_authority
         return {
             "checkpoint_paths": {
                 checkpoint: sorted(leaf["path"] for leaf in snapshot["leaves"])
@@ -2882,6 +2908,14 @@ class RetainedReplayFixtureController:
                 "replay_rows": fixture.registry._cache_runtime_authority[
                     "replay_rows"
                 ].tolist(),
+                "draft_writer_authority": {
+                    "context_enabled": bool(draft_authority["context_enabled"]),
+                    "query_enabled": bool(draft_authority["query_enabled"]),
+                    "context_source_rows": draft_authority[
+                        "context_source_rows"
+                    ].tolist(),
+                    "query_source_rows": draft_authority["query_source_rows"].tolist(),
+                },
                 "s0_authority": fixture.registry._cache_s0_authority,
             },
         }
@@ -3553,6 +3587,12 @@ class RetainedReplayFixtureController:
         speculator = self.runner.speculator
         group_ids = tuple(getattr(speculator, "draft_kv_cache_group_ids", ()))
         if fixture.is_dummy or speculator is None or not group_ids:
+            fixture.registry._cache_draft_writer_authority = {
+                "context_enabled": False,
+                "query_enabled": False,
+                "context_source_rows": torch.empty(0, dtype=torch.int64),
+                "query_source_rows": torch.empty(0, dtype=torch.int64),
+            }
             return []
         num_reqs = int(fixture.input_batch.num_reqs)
         num_target_tokens = int(fixture.input_batch.num_tokens)
@@ -3639,6 +3679,12 @@ class RetainedReplayFixtureController:
             )
         ]
         if getattr(self.runner, "dspark_prefill_only", False):
+            fixture.registry._cache_draft_writer_authority = {
+                "context_enabled": True,
+                "query_enabled": False,
+                "context_source_rows": writers[0].source_rows.clone(),
+                "query_source_rows": torch.empty(0, dtype=torch.int64),
+            }
             return writers
         writers.append(
             _CacheWriter(
@@ -3654,6 +3700,12 @@ class RetainedReplayFixtureController:
                 enforce_committed_extent=False,
             )
         )
+        fixture.registry._cache_draft_writer_authority = {
+            "context_enabled": True,
+            "query_enabled": True,
+            "context_source_rows": writers[0].source_rows.clone(),
+            "query_source_rows": writers[1].source_rows.clone(),
+        }
         return writers
 
     def _build_registry(
@@ -3685,6 +3737,7 @@ class RetainedReplayFixtureController:
                     f"kv-src:{cache.name}", cache.tensor, cache.source
                 )
         owner_inventory = []
+        logical_views_by_id = {view.view_id: view for view in logical_views}
         static_context = self.runner.compilation_config.static_forward_context
         for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
             for layer_name in group.layer_names:
@@ -3695,10 +3748,17 @@ class RetainedReplayFixtureController:
                         f"{layer_name}: bound owner inventory is incomplete"
                     )
                 view_id = f"group-{group_id}:{layer_name}"
+                view = logical_views_by_id.get(view_id)
+                if view is None:
+                    raise RetainedReplayFixtureError(
+                        f"{view_id}: logical owner view is absent"
+                    )
                 owner_inventory.append(
                     {
                         "view_id": view_id,
                         "owner_type": type(owner).__qualname__,
+                        "storage_id": view.storage_id,
+                        "restoration_entry": view.restoration_entry,
                         "coverage": "logical",
                         "exclusion_reason": None,
                     }

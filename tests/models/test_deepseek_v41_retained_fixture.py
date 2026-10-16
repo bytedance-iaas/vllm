@@ -23,6 +23,7 @@ from benchmarks.replayssm.dsv41_retained_control_compare import (
     _identity_normalization_provenance,
     _validate_draft_writer_runtime_authority,
     _validate_logical_payload,
+    _validate_s0_authority,
     _validate_view_layout,
     _validated_scratch_rows,
 )
@@ -853,9 +854,10 @@ def test_logical_comparator_binds_total_length_sampling_delta() -> None:
     skipped["value"] = True
     total = leaves["post_sampling:registry/request:total_len"]
     payload[total["payload_key"]] = torch.tensor([4], dtype=torch.int32)
-    _validate_logical_payload(
+    computed = leaves["post_sampling:registry/request:num_computed_tokens"]
+    payload[computed["payload_key"]] = torch.tensor([4], dtype=torch.int32)
+    _validate_s0_authority(
         Path("in-memory"),
-        "post_sampling",
         view,
         leaves,
         payload,
@@ -1246,6 +1248,7 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
     )
     fixture = SimpleNamespace(
         is_dummy=False,
+        registry=TouchedStateRegistry(),
         input_batch=SimpleNamespace(
             num_reqs=1,
             num_tokens=2,
@@ -1266,6 +1269,11 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
     assert query.positions.tolist() == [4, 5]
     assert query.slots_by_layer["draft"].tolist() == [16, 17]
     assert query.enforce_committed_extent is False
+    authority = fixture.registry._cache_draft_writer_authority
+    assert authority["context_enabled"] is True
+    assert authority["query_enabled"] is True
+    assert authority["context_source_rows"].tolist() == [0, 1]
+    assert authority["query_source_rows"].tolist() == [0, 1]
 
 
 def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:

@@ -640,10 +640,8 @@ def _validate_s0_authority(
     total_by_slot = dict(zip(map(int, total_slots), map(int, total_values)))
     for request, slot in enumerate(request_slots):
         query_len = int(query_start[request + 1]) - int(query_start[request])
-        expected_post = (
-            int(authority["computed_extents"][request])
-            + query_len
-            - int(rejected_values[request])
+        expected_post = int(authority["computed_extents"][request]) + (
+            0 if skipped_value else query_len - int(rejected_values[request])
         )
         if post_by_slot.get(int(slot)) != expected_post:
             raise ValueError(f"{path}: S0 computed extent differs from GPU state")
@@ -897,21 +895,60 @@ def _validate_logical_payload(
     writer_phases = descriptor_metadata.get("writer_phases")
     writer_records = descriptor_metadata.get("writer_records")
     writer_enforce = descriptor_metadata.get("writer_enforce_committed")
-    expected_phases = (
-        ["target-full", "target-replay"]
-        if checkpoint == "post_sampling"
-        else [
-            "target-full",
-            "target-replay",
-            "draft-context",
-            "draft-query",
-        ]
-    )
+    draft_writer_authority = logical_mapping.get("draft_writer_authority")
+    draft_source_rows: dict[str, list[int]] = {}
+    if checkpoint == "post_sampling":
+        expected_phases = ["target-full", "target-replay"]
+    else:
+        runtime_root = "s1:draft_writer_runtime_authority"
+
+        def runtime_value(field: str) -> Any:
+            leaf = leaves.get(f"{runtime_root}/{field}")
+            if leaf is None:
+                raise ValueError(
+                    f"{path}: draft writer runtime authority is absent: {field}"
+                )
+            payload_key = leaf.get("payload_key")
+            return (
+                leaf.get("value")
+                if payload_key is None
+                else payload[payload_key].reshape(-1).tolist()
+            )
+
+        context_enabled = runtime_value("context_enabled")
+        query_enabled = runtime_value("query_enabled")
+        context_rows = runtime_value("context_source_rows")
+        query_rows = runtime_value("query_source_rows")
+        runtime_authority = {
+            "context_enabled": context_enabled,
+            "query_enabled": query_enabled,
+            "context_source_rows": context_rows,
+            "query_source_rows": query_rows,
+        }
+        if (
+            not isinstance(context_enabled, bool)
+            or not isinstance(query_enabled, bool)
+            or not isinstance(context_rows, list)
+            or not isinstance(query_rows, list)
+            or (query_enabled and not context_enabled)
+            or (not context_enabled and context_rows)
+            or (not query_enabled and query_rows)
+            or draft_writer_authority != runtime_authority
+        ):
+            raise ValueError(
+                f"{path}: draft writer runtime policy is invalid for {root}"
+            )
+        expected_phases = ["target-full", "target-replay"]
+        if context_enabled:
+            expected_phases.append("draft-context")
+            draft_source_rows["draft-context"] = context_rows
+        if query_enabled:
+            expected_phases.append("draft-query")
+            draft_source_rows["draft-query"] = query_rows
     if (
         not isinstance(writer_count, int)
         or writer_count < 1
-        or writer_phases
-        not in [expected_phases[:end] for end in range(2, len(expected_phases) + 1)]
+        or writer_phases != expected_phases
         or writer_count != len(writer_phases)
         or not isinstance(writer_records, dict)
         or set(writer_records) != set(writer_phases)
@@ -1012,6 +1049,12 @@ def _validate_logical_payload(
                     f"{path}: target writer runtime authority differs for {phase}"
                 )
         elif phase.startswith("draft-"):
+            expected_source_rows = draft_source_rows.get(phase)
+            if (
+                not isinstance(expected_source_rows, list)
+                or source_rows != expected_source_rows
+            ):
+                raise ValueError(f"{path}: draft writer source rows differ for {phase}")
             _validate_draft_writer_runtime_authority(
                 path,
                 phase,
@@ -1395,6 +1438,21 @@ def _validate_evidence_contract(
         if coverage == "logical":
             if item.get("exclusion_reason") is not None:
                 raise ValueError(f"{path}: logical owner has an exclusion reason")
+            view = next(
+                (
+                    candidate
+                    for candidate in logical_cache_views
+                    if candidate["view_id"] == view_id
+                ),
+                None,
+            )
+            if (
+                view is None
+                or item.get("owner_type") != view.get("owner_type")
+                or item.get("storage_id") != view.get("storage_id")
+                or item.get("restoration_entry") != view.get("restoration_entry")
+            ):
+                raise ValueError(f"{path}: logical owner storage binding differs")
             covered_ids.add(view_id)
         else:
             raise ValueError(f"{path}: bound cache owner lacks a logical view")
