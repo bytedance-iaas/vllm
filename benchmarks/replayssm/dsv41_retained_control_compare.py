@@ -510,6 +510,178 @@ def _validate_view_layout(path: Path, view: dict[str, Any]) -> int:
     return element_size
 
 
+def _cache_view_geometry(
+    path: Path,
+    view: dict[str, Any],
+) -> tuple[int, int, int, int, int, int]:
+    element_size = _validate_view_layout(path, view)
+    shape = tuple(int(value) for value in view["shape"])
+    strides = tuple(int(value) for value in view["strides_bytes"])
+    storage_offset = int(view["storage_offset_bytes"])
+    storage_nbytes = int(view["storage_nbytes"])
+    if (
+        len(shape) != 3
+        or any(value <= 0 for value in shape)
+        or len(strides) != 3
+        or any(value <= 0 for value in strides)
+    ):
+        raise ValueError(f"{path}: cache-view geometry is invalid")
+    block_stride = strides[0]
+    block_origin = storage_offset - storage_offset % block_stride
+    page_begin = storage_offset - block_origin
+    page_bytes = (
+        (shape[1] - 1) * strides[1] + (shape[2] - 1) * strides[2] + element_size
+    )
+    page_end = page_begin + page_bytes
+    footprint_end = storage_offset + (shape[0] - 1) * block_stride + page_bytes
+    if (
+        page_begin < 0
+        or page_end > block_stride
+        or storage_offset < 0
+        or footprint_end > storage_nbytes
+    ):
+        raise ValueError(f"{path}: cache view crosses its block or storage bounds")
+    return (
+        block_stride,
+        block_origin,
+        page_begin,
+        page_end,
+        storage_offset,
+        footprint_end,
+    )
+
+
+def _allocated_blocks_by_group(
+    path: Path,
+    logical_mapping: dict[str, Any],
+) -> dict[int, set[int]]:
+    block_tables = logical_mapping.get("block_tables")
+    allocated_counts = logical_mapping.get("allocated_block_counts")
+    if (
+        not isinstance(block_tables, list)
+        or not isinstance(allocated_counts, list)
+        or len(block_tables) != len(allocated_counts)
+    ):
+        raise ValueError(f"{path}: allocated block ownership is absent")
+    result: dict[int, set[int]] = {}
+    for group_id, (table, counts) in enumerate(zip(block_tables, allocated_counts)):
+        if (
+            not isinstance(table, list)
+            or not isinstance(counts, list)
+            or len(table) != len(counts)
+        ):
+            raise ValueError(f"{path}: allocated block ownership differs")
+        owned: set[int] = set()
+        for row, count in zip(table, counts):
+            if (
+                not isinstance(row, list)
+                or not isinstance(count, int)
+                or count < 0
+                or count > len(row)
+                or any(not isinstance(value, int) for value in row)
+            ):
+                raise ValueError(f"{path}: allocated block ownership differs")
+            owned.update(int(value) for value in row[:count] if int(value) > 0)
+        result[group_id] = owned
+    return result
+
+
+def _validate_cache_view_overlays(
+    path: Path,
+    views: list[dict[str, Any]],
+    logical_mapping: dict[str, Any],
+) -> None:
+    allocated = _allocated_blocks_by_group(path, logical_mapping)
+    by_storage: dict[str, list[dict[str, Any]]] = {}
+    for view in views:
+        storage_id = view.get("storage_id")
+        group_id = view.get("group_id")
+        if (
+            not isinstance(storage_id, str)
+            or not storage_id
+            or not isinstance(group_id, int)
+            or group_id not in allocated
+        ):
+            raise ValueError(f"{path}: cache-view storage ownership is invalid")
+        by_storage.setdefault(storage_id, []).append(view)
+
+    for storage_views in by_storage.values():
+        ordered = sorted(storage_views, key=lambda item: str(item["view_id"]))
+        for left_index, left in enumerate(ordered):
+            left_geometry = _cache_view_geometry(path, left)
+            left_aliases = set(left["aliases"])
+            for right in ordered[left_index + 1 :]:
+                right_geometry = _cache_view_geometry(path, right)
+                right_aliases = set(right["aliases"])
+                same_group = int(left["group_id"]) == int(right["group_id"])
+                exact_alias = same_group and all(
+                    left.get(field) == right.get(field)
+                    for field in (
+                        "storage_offset_bytes",
+                        "shape",
+                        "strides_bytes",
+                        "dtype",
+                        "record_format",
+                    )
+                )
+                left_names_right = right["view_id"] in left_aliases
+                right_names_left = left["view_id"] in right_aliases
+                if exact_alias:
+                    if not left_names_right or not right_names_left:
+                        raise ValueError(
+                            f"{path}: exact cache alias evidence is incomplete"
+                        )
+                    continue
+                if left_names_right or right_names_left:
+                    raise ValueError(
+                        f"{path}: non-identical cache views are labeled aliases"
+                    )
+
+                (
+                    left_stride,
+                    left_origin,
+                    left_begin,
+                    left_end,
+                    left_footprint_begin,
+                    left_footprint_end,
+                ) = left_geometry
+                (
+                    right_stride,
+                    right_origin,
+                    right_begin,
+                    right_end,
+                    right_footprint_begin,
+                    right_footprint_end,
+                ) = right_geometry
+                footprint_overlap = max(
+                    left_footprint_begin,
+                    right_footprint_begin,
+                ) < min(left_footprint_end, right_footprint_end)
+                if not footprint_overlap:
+                    continue
+                if left_stride != right_stride or left_origin != right_origin:
+                    raise ValueError(
+                        f"{path}: shared cache storage has incompatible block geometry"
+                    )
+                page_overlap = max(left_begin, right_begin) < min(
+                    left_end,
+                    right_end,
+                )
+                if not page_overlap:
+                    continue
+                if same_group:
+                    raise ValueError(
+                        f"{path}: same-group cache views overlap without identity"
+                    )
+                collisions = (
+                    allocated[int(left["group_id"])] & allocated[int(right["group_id"])]
+                )
+                if collisions:
+                    raise ValueError(
+                        f"{path}: cross-group allocated block ownership overlaps"
+                    )
+
+
 def _validate_s0_authority(
     path: Path,
     view: dict[str, Any],
@@ -530,6 +702,9 @@ def _validate_s0_authority(
         "is_prefilling",
         "replay_start",
         "allocated_block_counts",
+        "block_table_widths",
+        "block_table_witness",
+        "allocated_block_witness",
         "replay_rows",
     )
     runtime: dict[str, Any] = {}
@@ -547,6 +722,51 @@ def _validate_s0_authority(
         "allocated_block_counts"
     ):
         raise ValueError(f"{path}: runtime allocated-block counts differ")
+    block_tables = logical_mapping.get("block_tables")
+    table_widths = runtime["block_table_widths"]
+    table_witness = runtime["block_table_witness"]
+    allocated_witness = runtime["allocated_block_witness"]
+    allocated_counts = runtime["allocated_block_counts"]
+    if (
+        not isinstance(block_tables, list)
+        or len(table_widths) != len(block_tables)
+        or len(table_witness) != len(block_tables)
+        or len(allocated_witness) != len(block_tables)
+        or len(allocated_counts) != len(block_tables)
+    ):
+        raise ValueError(f"{path}: runtime block-table witness differs")
+    for group_id, table in enumerate(block_tables):
+        width = table_widths[group_id]
+        witness_rows = table_witness[group_id]
+        allocated_rows = allocated_witness[group_id]
+        counts = allocated_counts[group_id]
+        if (
+            not isinstance(width, int)
+            or width < 0
+            or not isinstance(table, list)
+            or len(witness_rows) != len(table)
+            or len(allocated_rows) != len(table)
+            or len(counts) != len(table)
+        ):
+            raise ValueError(f"{path}: runtime block-table witness differs")
+        for row, witness, allocated_row, count in zip(
+            table,
+            witness_rows,
+            allocated_rows,
+            counts,
+        ):
+            if (
+                not isinstance(row, list)
+                or len(row) != width
+                or not isinstance(count, int)
+                or count < 0
+                or count > width
+                or witness[:width] != row
+                or any(int(value) != -1 for value in witness[width:])
+                or allocated_row[:count] != row[:count]
+                or any(int(value) != -1 for value in allocated_row[count:])
+            ):
+                raise ValueError(f"{path}: runtime allocated block witness differs")
     if runtime["replay_rows"] != logical_mapping.get("replay_rows"):
         raise ValueError(f"{path}: runtime replay rows differ")
     for field in (
@@ -1472,6 +1692,7 @@ def _validate_evidence_contract(
             raise ValueError(f"{path}: bound cache owner lacks a logical view")
     if logical_view_ids != covered_ids or not logical_view_ids.issubset(inventory_ids):
         raise ValueError(f"{path}: logical cache owner inventory differs")
+    _validate_cache_view_overlays(path, logical_cache_views, logical_mapping)
     for view in logical_cache_views:
         for alias in view["aliases"]:
             if alias not in logical_view_ids:

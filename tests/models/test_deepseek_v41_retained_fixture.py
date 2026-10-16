@@ -21,6 +21,7 @@ from benchmarks.replayssm.dsv41_retained_control_compare import (
     _decode_logical_raw,
     _floating_metrics,
     _identity_normalization_provenance,
+    _validate_cache_view_overlays,
     _validate_draft_writer_runtime_authority,
     _validate_logical_payload,
     _validate_s0_authority,
@@ -35,6 +36,7 @@ from vllm.models.deepseek_v41.nvidia.retained_replay_fixture import (
     RetainedReplayFixtureError,
     TouchedStateRegistry,
     _cache_record_format,
+    _CacheIntervals,
     _CacheWriter,
     _decode_cache_record_cpu,
     _LogicalCacheView,
@@ -228,6 +230,142 @@ def test_cache_record_decoder_rejects_unknown_or_nonfinite_layout() -> None:
         _decode_cache_record_cpu(plain, 0, 0)
     with pytest.raises(RetainedReplayFixtureError, match="finite scalar"):
         _decode_cache_record_cpu(plain, 0, 0, fp8_scale=float("inf"))
+
+
+def _storage_overlay_view(
+    tensor: torch.Tensor,
+    *,
+    group_id: int,
+    name: str,
+) -> _LogicalCacheView:
+    return _LogicalCacheView(
+        view_id=f"group-{group_id}:{name}",
+        storage_id="",
+        group_id=group_id,
+        layer_name=name,
+        owner_type="Owner",
+        spec_type="Spec",
+        spec_metadata={"type": "Spec"},
+        cache_kind="compressed_main",
+        record_format="v4_ue8m0_fp8_bf16",
+        tensor=tensor,
+        block_size=int(tensor.shape[1]),
+        tokens_per_state=1,
+        s0_extents=(),
+        live_window=None,
+        destination_blocks=set(),
+        consumers=[name],
+        aliases=[],
+        fp8_scale=None,
+        restoration_entry="",
+    )
+
+
+def _bind_overlay_views(
+    views: list[_LogicalCacheView],
+    ownership: dict[int, set[int]],
+) -> None:
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    record = _CacheIntervals(
+        name="overlay",
+        tensor=views[0].tensor,
+        destination=[],
+        source=[],
+        views=views,
+    )
+    controller._bind_cache_storage_views([record], ownership)
+
+
+def test_storage_views_accept_same_group_exact_alias() -> None:
+    backing = torch.zeros(4096, dtype=torch.uint8)
+    tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
+    left = _storage_overlay_view(tensor, group_id=0, name="left")
+    right = _storage_overlay_view(tensor, group_id=0, name="right")
+
+    _bind_overlay_views([left, right], {0: {1, 3}})
+
+    assert left.aliases == [right.view_id]
+    assert right.aliases == [left.view_id]
+
+
+def test_storage_views_reject_same_group_partial_overlap() -> None:
+    backing = torch.zeros(4096, dtype=torch.uint8)
+    left_tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
+    right_tensor = backing.as_strided(
+        (4, 1, 584),
+        (1024, 584, 1),
+        storage_offset=256,
+    )
+    views = [
+        _storage_overlay_view(left_tensor, group_id=0, name="left"),
+        _storage_overlay_view(right_tensor, group_id=0, name="right"),
+    ]
+
+    with pytest.raises(RetainedReplayFixtureError, match="unexplained.*overlap"):
+        _bind_overlay_views(views, {0: {1, 3}})
+
+
+@pytest.mark.parametrize("right_offset", [0, 256])
+def test_storage_views_accept_cross_group_overlay_with_disjoint_blocks(
+    right_offset: int,
+) -> None:
+    backing = torch.zeros(4096, dtype=torch.uint8)
+    left_tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
+    right_tensor = backing.as_strided(
+        (4, 1, 584),
+        (1024, 584, 1),
+        storage_offset=right_offset,
+    )
+    left = _storage_overlay_view(left_tensor, group_id=0, name="left")
+    right = _storage_overlay_view(right_tensor, group_id=1, name="right")
+
+    _bind_overlay_views([left, right], {0: {1, 3}, 1: {2}})
+
+    assert left.aliases == []
+    assert right.aliases == []
+
+
+def test_storage_views_reject_cross_group_allocated_block_collision() -> None:
+    backing = torch.zeros(4096, dtype=torch.uint8)
+    tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
+    views = [
+        _storage_overlay_view(tensor, group_id=0, name="left"),
+        _storage_overlay_view(tensor, group_id=1, name="right"),
+    ]
+
+    with pytest.raises(RetainedReplayFixtureError, match="ownership overlaps"):
+        _bind_overlay_views(views, {0: {1, 3}, 1: {3}})
+
+
+def test_storage_views_reject_shifted_block_origin_and_page_crossing() -> None:
+    backing = torch.zeros(6144, dtype=torch.uint8)
+    left_tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
+    shifted_tensor = backing.as_strided(
+        (4, 1, 584),
+        (1024, 584, 1),
+        storage_offset=1024,
+    )
+    views = [
+        _storage_overlay_view(left_tensor, group_id=0, name="left"),
+        _storage_overlay_view(shifted_tensor, group_id=1, name="shifted"),
+    ]
+    with pytest.raises(RetainedReplayFixtureError, match="block geometry"):
+        _bind_overlay_views(views, {0: {1}, 1: {2}})
+
+    crossing_tensor = backing.as_strided(
+        (4, 1, 584),
+        (1024, 584, 1),
+        storage_offset=512,
+    )
+    crossing = _storage_overlay_view(
+        crossing_tensor,
+        group_id=1,
+        name="crossing",
+    )
+    with pytest.raises(RetainedReplayFixtureError, match="block or storage bounds"):
+        _bind_overlay_views([views[0], crossing], {0: {1}, 1: {2}})
 
 
 def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
@@ -604,6 +742,170 @@ def _logical_evidence_bundle():
     return view.metadata(), leaves, snapshot["tensors"], mapping
 
 
+def _overlay_metadata(
+    source: dict,
+    *,
+    group_id: int,
+    view_id: str,
+    storage_offset: int,
+) -> dict:
+    view = copy.deepcopy(source)
+    view.update(
+        {
+            "view_id": view_id,
+            "group_id": group_id,
+            "layer_name": view_id.split(":", 1)[1],
+            "storage_id": "storage-overlay",
+            "restoration_entry": "kv-dst:storage-overlay",
+            "storage_offset_bytes": storage_offset,
+            "storage_nbytes": 5 * 65536,
+            "strides_bytes": [65536, 1024, 2],
+            "aliases": [],
+        }
+    )
+    return view
+
+
+@pytest.mark.parametrize("right_offset", [0, 2048])
+def test_comparator_accepts_cross_group_overlay_with_disjoint_ownership(
+    right_offset: int,
+) -> None:
+    source, _, _, _ = _logical_evidence_bundle()
+    views = [
+        _overlay_metadata(
+            source,
+            group_id=0,
+            view_id="group-0:left",
+            storage_offset=0,
+        ),
+        _overlay_metadata(
+            source,
+            group_id=1,
+            view_id="group-1:right",
+            storage_offset=right_offset,
+        ),
+    ]
+    mapping = {
+        "block_tables": [[[1, 3]], [[2, 4]]],
+        "allocated_block_counts": [[2], [2]],
+    }
+
+    _validate_cache_view_overlays(Path("in-memory"), views, mapping)
+    assert views[0]["aliases"] == []
+    assert views[1]["aliases"] == []
+
+
+def test_comparator_rejects_cross_group_collision_and_forged_alias() -> None:
+    source, _, _, _ = _logical_evidence_bundle()
+    left = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:left",
+        storage_offset=0,
+    )
+    right = _overlay_metadata(
+        source,
+        group_id=1,
+        view_id="group-1:right",
+        storage_offset=2048,
+    )
+    mapping = {
+        "block_tables": [[[1, 3]], [[3, 4]]],
+        "allocated_block_counts": [[2], [2]],
+    }
+    with pytest.raises(ValueError, match="allocated block ownership overlaps"):
+        _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
+
+    mapping["block_tables"][1][0][0] = 2
+    left["aliases"] = [right["view_id"]]
+    right["aliases"] = [left["view_id"]]
+    with pytest.raises(ValueError, match="non-identical.*aliases"):
+        _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
+
+
+def test_comparator_rejects_same_group_partial_overlap_and_shifted_origin() -> None:
+    source, _, _, _ = _logical_evidence_bundle()
+    left = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:left",
+        storage_offset=0,
+    )
+    partial = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:partial",
+        storage_offset=2048,
+    )
+    mapping = {
+        "block_tables": [[[1, 3]]],
+        "allocated_block_counts": [[2]],
+    }
+    with pytest.raises(ValueError, match="same-group cache views overlap"):
+        _validate_cache_view_overlays(Path("in-memory"), [left, partial], mapping)
+
+    shifted = _overlay_metadata(
+        source,
+        group_id=1,
+        view_id="group-1:shifted",
+        storage_offset=65536,
+    )
+    disjoint_mapping = {
+        "block_tables": [[[1]], [[2]]],
+        "allocated_block_counts": [[1], [1]],
+    }
+    with pytest.raises(ValueError, match="incompatible block geometry"):
+        _validate_cache_view_overlays(
+            Path("in-memory"),
+            [left, shifted],
+            disjoint_mapping,
+        )
+
+
+def test_comparator_accepts_only_same_group_exact_alias() -> None:
+    source, _, _, _ = _logical_evidence_bundle()
+    left = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:left",
+        storage_offset=0,
+    )
+    right = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:right",
+        storage_offset=0,
+    )
+    left["aliases"] = [right["view_id"]]
+    right["aliases"] = [left["view_id"]]
+    mapping = {
+        "block_tables": [[[1, 3]]],
+        "allocated_block_counts": [[2]],
+    }
+
+    _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
+
+    right["aliases"] = []
+    with pytest.raises(ValueError, match="exact cache alias evidence is incomplete"):
+        _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
+
+
+def test_comparator_binds_block_table_and_allocated_witnesses() -> None:
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    _validate_s0_authority(Path("in-memory"), view, leaves, payload, mapping)
+
+    mapping["block_tables"][0][0][1] = 9
+    with pytest.raises(ValueError, match="block witness differs"):
+        _validate_s0_authority(Path("in-memory"), view, leaves, payload, mapping)
+
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    mapping["allocated_block_counts"] = [[1]]
+    allocated_leaf = leaves["l20:cache_runtime_authority/allocated_block_counts"]
+    payload[allocated_leaf["payload_key"]] = torch.tensor([[1]], dtype=torch.int64)
+    with pytest.raises(ValueError, match="allocated block witness differs"):
+        _validate_s0_authority(Path("in-memory"), view, leaves, payload, mapping)
+
+
 def test_logical_comparator_binds_writer_destination_and_spec() -> None:
     view, leaves, payload, mapping = _logical_evidence_bundle()
     _validate_logical_payload(
@@ -919,7 +1221,7 @@ def test_logical_comparator_ignores_unallocated_stale_table_blocks() -> None:
     mapping["allocated_block_counts"] = [[1]]
     allocated_leaf = leaves["l20:cache_runtime_authority/allocated_block_counts"]
     payload[allocated_leaf["payload_key"]] = torch.tensor([[1]], dtype=torch.int64)
-    with pytest.raises(ValueError, match="destination coverage differs"):
+    with pytest.raises(ValueError, match="allocated block witness differs"):
         _validate_logical_payload(
             Path("in-memory"),
             "post_sampling",

@@ -1330,6 +1330,37 @@ class TouchedStateRegistry:
             ),
             "replay_rows": replay_rows.clone(),
         }
+        table_widths = torch.tensor(
+            [int(table.shape[1]) for table in self._cache_block_tables],
+            dtype=torch.int64,
+        )
+        max_width = int(table_widths.max().item()) if table_widths.numel() else 0
+        block_table_witness = torch.full(
+            (len(self._cache_block_tables), num_reqs, max_width),
+            -1,
+            dtype=torch.int64,
+        )
+        allocated_block_witness = torch.full_like(block_table_witness, -1)
+        for group_id, (table, counts) in enumerate(
+            zip(
+                self._cache_block_tables,
+                self._cache_allocated_blocks,
+            )
+        ):
+            width = int(table.shape[1])
+            block_table_witness[group_id, :, :width].copy_(table.to(torch.int64))
+            for request, count in enumerate(counts):
+                if count:
+                    allocated_block_witness[group_id, request, :count].copy_(
+                        table[request, :count].to(torch.int64)
+                    )
+        self._cache_runtime_authority.update(
+            {
+                "block_table_widths": table_widths,
+                "block_table_witness": block_table_witness,
+                "allocated_block_witness": allocated_block_witness,
+            }
+        )
         target_writers: dict[str, Any] = {}
         for writer in writers:
             if writer.phase not in ("target-full", "target-replay"):
@@ -3467,16 +3498,53 @@ class RetainedReplayFixtureController:
         return "compressed_main"
 
     @staticmethod
-    def _view_page_span(view: _LogicalCacheView) -> tuple[int, int, int]:
+    def _view_page_geometry(
+        view: _LogicalCacheView,
+    ) -> tuple[int, int, int, int, int, int]:
         element_size = view.tensor.element_size()
-        stride = view.tensor.stride(0) * element_size
-        begin = view.tensor.storage_offset() * element_size % stride
-        content = view.tensor.shape[1] * view.tensor.shape[2] * element_size
-        return stride, begin, begin + content
+        shape = tuple(int(value) for value in view.tensor.shape)
+        strides = tuple(int(value) * element_size for value in view.tensor.stride())
+        storage_offset = int(view.tensor.storage_offset()) * element_size
+        storage_nbytes = int(view.tensor.untyped_storage().nbytes())
+        if (
+            len(shape) != 3
+            or any(value <= 0 for value in shape)
+            or len(strides) != 3
+            or any(value <= 0 for value in strides)
+        ):
+            raise RetainedReplayFixtureError(
+                f"{view.view_id}: cache-view geometry is invalid"
+            )
+        block_stride = strides[0]
+        block_origin = storage_offset - storage_offset % block_stride
+        page_begin = storage_offset - block_origin
+        page_bytes = (
+            (shape[1] - 1) * strides[1] + (shape[2] - 1) * strides[2] + element_size
+        )
+        page_end = page_begin + page_bytes
+        footprint_end = storage_offset + (shape[0] - 1) * block_stride + page_bytes
+        if (
+            page_begin < 0
+            or page_end > block_stride
+            or storage_offset < 0
+            or footprint_end > storage_nbytes
+        ):
+            raise RetainedReplayFixtureError(
+                f"{view.view_id}: cache view crosses its block or storage bounds"
+            )
+        return (
+            block_stride,
+            block_origin,
+            page_begin,
+            page_end,
+            storage_offset,
+            footprint_end,
+        )
 
     def _bind_cache_storage_views(
         self,
         records: list[_CacheIntervals],
+        allocated_blocks_by_group: dict[int, set[int]],
     ) -> None:
         records = [record for record in records if record.views]
         ordered = sorted(
@@ -3488,28 +3556,71 @@ class RetainedReplayFixtureController:
             for view in record.views:
                 view.storage_id = storage_id
             for left_index, left in enumerate(record.views):
-                left_stride, left_begin, left_end = self._view_page_span(left)
+                (
+                    left_stride,
+                    left_origin,
+                    left_begin,
+                    left_end,
+                    left_footprint_begin,
+                    left_footprint_end,
+                ) = self._view_page_geometry(left)
                 for right in record.views[left_index + 1 :]:
-                    right_stride, right_begin, right_end = self._view_page_span(right)
+                    (
+                        right_stride,
+                        right_origin,
+                        right_begin,
+                        right_end,
+                        right_footprint_begin,
+                        right_footprint_end,
+                    ) = self._view_page_geometry(right)
+                    same_group = left.group_id == right.group_id
                     exact_alias = (
-                        left.tensor.storage_offset() == right.tensor.storage_offset()
+                        same_group
+                        and left.tensor.storage_offset()
+                        == right.tensor.storage_offset()
                         and left.tensor.shape == right.tensor.shape
                         and left.tensor.stride() == right.tensor.stride()
+                        and left.tensor.dtype == right.tensor.dtype
                         and left.record_format == right.record_format
                     )
                     if exact_alias:
                         left.aliases.append(right.view_id)
                         right.aliases.append(left.view_id)
                         continue
-                    if left_stride != right_stride:
+                    footprint_overlap = max(
+                        left_footprint_begin,
+                        right_footprint_begin,
+                    ) < min(left_footprint_end, right_footprint_end)
+                    if not footprint_overlap:
+                        continue
+                    if left_stride != right_stride or left_origin != right_origin:
                         raise RetainedReplayFixtureError(
                             f"{left.view_id}/{right.view_id}: shared storage has "
-                            "incompatible block strides"
+                            "incompatible block geometry"
                         )
-                    if max(left_begin, right_begin) < min(left_end, right_end):
+                    page_overlap = max(left_begin, right_begin) < min(
+                        left_end,
+                        right_end,
+                    )
+                    if not page_overlap:
+                        continue
+                    if same_group:
                         raise RetainedReplayFixtureError(
                             f"{left.view_id}/{right.view_id}: unexplained cache-view "
                             "overlap"
+                        )
+                    left_blocks = allocated_blocks_by_group.get(left.group_id)
+                    right_blocks = allocated_blocks_by_group.get(right.group_id)
+                    if left_blocks is None or right_blocks is None:
+                        raise RetainedReplayFixtureError(
+                            f"{left.view_id}/{right.view_id}: cross-group block "
+                            "ownership is absent"
+                        )
+                    collisions = left_blocks & right_blocks
+                    if collisions:
+                        raise RetainedReplayFixtureError(
+                            f"{left.view_id}/{right.view_id}: cross-group allocated "
+                            f"block ownership overlaps: {sorted(collisions)[:8]}"
                         )
             for view in record.views:
                 view.aliases.sort()
@@ -3889,6 +4000,7 @@ class RetainedReplayFixtureController:
         intervals_by_storage: dict[
             tuple[str, int | None, int, int], _CacheIntervals
         ] = {}
+        allocated_blocks_by_group: dict[int, set[int]] = {}
 
         speculative_groups = set(
             getattr(self.runner.speculator, "draft_kv_cache_group_ids", ())
@@ -3944,6 +4056,7 @@ class RetainedReplayFixtureController:
                         ]
                         if block > 0
                     )
+            allocated_blocks_by_group[group_id] = group_blocks.copy()
 
             block_size = runner.block_tables.kernel_block_sizes[group_id]
             frontier_blocks: set[int] = set()
@@ -4067,7 +4180,10 @@ class RetainedReplayFixtureController:
         if not intervals_by_storage:
             raise RetainedReplayFixtureError("no bound KV cache rows were discovered")
         if collect_logical:
-            self._bind_cache_storage_views(list(intervals_by_storage.values()))
+            self._bind_cache_storage_views(
+                list(intervals_by_storage.values()),
+                allocated_blocks_by_group,
+            )
             for record in intervals_by_storage.values():
                 if not record.views:
                     continue
