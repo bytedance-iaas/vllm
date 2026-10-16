@@ -281,6 +281,7 @@ class DecoderReplayCudaGraphManager(CudaGraphManager):
         self.input_buffers = [
             torch.zeros(n, *s, dtype=d, device=device) for s, d in zip(shapes, dtypes)
         ]
+        self._captured_forward_contexts: dict[BatchDescriptor, ForwardContext] = {}
 
     def capture_replay_graphs(
         self, prepare: Callable[[BatchExecutionDescriptor], None]
@@ -291,6 +292,10 @@ class DecoderReplayCudaGraphManager(CudaGraphManager):
             prepare(desc)
             assert self.layers.replay_batch is not None
             context = self.layers.replay_batch.forward_context
+            if not warmup:
+                batch_descriptor = context.batch_descriptor
+                assert batch_descriptor is not None
+                self._captured_forward_contexts[batch_descriptor] = context
             inputs = [buf[: desc.num_tokens] for buf in self.input_buffers]
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
@@ -303,6 +308,15 @@ class DecoderReplayCudaGraphManager(CudaGraphManager):
 
         self.capture(create_forward_fn, "Capturing decoder replay CUDA graphs")
         self.layers.replay_batch = None
+
+    def captured_forward_context(self, descriptor: BatchDescriptor) -> ForwardContext:
+        """Return the context whose tensor addresses are bound by this graph."""
+        try:
+            return self._captured_forward_contexts[descriptor]
+        except KeyError as error:
+            raise RuntimeError(
+                f"decoder replay graph has no captured context for {descriptor}"
+            ) from error
 
     def run(self, rows: torch.Tensor, inputs: tuple) -> tuple[torch.Tensor, ...]:
         """Replay the forward context's graph on ``rows`` of ``inputs``."""

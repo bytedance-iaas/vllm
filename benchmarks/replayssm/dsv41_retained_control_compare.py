@@ -1816,6 +1816,7 @@ def _validate_evidence_contract(
     registry_entries = contract.get("registry_entries")
     meaningful_counts = contract.get("meaningful_counts")
     graph_input_count = contract.get("graph_input_count")
+    graph_runtime = contract.get("graph_runtime")
     logical_cache_views = contract.get("logical_cache_views")
     cache_owner_inventory = contract.get("cache_owner_inventory")
     logical_mapping = contract.get("logical_mapping")
@@ -1825,6 +1826,7 @@ def _validate_evidence_contract(
         and isinstance(registry_entries, list)
         and isinstance(meaningful_counts, dict)
         and isinstance(graph_input_count, int)
+        and isinstance(graph_runtime, dict)
         and isinstance(logical_cache_views, list)
         and isinstance(cache_owner_inventory, list)
         and isinstance(logical_mapping, dict)
@@ -1863,6 +1865,41 @@ def _validate_evidence_contract(
     }
     if graph_names != expected_graph_names:
         raise ValueError(f"{path}: graph input inventory is incomplete")
+    runtime_names = {
+        name for name in registry_entries if name.startswith("replay_graph:runtime:")
+    }
+    runtime_storage_count = graph_runtime.get("storage_count")
+    tensor_paths = graph_runtime.get("tensor_paths")
+    slot_mapping_paths = graph_runtime.get("slot_mapping_paths")
+    storage_paths = graph_runtime.get("storage_paths")
+    if (
+        graph_runtime.get("schema") != 1
+        or not isinstance(runtime_storage_count, int)
+        or runtime_storage_count <= 0
+        or not isinstance(graph_runtime.get("descriptor_rows"), int)
+        or graph_runtime["descriptor_rows"] <= 0
+        or not isinstance(graph_runtime.get("snapshot_bytes"), int)
+        or graph_runtime["snapshot_bytes"] <= 0
+        or not isinstance(tensor_paths, list)
+        or not tensor_paths
+        or not isinstance(slot_mapping_paths, list)
+        or not slot_mapping_paths
+        or not isinstance(storage_paths, list)
+        or len(storage_paths) != runtime_storage_count
+    ):
+        raise ValueError(f"{path}: graph runtime contract is invalid")
+    expected_runtime_names = {
+        f"replay_graph:runtime:{index}" for index in range(runtime_storage_count)
+    }
+    if runtime_names != expected_runtime_names:
+        raise ValueError(f"{path}: graph runtime inventory is incomplete")
+    if not all(
+        isinstance(paths, list)
+        and paths
+        and all(isinstance(item, str) and item for item in paths)
+        for paths in storage_paths
+    ):
+        raise ValueError(f"{path}: graph runtime storage paths are invalid")
 
     if manifest.get("active_role") == "active" and not logical_cache_views:
         raise ValueError(f"{path}: active evidence has no logical cache views")

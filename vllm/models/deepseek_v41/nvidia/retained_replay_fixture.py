@@ -128,6 +128,141 @@ def clone_owned(value: Any, memo: dict[int, Any] | None = None) -> Any:
     return value
 
 
+def _graph_runtime_tensor_leaves(
+    value: Any,
+    path: str,
+    seen: set[int] | None = None,
+) -> list[tuple[str, torch.Tensor]]:
+    """Collect tensor fields whose addresses may be bound by a captured graph."""
+    if seen is None:
+        seen = set()
+    if isinstance(value, torch.Tensor):
+        return [(path, value)]
+    value_id = id(value)
+    if value_id in seen:
+        return []
+    if type(value).__name__ == "FlashMLASchedMeta":
+        seen.add(value_id)
+        leaves = []
+        for name in ("tile_scheduler_metadata", "num_splits"):
+            if hasattr(value, name):
+                leaves.extend(
+                    _graph_runtime_tensor_leaves(
+                        getattr(value, name),
+                        f"{path}/{name}",
+                        seen,
+                    )
+                )
+        return leaves
+    if is_dataclass(value) and not isinstance(value, type):
+        seen.add(value_id)
+        leaves = []
+        for field in fields(value):
+            if field.name == "builder":
+                continue
+            leaves.extend(
+                _graph_runtime_tensor_leaves(
+                    getattr(value, field.name),
+                    f"{path}/{field.name}",
+                    seen,
+                )
+            )
+        return leaves
+    if isinstance(value, dict):
+        seen.add(value_id)
+        leaves = []
+        for key in sorted(value, key=repr):
+            leaves.extend(
+                _graph_runtime_tensor_leaves(
+                    value[key],
+                    f"{path}/{key}",
+                    seen,
+                )
+            )
+        return leaves
+    if isinstance(value, (list, tuple)):
+        seen.add(value_id)
+        leaves = []
+        for index, item in enumerate(value):
+            leaves.extend(_graph_runtime_tensor_leaves(item, f"{path}/{index}", seen))
+        return leaves
+    return []
+
+
+def _forward_context_runtime_tensors(
+    context: ForwardContext,
+) -> list[tuple[str, torch.Tensor]]:
+    roots = {
+        "attn_metadata": context.attn_metadata,
+        "slot_mapping": context.slot_mapping,
+        "dp_metadata": context.dp_metadata,
+        "ubatch_slices": context.ubatch_slices,
+        "is_padding": context.is_padding,
+        "additional_kwargs": context.additional_kwargs,
+    }
+    return _graph_runtime_tensor_leaves(roots, "forward_context")
+
+
+def _tensor_address_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+    storage = tensor.untyped_storage()
+    return (
+        tensor.device.type,
+        tensor.device.index,
+        storage.data_ptr(),
+        storage.nbytes(),
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.layout),
+    )
+
+
+def _tensor_binding_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+    return (id(tensor), *_tensor_address_signature(tensor))
+
+
+def _tensor_view_byte_intervals(name: str, tensor: torch.Tensor) -> list[_ByteInterval]:
+    if tensor.layout != torch.strided:
+        raise RetainedReplayFixtureError(f"{name}: graph runtime tensor is not strided")
+    if tensor.numel() == 0:
+        return []
+    low = high = int(tensor.storage_offset())
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        extent = (int(size) - 1) * int(stride)
+        if extent < 0:
+            low += extent
+        else:
+            high += extent
+    element_size = tensor.element_size()
+    begin = low * element_size
+    end = (high + 1) * element_size
+    storage_nbytes = tensor.untyped_storage().nbytes()
+    if begin < 0 or end > storage_nbytes:
+        raise RetainedReplayFixtureError(
+            f"{name}: graph runtime tensor exceeds its storage"
+        )
+    return [(begin, end)]
+
+
+def _copy_byte_intervals(
+    tensor: torch.Tensor,
+    intervals: list[_ByteInterval],
+) -> torch.Tensor:
+    value = torch.empty(
+        sum(end - begin for begin, end in intervals),
+        dtype=torch.uint8,
+        device=tensor.device,
+    )
+    offset = 0
+    for begin, end in intervals:
+        length = end - begin
+        value[offset : offset + length].copy_(tensor[begin:end])
+        offset += length
+    return value
+
+
 def _storage_key(tensor: torch.Tensor) -> tuple[str, int | None, int, int]:
     storage = tensor.untyped_storage()
     return (
@@ -1153,6 +1288,7 @@ class TouchedStateRegistry:
             tuple[str, tuple[int, int, int, int, int]], str
         ] = {}
         self._cache_owner_inventory: list[dict[str, Any]] = []
+        self._graph_runtime_contract: dict[str, Any] = {}
 
     def _claim(self, name: str) -> None:
         if name in self._names:
@@ -1830,6 +1966,22 @@ class TouchedStateRegistry:
                 f"{epoch} restore mismatches: {mismatches[:8]}"
             )
 
+    def verify_prefix(self, epoch: str, prefix: str) -> None:
+        matching = [entry for entry in self.entries if entry.name.startswith(prefix)]
+        if not matching:
+            raise RetainedReplayFixtureError(
+                f"{epoch}: no registered state matches {prefix}"
+            )
+        mismatches = [
+            entry.name
+            for entry in matching
+            if entry.current_digest() != entry.epoch_digest(epoch)
+        ]
+        if mismatches:
+            raise RetainedReplayFixtureError(
+                f"{epoch} restore mismatches: {mismatches[:8]}"
+            )
+
     def digest(self, epoch: str | None = None) -> str:
         rows = []
         for entry in self.entries:
@@ -1955,6 +2107,26 @@ class TouchedStateRegistry:
     @property
     def source_bytes(self) -> int:
         return sum(source.bytes for source in self.sources)
+
+
+@dataclass
+class _ReplayGraphRuntimeStorage:
+    name: str
+    tensor: torch.Tensor
+    intervals: list[_ByteInterval]
+    paths: tuple[str, ...]
+    frozen: torch.Tensor | None
+
+
+@dataclass
+class _ReplayGraphRuntimeState:
+    manager: Any
+    descriptor: Any
+    context: ForwardContext
+    bindings: dict[str, tuple[Any, ...]]
+    slot_mapping_paths: tuple[str, ...]
+    storages: list[_ReplayGraphRuntimeStorage]
+    tensor_paths: tuple[str, ...]
 
 
 @dataclass
@@ -2091,6 +2263,7 @@ class RetainedReplayFixtureController:
         self._active_checkpoints: dict[str, dict[str, Any]] | None = None
         self._active_checkpoint_error: str | None = None
         self._graph_observations: dict[str, dict[str, Any]] = {}
+        self._production_graph_runtime: _ReplayGraphRuntimeState | None = None
         self.worker_incarnation = (
             f"{socket.gethostname()}:{os.getpid()}:{time.time_ns()}"
         )
@@ -2159,6 +2332,195 @@ class RetainedReplayFixtureController:
             )
         return manager, descriptor, capture
 
+    def _capture_production_graph_runtime(
+        self,
+        replay_batch: ReplayBatch,
+    ) -> _ReplayGraphRuntimeState:
+        manager, descriptor, _ = self._production_graph_components(replay_batch)
+        try:
+            context = manager.captured_forward_context(descriptor)
+        except Exception as error:
+            raise RetainedReplayFixtureError(
+                "production replay graph did not retain its capture context"
+            ) from error
+        captured_slots = context.slot_mapping
+        production_slots = replay_batch.forward_context.slot_mapping
+        if not isinstance(captured_slots, dict) or not isinstance(
+            production_slots, dict
+        ):
+            raise RetainedReplayFixtureError(
+                "production replay graph requires flat slot mappings"
+            )
+        if captured_slots.keys() != production_slots.keys():
+            raise RetainedReplayFixtureError(
+                "production replay slot-mapping inventory differs from capture"
+            )
+        slot_mapping_paths = []
+        for name in sorted(captured_slots):
+            captured = captured_slots[name]
+            production = production_slots[name]
+            if not isinstance(captured, torch.Tensor) or not isinstance(
+                production, torch.Tensor
+            ):
+                raise RetainedReplayFixtureError(
+                    f"{name}: production replay slot mapping is not a tensor"
+                )
+            if _tensor_address_signature(captured) != _tensor_address_signature(
+                production
+            ):
+                raise RetainedReplayFixtureError(
+                    f"{name}: production replay slot mapping is not graph-bound"
+                )
+            slot_mapping_paths.append(f"forward_context/slot_mapping/{name}")
+
+        leaves = _forward_context_runtime_tensors(context)
+        if not leaves:
+            raise RetainedReplayFixtureError(
+                "production replay graph has no runtime tensor bindings"
+            )
+        bindings = {path: _tensor_binding_signature(tensor) for path, tensor in leaves}
+        grouped: dict[tuple[str, int | None, int, int], dict[str, Any]] = {}
+        for path, tensor in leaves:
+            intervals = _tensor_view_byte_intervals(path, tensor)
+            if not intervals:
+                continue
+            key = _storage_key(tensor)
+            group = grouped.setdefault(
+                key,
+                {
+                    "tensor": _storage_bytes_view(tensor),
+                    "intervals": [],
+                    "paths": [],
+                },
+            )
+            group["intervals"].extend(intervals)
+            group["paths"].append(path)
+        if not grouped:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime tensor storage is empty"
+            )
+
+        storages = []
+        ordered = sorted(
+            grouped.values(),
+            key=lambda group: tuple(sorted(set(group["paths"]))),
+        )
+        for index, group in enumerate(ordered):
+            tensor = group["tensor"]
+            intervals = _merge_byte_intervals(group["intervals"])
+            paths = tuple(sorted(set(group["paths"])))
+            storages.append(
+                _ReplayGraphRuntimeStorage(
+                    name=f"replay_graph:runtime:{index}",
+                    tensor=tensor,
+                    intervals=intervals,
+                    paths=paths,
+                    frozen=_copy_byte_intervals(tensor, intervals),
+                )
+            )
+        return _ReplayGraphRuntimeState(
+            manager=manager,
+            descriptor=descriptor,
+            context=context,
+            bindings=bindings,
+            slot_mapping_paths=tuple(slot_mapping_paths),
+            storages=storages,
+            tensor_paths=tuple(sorted(bindings)),
+        )
+
+    def _verify_production_graph_runtime(
+        self,
+        replay_batch: ReplayBatch,
+    ) -> _ReplayGraphRuntimeState:
+        runtime = getattr(self, "_production_graph_runtime", None)
+        if runtime is None:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime was not frozen"
+            )
+        manager, descriptor, _ = self._production_graph_components(replay_batch)
+        if manager is not runtime.manager or descriptor != runtime.descriptor:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime owner changed"
+            )
+        try:
+            context = manager.captured_forward_context(descriptor)
+        except Exception as error:
+            raise RetainedReplayFixtureError(
+                "production replay graph capture context disappeared"
+            ) from error
+        if context is not runtime.context:
+            raise RetainedReplayFixtureError(
+                "production replay graph capture context changed"
+            )
+        current = {
+            path: _tensor_binding_signature(tensor)
+            for path, tensor in _forward_context_runtime_tensors(context)
+        }
+        if current != runtime.bindings:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime bindings changed"
+            )
+        return runtime
+
+    def _restore_production_graph_runtime(
+        self,
+        replay_batch: ReplayBatch,
+    ) -> None:
+        runtime = self._verify_production_graph_runtime(replay_batch)
+        for storage in runtime.storages:
+            frozen = storage.frozen
+            if frozen is None:
+                raise RetainedReplayFixtureError(
+                    f"{storage.name}: frozen graph runtime state is absent"
+                )
+            offset = 0
+            for begin, end in storage.intervals:
+                length = end - begin
+                storage.tensor[begin:end].copy_(frozen[offset : offset + length])
+                offset += length
+            if not torch.equal(
+                _copy_byte_intervals(storage.tensor, storage.intervals),
+                frozen,
+            ):
+                raise RetainedReplayFixtureError(
+                    f"{storage.name}: frozen graph runtime restore failed"
+                )
+
+    def _register_production_graph_runtime(
+        self,
+        registry: TouchedStateRegistry,
+        replay_batch: ReplayBatch,
+    ) -> None:
+        runtime = self._verify_production_graph_runtime(replay_batch)
+        storage_paths = []
+        snapshot_bytes = 0
+        for storage in runtime.storages:
+            frozen = storage.frozen
+            if frozen is None or not torch.equal(
+                _copy_byte_intervals(storage.tensor, storage.intervals),
+                frozen,
+            ):
+                raise RetainedReplayFixtureError(
+                    f"{storage.name}: production graph runtime changed before register"
+                )
+            registry.add_intervals(
+                storage.name,
+                storage.tensor,
+                storage.intervals,
+            )
+            storage_paths.append(list(storage.paths))
+            snapshot_bytes += sum(end - begin for begin, end in storage.intervals)
+            storage.frozen = None
+        registry._graph_runtime_contract = {
+            "schema": 1,
+            "descriptor_rows": int(runtime.descriptor.num_tokens),
+            "tensor_paths": list(runtime.tensor_paths),
+            "slot_mapping_paths": list(runtime.slot_mapping_paths),
+            "storage_paths": storage_paths,
+            "storage_count": len(runtime.storages),
+            "snapshot_bytes": snapshot_bytes,
+        }
+
     def freeze_production_replay_batch(self) -> ReplayBatch:
         from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
 
@@ -2173,7 +2535,11 @@ class RetainedReplayFixtureController:
             raise RetainedReplayFixtureError(
                 "retained A-control does not support a selected front graph"
             )
-        self._production_graph_components(live)
+        if self._production_graph_runtime is not None:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime was frozen twice"
+            )
+        self._production_graph_runtime = self._capture_production_graph_runtime(live)
         return ReplayBatch(
             rows=clone_owned(live.rows),
             forward_context=clone_owned(live.forward_context),
@@ -2200,6 +2566,15 @@ class RetainedReplayFixtureController:
             "capture_replay_calls": 0,
             "error": None,
         }
+        runtime = getattr(self, "_production_graph_runtime", None)
+        if runtime is not None:
+            observation.update(
+                {
+                    "runtime_tensor_count": len(runtime.tensor_paths),
+                    "runtime_storage_count": len(runtime.storages),
+                    "runtime_slot_mapping_count": len(runtime.slot_mapping_paths),
+                }
+            )
         self._graph_observations[phase] = observation
         original_callback = frozen.run_graph
         assert original_callback is not None
@@ -2222,6 +2597,11 @@ class RetainedReplayFixtureController:
                     raise RetainedReplayFixtureError(
                         "the selected production replay graph changed"
                     )
+                if getattr(self, "_production_graph_runtime", None) is not None:
+                    self._verify_production_graph_runtime(frozen)
+                    fixture = getattr(self, "fixture", None)
+                    if fixture is not None:
+                        fixture.registry.verify_prefix("s0", "replay_graph:runtime:")
                 had_instance_replay = "replay" in capture.__dict__
                 prior_instance_replay = capture.__dict__.get("replay")
                 original_replay = capture.replay
@@ -2474,6 +2854,7 @@ class RetainedReplayFixtureController:
                 f"cannot begin fixture capture from state {self.state}"
             )
         torch.cuda.synchronize(self.runner.device)
+        self._restore_production_graph_runtime(production_replay_batch)
         writer_contexts = [
             (
                 full_forward_context,
@@ -2565,6 +2946,10 @@ class RetainedReplayFixtureController:
                 bool(draft_layer_names) and not is_dummy and not dspark_prefill_only
             ),
         }
+        self._register_production_graph_runtime(
+            registry,
+            production_replay_batch,
+        )
         self._register_production_graph_inputs(
             registry,
             production_replay_batch,
@@ -2980,6 +3365,7 @@ class RetainedReplayFixtureController:
                 entry.name.startswith("replay_graph:input:")
                 for entry in fixture.registry.entries
             ),
+            "graph_runtime": fixture.registry._graph_runtime_contract,
             "logical_cache_views": [
                 view.metadata() for view in fixture.registry._cache_views
             ],

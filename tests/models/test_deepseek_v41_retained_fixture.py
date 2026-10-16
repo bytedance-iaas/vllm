@@ -59,6 +59,12 @@ class _OwnedTree:
     children: dict[str, torch.Tensor]
 
 
+@dataclass
+class _GraphRuntimeMetadata:
+    slot_mapping: torch.Tensor
+    is_valid_token: torch.Tensor
+
+
 def _ranked_config_manifest(
     rank: int,
     engine_id: str,
@@ -2686,6 +2692,123 @@ def test_production_graph_observer_requires_actual_capture_replay() -> None:
     assert capture.calls == 1
     assert observation["callback_calls"] == 1
     assert observation["capture_replay_calls"] == 1
+
+
+def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
+    class Capture:
+        num_graphs = 1
+        num_eager_breaks = 0
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def replay(self) -> None:
+            self.calls += 1
+
+    class Manager:
+        def __init__(self, descriptor, context, capture) -> None:
+            self.context = context
+            self.capture = capture
+            self.destination = torch.zeros(16, dtype=torch.int32)
+            self.input_buffers = [torch.zeros(8)]
+            self.breakable_cg_runner = SimpleNamespace(
+                entries={descriptor: SimpleNamespace(capture=capture)}
+            )
+
+        def captured_forward_context(self, descriptor):
+            assert descriptor == self.context.batch_descriptor
+            return self.context
+
+        def run(self, rows, inputs):
+            del rows
+            self.capture.replay()
+            slot = int(self.context.slot_mapping["layer"][0])
+            if slot >= 0:
+                self.destination[slot] += 1
+            return inputs
+
+    descriptor = BatchDescriptor(num_tokens=8)
+    slots = torch.tensor([3, 4, 5, -1, -1, -1, -1, -1], dtype=torch.int64)
+    valid = slots >= 0
+    padding = ~valid
+    capture = Capture()
+    capture_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={
+            "layer": _GraphRuntimeMetadata(slots[:], valid[:]),
+        },
+        slot_mapping={"layer": slots[:]},
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        batch_descriptor=descriptor,
+        is_padding=padding[:],
+    )
+    manager = Manager(descriptor, capture_context, capture)
+    production_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={"layer": slots[:]},
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        batch_descriptor=descriptor,
+    )
+    live = ReplayBatch(torch.tensor([0]), production_context, manager.run)
+    runner = SimpleNamespace(
+        model_state=SimpleNamespace(
+            decoder_replay_layers=SimpleNamespace(replay_batch=live),
+            _decoder_model=SimpleNamespace(decoder_replay_front_graph=None),
+        )
+    )
+    controller = RetainedReplayFixtureController(runner)
+    frozen = controller.freeze_production_replay_batch()
+    slot_pointer = slots.data_ptr()
+    expected_slots = slots.clone()
+    expected_valid = valid.clone()
+    expected_padding = padding.clone()
+
+    slots.fill_(-1)
+    valid.zero_()
+    padding.fill_(True)
+    registry = TouchedStateRegistry()
+    controller._restore_production_graph_runtime(frozen)
+    controller._register_production_graph_runtime(registry, frozen)
+
+    assert slots.data_ptr() == slot_pointer
+    assert torch.equal(slots, expected_slots)
+    assert torch.equal(valid, expected_valid)
+    assert torch.equal(padding, expected_padding)
+    assert registry._graph_runtime_contract["storage_count"] == 3
+    assert registry._graph_runtime_contract["slot_mapping_paths"] == [
+        "forward_context/slot_mapping/layer"
+    ]
+
+    slots.fill_(6)
+    valid.zero_()
+    padding.fill_(True)
+    live_slots = slots.clone()
+    live_valid = valid.clone()
+    live_padding = padding.clone()
+    registry.capture_epoch("live", cpu=True)
+    controller.fixture = SimpleNamespace(registry=registry)
+    working = controller.observed_production_replay_batch(frozen, "a-001")
+
+    try:
+        registry.restore("s0")
+        registry.verify("s0")
+        outputs = working.run_graph(torch.tensor([0]), (torch.tensor([9]),))
+        assert outputs[0].tolist() == [9]
+        assert manager.destination[3] == 1
+        raise RuntimeError("forced failure after replay")
+    except RuntimeError as error:
+        assert str(error) == "forced failure after replay"
+    finally:
+        registry.restore("live")
+        registry.verify("live")
+
+    assert slots.data_ptr() == slot_pointer
+    assert torch.equal(slots, live_slots)
+    assert torch.equal(valid, live_valid)
+    assert torch.equal(padding, live_padding)
+    assert capture.calls == 1
+    assert controller.graph_observation("a-001")["capture_replay_calls"] == 1
 
 
 def test_a_checkpoint_capture_defers_local_export_failure(monkeypatch) -> None:
