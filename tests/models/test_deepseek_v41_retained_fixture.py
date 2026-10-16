@@ -1903,6 +1903,168 @@ def test_draft_phase_policy_rejects_active_self_disable() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "role,dspark_prefill_only,context_expected,query_expected",
+    [
+        ("active", False, True, True),
+        ("active", True, True, False),
+        ("idle", False, False, False),
+    ],
+)
+def test_s1_accepts_valid_draft_phase_modes(
+    role: str,
+    dspark_prefill_only: bool,
+    context_expected: bool,
+    query_expected: bool,
+) -> None:
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    for key, leaf in list(leaves.items()):
+        if not key.startswith("post_sampling:"):
+            continue
+        cloned = copy.deepcopy(leaf)
+        cloned["checkpoint"] = "s1"
+        leaves[f"s1:{cloned['path']}"] = cloned
+
+    def add_snapshot(path: str, value) -> None:
+        snapshot = typed_tree_snapshot("s1", value, path=path)
+        for leaf in snapshot["leaves"]:
+            leaf = copy.deepcopy(leaf)
+            payload_key = leaf.get("payload_key")
+            if payload_key is not None:
+                new_key = f"s1-{path}-{payload_key}"
+                payload[new_key] = snapshot["tensors"][payload_key]
+                leaf["payload_key"] = new_key
+            leaves[f"s1:{leaf['path']}"] = leaf
+
+    def replace_l20(path: str, value) -> None:
+        snapshot = typed_tree_snapshot("l20", value, path=path)
+        for leaf in snapshot["leaves"]:
+            leaf = copy.deepcopy(leaf)
+            payload_key = leaf.get("payload_key")
+            if payload_key is not None:
+                new_key = f"l20-{path}-{payload_key}"
+                payload[new_key] = snapshot["tensors"][payload_key]
+                leaf["payload_key"] = new_key
+            leaves[f"l20:{leaf['path']}"] = leaf
+
+    layer_name = view["layer_name"]
+    mapping["s0_authority"].update(
+        {
+            "speculative_group_ids": [0],
+            "draft_layer_names": [layer_name],
+            "draft_layer_group_ids": [0],
+            "draft_layer_group_indices": [0],
+        }
+    )
+    for root in ("s0_cache_authority", "cache_runtime_authority"):
+        replace_l20(f"{root}/speculative_group_ids", torch.tensor([0]))
+        replace_l20(f"{root}/draft_layer_names", [layer_name])
+        replace_l20(f"{root}/draft_layer_group_ids", torch.tensor([0]))
+        replace_l20(f"{root}/draft_layer_group_indices", torch.tensor([0]))
+
+    policy = {
+        "is_dummy": role == "idle",
+        "dspark_prefill_only": dspark_prefill_only,
+        "context_expected": context_expected,
+        "query_expected": query_expected,
+    }
+    mapping["draft_phase_policy"] = dict(policy)
+    replace_l20("cache_runtime_authority/draft_phase_policy", policy)
+
+    context_rows = torch.tensor([0]) if context_expected else torch.empty(0)
+    query_rows = torch.tensor([0]) if query_expected else torch.empty(0)
+    writer_authority = {
+        "context_enabled": context_expected,
+        "query_enabled": query_expected,
+        "context_source_rows": context_rows.to(torch.int64),
+        "query_source_rows": query_rows.to(torch.int64),
+        "layer_names": (layer_name,),
+        "layer_group_ids": torch.tensor([0]),
+        "layer_group_indices": torch.tensor([0]),
+    }
+    mapping["draft_writer_authority"] = {
+        "context_enabled": context_expected,
+        "query_enabled": query_expected,
+        "context_source_rows": context_rows.to(torch.int64).tolist(),
+        "query_source_rows": query_rows.to(torch.int64).tolist(),
+        "layer_names": [layer_name],
+        "layer_group_ids": [0],
+        "layer_group_indices": [0],
+    }
+    add_snapshot("draft_writer_runtime_authority", writer_authority)
+
+    root = f"s1:logical_kv/{view['view_id']}"
+    descriptor_metadata = leaves[f"{root}/descriptors"]["metadata"]
+    phases = ["target-full", "target-replay"]
+    if context_expected:
+        phases.append("draft-context")
+    if query_expected:
+        phases.append("draft-query")
+    descriptor_metadata["writer_count"] = len(phases)
+    descriptor_metadata["writer_phases"] = phases
+    descriptor_metadata["writer_records"] = {
+        **descriptor_metadata["writer_records"],
+        **{phase: [] for phase in phases if phase.startswith("draft-")},
+    }
+    descriptor_metadata["writer_enforce_committed"] = {
+        phase: not phase.startswith("draft-") for phase in phases
+    }
+
+    writer_specs = []
+    if context_expected:
+        writer_specs.append(
+            (
+                "draft-context",
+                "s1:registry/speculator:context_positions",
+                "registry/speculator:context_positions",
+                "registry/speculator:context_slots:0",
+                torch.tensor([5]),
+            )
+        )
+    if query_expected:
+        writer_specs.append(
+            (
+                "draft-query",
+                "s1:registry/speculator:input:positions",
+                "registry/speculator:input:positions",
+                "registry/speculator:query_slot_mappings",
+                torch.tensor([6]),
+            )
+        )
+    for (
+        phase,
+        position_path,
+        position_leaf_path,
+        slot_leaf_path,
+        positions,
+    ) in writer_specs:
+        add_snapshot(
+            f"logical_kv/{view['view_id']}/writer_authority/{phase}",
+            {
+                "position_path": position_path,
+                "source_rows": torch.tensor([0]),
+                "positions": positions,
+                "request_ordinals": torch.tensor([0]),
+                "request_state_slots": torch.tensor([7]),
+                "slots": torch.tensor([-1]),
+            },
+        )
+        add_snapshot(position_leaf_path, positions)
+        slots = torch.tensor([[-1]]) if phase == "draft-query" else torch.tensor([-1])
+        add_snapshot(slot_leaf_path, slots)
+        slot_leaf = leaves[f"s1:{slot_leaf_path}"]
+        slot_leaf["metadata"] = {"indices": [0]}
+
+    _validate_logical_payload(
+        Path(f"in-memory-{role}-{dspark_prefill_only}"),
+        "s1",
+        view,
+        leaves,
+        payload,
+        mapping,
+    )
+
+
 def test_shared_config_derives_dspark_prefill_only_policy() -> None:
     manifest = {
         "shared_config": {

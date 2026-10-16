@@ -1395,11 +1395,11 @@ def _validate_logical_payload(
             logical_mapping,
         )
         s0_authority = logical_mapping.get("s0_authority")
-        identity_fields = (
-            "draft_layer_names",
-            "draft_layer_group_ids",
-            "draft_layer_group_indices",
-        )
+        identity_fields = {
+            "layer_names": "draft_layer_names",
+            "layer_group_ids": "draft_layer_group_ids",
+            "layer_group_indices": "draft_layer_group_indices",
+        }
         if (
             not isinstance(context_enabled, bool)
             or not isinstance(query_enabled, bool)
@@ -1411,8 +1411,8 @@ def _validate_logical_payload(
             or draft_writer_authority != runtime_authority
             or not isinstance(s0_authority, dict)
             or any(
-                runtime_authority[field] != s0_authority.get(field)
-                for field in identity_fields
+                runtime_authority[s1_field] != s0_authority.get(s0_field)
+                for s1_field, s0_field in identity_fields.items()
             )
             or context_enabled != phase_policy["context_expected"]
             or query_enabled != phase_policy["query_expected"]
