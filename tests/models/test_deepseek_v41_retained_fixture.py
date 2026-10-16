@@ -246,6 +246,35 @@ def test_cache_record_decoder_rejects_unknown_or_nonfinite_layout() -> None:
         _decode_cache_record_cpu(plain, 0, 0, fp8_scale=float("inf"))
 
 
+def test_cache_consumers_include_shared_indexer_owner() -> None:
+    owner = SimpleNamespace()
+    direct = SimpleNamespace(k_cache=owner)
+    shared = SimpleNamespace(indexer=SimpleNamespace(k_cache=owner))
+    unrelated = SimpleNamespace(indexer=SimpleNamespace(k_cache=object()))
+    controller = RetainedReplayFixtureController.__new__(
+        RetainedReplayFixtureController
+    )
+    controller.runner = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "layer.direct": direct,
+                "layer.shared": shared,
+                "layer.unrelated": unrelated,
+                "layer.no_indexer": SimpleNamespace(),
+            }
+        )
+    )
+
+    consumers, scale = controller._cache_consumers_and_scale(
+        "layer.owner",
+        owner,
+        torch.empty((1, 1, 1), dtype=torch.uint8),
+    )
+
+    assert consumers == ["layer.direct", "layer.owner", "layer.shared"]
+    assert scale is None
+
+
 def test_batched_cache_decoder_reports_physical_record() -> None:
     cache = torch.zeros((1, 1, 584), dtype=torch.uint8)
     cache.view(-1)[576 + 7] = 165

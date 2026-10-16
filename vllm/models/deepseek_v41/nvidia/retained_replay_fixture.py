@@ -3965,6 +3965,8 @@ class RetainedReplayFixtureController:
             references = (
                 getattr(candidate, "swa_cache_layer", None) is owner
                 or getattr(candidate, "k_cache", None) is owner
+                or getattr(getattr(candidate, "indexer", None), "k_cache", None)
+                is owner
                 or getattr(candidate, "state_cache", None) is owner
                 or getattr(candidate, "compressed_cache_prefix", None) == layer_name
                 or getattr(getattr(candidate, "compressor", None), "state_cache", None)
