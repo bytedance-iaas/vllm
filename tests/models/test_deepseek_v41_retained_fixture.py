@@ -2755,7 +2755,8 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
         model_state=SimpleNamespace(
             decoder_replay_layers=SimpleNamespace(replay_batch=live),
             _decoder_model=SimpleNamespace(decoder_replay_front_graph=None),
-        )
+        ),
+        _dsv41_fixture_vote=lambda ready: ready,
     )
     controller = RetainedReplayFixtureController(runner)
     frozen = controller.freeze_production_replay_batch()
@@ -2779,6 +2780,13 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     assert registry._graph_runtime_contract["slot_mapping_paths"] == [
         "forward_context/slot_mapping/layer"
     ]
+    runtime_leaves = [
+        leaf
+        for leaf in registry.typed_snapshot("s0", epoch="s0")["leaves"]
+        if leaf["path"].startswith("registry/replay_graph:runtime:")
+    ]
+    assert runtime_leaves
+    assert all(leaf["comparison"] == "exact" for leaf in runtime_leaves)
 
     slots.fill_(6)
     valid.zero_()
@@ -2809,6 +2817,82 @@ def test_graph_runtime_registry_restores_captured_bindings_and_live() -> None:
     assert torch.equal(padding, live_padding)
     assert capture.calls == 1
     assert controller.graph_observation("a-001")["capture_replay_calls"] == 1
+
+    registry.restore("s0")
+    slots[0] = 999
+    corrupted = controller.observed_production_replay_batch(frozen, "a-corrupt")
+    with pytest.raises(RetainedReplayFixtureError, match="restore mismatches"):
+        corrupted.run_graph(torch.tensor([0]), (torch.tensor([9]),))
+    assert capture.calls == 1
+    registry.restore("live")
+    registry.verify("live")
+
+    registry.restore("s0")
+    captured_slot_mapping = capture_context.slot_mapping["layer"]
+    capture_context.slot_mapping["layer"] = captured_slot_mapping.clone()
+    rebound = controller.observed_production_replay_batch(frozen, "a-rebound")
+    with pytest.raises(RetainedReplayFixtureError, match="bindings changed"):
+        rebound.run_graph(torch.tensor([0]), (torch.tensor([9]),))
+    assert capture.calls == 1
+    capture_context.slot_mapping["layer"] = captured_slot_mapping
+    registry.restore("live")
+    registry.verify("live")
+
+    registry.restore("s0")
+    entry = manager.breakable_cg_runner.entries[descriptor]
+    replacement = Capture()
+    entry.capture = replacement
+    replaced = controller.observed_production_replay_batch(frozen, "a-replaced")
+    with pytest.raises(RetainedReplayFixtureError, match="runtime owner changed"):
+        replaced.run_graph(torch.tensor([0]), (torch.tensor([9]),))
+    assert capture.calls == 1
+    assert replacement.calls == 0
+    entry.capture = capture
+    registry.restore("live")
+    registry.verify("live")
+
+    registry.restore("s0")
+    runner._dsv41_fixture_vote = lambda ready: False
+    peer_failed = controller.observed_production_replay_batch(frozen, "a-peer-failed")
+    with pytest.raises(RetainedReplayFixtureError, match="peer rejected"):
+        peer_failed.run_graph(torch.tensor([0]), (torch.tensor([9]),))
+    assert capture.calls == 1
+    runner._dsv41_fixture_vote = lambda ready: ready
+    registry.restore("live")
+    registry.verify("live")
+
+    slots.fill_(-1)
+    valid.zero_()
+    padding.fill_(True)
+    runner.model_state.decoder_replay_layers.replay_batch = working
+    controller.rollback_production_graph_runtime()
+    assert runner.model_state.decoder_replay_layers.replay_batch is live
+    assert torch.equal(slots, expected_slots)
+    assert torch.equal(valid, expected_valid)
+    assert torch.equal(padding, expected_padding)
+
+
+def test_fixture_preparation_rollback_aborts_on_restore_failure() -> None:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.dp_size = 1
+    failures = []
+    controller = SimpleNamespace(
+        rollback_production_graph_runtime=lambda: None,
+        fail=failures.append,
+    )
+
+    runner._rollback_dsv41_fixture_preparation(controller, "builder failed")
+    assert failures == ["builder failed"]
+
+    def fail_rollback():
+        raise RuntimeError("restore failed")
+
+    controller.rollback_production_graph_runtime = fail_rollback
+    with pytest.raises(RuntimeError, match="restore failed"):
+        runner._rollback_dsv41_fixture_preparation(controller, "builder failed")
+    assert failures[-1] == "restore failed"
 
 
 def test_a_checkpoint_capture_defers_local_export_failure(monkeypatch) -> None:

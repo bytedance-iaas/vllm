@@ -2122,7 +2122,9 @@ class _ReplayGraphRuntimeStorage:
 class _ReplayGraphRuntimeState:
     manager: Any
     descriptor: Any
+    capture: Any
     context: ForwardContext
+    replay_batch: ReplayBatch
     bindings: dict[str, tuple[Any, ...]]
     slot_mapping_paths: tuple[str, ...]
     storages: list[_ReplayGraphRuntimeStorage]
@@ -2336,7 +2338,7 @@ class RetainedReplayFixtureController:
         self,
         replay_batch: ReplayBatch,
     ) -> _ReplayGraphRuntimeState:
-        manager, descriptor, _ = self._production_graph_components(replay_batch)
+        manager, descriptor, capture = self._production_graph_components(replay_batch)
         try:
             context = manager.captured_forward_context(descriptor)
         except Exception as error:
@@ -2421,7 +2423,9 @@ class RetainedReplayFixtureController:
         return _ReplayGraphRuntimeState(
             manager=manager,
             descriptor=descriptor,
+            capture=capture,
             context=context,
+            replay_batch=replay_batch,
             bindings=bindings,
             slot_mapping_paths=tuple(slot_mapping_paths),
             storages=storages,
@@ -2437,8 +2441,12 @@ class RetainedReplayFixtureController:
             raise RetainedReplayFixtureError(
                 "production replay graph runtime was not frozen"
             )
-        manager, descriptor, _ = self._production_graph_components(replay_batch)
-        if manager is not runtime.manager or descriptor != runtime.descriptor:
+        manager, descriptor, capture = self._production_graph_components(replay_batch)
+        if (
+            manager is not runtime.manager
+            or descriptor != runtime.descriptor
+            or capture is not runtime.capture
+        ):
             raise RetainedReplayFixtureError(
                 "production replay graph runtime owner changed"
             )
@@ -2508,9 +2516,9 @@ class RetainedReplayFixtureController:
                 storage.tensor,
                 storage.intervals,
             )
+            registry._comparison_overrides[storage.name] = "exact"
             storage_paths.append(list(storage.paths))
             snapshot_bytes += sum(end - begin for begin, end in storage.intervals)
-            storage.frozen = None
         registry._graph_runtime_contract = {
             "schema": 1,
             "descriptor_rows": int(runtime.descriptor.num_tokens),
@@ -2520,6 +2528,30 @@ class RetainedReplayFixtureController:
             "storage_count": len(runtime.storages),
             "snapshot_bytes": snapshot_bytes,
         }
+
+    def commit_production_graph_runtime(self) -> None:
+        runtime = self._production_graph_runtime
+        if runtime is None:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime transaction is absent"
+            )
+        for storage in runtime.storages:
+            storage.frozen = None
+
+    def rollback_production_graph_runtime(self) -> None:
+        runtime = self._production_graph_runtime
+        if runtime is None:
+            raise RetainedReplayFixtureError(
+                "production replay graph runtime transaction is absent"
+            )
+        layers = getattr(self.runner.model_state, "decoder_replay_layers", None)
+        if layers is None:
+            raise RetainedReplayFixtureError(
+                "production replay layers disappeared during rollback"
+            )
+        layers.replay_batch = runtime.replay_batch
+        self._restore_production_graph_runtime(runtime.replay_batch)
+        self._production_graph_runtime = None
 
     def freeze_production_replay_batch(self) -> ReplayBatch:
         from vllm.models.deepseek_v41.decoder_replay_layers import ReplayBatch
@@ -2584,6 +2616,10 @@ class RetainedReplayFixtureController:
             inputs: tuple[Any, ...],
         ) -> tuple[torch.Tensor, ...]:
             observation["callback_calls"] += 1
+            local_error = None
+            had_instance_replay = False
+            prior_instance_replay = None
+            original_replay = None
             try:
                 current_manager, current_descriptor, current_capture = (
                     self._production_graph_components(frozen)
@@ -2606,11 +2642,24 @@ class RetainedReplayFixtureController:
                 prior_instance_replay = capture.__dict__.get("replay")
                 original_replay = capture.replay
             except Exception as error:
-                observation["error"] = f"{type(error).__name__}: {error}"
+                local_error = error
+
+            if getattr(self, "_production_graph_runtime", None) is not None:
+                globally_ready = self.runner._dsv41_fixture_vote(local_error is None)
+                if not globally_ready:
+                    message = str(
+                        local_error
+                        or f"{phase}: a peer rejected replay graph runtime state"
+                    )
+                    observation["error"] = message
+                    raise RetainedReplayFixtureError(message)
+            elif local_error is not None:
+                observation["error"] = f"{type(local_error).__name__}: {local_error}"
                 return original_callback(rows, inputs)
 
             def observed_replay() -> None:
                 observation["capture_replay_calls"] += 1
+                assert original_replay is not None
                 original_replay()
 
             capture.replay = observed_replay

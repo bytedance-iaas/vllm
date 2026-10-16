@@ -1230,6 +1230,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             dist.all_reduce(votes, group=get_dp_group().cpu_group)
         return bool(votes.all())
 
+    def _rollback_dsv41_fixture_preparation(
+        self,
+        controller: Any,
+        error: BaseException | str,
+    ) -> None:
+        rollback_error = None
+        try:
+            controller.rollback_production_graph_runtime()
+        except Exception as caught:
+            rollback_error = caught
+        if not self._dsv41_fixture_vote(rollback_error is None):
+            message = str(
+                rollback_error
+                or "a peer failed to restore production replay graph runtime"
+            )
+            controller.fail(message)
+            raise RuntimeError(message)
+        controller.fail(error)
+
     def _maybe_begin_dsv41_retained_fixture(
         self,
         *,
@@ -1299,13 +1318,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             return
         assert production_replay_batch is not None
-        working_replay_batch = controller.observed_production_replay_batch(
-            production_replay_batch,
-            "production",
-        )
-        replay_layers = self.model_state.decoder_replay_layers
-        assert replay_layers is not None
-        replay_layers.replay_batch = working_replay_batch
+        working_replay_batch = None
+        local_error = None
+        try:
+            working_replay_batch = controller.observed_production_replay_batch(
+                production_replay_batch,
+                "production",
+            )
+            replay_layers = self.model_state.decoder_replay_layers
+            assert replay_layers is not None
+            replay_layers.replay_batch = working_replay_batch
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            self._rollback_dsv41_fixture_preparation(
+                controller,
+                local_error or "a peer failed to observe the production replay graph",
+            )
+            return
 
         replay_batch = None
         local_error = None
@@ -1325,7 +1355,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         except Exception as error:
             local_error = error
         if not self._dsv41_fixture_vote(local_error is None):
-            controller.fail(local_error or "a peer failed retained replay construction")
+            self._rollback_dsv41_fixture_preparation(
+                controller,
+                local_error or "a peer failed retained replay construction",
+            )
             return
         assert replay_batch is not None
 
@@ -1336,13 +1369,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         except Exception as error:
             local_error = error
         if not self._dsv41_fixture_vote(local_error is None):
-            controller.fail(local_error or "a peer failed ordinary Decode planning")
+            self._rollback_dsv41_fixture_preparation(
+                controller,
+                local_error or "a peer failed ordinary Decode planning",
+            )
             return
         assert ordinary_plan is not None
-        any_ordinary, ordinary_dp_tokens = self._dsv41_fixture_work(
-            ordinary_plan.has_ordinary,
-            ordinary_plan.num_execution_tokens,
-        )
+        local_error = None
+        try:
+            any_ordinary, ordinary_dp_tokens = self._dsv41_fixture_work(
+                ordinary_plan.has_ordinary,
+                ordinary_plan.num_execution_tokens,
+            )
+        except Exception as error:
+            local_error = error
+        if not self._dsv41_fixture_vote(local_error is None):
+            self._rollback_dsv41_fixture_preparation(
+                controller,
+                local_error or "a peer failed ordinary Decode coordination",
+            )
+            return
         ordinary_batch = None
         local_error = None
         try:
@@ -1361,7 +1407,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         except Exception as error:
             local_error = error
         if not self._dsv41_fixture_vote(local_error is None):
-            controller.fail(local_error or "a peer failed ordinary Decode construction")
+            self._rollback_dsv41_fixture_preparation(
+                controller,
+                local_error or "a peer failed ordinary Decode construction",
+            )
             return
 
         local_error = None
@@ -1401,8 +1450,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         except Exception as error:
             local_error = error
         if not self._dsv41_fixture_vote(local_error is None):
-            controller.fail(local_error or "a peer failed fixture preparation")
+            self._rollback_dsv41_fixture_preparation(
+                controller,
+                local_error or "a peer failed fixture preparation",
+            )
             return
+        controller.commit_production_graph_runtime()
         self.model.set_decoder_boundary_capture(controller.capture_boundary)
 
     def _maybe_finalize_dsv41_retained_fixture(
