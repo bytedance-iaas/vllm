@@ -2895,22 +2895,6 @@ def test_fixture_preparation_rollback_aborts_on_restore_failure() -> None:
     assert failures[-1] == "restore failed"
 
 
-def test_profile_capture_releases_discarded_replay_contexts() -> None:
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-
-    calls = []
-    runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model_state = SimpleNamespace(
-        replay_cudagraphs=SimpleNamespace(
-            clear_captured_forward_contexts=lambda: calls.append("clear")
-        )
-    )
-
-    runner._clear_profile_replay_graph_contexts()
-
-    assert calls == ["clear"]
-
-
 def test_a_checkpoint_capture_defers_local_export_failure(monkeypatch) -> None:
     import vllm.models.deepseek_v41.nvidia.retained_replay_fixture as module
 

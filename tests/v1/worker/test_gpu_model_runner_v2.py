@@ -417,3 +417,68 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+def test_profile_capture_releases_contexts_before_memory_query(monkeypatch):
+    runner = _make_capture_runner(captured=True)
+    contexts = []
+    events = []
+    marker = object()
+    runner.model_state.replay_cudagraphs = SimpleNamespace(
+        clear_captured_forward_contexts=lambda: (
+            events.append("clear"),
+            contexts.clear(),
+        )
+    )
+
+    def capture(*args, **kwargs):
+        del args, kwargs
+        events.append("capture")
+        contexts.append(marker)
+
+    runner.cudagraph_manager.capture = capture
+    free_memory = iter((3 << 30, 2 << 30))
+    observed_contexts = []
+
+    def get_memory_info():
+        observed_contexts.append(tuple(contexts))
+        return next(free_memory), 4 << 30
+
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", get_memory_info)
+    monkeypatch.setattr(model_runner_module, "lock_workspace", lambda: None)
+
+    assert runner.capture_model(profile_only=True) == 1 << 30
+    assert events == ["capture", "clear"]
+    assert observed_contexts == [(), ()]
+    assert contexts == []
+
+
+def test_real_capture_retains_replay_contexts(monkeypatch):
+    runner = _make_capture_runner(captured=True)
+    contexts = []
+    marker = object()
+    runner.model_state.replay_cudagraphs = SimpleNamespace(
+        clear_captured_forward_contexts=lambda: contexts.clear()
+    )
+    runner.cudagraph_manager.capture = lambda *args, **kwargs: contexts.append(marker)
+    observed_contexts = []
+
+    def get_memory_info():
+        observed_contexts.append(tuple(contexts))
+        return 1 << 30, 1 << 30
+
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", get_memory_info)
+    monkeypatch.setattr(model_runner_module, "lock_workspace", lambda: None)
+
+    runner.capture_model()
+
+    assert observed_contexts == [(), (marker,)]
+    assert contexts == [marker]

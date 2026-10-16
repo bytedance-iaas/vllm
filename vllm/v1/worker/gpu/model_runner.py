@@ -2017,9 +2017,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.adaptive_verification.set_initial_cost_curves(timings)
                     self.kv_connector.reset_capture_state()
 
-            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
             if profile_only:
                 self._clear_profile_replay_graph_contexts()
+            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         if not profile_only:
             # Lock workspace to prevent resizing during execution. A resize after
