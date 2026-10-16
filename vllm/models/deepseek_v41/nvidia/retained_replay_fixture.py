@@ -1264,6 +1264,7 @@ class TouchedStateRegistry:
         self._meaningful_counts: dict[str, int] = {}
         self._comparison_overrides: dict[str, str] = {}
         self._selection_metadata: dict[str, dict[str, Any]] = {}
+        self._checkpoint_raw_exact: dict[str, set[str]] = {}
         self._cache_views: list[_LogicalCacheView] = []
         self._cache_writers: list[_CacheWriter] = []
         self._cache_block_tables: tuple[torch.Tensor, ...] = ()
@@ -1387,6 +1388,18 @@ class TouchedStateRegistry:
         self._meaningful_counts[name] = compare_prefix
         self._comparison_overrides[name] = comparison
         self._selection_metadata[name] = metadata
+
+    def set_checkpoint_raw_exact(self, checkpoint: str, name: str) -> None:
+        matching = [
+            entry
+            for entry in self.entries
+            if isinstance(entry, _TensorSelection) and entry.name == name
+        ]
+        if len(matching) != 1:
+            raise RetainedReplayFixtureError(
+                f"{name}: checkpoint raw tensor is absent or ambiguous"
+            )
+        self._checkpoint_raw_exact.setdefault(checkpoint, set()).add(name)
 
     def configure_logical_cache(
         self,
@@ -2084,6 +2097,21 @@ class TouchedStateRegistry:
                     if isinstance(entry, _TensorIntervals)
                     else _registry_comparison(entry.name, value)
                 )
+            if entry.name in self._checkpoint_raw_exact.get(checkpoint, set()):
+                if not isinstance(value, torch.Tensor):
+                    raise RetainedReplayFixtureError(
+                        f"{entry.name}: raw checkpoint value is not a tensor"
+                    )
+                selection.update(
+                    {
+                        "encoding": "contiguous_tensor_bytes_v1",
+                        "original_dtype": str(value.dtype),
+                        "original_shape": list(value.shape),
+                        "byte_order": sys.byteorder,
+                    }
+                )
+                value = value.contiguous().view(torch.uint8).reshape(-1)
+                comparison = "exact"
             builder.add(
                 value,
                 f"registry/{_safe_path_component(entry.name)}",
@@ -4975,6 +5003,15 @@ class RetainedReplayFixtureController:
                     tensor,
                     rows,
                     meaningful_count=meaningful_count,
+                )
+            from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+                DSparkSpeculator,
+            )
+
+            if isinstance(speculator, DSparkSpeculator):
+                registry.set_checkpoint_raw_exact(
+                    "post_sampling",
+                    "speculator:hidden_states",
                 )
             for name in ("draft_logits", "temperature", "seeds"):
                 tensor = getattr(speculator, name, None)

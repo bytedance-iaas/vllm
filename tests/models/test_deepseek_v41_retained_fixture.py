@@ -2171,6 +2171,50 @@ def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     assert features["metadata"]["compare_prefix"] == 1
 
 
+def test_post_sampling_dspark_workspace_preserves_nan_bytes_exactly() -> None:
+    bits = torch.tensor(
+        [[0x3F80, 0x7FC1], [0x7FFF, 0x4000]],
+        dtype=torch.uint16,
+    )
+    workspace = bits.view(torch.bfloat16)
+    registry = TouchedStateRegistry()
+    registry.add_rows(
+        "speculator:hidden_states",
+        workspace,
+        torch.tensor([0, 1]),
+    )
+    registry.set_checkpoint_raw_exact(
+        "post_sampling",
+        "speculator:hidden_states",
+    )
+
+    post_sampling = registry.typed_snapshot("post_sampling")
+    post_leaf = post_sampling["leaves"][0]
+    post_value = post_sampling["tensors"][post_leaf["payload_key"]]
+    assert post_leaf["comparison"] == "exact"
+    assert post_leaf["dtype"] == "torch.uint8"
+    assert post_leaf["metadata"]["encoding"] == "contiguous_tensor_bytes_v1"
+    assert post_leaf["metadata"]["original_dtype"] == "torch.bfloat16"
+    assert post_leaf["metadata"]["original_shape"] == [2, 2]
+    assert torch.equal(
+        post_value,
+        bits.view(torch.uint8).reshape(-1),
+    )
+
+    s1 = registry.typed_snapshot("s1")
+    s1_leaf = s1["leaves"][0]
+    s1_value = s1["tensors"][s1_leaf["payload_key"]]
+    assert s1_leaf["comparison"] == "floating"
+    assert s1_leaf["dtype"] == "torch.bfloat16"
+    assert "encoding" not in s1_leaf["metadata"]
+    with pytest.raises(ValueError, match="unexpected NaN"):
+        _floating_metrics(
+            s1_value,
+            s1_value,
+            denominator_floor=1e-12,
+        )
+
+
 def _scratch_run(
     values: torch.Tensor,
     *,
