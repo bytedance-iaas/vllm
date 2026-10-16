@@ -592,37 +592,78 @@ def _validate_cache_view_overlays(
     logical_mapping: dict[str, Any],
 ) -> None:
     allocated = _allocated_blocks_by_group(path, logical_mapping)
+    views_by_id: dict[str, dict[str, Any]] = {}
+    geometry_by_id: dict[str, tuple[int, int, int, int, int, int]] = {}
+    alias_fields = (
+        "storage_offset_bytes",
+        "shape",
+        "strides_bytes",
+        "dtype",
+        "record_format",
+    )
     by_storage: dict[str, list[dict[str, Any]]] = {}
     for view in views:
+        view_id = view.get("view_id")
         storage_id = view.get("storage_id")
         group_id = view.get("group_id")
         if (
-            not isinstance(storage_id, str)
+            not isinstance(view_id, str)
+            or not view_id
+            or view_id in views_by_id
+            or not isinstance(storage_id, str)
             or not storage_id
             or not isinstance(group_id, int)
             or group_id not in allocated
         ):
             raise ValueError(f"{path}: cache-view storage ownership is invalid")
+        views_by_id[view_id] = view
+        geometry = _cache_view_geometry(path, view)
+        geometry_by_id[view_id] = geometry
+        block_stride, _, page_begin, page_end, storage_offset, _ = geometry
+        capacity = int(view["shape"][0])
+        storage_nbytes = int(view["storage_nbytes"])
+        page_bytes = page_end - page_begin
+        for block in allocated[group_id]:
+            if block <= 0 or block >= capacity:
+                raise ValueError(f"{path}: allocated block exceeds cache-view capacity")
+            if storage_offset + block * block_stride + page_bytes > storage_nbytes:
+                raise ValueError(
+                    f"{path}: allocated block exceeds cache-view storage bounds"
+                )
         by_storage.setdefault(storage_id, []).append(view)
+
+    for view_id, view in views_by_id.items():
+        aliases = view.get("aliases")
+        if (
+            not isinstance(aliases, list)
+            or any(not isinstance(alias, str) for alias in aliases)
+            or len(set(aliases)) != len(aliases)
+        ):
+            raise ValueError(f"{path}: cache alias inventory is invalid")
+        for alias in aliases:
+            peer = views_by_id.get(alias)
+            if (
+                peer is None
+                or peer.get("group_id") != view.get("group_id")
+                or peer.get("storage_id") != view.get("storage_id")
+                or any(peer.get(field) != view.get(field) for field in alias_fields)
+                or view_id not in peer.get("aliases", [])
+            ):
+                raise ValueError(
+                    f"{path}: cache alias crosses identity or storage boundaries"
+                )
 
     for storage_views in by_storage.values():
         ordered = sorted(storage_views, key=lambda item: str(item["view_id"]))
         for left_index, left in enumerate(ordered):
-            left_geometry = _cache_view_geometry(path, left)
+            left_geometry = geometry_by_id[str(left["view_id"])]
             left_aliases = set(left["aliases"])
             for right in ordered[left_index + 1 :]:
-                right_geometry = _cache_view_geometry(path, right)
+                right_geometry = geometry_by_id[str(right["view_id"])]
                 right_aliases = set(right["aliases"])
                 same_group = int(left["group_id"]) == int(right["group_id"])
                 exact_alias = same_group and all(
-                    left.get(field) == right.get(field)
-                    for field in (
-                        "storage_offset_bytes",
-                        "shape",
-                        "strides_bytes",
-                        "dtype",
-                        "record_format",
-                    )
+                    left.get(field) == right.get(field) for field in alias_fields
                 )
                 left_names_right = right["view_id"] in left_aliases
                 right_names_left = left["view_id"] in right_aliases
@@ -727,14 +768,18 @@ def _validate_s0_authority(
     table_witness = runtime["block_table_witness"]
     allocated_witness = runtime["allocated_block_witness"]
     allocated_counts = runtime["allocated_block_counts"]
+    request_slots = logical_mapping.get("request_state_slots")
     if (
         not isinstance(block_tables, list)
+        or not isinstance(request_slots, list)
         or len(table_widths) != len(block_tables)
         or len(table_witness) != len(block_tables)
         or len(allocated_witness) != len(block_tables)
         or len(allocated_counts) != len(block_tables)
+        or any(not isinstance(width, int) or width <= 0 for width in table_widths)
     ):
         raise ValueError(f"{path}: runtime block-table witness differs")
+    max_width = max(table_widths, default=0)
     for group_id, table in enumerate(block_tables):
         width = table_widths[group_id]
         witness_rows = table_witness[group_id]
@@ -744,9 +789,10 @@ def _validate_s0_authority(
             not isinstance(width, int)
             or width < 0
             or not isinstance(table, list)
-            or len(witness_rows) != len(table)
-            or len(allocated_rows) != len(table)
-            or len(counts) != len(table)
+            or len(table) != len(request_slots)
+            or len(witness_rows) != len(request_slots)
+            or len(allocated_rows) != len(request_slots)
+            or len(counts) != len(request_slots)
         ):
             raise ValueError(f"{path}: runtime block-table witness differs")
         for row, witness, allocated_row, count in zip(
@@ -758,6 +804,8 @@ def _validate_s0_authority(
             if (
                 not isinstance(row, list)
                 or len(row) != width
+                or len(witness) != max_width
+                or len(allocated_row) != max_width
                 or not isinstance(count, int)
                 or count < 0
                 or count > width

@@ -3555,6 +3555,36 @@ class RetainedReplayFixtureController:
             storage_id = f"storage-{storage_index:03d}"
             for view in record.views:
                 view.storage_id = storage_id
+                (
+                    block_stride,
+                    _,
+                    page_begin,
+                    page_end,
+                    storage_offset,
+                    _,
+                ) = self._view_page_geometry(view)
+                allocated_blocks = allocated_blocks_by_group.get(view.group_id)
+                if allocated_blocks is None:
+                    raise RetainedReplayFixtureError(
+                        f"{view.view_id}: allocated block ownership is absent"
+                    )
+                capacity = int(view.tensor.shape[0])
+                storage_nbytes = int(view.tensor.untyped_storage().nbytes())
+                page_bytes = page_end - page_begin
+                for block in allocated_blocks:
+                    if block <= 0 or block >= capacity:
+                        raise RetainedReplayFixtureError(
+                            f"{view.view_id}: allocated block {block} exceeds "
+                            f"cache capacity {capacity}"
+                        )
+                    if (
+                        storage_offset + block * block_stride + page_bytes
+                        > storage_nbytes
+                    ):
+                        raise RetainedReplayFixtureError(
+                            f"{view.view_id}: allocated block {block} exceeds "
+                            "cache storage bounds"
+                        )
             for left_index, left in enumerate(record.views):
                 (
                     left_stride,

@@ -339,6 +339,15 @@ def test_storage_views_reject_cross_group_allocated_block_collision() -> None:
         _bind_overlay_views(views, {0: {1, 3}, 1: {3}})
 
 
+def test_storage_views_reject_allocated_block_beyond_capacity() -> None:
+    backing = torch.zeros(4096, dtype=torch.uint8)
+    tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
+    view = _storage_overlay_view(tensor, group_id=0, name="left")
+
+    with pytest.raises(RetainedReplayFixtureError, match="exceeds cache capacity"):
+        _bind_overlay_views([view], {0: {4}})
+
+
 def test_storage_views_reject_shifted_block_origin_and_page_crossing() -> None:
     backing = torch.zeros(6144, dtype=torch.uint8)
     left_tensor = backing.as_strided((4, 1, 584), (1024, 584, 1))
@@ -758,11 +767,12 @@ def _overlay_metadata(
             "storage_id": "storage-overlay",
             "restoration_entry": "kv-dst:storage-overlay",
             "storage_offset_bytes": storage_offset,
-            "storage_nbytes": 5 * 65536,
+            "storage_nbytes": 9 * 65536,
             "strides_bytes": [65536, 1024, 2],
             "aliases": [],
         }
     )
+    view["shape"][0] = 8
     return view
 
 
@@ -819,7 +829,7 @@ def test_comparator_rejects_cross_group_collision_and_forged_alias() -> None:
     mapping["block_tables"][1][0][0] = 2
     left["aliases"] = [right["view_id"]]
     right["aliases"] = [left["view_id"]]
-    with pytest.raises(ValueError, match="non-identical.*aliases"):
+    with pytest.raises(ValueError, match="cache alias"):
         _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
 
 
@@ -862,6 +872,30 @@ def test_comparator_rejects_same_group_partial_overlap_and_shifted_origin() -> N
         )
 
 
+def test_comparator_rejects_allocated_block_beyond_forged_capacity() -> None:
+    source, _, _, _ = _logical_evidence_bundle()
+    left = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:left",
+        storage_offset=0,
+    )
+    right = _overlay_metadata(
+        source,
+        group_id=1,
+        view_id="group-1:right",
+        storage_offset=65536,
+    )
+    left["shape"][0] = 1
+    mapping = {
+        "block_tables": [[[3]], [[2]]],
+        "allocated_block_counts": [[1], [1]],
+    }
+
+    with pytest.raises(ValueError, match="exceeds cache-view capacity"):
+        _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
+
+
 def test_comparator_accepts_only_same_group_exact_alias() -> None:
     source, _, _, _ = _logical_evidence_bundle()
     left = _overlay_metadata(
@@ -886,7 +920,34 @@ def test_comparator_accepts_only_same_group_exact_alias() -> None:
     _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
 
     right["aliases"] = []
-    with pytest.raises(ValueError, match="exact cache alias evidence is incomplete"):
+    with pytest.raises(ValueError, match="cache alias"):
+        _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
+
+
+def test_comparator_rejects_alias_across_storage_buckets() -> None:
+    source, _, _, _ = _logical_evidence_bundle()
+    left = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:left",
+        storage_offset=0,
+    )
+    right = _overlay_metadata(
+        source,
+        group_id=0,
+        view_id="group-0:right",
+        storage_offset=0,
+    )
+    right["storage_id"] = "storage-other"
+    right["restoration_entry"] = "kv-dst:storage-other"
+    left["aliases"] = [right["view_id"]]
+    right["aliases"] = [left["view_id"]]
+    mapping = {
+        "block_tables": [[[1, 3]]],
+        "allocated_block_counts": [[2]],
+    }
+
+    with pytest.raises(ValueError, match="crosses identity or storage"):
         _validate_cache_view_overlays(Path("in-memory"), [left, right], mapping)
 
 
@@ -902,6 +963,16 @@ def test_comparator_binds_block_table_and_allocated_witnesses() -> None:
     mapping["allocated_block_counts"] = [[1]]
     allocated_leaf = leaves["l20:cache_runtime_authority/allocated_block_counts"]
     payload[allocated_leaf["payload_key"]] = torch.tensor([[1]], dtype=torch.int64)
+    with pytest.raises(ValueError, match="allocated block witness differs"):
+        _validate_s0_authority(Path("in-memory"), view, leaves, payload, mapping)
+
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    mapping["allocated_block_counts"] = [[1]]
+    allocated_leaf = leaves["l20:cache_runtime_authority/allocated_block_counts"]
+    payload[allocated_leaf["payload_key"]] = torch.tensor([[1]], dtype=torch.int64)
+    witness_leaf = leaves["l20:cache_runtime_authority/allocated_block_witness"]
+    witness_key = witness_leaf["payload_key"]
+    payload[witness_key] = payload[witness_key][:, :, :1]
     with pytest.raises(ValueError, match="allocated block witness differs"):
         _validate_s0_authority(Path("in-memory"), view, leaves, payload, mapping)
 
