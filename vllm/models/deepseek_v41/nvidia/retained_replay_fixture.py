@@ -2260,6 +2260,7 @@ class RetainedReplayFixtureController:
             raise RetainedReplayFixtureError(
                 "target scratch producer layers are absent"
             )
+        scratch_producers: dict[str, dict[str, Any]] = {}
 
         candidate_name = "model:candidate_block_buffer"
         if candidate_name in registry._names:
@@ -2309,6 +2310,12 @@ class RetainedReplayFixtureController:
                     ).tolist(),
                 },
             )
+            scratch_producers["candidate"] = {
+                "producer_layer": source_layer,
+                "cache_owner": getattr(producer, "compressed_cache_prefix", None),
+                "compress_ratio": ratio,
+                "candidate_block_size": block_size,
+            }
 
         topk_name = "model:topk_indices_buffer"
         if topk_name in registry._names:
@@ -2365,6 +2372,13 @@ class RetainedReplayFixtureController:
                     ).tolist(),
                 },
             )
+            scratch_producers["topk"] = {
+                "producer_layer": source_layer,
+                "cache_owner": indexer_cache_owner,
+                "compress_ratio": ratio,
+                "candidate_block_size": int(getattr(config, "candidate_block_size", 0)),
+            }
+        registry._cache_runtime_authority["scratch_producers"] = scratch_producers
 
     def begin(
         self,
@@ -3980,6 +3994,18 @@ class RetainedReplayFixtureController:
             raise RetainedReplayFixtureError("no bound KV cache rows were discovered")
         if collect_logical:
             self._bind_cache_storage_views(list(intervals_by_storage.values()))
+            for record in intervals_by_storage.values():
+                if not record.views:
+                    continue
+                storage_ids = {view.storage_id for view in record.views}
+                if len(storage_ids) != 1:
+                    raise RetainedReplayFixtureError(
+                        "logical cache restoration storage identity is ambiguous"
+                    )
+                storage_id = next(iter(storage_ids))
+                record.name = storage_id
+                for view in record.views:
+                    view.restoration_entry = f"kv-dst:{storage_id}"
         for record in intervals_by_storage.values():
             record.destination = _merge_byte_intervals(record.destination)
             record.source = _subtract_byte_intervals(record.source, record.destination)
@@ -4156,8 +4182,16 @@ class RetainedReplayFixtureController:
                         device=draft_block_tables.slot_mappings.device,
                     ),
                 )
-            for group_id, tensor in enumerate(
+            context_slot_mappings = tuple(
                 getattr(speculator, "_context_slot_mappings", ())
+            )
+            if len(context_slot_mappings) != len(draft_group_ids):
+                raise RetainedReplayFixtureError(
+                    "draft context runtime slot groups are incomplete"
+                )
+            for group_id, tensor in zip(
+                draft_group_ids,
+                context_slot_mappings,
             ):
                 registry.add_rows(
                     f"speculator:context_slots:{group_id}",

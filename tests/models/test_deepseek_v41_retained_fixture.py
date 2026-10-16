@@ -21,6 +21,7 @@ from benchmarks.replayssm.dsv41_retained_control_compare import (
     _decode_logical_raw,
     _floating_metrics,
     _identity_normalization_provenance,
+    _validate_draft_writer_runtime_authority,
     _validate_logical_payload,
     _validate_view_layout,
     _validated_scratch_rows,
@@ -253,7 +254,7 @@ def test_logical_cache_snapshot_binds_writer_and_preserved_rows() -> None:
         consumers=["layer"],
         aliases=[],
         fp8_scale=None,
-        restoration_entry="kv-dst:layer",
+        restoration_entry="kv-dst:storage-000",
     )
     writer = _CacheWriter(
         phase="target-full",
@@ -356,7 +357,7 @@ def test_logical_cache_snapshot_skips_unallocated_stale_table_blocks() -> None:
         consumers=["layer"],
         aliases=[],
         fp8_scale=None,
-        restoration_entry="kv-dst:layer",
+        restoration_entry="kv-dst:storage-000",
     )
     registry = TouchedStateRegistry()
     empty_writers = [
@@ -433,11 +434,13 @@ def _logical_evidence_bundle():
             "dtype": "torch.bfloat16",
             "tokens_per_state": 1,
             "state_content_size_bytes": 1024,
+            "state_content_bytes": None,
             "page_size_bytes": 4096,
             "real_page_size_bytes": 4096,
             "page_size_padded": None,
             "num_states": 4,
             "num_heads": 1,
+            "num_head_slots": None,
             "prefix_cacheable": True,
             "prefix_replay_tokens": 0,
         },
@@ -452,7 +455,7 @@ def _logical_evidence_bundle():
         consumers=["model.layers.20.self_attn"],
         aliases=[],
         fp8_scale=None,
-        restoration_entry="kv-dst:model.layers.20.self_attn",
+        restoration_entry="kv-dst:storage-000",
     )
     writers = [
         _CacheWriter(
@@ -487,14 +490,14 @@ def _logical_evidence_bundle():
     storage = cache.view(torch.uint8).reshape(-1)
     page_bytes = cache.stride(0) * cache.element_size()
     registry.add_intervals(
-        "kv-dst:model.layers.20.self_attn",
+        "kv-dst:storage-000",
         storage,
         [(page_bytes, 2 * page_bytes), (3 * page_bytes, 4 * page_bytes)],
     )
     computed_state = torch.zeros(8, dtype=torch.int32)
     computed_state[7] = 5
     total_state = torch.zeros(8, dtype=torch.int32)
-    total_state[7] = 4
+    total_state[7] = 5
     registry.add_rows(
         "request:num_computed_tokens",
         computed_state,
@@ -538,7 +541,11 @@ def _logical_evidence_bundle():
         ),
         typed_tree_snapshot(
             "post_sampling",
-            {"num_rejected": torch.tensor([0], dtype=torch.int32)},
+            {
+                "skipped": False,
+                "num_sampled": torch.tensor([1], dtype=torch.int32),
+                "num_rejected": torch.tensor([0], dtype=torch.int32),
+            },
             path="decisions",
         ),
     )
@@ -789,7 +796,7 @@ def test_logical_comparator_filters_executed_rejected_rows() -> None:
             [6], dtype=torch.int64
         ),
         "post_sampling:registry/request:total_len": torch.tensor(
-            [6], dtype=torch.int32
+            [7], dtype=torch.int32
         ),
         "post_sampling:decisions/num_rejected": torch.tensor([1], dtype=torch.int32),
         "l20:boundary/positions": torch.tensor([4, 5], dtype=torch.int64),
@@ -831,6 +838,31 @@ def test_logical_comparator_filters_executed_rejected_rows() -> None:
     )
 
 
+def test_logical_comparator_binds_total_length_sampling_delta() -> None:
+    view, leaves, payload, mapping = _logical_evidence_bundle()
+    _validate_logical_payload(
+        Path("in-memory"),
+        "post_sampling",
+        view,
+        leaves,
+        payload,
+        mapping,
+    )
+
+    skipped = leaves["post_sampling:decisions/skipped"]
+    skipped["value"] = True
+    total = leaves["post_sampling:registry/request:total_len"]
+    payload[total["payload_key"]] = torch.tensor([4], dtype=torch.int32)
+    _validate_logical_payload(
+        Path("in-memory"),
+        "post_sampling",
+        view,
+        leaves,
+        payload,
+        mapping,
+    )
+
+
 @pytest.mark.parametrize(
     "record_format,raw_width,scale_width,decoded_width",
     [
@@ -854,8 +886,22 @@ def test_logical_decoder_accepts_empty_fp4_views(
 
 def test_logical_comparator_requires_restoration_entry() -> None:
     view, leaves, payload, mapping = _logical_evidence_bundle()
-    view["restoration_entry"] = "kv-dst:unknown"
-    with pytest.raises(ValueError, match="restoration entry is absent"):
+    payload["empty-restoration"] = torch.empty(0, dtype=torch.uint8)
+    leaves["post_sampling:registry/kv-dst:storage-999"] = {
+        "checkpoint": "post_sampling",
+        "path": "registry/kv-dst:storage-999",
+        "family": "registry/kv-dst:storage-999",
+        "comparison": "diagnostic",
+        "dtype": "torch.uint8",
+        "shape": [0],
+        "payload_key": "empty-restoration",
+        "metadata": {
+            "kind": "byte_intervals",
+            "intervals": [],
+        },
+    }
+    view["restoration_entry"] = "kv-dst:storage-999"
+    with pytest.raises(ValueError, match="restoration identity is invalid"):
         _validate_logical_payload(
             Path("in-memory"),
             "post_sampling",
@@ -889,6 +935,8 @@ def test_logical_comparator_ignores_unallocated_stale_table_blocks() -> None:
         ("head_size_v", 7, "spec/layout agreement differs"),
         ("num_kv_heads", 7, "spec/layout agreement differs"),
         ("page_size_bytes", 1, "spec page geometry differs"),
+        ("num_head_slots", 99, "spec head-slot geometry differs"),
+        ("state_content_bytes", 28, "spec state-content geometry differs"),
     ],
 )
 def test_logical_comparator_rejects_forged_spec_geometry(
@@ -1031,8 +1079,19 @@ def test_logical_comparator_accepts_live_storage_layouts(
                 "head_size_v": 0,
                 "num_kv_heads": 1,
                 "num_heads": 1,
+                "num_head_slots": None,
                 "num_states": block_size,
                 "tokens_per_state": spec_tokens,
+                "state_content_bytes": (
+                    record_bytes
+                    if record_format
+                    in (
+                        "v4_ue8m0_fp8_bf16",
+                        "v41_ue8m0_mxfp8",
+                        "v41_nvfp4",
+                    )
+                    else None
+                ),
                 "state_content_size_bytes": record_bytes,
                 "alignment": None,
                 "page_size_padded": None,
@@ -1076,7 +1135,7 @@ def test_registry_builds_owner_specific_replay_s0_domains() -> None:
             consumers=[layer_name],
             aliases=[],
             fp8_scale=None,
-            restoration_entry=f"kv-dst:{layer_name}",
+            restoration_entry=f"kv-dst:storage-{group_id:03d}",
         )
 
     views = [
@@ -1209,6 +1268,67 @@ def test_draft_cache_writers_bind_context_and_query_rows() -> None:
     assert query.enforce_committed_extent is False
 
 
+def test_draft_writer_slots_bind_independent_runtime_mappings() -> None:
+    leaves = {
+        "s1:registry/speculator:context_slots:2": {
+            "payload_key": "context",
+            "metadata": {"indices": [0, 1]},
+        },
+        "s1:registry/speculator:query_slot_mappings": {
+            "payload_key": "query",
+            "metadata": {"indices": [2]},
+        },
+    }
+    payload = {
+        "context": torch.tensor([12, 15], dtype=torch.int64),
+        "query": torch.tensor([[16, 17]], dtype=torch.int64),
+    }
+    mapping = {"s0_authority": {"speculative_group_ids": [2]}}
+
+    _validate_draft_writer_runtime_authority(
+        Path("in-memory"),
+        "draft-context",
+        2,
+        [1],
+        [15],
+        leaves,
+        payload,
+        mapping,
+    )
+    _validate_draft_writer_runtime_authority(
+        Path("in-memory"),
+        "draft-query",
+        2,
+        [0, 1],
+        [16, 17],
+        leaves,
+        payload,
+        mapping,
+    )
+    with pytest.raises(ValueError, match="draft writer runtime authority differs"):
+        _validate_draft_writer_runtime_authority(
+            Path("in-memory"),
+            "draft-context",
+            2,
+            [1],
+            [-1],
+            leaves,
+            payload,
+            mapping,
+        )
+    with pytest.raises(ValueError, match="draft writer runtime authority differs"):
+        _validate_draft_writer_runtime_authority(
+            Path("in-memory"),
+            "draft-query",
+            2,
+            [0, 1],
+            [-1, -1],
+            leaves,
+            payload,
+            mapping,
+        )
+
+
 def test_typed_registry_keeps_kv_bytes_and_sampling_parameters_exact() -> None:
     computed = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     temperature = torch.tensor([0.7], dtype=torch.float32)
@@ -1267,7 +1387,7 @@ def _scratch_run(
         "require_unique_valid_ids": True,
         "require_trailing_sentinels": True,
         "valid_id_exclusive_bounds": [4] * values.shape[0],
-        "expected_valid_counts": [3] * values.shape[0],
+        "expected_valid_counts": [4] * values.shape[0],
     }
     leaf = {
         "checkpoint": "s1",
@@ -1300,6 +1420,24 @@ def _scratch_run(
             "consumers": ["model.layers.20.self_attn.indexer.k_cache"],
         },
     ]
+    producer_authority = {
+        "producer_layer": 20,
+        "cache_owner": "model.layers.20.self_attn",
+        "compress_ratio": 2,
+        "candidate_block_size": 2,
+    }
+    authority_leaves = {
+        f"l20:cache_runtime_authority/scratch_producers/candidate/{field}": {
+            "checkpoint": "l20",
+            "path": (f"cache_runtime_authority/scratch_producers/candidate/{field}"),
+            "family": (f"cache_runtime_authority/scratch_producers/candidate/{field}"),
+            "comparison": "exact",
+            "dtype": type(value).__qualname__,
+            "shape": None,
+            "value": value,
+        }
+        for field, value in producer_authority.items()
+    }
     return EvidenceRun(
         Path("rank-00/a-001.json"),
         {
@@ -1332,6 +1470,7 @@ def _scratch_run(
                 "shape": [values.shape[0]],
                 "payload_key": "replay_rows",
             },
+            **authority_leaves,
         },
     )
 
@@ -1359,15 +1498,32 @@ def _add_topk(run: EvidenceRun, values: torch.Tensor) -> None:
         "payload_key": "topk",
         "metadata": metadata,
     }
+    producer_authority = {
+        "producer_layer": 20,
+        "cache_owner": "model.layers.20.self_attn.indexer.k_cache",
+        "compress_ratio": 2,
+        "candidate_block_size": 2,
+    }
+    for field, value in producer_authority.items():
+        authority_path = f"cache_runtime_authority/scratch_producers/topk/{field}"
+        run.leaves[f"l20:{authority_path}"] = {
+            "checkpoint": "l20",
+            "path": authority_path,
+            "family": authority_path,
+            "comparison": "exact",
+            "dtype": type(value).__qualname__,
+            "shape": None,
+            "value": value,
+        }
 
 
 def test_scratch_comparator_canonicalizes_candidates_and_diagnoses_topk() -> None:
     left = _scratch_run(
-        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     right = _scratch_run(
-        torch.tensor([[2, 0, 1, -1]], dtype=torch.int32),
+        torch.tensor([[2, 0, 3, 1]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     assert torch.equal(
@@ -1401,14 +1557,14 @@ def test_scratch_comparator_canonicalizes_candidates_and_diagnoses_topk() -> Non
 
 def test_scratch_comparator_rejects_duplicate_or_out_of_range_ids() -> None:
     duplicate = _scratch_run(
-        torch.tensor([[1, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[1, 1, 2, 3]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     with pytest.raises(ValueError, match="duplicate scratch ID"):
         _validated_scratch_rows(duplicate, next(iter(duplicate.leaves.values())))
 
     out_of_range = _scratch_run(
-        torch.tensor([[1, 2, 8, -1]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, 8]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     with pytest.raises(ValueError, match="exceeds visibility"):
@@ -1417,7 +1573,7 @@ def test_scratch_comparator_rejects_duplicate_or_out_of_range_ids() -> None:
 
 def test_scratch_comparator_binds_boundary_and_cache_owner() -> None:
     run = _scratch_run(
-        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
         comparison="canonical_membership",
     )
     leaf = run.leaves["s1:registry/model:candidate_block_buffer"]
@@ -1427,14 +1583,36 @@ def test_scratch_comparator_binds_boundary_and_cache_owner() -> None:
 
     leaf["metadata"]["row_positions"] = [15]
     leaf["metadata"]["cache_owner"] = "model.layers.999.self_attn"
-    with pytest.raises(ValueError, match="cache ownership differs"):
+    with pytest.raises(ValueError, match="producer authority differs"):
+        _validated_scratch_rows(run, leaf)
+
+
+def test_scratch_comparator_binds_exact_configured_producer() -> None:
+    run = _scratch_run(
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    leaf = run.leaves["s1:registry/model:candidate_block_buffer"]
+    leaf["metadata"]["producer_layer"] = 21
+    with pytest.raises(ValueError, match="scratch producer authority differs"):
+        _validated_scratch_rows(run, leaf)
+
+
+def test_scratch_comparator_recomputes_candidate_cardinality() -> None:
+    run = _scratch_run(
+        torch.tensor([[-1, -1, -1, -1]], dtype=torch.int32),
+        comparison="canonical_membership",
+    )
+    leaf = run.leaves["s1:registry/model:candidate_block_buffer"]
+    leaf["metadata"]["expected_valid_counts"] = [0]
+    with pytest.raises(ValueError, match="scratch valid count differs"):
         _validated_scratch_rows(run, leaf)
 
 
 def test_scratch_comparator_rejects_replay_row_reassignment() -> None:
     run = _scratch_run(
         torch.tensor(
-            [[0, 1, 2, -1], [0, 1, 2, -1]],
+            [[0, 1, 2, 3], [0, 1, 2, 3]],
             dtype=torch.int32,
         ),
         comparison="canonical_membership",

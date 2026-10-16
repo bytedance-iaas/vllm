@@ -443,18 +443,40 @@ def _validate_view_layout(path: Path, view: dict[str, Any]) -> int:
         "plain_fp8": 512,
         "compressor_ring_fp32": 1024,
     }[view["record_format"]]
+    head_size = int(spec.get("head_size", -1))
+    head_size_v = int(spec.get("head_size_v", -1))
+    num_kv_heads = int(spec.get("num_kv_heads", -1))
+    num_heads = int(spec.get("num_heads", -1))
+    num_head_slots = spec.get("num_head_slots")
+    state_content_bytes = spec.get("state_content_bytes")
     if (
         spec.get("type") != view.get("spec_type")
         or spec.get("dtype") != dtype
         or int(spec.get("block_size", -1)) <= 0
         or int(spec.get("num_states", -1)) != shape[1]
         or int(spec.get("state_content_size_bytes", -1)) != record_bytes
-        or int(spec.get("head_size", -1)) != expected_head_size
-        or int(spec.get("head_size_v", -1)) != 0
-        or int(spec.get("num_kv_heads", -1)) != 1
-        or int(spec.get("num_heads", -1)) != 1
+        or head_size != expected_head_size
+        or head_size_v != 0
+        or num_kv_heads != 1
+        or num_heads != 1
     ):
         raise ValueError(f"{path}: logical spec/layout agreement differs")
+    if (
+        num_head_slots is not None
+        and (
+            not isinstance(num_head_slots, int)
+            or num_head_slots <= 0
+            or num_head_slots != num_heads
+        )
+    ) or (num_head_slots is None and num_heads != num_kv_heads):
+        raise ValueError(f"{path}: logical spec head-slot geometry differs")
+    derived_state_bytes = (
+        (head_size + head_size_v) * element_size
+        if state_content_bytes is None
+        else state_content_bytes
+    )
+    if not isinstance(derived_state_bytes, int) or derived_state_bytes != record_bytes:
+        raise ValueError(f"{path}: logical spec state-content geometry differs")
     if view.get("cache_kind") == "compressor_ring":
         if (
             view.get("spec_type") != "CircularBufferSpec"
@@ -585,20 +607,33 @@ def _validate_s0_authority(
 
     post_computed = leaves.get("post_sampling:registry/request:num_computed_tokens")
     post_total = leaves.get("post_sampling:registry/request:total_len")
+    sampled = leaves.get("post_sampling:decisions/num_sampled")
     rejected = leaves.get("post_sampling:decisions/num_rejected")
-    if post_computed is None or post_total is None or rejected is None:
+    skipped = leaves.get("post_sampling:decisions/skipped")
+    if (
+        post_computed is None
+        or post_total is None
+        or sampled is None
+        or rejected is None
+        or skipped is None
+    ):
         raise ValueError(f"{path}: S0 checkpoint binding is absent")
     computed_values = payload[post_computed["payload_key"]].reshape(-1).tolist()
     computed_slots = post_computed.get("metadata", {}).get("indices")
     total_values = payload[post_total["payload_key"]].reshape(-1).tolist()
     total_slots = post_total.get("metadata", {}).get("indices")
+    sampled_values = payload[sampled["payload_key"]].reshape(-1).tolist()
     rejected_values = payload[rejected["payload_key"]].reshape(-1).tolist()
+    skipped_value = skipped.get("value")
     if (
         not isinstance(computed_slots, list)
         or len(computed_slots) != len(computed_values)
         or not isinstance(total_slots, list)
         or len(total_slots) != len(total_values)
+        or len(sampled_values) != len(request_slots)
         or len(rejected_values) != len(request_slots)
+        or not isinstance(skipped_value, bool)
+        or any(int(value) < 0 for value in sampled_values)
     ):
         raise ValueError(f"{path}: S0 checkpoint binding cardinality differs")
     post_by_slot = dict(zip(map(int, computed_slots), map(int, computed_values)))
@@ -612,7 +647,10 @@ def _validate_s0_authority(
         )
         if post_by_slot.get(int(slot)) != expected_post:
             raise ValueError(f"{path}: S0 computed extent differs from GPU state")
-        if total_by_slot.get(int(slot)) != int(authority["total_lengths"][request]):
+        expected_total = int(authority["total_lengths"][request]) + (
+            0 if skipped_value else int(sampled_values[request])
+        )
+        if total_by_slot.get(int(slot)) != expected_total:
             raise ValueError(f"{path}: S0 total length differs from GPU state")
 
     replay_window = authority.get("replay_window")
@@ -644,6 +682,75 @@ def _validate_s0_authority(
     if view.get("s0_extents") != expected:
         raise ValueError(f"{path}: owner-specific S0 extent differs")
     return tuple(expected)
+
+
+def _validate_draft_writer_runtime_authority(
+    path: Path,
+    phase: str,
+    group_id: int,
+    source_rows: list[int],
+    slots: list[int],
+    leaves: dict[str, dict[str, Any]],
+    payload: dict[str, torch.Tensor],
+    logical_mapping: dict[str, Any],
+) -> None:
+    speculative_groups = logical_mapping["s0_authority"].get("speculative_group_ids")
+    if not isinstance(speculative_groups, list):
+        raise ValueError(f"{path}: draft writer group authority is absent")
+    if group_id not in speculative_groups:
+        if slots:
+            raise ValueError(
+                f"{path}: draft writer escaped its cache group for {phase}"
+            )
+        return
+    if phase == "draft-context":
+        runtime_slots_leaf = leaves.get(
+            f"s1:registry/speculator:context_slots:{group_id}"
+        )
+        if (
+            runtime_slots_leaf is None
+            or runtime_slots_leaf.get("payload_key") is None
+            or not isinstance(
+                runtime_slots_leaf.get("metadata", {}).get("indices"),
+                list,
+            )
+        ):
+            raise ValueError(f"{path}: draft-context runtime slots are absent")
+        runtime_indices = runtime_slots_leaf["metadata"]["indices"]
+        runtime_values = payload[runtime_slots_leaf["payload_key"]].reshape(-1).tolist()
+        runtime_by_row = dict(zip(map(int, runtime_indices), map(int, runtime_values)))
+        expected_slots = [runtime_by_row.get(int(row)) for row in source_rows]
+        if None in expected_slots or slots != expected_slots:
+            raise ValueError(
+                f"{path}: draft writer runtime authority differs for {phase}"
+            )
+        return
+    if phase != "draft-query":
+        raise ValueError(f"{path}: unsupported draft writer phase {phase}")
+    runtime_slots_leaf = leaves.get("s1:registry/speculator:query_slot_mappings")
+    runtime_indices = (
+        None
+        if runtime_slots_leaf is None
+        else runtime_slots_leaf.get("metadata", {}).get("indices")
+    )
+    runtime_values = (
+        None
+        if runtime_slots_leaf is None or runtime_slots_leaf.get("payload_key") is None
+        else payload[runtime_slots_leaf["payload_key"]]
+    )
+    if (
+        not isinstance(runtime_indices, list)
+        or group_id not in runtime_indices
+        or not isinstance(runtime_values, torch.Tensor)
+        or runtime_values.ndim != 2
+    ):
+        raise ValueError(f"{path}: draft-query runtime slots are absent")
+    runtime_row = runtime_indices.index(group_id)
+    expected_slots = (
+        runtime_values[runtime_row, : len(source_rows)].reshape(-1).tolist()
+    )
+    if slots != expected_slots:
+        raise ValueError(f"{path}: draft writer runtime authority differs for {phase}")
 
 
 def _validate_logical_payload(
@@ -729,7 +836,12 @@ def _validate_logical_payload(
     ratio = int(view["tokens_per_state"])
 
     restoration_entry = view.get("restoration_entry")
-    if not isinstance(restoration_entry, str) or not restoration_entry:
+    storage_id = view.get("storage_id")
+    if (
+        not isinstance(storage_id, str)
+        or not storage_id
+        or restoration_entry != f"kv-dst:{storage_id}"
+    ):
         raise ValueError(f"{path}: restoration identity is invalid for {root}")
     restoration_key = f"{checkpoint}:registry/{_safe_path_component(restoration_entry)}"
     restoration_leaf = leaves.get(restoration_key)
@@ -899,6 +1011,17 @@ def _validate_logical_payload(
                 raise ValueError(
                     f"{path}: target writer runtime authority differs for {phase}"
                 )
+        elif phase.startswith("draft-"):
+            _validate_draft_writer_runtime_authority(
+                path,
+                phase,
+                group_id,
+                source_rows,
+                slots,
+                leaves,
+                payload,
+                logical_mapping,
+            )
         source_leaf = (
             None if not isinstance(position_path, str) else leaves.get(position_path)
         )
@@ -1882,6 +2005,22 @@ def _validated_scratch_rows(
 
     cache_owner = metadata.get("cache_owner")
     producer_layer = metadata.get("producer_layer")
+    producer_key = (
+        "candidate" if leaf["comparison"] == "canonical_membership" else "topk"
+    )
+    producer_root = f"l20:cache_runtime_authority/scratch_producers/{producer_key}"
+    for field in (
+        "producer_layer",
+        "cache_owner",
+        "compress_ratio",
+        "candidate_block_size",
+    ):
+        authority_leaf = run.leaves.get(f"{producer_root}/{field}")
+        authority_value = (
+            None if authority_leaf is None else _exact_value(run, authority_leaf)
+        )
+        if authority_value != metadata.get(field):
+            raise ValueError(f"{leaf['path']}: scratch producer authority differs")
     matching_views = [
         view
         for view in views
@@ -1939,8 +2078,10 @@ def _validated_scratch_rows(
         )
         if bound != expected_bound:
             raise ValueError(f"{leaf['path']}: scratch visibility bound differs")
-        if leaf["comparison"] != "diagnostic_topk" and valid.numel() != expected_count:
-            raise ValueError(f"{leaf['path']}: scratch valid count differs")
+        if leaf["comparison"] != "diagnostic_topk":
+            derived_count = min(tensor.shape[1], expected_bound)
+            if expected_count != derived_count or valid.numel() != derived_count:
+                raise ValueError(f"{leaf['path']}: scratch valid count differs")
         if bound < 0 or bool((valid >= bound).any()):
             raise ValueError(f"{leaf['path']}: scratch ID exceeds visibility")
         if torch.unique(valid).numel() != valid.numel():
