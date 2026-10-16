@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
 )
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -156,6 +157,26 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
                 ),
             )
         ],
+    )
+
+
+def _make_encoder_only_scheduler(kv_role: str) -> MooncakeConnectorScheduler:
+    vllm_config = create_vllm_config(kv_connector="MooncakeConnector", kv_role=kv_role)
+    assert vllm_config.kv_transfer_config is not None
+    vllm_config.kv_transfer_config.dsv41_encoder_only_prefill = True
+    return MooncakeConnectorScheduler(
+        vllm_config,
+        f"test-{kv_role}",
+        _make_test_kv_cache_config(),
+    )
+
+
+def _image_feature(offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier=f"image-{offset}-{length}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
     )
 
 
@@ -811,6 +832,75 @@ def test_mooncake_finished_count_uses_canonical_context_workers(
     )
 
     assert connector.get_finished_count() == expected
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_encoder_only_multimodal_stop_is_shared_and_text_is_unchanged():
+    producer = _make_encoder_only_scheduler("kv_producer")
+    consumer = _make_encoder_only_scheduler("kv_consumer")
+
+    p_request = create_request(num_tokens=12, do_remote_decode=True)
+    p_request.mm_features = [_image_feature(offset=8, length=4)]
+    p_request.prompt_embeds = torch.arange(24, dtype=torch.float32).view(12, 2)
+    p_request.prompt_is_token_ids = [True] * 12
+
+    producer.on_new_request(p_request)
+
+    assert p_request.num_prompt_tokens == 8
+    assert len(p_request.prompt_token_ids) == 8
+    assert p_request.prompt_embeds.shape[0] == 8
+    assert len(p_request.prompt_is_token_ids) == 8
+    assert len(p_request._all_token_ids) == 8
+    assert p_request.mm_features == []
+    producer.on_new_request(p_request)
+    assert p_request.num_prompt_tokens == 8
+
+    d_request = create_request(num_tokens=12, do_remote_prefill=True)
+    d_request.mm_features = [_image_feature(offset=8, length=4)]
+    assert consumer.get_num_new_matched_tokens(d_request, 0) == (8, True)
+    assert consumer.get_num_new_matched_tokens(d_request, 3) == (5, True)
+    assert consumer.get_num_new_matched_tokens(d_request, 8) == (0, False)
+    assert d_request.num_prompt_tokens == 12
+
+    p_text = create_request(num_tokens=12, do_remote_decode=True)
+    producer.on_new_request(p_text)
+    assert p_text.num_prompt_tokens == 12
+
+    d_text = create_request(num_tokens=12, do_remote_prefill=True)
+    assert consumer.get_num_new_matched_tokens(d_text, 0) == (12, True)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_encoder_only_multimodal_zero_transfer_keeps_cleanup_notification():
+    producer = _make_encoder_only_scheduler("kv_producer")
+    consumer = _make_encoder_only_scheduler("kv_consumer")
+
+    p_request = create_request(num_tokens=12, do_remote_decode=True)
+    p_request.mm_features = [_image_feature(offset=0, length=12)]
+    producer.on_new_request(p_request)
+    assert p_request.num_prompt_tokens == 12
+
+    d_request = create_request(num_tokens=12, do_remote_prefill=True)
+    d_request.mm_features = [_image_feature(offset=0, length=12)]
+    assert consumer.get_num_new_matched_tokens(d_request, 0) == (0, False)
+    assert d_request.kv_transfer_params is not None
+    d_request.kv_transfer_params.update(
+        remote_bootstrap_addr="127.0.0.1:8998",
+        transfer_id="xfer-zero",
+    )
+
+    blocks = MagicMock()
+    consumer.update_state_after_alloc(d_request, blocks, 0)
+
+    queued_request, block_ids, awaiting_kvs = consumer._reqs_need_recv[
+        d_request.request_id
+    ]
+    assert queued_request is d_request
+    assert block_ids == []
+    assert not awaiting_kvs
+    blocks.get_unhashed_block_ids_all_groups.assert_not_called()
 
 
 def test_scheduler_request_finished():

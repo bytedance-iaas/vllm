@@ -112,11 +112,10 @@ def test_validate_config_rejects_generic_multimodal_pcp():
 
 
 @pytest.mark.skip_global_cleanup
-def test_dsv41_pcp_rejects_scheduled_multimodal_inputs():
-    with pytest.raises(NotImplementedError, match="text-only"):
-        PCPManager.validate_scheduler_output(
-            SimpleNamespace(scheduled_encoder_inputs={"req": [object()]})
-        )
+def test_dsv41_pcp_accepts_scheduled_multimodal_inputs():
+    PCPManager.validate_scheduler_output(
+        SimpleNamespace(scheduled_encoder_inputs={"req": [object()]})
+    )
 
     PCPManager.validate_scheduler_output(SimpleNamespace(scheduled_encoder_inputs={}))
 
