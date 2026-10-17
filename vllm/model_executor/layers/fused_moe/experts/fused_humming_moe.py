@@ -190,6 +190,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             gemm_type=self.humming_gemm_type(),
             device=self.locks.device,
         )
+        self._maybe_apply_dsv41_w2_h20_tuning()
         self.compute_config_strs = {
             name: json.dumps(config) for name, config in self.compute_configs.items()
         }
@@ -197,6 +198,88 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
+
+    def _maybe_apply_dsv41_w2_h20_tuning(self) -> None:
+        if not envs.VLLM_HUMMING_DSV41_W2_N128_TUNING:
+            return
+
+        from vllm.utils.humming import GemmType as HummingGemmType
+        from vllm.utils.humming import dtypes
+
+        config = self.humming_configs["w2"]
+        device_index = self.locks.device.index
+        assert device_index is not None
+        device_name = current_platform.get_device_name(device_index).upper()
+        expected = (
+            self.humming_gemm_type() == HummingGemmType.GROUPED_CONTIGUOUS
+            and not self.moe_config.moe_parallel_config.use_ep
+            and "H20" in device_name
+            and "H200" not in device_name
+            and config.sm_version == 90
+            and config.num_experts == 384
+            and (config.shape_n, config.shape_k) == (5120, 640)
+            and (config.pad_shape_n, config.pad_shape_k) == (0, 64)
+            and config.a_dtype == dtypes.bfloat16
+            and config.b_dtype == dtypes.float4e2m1
+            and config.c_dtype == dtypes.bfloat16
+            and config.bs_dtype == dtypes.float8e8m0
+            and config.as_dtype is None
+            and config.weight_scale_type.value == "group"
+            and config.weight_scale_2_type.value == "none"
+            and config.weight_scale_group_size == 32
+            and config.weight_scale_group_size_n == 0
+            and not config.input_quant_mode.should_quantize
+            and not config.has_zero_point
+            and not config.is_fp_zero_point
+            and not config.has_bias
+            and config.mma_type.value == "wgmma"
+            and not config.use_int_weight_scale
+            and not config.use_fused_e8m0_scale
+            and not config.use_packed_k_layout
+            and not envs.VLLM_HUMMING_USE_F16_ACCUM
+            and not envs.VLLM_BATCH_INVARIANT
+        )
+        if not expected:
+            raise RuntimeError(
+                "VLLM_HUMMING_DSV41_W2_N128_TUNING requires the validated "
+                "H20 DSV4.1 W2 BF16 grouped-contiguous configuration."
+            )
+
+        baseline = {
+            "block_shape": (64, 256, 64),
+            "warp_shape": (64, 64, 64),
+            "use_stream_k": False,
+            "use_f16_accum": False,
+            "num_sms": 78,
+            "num_stages": 4,
+            "num_ctas_per_sm": 2,
+        }
+        candidate = baseline | {
+            "block_shape": (64, 128, 64),
+            "warp_shape": (64, 32, 64),
+            "num_ctas_per_sm": 3,
+        }
+        replaced = 0
+        intervals = []
+        for lower, upper, tuning in self.w2_tuning_config:
+            if lower == 33152 and upper == 1 << 30:
+                if tuning != baseline:
+                    raise RuntimeError(
+                        "DSV4.1 W2 large-M heuristic changed; refusing to "
+                        "apply a stale tuning override."
+                    )
+                tuning = candidate
+                replaced += 1
+            intervals.append((lower, upper, tuning))
+        if replaced != 1:
+            raise RuntimeError(
+                "Expected exactly one DSV4.1 W2 large-M tuning interval, "
+                f"found {replaced}."
+            )
+        self.w2_tuning_config = intervals
+        logger.info_once(
+            "Enabled validated H20 DSV4.1 W2 N128 grouped tuning for M > 33152"
+        )
 
     def _use_h20_mxfp4_fp8_grouped_m_major(
         self,
