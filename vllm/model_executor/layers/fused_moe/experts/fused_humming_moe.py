@@ -191,6 +191,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             device=self.locks.device,
         )
         self._maybe_apply_dsv41_w2_h20_tuning()
+        self._maybe_apply_dsv41_w13_split_issue_wait()
         self.compute_config_strs = {
             name: json.dumps(config) for name, config in self.compute_configs.items()
         }
@@ -280,6 +281,85 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         logger.info_once(
             "Enabled validated H20 DSV4.1 W2 N128 grouped tuning for M > 33152"
         )
+
+    def _maybe_apply_dsv41_w13_split_issue_wait(self) -> None:
+        if not envs.VLLM_HUMMING_DSV41_W13_SPLIT_ISSUE_WAIT:
+            return
+
+        from vllm.utils.humming import GemmType as HummingGemmType
+        from vllm.utils.humming import dtypes
+
+        config = self.humming_configs["w13"]
+        compute_config = self.compute_configs["w13"]
+        device_index = self.locks.device.index
+        assert device_index is not None
+        device_name = current_platform.get_device_name(device_index).upper()
+        expected = (
+            self.humming_gemm_type() == HummingGemmType.GROUPED_CONTIGUOUS
+            and not self.moe_config.moe_parallel_config.use_ep
+            and "H20" in device_name
+            and "H200" not in device_name
+            and config.sm_version == 90
+            and config.num_experts == 384
+            and (config.shape_n, config.shape_k) == (1280, 5120)
+            and (config.pad_shape_n, config.pad_shape_k) == (128, 0)
+            and config.a_dtype == dtypes.int8
+            and config.b_dtype == dtypes.float4e2m1
+            and config.c_dtype == dtypes.bfloat16
+            and config.bs_dtype == dtypes.float8e8m0
+            and config.as_dtype == dtypes.float32
+            and config.input_scale_group_size == 128
+            and config.input_quant_mode.value == "dynamic_group"
+            and config.weight_scale_type.value == "group"
+            and config.weight_scale_2_type.value == "channel"
+            and config.weight_scale_group_size == 32
+            and config.weight_scale_group_size_n == 0
+            and not config.has_zero_point
+            and not config.is_fp_zero_point
+            and not config.has_bias
+            and config.mma_type.value == "wgmma"
+            and not config.use_int_weight_scale
+            and config.use_fused_e8m0_scale
+            and config.use_packed_k_layout
+            and not compute_config["use_f16_accum"]
+            and not compute_config["use_batch_invariant"]
+            and not compute_config["use_m_major_input_scale"]
+        )
+        if not expected:
+            raise RuntimeError(
+                "VLLM_HUMMING_DSV41_W13_SPLIT_ISSUE_WAIT requires the "
+                "validated H20 DSV4.1 W13 INT8 grouped-contiguous configuration."
+            )
+
+        baseline = {
+            "block_shape": (64, 128, 128),
+            "warp_shape": (64, 32, 128),
+            "use_stream_k": True,
+            "use_f16_accum": False,
+            "num_sms": 78,
+            "num_stages": 4,
+            "num_ctas_per_sm": 2,
+        }
+        candidate = baseline | {"wgmma_split_issue_wait": True}
+        replaced = 0
+        intervals = []
+        for lower, upper, tuning in self.w13_tuning_config:
+            if lower == 33152 and upper == 1 << 30:
+                if tuning != baseline:
+                    raise RuntimeError(
+                        "DSV4.1 W13 large-M heuristic changed; refusing to "
+                        "apply a stale split issue/wait override."
+                    )
+                tuning = candidate
+                replaced += 1
+            intervals.append((lower, upper, tuning))
+        if replaced != 1:
+            raise RuntimeError(
+                "Expected exactly one DSV4.1 W13 large-M tuning interval, "
+                f"found {replaced}."
+            )
+        self.w13_tuning_config = intervals
+        logger.info_once("Enabled H20 DSV4.1 W13 split issue/wait tuning for M > 33152")
 
     def _use_h20_mxfp4_fp8_grouped_m_major(
         self,

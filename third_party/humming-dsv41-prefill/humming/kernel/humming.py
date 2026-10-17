@@ -440,6 +440,16 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
     def check_config(self):
         assert self.num_threads <= 1024
+        if self.wgmma_split_issue_wait:
+            assert self.mma_type == MmaType.WGMMA, (
+                "wgmma_split_issue_wait requires WGMMA"
+            )
+            assert self.use_packed_k_layout, (
+                "wgmma_split_issue_wait requires packed-K weights"
+            )
+            assert self.warp_shape[1] > 16, (
+                "wgmma_split_issue_wait requires at least two fragments"
+            )
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         if self.mma_type != MmaType.UMMA:

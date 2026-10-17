@@ -136,7 +136,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if (remaining_iters == 1) producer.load_channel();
       PRAGMA_UNROLL
       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
-        if constexpr (Ctx::kWarpIters == 1) {
+        if constexpr (TuningConfig::kWgmmaSplitIssueWait) {
+          mma.issue(stage_id, warp_iter_id);
+        } else if constexpr (Ctx::kWarpIters == 1) {
           mma.run(stage_id, warp_iter_id);
           __syncthreads();
           if constexpr (kNumStages > 2) {
@@ -147,7 +149,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           consumer.wait_stage((stage_id + 1) % kNumStages);
         }
         s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
-        if constexpr (Ctx::kWarpIters > 1) mma.run(stage_id, warp_iter_id);
+        if constexpr (TuningConfig::kWgmmaSplitIssueWait) {
+          mma.wait_and_promote(stage_id, warp_iter_id);
+        } else if constexpr (Ctx::kWarpIters > 1) {
+          mma.run(stage_id, warp_iter_id);
+        }
         if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
           __syncthreads();
           if constexpr (kNumStages > 2) {

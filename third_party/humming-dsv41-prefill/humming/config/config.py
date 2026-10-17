@@ -442,6 +442,7 @@ class TuningConfig(BaseHummingConfig):
     warp_shape: tuple[int, int, int]
 
     use_stream_k: bool = True
+    wgmma_split_issue_wait: bool = False
 
     num_stages: int = 2
     num_ctas_per_sm: int = 1
@@ -480,6 +481,7 @@ class TuningConfig(BaseHummingConfig):
     )
 
     _name_map = {
+        "wgmma_split_issue_wait": "kWgmmaSplitIssueWait",
         "use_mbarrier": "kUseMBarrier",
         "use_tma_as": "kUseTmaAS",
         "use_tma_as2": "kUseTmaAS2",
