@@ -135,7 +135,7 @@ else()
       BINARY_DIR "${_deepgemm_bin}"
       GIT_REPOSITORY "${_deepgemm_git_repo}"
       GIT_TAG "${_deepgemm_git_commit}"
-      GIT_SUBMODULES "third-party/cutlass" "third-party/deep_jit"
+      # Follow the exact pin's .gitmodules; retained and CI pins differ.
       GIT_PROGRESS TRUE
     )
   endif()
