@@ -24,6 +24,7 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -31,6 +32,31 @@ EngineId = str
 # block ids as returned by the hybrid KV cache manager. list[list[int]] are allow
 # mutability and are for connector internal use only.
 BlockIds = tuple[list[int], ...] | list[list[int]]
+
+
+def get_prefill_stop(request: "Request", backoff: int) -> int:
+    """Return the shared P/D stop without splitting a multimodal item."""
+    stop = max(request.num_prompt_tokens - backoff, 0)
+    for feature in request.mm_features:
+        position = feature.mm_position
+        if position.offset < stop < position.offset + position.length:
+            stop = position.offset
+    return max(stop, 0)
+
+
+def truncate_prompt_for_prefill(request: "Request", stop: int) -> None:
+    """Drop the producer prompt suffix and its multimodal features together."""
+    if request.prompt_token_ids is not None:
+        request.prompt_token_ids = request.prompt_token_ids[:stop]
+    if request.prompt_embeds is not None:
+        request.prompt_embeds = request.prompt_embeds[:stop]
+    if request.prompt_is_token_ids is not None:
+        request.prompt_is_token_ids = request.prompt_is_token_ids[:stop]
+    del request._all_token_ids[stop:]
+    request.num_prompt_tokens = stop
+    request.mm_features = [
+        feature for feature in request.mm_features if feature.mm_position.offset < stop
+    ]
 
 
 def get_kv_connector_cache_layout(vllm_config: VllmConfig | None = None):

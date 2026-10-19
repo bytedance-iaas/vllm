@@ -92,7 +92,7 @@ def test_cache_only_request_validation_is_request_scoped(
     core.scheduler.add_request.assert_called_once_with(request)
 
 
-def test_cache_only_request_rejects_multimodal():
+def test_cache_only_request_accepts_multimodal():
     params = SamplingParams(
         max_tokens=1,
         extra_args={
@@ -103,8 +103,7 @@ def test_cache_only_request_rejects_multimodal():
             }
         },
     )
-    with pytest.raises(VLLMValidationError, match="text-only"):
-        validate_dsv41_cache_only_request(params, None, has_mm_features=True)
+    validate_dsv41_cache_only_request(params, None, has_mm_features=True)
 
 
 def test_frontend_rejects_bad_p_request_before_engine_admission():

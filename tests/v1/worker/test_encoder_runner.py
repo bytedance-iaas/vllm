@@ -241,6 +241,45 @@ def test_multi_request_batch_gathers_per_request(draft_lookahead):
     assert int(is_mm_embed.sum()) == (14 if draft_lookahead else 16)
 
 
+def test_empty_pcp_segment_inside_image_is_skipped():
+    """An empty rank-local PCP row must not form a zero-length image slice."""
+    image = _feature("image", offset=64, length=192)
+    runner = _make_runner([image], cached=[image])
+
+    mm_embeds, is_mm_embed = runner.gather_mm_embeddings(
+        req_ids=["req0", "req0"],
+        total_num_scheduled_tokens=64,
+        num_scheduled_tokens=np.array([64, 0]),
+        query_start_loc=np.array([0, 64]),
+        prefill_lens=np.array([1000, 1000]),
+        num_computed_tokens=np.array([0, 128]),
+    )
+
+    assert mm_embeds == []
+    assert not is_mm_embed.any()
+
+
+def test_pcp_segments_gather_exact_image_slices_with_empty_rank():
+    """Disjoint PCP segments preserve embedding values and local mask order."""
+    image = _feature("image", offset=32, length=96)
+    runner = _make_runner([image], cached=[image])
+    full = runner.encoder_cache.encoder_outputs["image"]
+
+    mm_embeds, is_mm_embed = runner.gather_mm_embeddings(
+        req_ids=["req0", "req0", "req0"],
+        total_num_scheduled_tokens=64,
+        num_scheduled_tokens=np.array([32, 32, 0]),
+        query_start_loc=np.array([0, 32, 64]),
+        prefill_lens=np.array([1000, 1000, 1000]),
+        num_computed_tokens=np.array([32, 96, 64]),
+    )
+
+    assert len(mm_embeds) == 2
+    torch.testing.assert_close(mm_embeds[0], full[:32])
+    torch.testing.assert_close(mm_embeds[1], full[64:96])
+    assert is_mm_embed.tolist() == [True] * 64
+
+
 def test_gather_preserves_mixed_modalities():
     """Modalities must be attached on tensors in gather order."""
     video = MultiModalFeatureSpec(

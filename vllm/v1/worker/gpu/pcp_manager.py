@@ -213,10 +213,7 @@ class PCPManager:
 
     @staticmethod
     def validate_scheduler_output(scheduler_output: "SchedulerOutput") -> None:
-        if scheduler_output.scheduled_encoder_inputs:
-            raise NotImplementedError(
-                "DeepSeek-V4.1 PP2/PCP4 Prefill currently supports text-only requests."
-            )
+        return None
 
     @staticmethod
     def _reorder_segments(

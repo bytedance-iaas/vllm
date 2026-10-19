@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
 )
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -156,6 +157,26 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
                 ),
             )
         ],
+    )
+
+
+def _make_encoder_only_scheduler(kv_role: str) -> MooncakeConnectorScheduler:
+    vllm_config = create_vllm_config(kv_connector="MooncakeConnector", kv_role=kv_role)
+    assert vllm_config.kv_transfer_config is not None
+    vllm_config.kv_transfer_config.dsv41_encoder_only_prefill = True
+    return MooncakeConnectorScheduler(
+        vllm_config,
+        f"test-{kv_role}",
+        _make_test_kv_cache_config(),
+    )
+
+
+def _image_feature(offset: int, length: int) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=None,
+        modality="image",
+        identifier=f"image-{offset}-{length}",
+        mm_position=PlaceholderRange(offset=offset, length=length),
     )
 
 
@@ -813,6 +834,102 @@ def test_mooncake_finished_count_uses_canonical_context_workers(
     assert connector.get_finished_count() == expected
 
 
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_encoder_only_multimodal_stop_is_shared_and_text_is_unchanged():
+    producer = _make_encoder_only_scheduler("kv_producer")
+    consumer = _make_encoder_only_scheduler("kv_consumer")
+
+    p_request = create_request(num_tokens=12, do_remote_decode=True)
+    p_request.mm_features = [_image_feature(offset=8, length=4)]
+    p_request.prompt_embeds = torch.arange(24, dtype=torch.float32).view(12, 2)
+    p_request.prompt_is_token_ids = [True] * 12
+
+    producer.on_new_request(p_request)
+
+    assert p_request.num_prompt_tokens == 8
+    assert len(p_request.prompt_token_ids) == 8
+    assert p_request.prompt_embeds.shape[0] == 8
+    assert len(p_request.prompt_is_token_ids) == 8
+    assert len(p_request._all_token_ids) == 8
+    assert p_request.mm_features == []
+    producer.on_new_request(p_request)
+    assert p_request.num_prompt_tokens == 8
+
+    d_request = create_request(num_tokens=12, do_remote_prefill=True)
+    d_request.mm_features = [_image_feature(offset=8, length=4)]
+    assert consumer.get_num_new_matched_tokens(d_request, 0) == (8, True)
+    assert consumer.get_num_new_matched_tokens(d_request, 3) == (5, True)
+    assert consumer.get_num_new_matched_tokens(d_request, 8) == (0, False)
+    assert d_request.num_prompt_tokens == 12
+
+    p_text = create_request(num_tokens=12, do_remote_decode=True)
+    producer.on_new_request(p_text)
+    assert p_text.num_prompt_tokens == 12
+
+    d_text = create_request(num_tokens=12, do_remote_prefill=True)
+    assert consumer.get_num_new_matched_tokens(d_text, 0) == (12, True)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_encoder_only_multimodal_large_prefix_and_multiple_images():
+    producer = _make_encoder_only_scheduler("kv_producer")
+    consumer = _make_encoder_only_scheduler("kv_consumer")
+    features = [
+        _image_feature(offset=32, length=64),
+        _image_feature(offset=220, length=80),
+    ]
+
+    p_request = create_request(num_tokens=300, do_remote_decode=True)
+    p_request.mm_features = features.copy()
+    producer.on_new_request(p_request)
+
+    assert p_request.num_prompt_tokens == 220
+    assert p_request.mm_features == [features[0]]
+    producer.on_new_request(p_request)
+    assert p_request.num_prompt_tokens == 220
+
+    d_request = create_request(num_tokens=300, do_remote_prefill=True)
+    d_request.mm_features = features.copy()
+    assert consumer.get_num_new_matched_tokens(d_request, 64) == (156, True)
+    assert consumer.get_num_new_matched_tokens(d_request, 220) == (0, False)
+    assert consumer.get_num_new_matched_tokens(d_request, 250) == (0, False)
+    assert d_request.mm_features == features
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_encoder_only_multimodal_zero_transfer_keeps_cleanup_notification():
+    producer = _make_encoder_only_scheduler("kv_producer")
+    consumer = _make_encoder_only_scheduler("kv_consumer")
+
+    p_request = create_request(num_tokens=12, do_remote_decode=True)
+    p_request.mm_features = [_image_feature(offset=0, length=12)]
+    producer.on_new_request(p_request)
+    assert p_request.num_prompt_tokens == 12
+
+    d_request = create_request(num_tokens=12, do_remote_prefill=True)
+    d_request.mm_features = [_image_feature(offset=0, length=12)]
+    assert consumer.get_num_new_matched_tokens(d_request, 0) == (0, False)
+    assert d_request.kv_transfer_params is not None
+    d_request.kv_transfer_params.update(
+        remote_bootstrap_addr="127.0.0.1:8998",
+        transfer_id="xfer-zero",
+    )
+
+    blocks = MagicMock()
+    consumer.update_state_after_alloc(d_request, blocks, 0)
+
+    queued_request, block_ids, awaiting_kvs = consumer._reqs_need_recv[
+        d_request.request_id
+    ]
+    assert queued_request is d_request
+    assert block_ids == []
+    assert not awaiting_kvs
+    blocks.get_unhashed_block_ids_all_groups.assert_not_called()
+
+
 def test_scheduler_request_finished():
     """Tests the scheduler-side logic when a request finishes.
 
@@ -1227,6 +1344,84 @@ async def test_heterogeneous_pp_waits_for_consumer_without_shared_layers():
                         set() if pp_rank == 0 else {"p-req"}
                     )
                 send.assert_called_once_with("consumer:1234", [0x1100], [0x2200], [256])
+        finally:
+            worker.shutdown()
+            worker.is_kv_consumer = True
+
+
+@pytest.mark.asyncio
+async def test_notification_only_pull_waits_for_prefill_and_releases_sender():
+    """A zero-payload pull still acknowledges and releases producer blocks."""
+    config = create_vllm_config(kv_connector="MooncakeConnector", kv_role="kv_producer")
+    with (
+        set_current_vllm_config(config),
+        patch_worker_dependencies(),
+        patch.object(MooncakeConnectorWorker, "_sync_block_size_with_kernel"),
+    ):
+        worker = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+        try:
+            worker.kv_caches_base_addr = [0x1000]
+            worker.block_len_per_layer = [256]
+            worker.kv_block_len_per_layer = [256]
+            worker.registered_layer_names = ["model.layers.0.self_attn"]
+            worker.registered_layer_indices = [0]
+            send_meta = SendBlockMeta(
+                p_req_id="p-zero",
+                transfer_id="transfer-zero",
+                local_block_ids=[[1]],
+                ready=asyncio.Event(),
+            )
+            worker.reqs_need_send[send_meta.transfer_id] = send_meta
+            sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())
+            metadata = MooncakeXferMetadata(
+                remote_hostname="consumer",
+                remote_port=1234,
+                remote_tp_size=1,
+                remote_tp_rank=0,
+                req_blocks={"d-zero": (send_meta.transfer_id, [])},
+                kv_caches_base_addr=[0x2000],
+                block_lens=[256],
+                kv_block_lens=[256],
+                registered_layer_names=["model.layers.0.self_attn"],
+                registered_layer_indices=[0],
+            )
+            with (
+                patch.object(worker, "sender_loop", asyncio.get_running_loop()),
+                patch.object(worker, "_send_blocks", return_value=0) as send,
+            ):
+                task = asyncio.create_task(
+                    worker.send_kv_to_decode(b"consumer", sock, metadata)
+                )
+                await asyncio.sleep(0)
+                assert not task.done()
+                send_meta.ready.set()
+                await task
+
+            send.assert_not_called()
+            response = worker._xfer_resp_decoder.decode(
+                sock.send_multipart.call_args.args[0][1]
+            )
+            assert response.ok_reqs == ["d-zero"]
+            assert send_meta.transfer_id not in worker.reqs_need_send
+            assert worker.finished_sending_reqs == {"p-zero"}
+
+            consumer = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+            consumer.shutdown = MagicMock()
+            consumer.finished_recving_reqs = set()
+            pull_meta = PullReqMeta(
+                d_req_id="d-zero",
+                transfer_id=send_meta.transfer_id,
+                local_block_ids=[],
+                remote_engine_id="producer",
+                remote_bootstrap_addr="http://producer",
+                awaiting_kvs=False,
+                pull_tasks_count=1,
+            )
+            consumer.process_pulling_result(response, {"d-zero": pull_meta})
+            assert pull_meta.pull_tasks_count == 0
+            assert not consumer.finished_recving_reqs
         finally:
             worker.shutdown()
             worker.is_kv_consumer = True
