@@ -150,11 +150,13 @@ FLASHINFER_MOE_EP_BACKENDS = frozenset(
     }
 )
 
+# Backends using vLLM's native MegaMoE runtime. They consume int64 token IDs;
+# FlashInfer MegaMoE keeps the runner's int32 IDs.
+NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"})
+
 # Backends that run a mega-MoE model path (fused expert module plus
-# prepare_megamoe routing): vLLM's native deep_gemm path, which any model
-# with a mega-MoE module may use (DeepSeek-V4, Kimi K3), plus the flashinfer
-# moe_ep variants.
-MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"}) | FLASHINFER_MOE_EP_BACKENDS
+# prepare_megamoe routing): native DeepGEMM plus FlashInfer moe_ep variants.
+MEGA_MOE_BACKENDS = NATIVE_MEGA_MOE_BACKENDS | FLASHINFER_MOE_EP_BACKENDS
 
 SparseIndexerTopkBackend = Literal[
     "auto",
