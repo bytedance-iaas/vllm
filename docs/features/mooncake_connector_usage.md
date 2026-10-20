@@ -56,6 +56,10 @@ Now you can send requests to the proxy server through port 8000.
     - Default: 480
     - If a request is aborted and the decoder has not yet notified the prefiller, the prefill instance will release its KV-cache blocks after this timeout to avoid holding them indefinitely.
 
+- `VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT`: Timeout (in seconds) for unclaimed transfer placeholders on the prefiller. (Optional)
+    - Default: 60
+    - When the decoder sends a transfer request for an ID that the prefiller has not yet registered, the prefiller discards the placeholder after this timeout and releases the sender task.
+
 ## KV Transfer Config
 
 ### KV Role Options
