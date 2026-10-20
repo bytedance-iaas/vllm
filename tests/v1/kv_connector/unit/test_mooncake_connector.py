@@ -1349,6 +1349,376 @@ async def test_heterogeneous_pp_waits_for_consumer_without_shared_layers():
             worker.is_kv_consumer = True
 
 
+@pytest.fixture
+def readiness_sender(monkeypatch):
+    """Use real readiness/descriptor logic with only the data plane stubbed."""
+    import msgspec
+
+    monkeypatch.setenv("VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT", "60")
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker.is_sender_worker = True
+    worker.vllm_config = SimpleNamespace(is_dsv41_encoder_only_prefill=False)
+    worker.pp_size = worker.tp_size = 1
+    worker.tp_rank = 0
+    worker.use_mla = True
+    worker.kv_cache_config = _make_test_kv_cache_config()
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(
+        handshake_target_ranks=lambda size: [0], local_replicates_kv_cache=False
+    )
+    worker.reqs_need_send = {}
+    worker.finished_sending_reqs = set()
+    worker.num_sender_tasks = 2
+    worker.max_pending_transfers = 128
+    worker._sender_semaphore = asyncio.Semaphore(worker.num_sender_tasks)
+    worker.kv_caches_base_addr = [0x1000]
+    worker.block_len_per_layer = worker.kv_block_len_per_layer = [256]
+    worker.registered_layer_names = ["model.layers.0.self_attn"]
+    worker.registered_layer_indices = worker.registered_group_indices = [0]
+    worker.sender_loop = SimpleNamespace(run_in_executor=AsyncMock(return_value=0))
+    worker._sender_executor = MagicMock()
+    worker._send_blocks = MagicMock(return_value=0)
+    worker._encoder = msgspec.msgpack.Encoder()
+    worker._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
+    worker._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
+    return worker
+
+
+def _readiness_pull(req_id):
+    return MooncakeXferMetadata(
+        remote_hostname="consumer",
+        remote_port=1234,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={req_id: (req_id, [[2]])},
+        kv_caches_base_addr=[0x2000],
+        block_lens=[256],
+        kv_block_lens=[256],
+        registered_layer_names=["model.layers.0.self_attn"],
+        registered_layer_indices=[0],
+    )
+
+
+async def _wait_for_sender(predicate):
+    async def poll():
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(poll(), timeout=1)
+
+
+@contextlib.asynccontextmanager
+async def _readiness_listener(worker):
+    incoming: asyncio.Queue[tuple[bytes, bytes]] = asyncio.Queue()
+    sock = AsyncMock(
+        spec=zmq.asyncio.Socket, send_multipart=AsyncMock(), recv_multipart=AsyncMock()
+    )
+    sock.bind_to_random_port = MagicMock(return_value=1234)
+    sock.recv_multipart.side_effect = incoming.get
+    worker.async_zmq_ctx = MagicMock()
+    worker.async_zmq_ctx.socket.return_value = sock
+    worker.hostname = "127.0.0.1"
+    worker.register_worker_with_bootstrap = AsyncMock()
+    ready = MagicMock()
+    task = asyncio.create_task(worker._mooncake_sender_listener(ready))
+    try:
+        await _wait_for_sender(lambda: ready.set.called)
+        yield incoming, sock
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _ready_producer(worker, req_id):
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_to_send[req_id] = (req_id, [])
+    await worker.record_send_reqs(metadata)
+    metadata.reqs_to_send[req_id] = (req_id, [[1]])
+    await worker.record_send_reqs(metadata)
+
+
+@pytest.mark.asyncio
+async def test_ownerless_waiters_do_not_block_ready_transfers(readiness_sender):
+    """More missing P requests than send slots must not delay ready KV."""
+    worker = readiness_sender
+    async with _readiness_listener(worker) as (incoming, sock):
+        for i in range(6):
+            incoming.put_nowait(
+                (b"missing", worker._encoder.encode(_readiness_pull(str(i))))
+            )
+        await _wait_for_sender(lambda: len(worker.reqs_need_send) == 6)
+        await _ready_producer(worker, "fresh")
+        incoming.put_nowait(
+            (b"fresh", worker._encoder.encode(_readiness_pull("fresh")))
+        )
+        await _wait_for_sender(lambda: sock.send_multipart.called)
+        identity, encoded = sock.send_multipart.call_args.args[0]
+        response = worker._xfer_resp_decoder.decode(encoded)
+        assert identity == b"fresh"
+        assert response.ok_reqs == ["fresh"]
+        assert response.err_reqs is None
+        assert worker.finished_sending_reqs == {"fresh"}
+        assert len(worker.reqs_need_send) == 6
+        worker.sender_loop.run_in_executor.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pending_transfer_limit_fails_fast_and_recovers(readiness_sender):
+    """Bound readiness tasks and admit fresh work after abandoned work exits."""
+    worker = readiness_sender
+    worker.max_pending_transfers = 2
+    async with _readiness_listener(worker) as (incoming, sock):
+        for req_id in ("old0", "old1", "overflow"):
+            incoming.put_nowait(
+                (req_id.encode(), worker._encoder.encode(_readiness_pull(req_id)))
+            )
+        await _wait_for_sender(lambda: sock.send_multipart.called)
+        identity, encoded = sock.send_multipart.call_args.args[0]
+        response = worker._xfer_resp_decoder.decode(encoded)
+        assert identity == b"overflow"
+        assert response.status == MooncakeXferResponseStatus.ERROR
+        assert "too many pending transfers" in response.err_msg
+        assert "overflow" not in worker.reqs_need_send
+        await _wait_for_sender(lambda: len(worker.reqs_need_send) == 2)
+        metadata = MooncakeConnectorMetadata()
+        metadata.reqs_not_processed.update(("old0", "old1"))
+        await worker.record_send_reqs(metadata)
+        await _wait_for_sender(lambda: sock.send_multipart.await_count == 3)
+        await _wait_for_sender(lambda: not worker._pending_sender_tasks)
+        await _ready_producer(worker, "fresh")
+        incoming.put_nowait(
+            (b"fresh", worker._encoder.encode(_readiness_pull("fresh")))
+        )
+        await _wait_for_sender(lambda: sock.send_multipart.await_count == 4)
+        response = worker._xfer_resp_decoder.decode(
+            sock.send_multipart.call_args.args[0][1]
+        )
+        assert response.ok_reqs == ["fresh"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_cancelled_prefill_wait_reports_error_without_sending(
+    readiness_sender, replacement
+):
+    """Cancellation wakes the old waiter without sending a replacement's KV."""
+    worker = readiness_sender
+    worker._sender_semaphore = asyncio.Semaphore(0)
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_to_send["p-old"] = ("old", [])
+    await worker.record_send_reqs(metadata)
+    old = worker.reqs_need_send["old"]
+    sock = AsyncMock(
+        spec=zmq.asyncio.Socket, send_multipart=AsyncMock(), recv_multipart=AsyncMock()
+    )
+    task = asyncio.create_task(
+        worker.send_kv_to_decode(b"d", sock, _readiness_pull("old"))
+    )
+    try:
+        await _wait_for_sender(lambda: bool(old.ready._waiters))
+        metadata = MooncakeConnectorMetadata()
+        metadata.reqs_not_processed.add("old")
+        await worker.record_send_reqs(metadata)
+        if replacement:
+            metadata.reqs_to_send["p-new"] = ("old", [])
+            metadata.reqs_not_processed.clear()
+            await worker.record_send_reqs(metadata)
+        await asyncio.wait_for(asyncio.shield(task), timeout=1)
+        response = worker._xfer_resp_decoder.decode(
+            sock.send_multipart.call_args.args[0][1]
+        )
+        assert response.status == MooncakeXferResponseStatus.FINISH
+        assert response.err_reqs == ["old"]
+        assert response.ok_reqs is None
+        assert not worker.finished_sending_reqs
+        worker.sender_loop.run_in_executor.assert_not_awaited()
+        if replacement:
+            assert worker.reqs_need_send["old"].p_req_id == "p-new"
+            assert not worker.reqs_need_send["old"].ready.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_ready_transfers_respect_limit_and_retain_blocks(readiness_sender):
+    """Ready KV stays pinned while waiting for the bounded data-plane pool."""
+    worker = readiness_sender
+    release = asyncio.Event()
+
+    async def send(*args):
+        await release.wait()
+        return 0
+
+    worker.sender_loop.run_in_executor.side_effect = send
+    tasks = []
+    metas = []
+    try:
+        for req_id in ("one", "two", "three"):
+            await _ready_producer(worker, req_id)
+            metas.append(worker.reqs_need_send[req_id])
+            tasks.append(
+                asyncio.create_task(
+                    worker.send_kv_to_decode(
+                        b"d",
+                        AsyncMock(
+                            spec=zmq.asyncio.Socket,
+                            send_multipart=AsyncMock(),
+                            recv_multipart=AsyncMock(),
+                        ),
+                        _readiness_pull(req_id),
+                    )
+                )
+            )
+        await _wait_for_sender(lambda: all(meta.sending == 1 for meta in metas))
+        assert worker.sender_loop.run_in_executor.await_count == 2
+        for meta in metas:
+            meta.expire_time = time.perf_counter() - 1
+        assert not await worker.fetch_finished_sending_reqs()
+        assert len(worker.reqs_need_send) == 3
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        assert worker.sender_loop.run_in_executor.await_count == 3
+        assert worker.finished_sending_reqs == {"one", "two", "three"}
+        assert all(meta.sending == 0 for meta in metas)
+        assert not worker.reqs_need_send
+    finally:
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_sender_error_does_not_leave_blocks_marked_sending(readiness_sender):
+    worker = readiness_sender
+    await _ready_producer(worker, "ready")
+    meta = worker.reqs_need_send["ready"]
+    worker._build_transfer_params = AsyncMock(
+        side_effect=RuntimeError("bad descriptor")
+    )
+    sock = AsyncMock(
+        spec=zmq.asyncio.Socket, send_multipart=AsyncMock(), recv_multipart=AsyncMock()
+    )
+    await worker._sender_worker(
+        sock, b"d", worker._encoder.encode(_readiness_pull("ready"))
+    )
+    response = worker._xfer_resp_decoder.decode(
+        sock.send_multipart.call_args.args[0][1]
+    )
+    assert response.status == MooncakeXferResponseStatus.ERROR
+    assert meta.sending == 0
+    assert not worker.finished_sending_reqs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expire", [False, True])
+async def test_prefill_without_blocks_completes_without_scheduler_callback(
+    readiness_sender, expire
+):
+    """Notify D of empty P completion without completing an already freed P req."""
+    worker = readiness_sender
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.is_dsv41_encoder_only_prefill = False
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler.kv_cache_config = worker.kv_cache_config
+    scheduler._is_hma_required = False
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler._reqs_without_blocks = set()
+    request = SimpleNamespace(
+        request_id="p-zero",
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params={"do_remote_decode": True, "transfer_id": "zero"},
+    )
+    admission = MooncakeConnectorMetadata()
+    admission.reqs_to_send[request.request_id] = ("zero", [])
+    await worker.record_send_reqs(admission)
+    delay_free, _ = scheduler.request_finished(request, ([],))
+    assert not delay_free
+    metadata = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+    await worker.record_send_reqs(metadata)
+    send_meta = worker.reqs_need_send["zero"]
+    assert send_meta.ready.is_set()
+    if expire:
+        send_meta.expire_time = time.perf_counter() - 1
+        assert not await worker.fetch_finished_sending_reqs()
+    else:
+        sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())
+        pull = _readiness_pull("zero")
+        pull.req_blocks["zero"] = ("zero", [])
+        await asyncio.wait_for(worker.send_kv_to_decode(b"d", sock, pull), timeout=1)
+        response = worker._xfer_resp_decoder.decode(
+            sock.send_multipart.call_args.args[0][1]
+        )
+        assert response.ok_reqs == ["zero"]
+        worker.sender_loop.run_in_executor.assert_not_awaited()
+    assert not worker.finished_sending_reqs
+    assert not worker.reqs_need_send
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort", [False, True])
+async def test_queued_prefill_is_claimed_before_block_allocation(
+    readiness_sender, monkeypatch, abort
+):
+    """A valid P queue wait outlives orphan TTL and still completes or cancels."""
+    worker = readiness_sender
+    monkeypatch.setitem(
+        envs.environment_variables,
+        "VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT",
+        lambda: 0.01,
+    )
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.is_dsv41_encoder_only_prefill = False
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler.kv_cache_config = worker.kv_cache_config
+    scheduler._is_hma_required = False
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_without_blocks = set()
+    scheduler._reqs_not_processed = set()
+    request = SimpleNamespace(
+        request_id="p-queued",
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params={
+            "do_remote_decode": True,
+            "transfer_id": "queued",
+            "_p_side_truncated": True,
+        },
+    )
+    sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())
+    task = asyncio.create_task(
+        worker.send_kv_to_decode(b"d", sock, _readiness_pull("queued"))
+    )
+    try:
+        await _wait_for_sender(lambda: "queued" in worker.reqs_need_send)
+        scheduler.on_new_request(request)
+        metadata = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+        await worker.record_send_reqs(metadata)
+        await asyncio.sleep(0.03)
+        assert not task.done()
+        sock.send_multipart.assert_not_awaited()
+        if abort:
+            request.status = RequestStatus.FINISHED_ABORTED
+        scheduler.request_finished(request, ([],) if abort else ([1],))
+        await worker.record_send_reqs(
+            scheduler.build_connector_meta(SchedulerOutput.make_empty())
+        )
+        await asyncio.wait_for(asyncio.shield(task), timeout=1)
+        response = worker._xfer_resp_decoder.decode(
+            sock.send_multipart.call_args.args[0][1]
+        )
+        assert response.err_reqs == (["queued"] if abort else None)
+        assert response.ok_reqs == (None if abort else ["queued"])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_notification_only_pull_waits_for_prefill_and_releases_sender():
     """A zero-payload pull still acknowledges and releases producer blocks."""

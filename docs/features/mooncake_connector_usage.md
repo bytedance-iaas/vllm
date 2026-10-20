@@ -71,6 +71,11 @@ Now you can send requests to the proxy server through port 8000.
 ### kv_connector_extra_config
 
 - **num_workers**: Size of thread pool for one prefiller worker to transfer KV caches by mooncake. (default 10)
+- **max_pending_transfers**: Maximum number of concurrent transfer metadata batches, including those waiting for Prefill readiness. (default 1024, positive integer)
+    - Readiness waits do not occupy the data-transfer slots, which remain limited to twice `num_workers`.
+    - Excess batches receive an explicit transfer error instead of waiting in an unbounded queue.
+    - Producer admission claims a transfer before KV allocation, so legitimate scheduler queue waits do not use the short orphan timeout.
+    - Producer cancellation wakes existing readiness waiters and reports a terminal transfer failure.
 - **mooncake_protocol**: Mooncake connector protocol. (default "rdma")
 - **device_name**: Comma-separated whitelist of RDMA devices (e.g. `"mlx5_0,mlx5_1"`) to restrict topology discovery to. Empty discovers every device. Useful on hosts exposing a mix of InfiniBand and RoCE ports, where both peers must settle on the same link layer.
 
