@@ -111,6 +111,7 @@ class MooncakeStoreScheduler:
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
+        self.lookup_skip_no_possible_increment = 0
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -134,6 +135,26 @@ class MooncakeStoreScheduler:
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
         if request.num_tokens < align:
+            return 0, False
+
+        max_usable_hit = (
+            min(
+                request.num_tokens - 1,
+                len(request.block_hashes) * self._hash_block_size,
+            )
+            // align
+            * align
+        )
+        if max_usable_hit <= num_computed_tokens:
+            self.lookup_skip_no_possible_increment += 1
+            logger.debug(
+                "Reqid: %s, Total tokens %d, local hit tokens: %d, "
+                "max usable kvpool hit tokens: %d; skipping lookup",
+                request.request_id,
+                request.num_tokens,
+                num_computed_tokens,
+                max_usable_hit,
+            )
             return 0, False
 
         lookup_result = self.client.lookup(

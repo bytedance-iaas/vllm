@@ -62,6 +62,7 @@ def _make_bare_scheduler(
     scheduler._next_store_job_id = 0
     scheduler._pinned_saves = {}
     scheduler._boundary_state_group_ids = frozenset({1})
+    scheduler.lookup_skip_no_possible_increment = 0
     return scheduler
 
 
@@ -883,6 +884,51 @@ def test_full_external_hit_with_full_local_hit_skips_load():
 
     assert need_to_allocate == 0
     assert load_async is False
+    assert scheduler.client.num_tokens == []
+    assert scheduler.lookup_skip_no_possible_increment == 1
+    assert "req-0" not in scheduler.load_specs
+
+
+def test_lookup_runs_when_remote_can_extend_local_hit():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=48,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=16
+    )
+
+    assert need_to_allocate == 16
+    assert load_async is True
+    assert scheduler.client.num_tokens == [48]
+    assert scheduler.lookup_skip_no_possible_increment == 0
+
+
+def test_lookup_skipped_when_hashes_bound_possible_hit_to_local_hit():
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=32)
+
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=128,
+        block_hashes=[b"h0", b"h1"],
+    )
+
+    need_to_allocate, load_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=32
+    )
+
+    assert need_to_allocate == 0
+    assert load_async is False
+    assert scheduler.client.num_tokens == []
+    assert scheduler.lookup_skip_no_possible_increment == 1
     assert "req-0" not in scheduler.load_specs
 
 
