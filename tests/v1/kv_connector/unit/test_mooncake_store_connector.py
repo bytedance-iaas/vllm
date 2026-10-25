@@ -1058,3 +1058,43 @@ def test_shutdown_scheduler_role_is_noop():
     # Scheduler role holds no store handle, so shutdown must be a safe no-op.
     assert connector.connector_worker is None
     connector.shutdown()
+
+
+def test_canonical_decode_cannot_lookup_from_the_shared_store():
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_profile import (  # noqa: E501
+        validate_store,
+    )
+
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={
+                "store_format": "dsv41_canonical_v1",
+                "pd_role": "decode",
+                "enable_lookup": True,
+                "cache_prefix": "test",
+                "model_revision": "revision",
+            }
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    with pytest.raises(ValueError, match="Decode Store lookup"):
+        validate_store(config)
+
+
+def test_store_resource_samples_reduce_as_gauges_instead_of_rpc_counts():
+    stats = MooncakeStoreConnectorStats(
+        data={
+            "resources": [
+                {"pending_jobs": 3, "pending_bytes": 128, "pinned_blocks": 4},
+                {"pending_jobs": 1, "pending_bytes": 64, "pinned_blocks": 0},
+            ]
+        }
+    )
+    reduced = stats.reduce()
+    assert reduced["pending_jobs_worker_max"] == 3
+    assert reduced["pinned_blocks_worker_max"] == 4
+    assert "resources_count" not in reduced

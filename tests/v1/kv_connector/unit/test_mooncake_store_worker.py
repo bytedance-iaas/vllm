@@ -4773,3 +4773,89 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_canonical_lookup_requires_every_component_of_each_chunk():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Component,
+        Manifest,
+        merge_components,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    components = [
+        Component(f"layer_{layer}/{kind}", 64, 128, 2, "uint8")
+        for layer in (2, 8, 14, 20)
+        for kind in ("main_kv", "indexer_k")
+    ]
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.manifest = Manifest(
+        "test", "revision", merge_components([components]), 64
+    )
+    canonical.store = Mock()
+    canonical._healthy = lambda: True
+    canonical._record = lambda *args, **kwargs: None
+    canonical.extra, canonical.max_bytes = {}, 2**30
+    canonical.store.batch_is_exist.return_value = [1] * 8 + [1] * 7 + [0] + [1] * 8
+    assert canonical.lookup(193, [b"a", b"b", b"c"]).hit_length == 64
+    assert canonical.store.batch_is_exist.call_count == 1
+    canonical.store = None
+
+
+def test_canonical_relay_load_uses_owner_key_but_its_own_block_table():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+        Manifest,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    component = Component("layer_8/main_kv", 64, 128, 2, "uint8")
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.manifest = Manifest("test", "revision", (component,), 64)
+    canonical.bindings = [Binding(component, 1, 1000, 256, 10, writer=False)]
+    canonical.writer = True
+    job = Job("r", ([2], [5]), (b"a",), 0, 64)
+    assert canonical._batch(job, saving=True) == ([], [], [])
+    keys, addresses, sizes = canonical._batch(job, saving=False)
+    assert keys == [canonical.manifest.key(component, b"a")]
+    assert addresses == [[2280]] and sizes == [[128]]
+
+
+def test_canonical_queue_rejection_acknowledges_saves_and_fails_loads_without_dma():
+    import threading
+    import time
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.lock = threading.Lock()
+    canonical.pending = {(True, 0): (1, time.monotonic())}
+    canonical.bindings, canonical.writer = [], True
+    canonical.max_jobs, canonical.max_bytes = 1, 1024
+    canonical.stall_seconds, canonical.unhealthy_until = 30, 0
+    canonical.completed, canonical.received, canonical.failed = {}, set(), set()
+    canonical.stats = MooncakeStoreConnectorStats()
+    job = Job("r", ([2],), (b"a",), 0, 64, 1)
+    canonical._submit(job, saving=True)
+    canonical._submit(job, saving=False)
+    assert canonical.build_connector_worker_meta().completed_saves == {1: 1}
+    results = canonical.get_transfer_results(set(), Metadata())
+    assert results.finished_recving == results.failed_recving == {"r"}
+    assert canonical.get_block_ids_with_load_errors() == set()
+    assert set(canonical.pending) == {(True, 0)}

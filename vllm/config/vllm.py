@@ -2787,7 +2787,13 @@ class VllmConfig:
         kv_config = self.kv_transfer_config
         model_config = self.model_config
         assert kv_config is not None
-        if kv_config.kv_connector != "MooncakeConnector":
+        if kv_config.kv_connector == "MultiConnector":
+            from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_profile import (  # noqa: E501
+                validate_composition,
+            )
+
+            validate_composition(self)
+        elif kv_config.kv_connector != "MooncakeConnector":
             raise ValueError(
                 "dsv41_encoder_only_prefill currently supports direct "
                 "MooncakeConnector P/D transfer only."

@@ -57,6 +57,12 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         for operation, records in sorted(self.data.items()):
             if not records:
                 continue
+            if operation == "resources":
+                for resource in {key for record in records for key in record}:
+                    reduced[f"{resource}_worker_max"] = max(
+                        int(record.get(resource, 0)) for record in records
+                    )
+                continue
             durations = [float(record["duration_seconds"]) for record in records]
             reduced[f"{operation}_count"] = len(records)
             reduced[f"{operation}_avg_ms"] = round(fmean(durations) * 1e3, 3)
@@ -111,6 +117,7 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
+        self._resource_gauge = None
 
         self._histogram_operation_time = self._histogram_cls(
             name="vllm:mooncake_store_operation_time_seconds",
@@ -178,6 +185,25 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             return
         for operation, records in transfer_stats_data.items():
             assert isinstance(records, list)
+            if operation == "resources":
+                if self._resource_gauge is None:
+                    self._resource_gauge = self._gauge_cls(
+                        name="vllm:mooncake_store_resources",
+                        documentation="Store queue and pins per engine.",
+                        labelnames=self._labelnames + ["resource"],
+                    )
+                for resource in (
+                    "pending_jobs",
+                    "pending_bytes",
+                    "unhealthy_workers",
+                    "pinned_jobs",
+                    "pinned_blocks",
+                    "pinned_bytes",
+                ):
+                    self._resource_gauge.labels(
+                        *self.per_engine_labelvalues[engine_idx], resource
+                    ).set(sum(int(record.get(resource, 0)) for record in records))
+                continue
             for record in records:
                 assert isinstance(record, dict)
                 status = str(record["status"])

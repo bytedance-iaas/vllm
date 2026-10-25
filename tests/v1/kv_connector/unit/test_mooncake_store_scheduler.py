@@ -1564,3 +1564,174 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def test_canonical_save_keeps_blocks_until_every_worker_acknowledges():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Dsv41StoreScheduler,
+    )
+
+    scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
+    scheduler.hash_tokens = scheduler.chunk_tokens = 64
+    scheduler.prefill = True
+    scheduler.saved, scheduler.pins, scheduler.bypass = {}, {}, set()
+    scheduler.requests = {}
+    scheduler.next_id, scheduler.workers = 0, 8
+    scheduler.cache_config = SimpleNamespace(
+        prefix_cacheable_group_ids=(0,),
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
+    )
+    scheduler.max_jobs, scheduler.max_blocks, scheduler.max_bytes = 32, 4096, 2**30
+    scheduler.stall_seconds, scheduler.bytes_per_block, scheduler.pin_times = (
+        30,
+        128,
+        {},
+    )
+    scheduler.pool = Mock(blocks=list(range(10)))
+    request = SimpleNamespace(request_id="r", block_hashes=[b"a", b"b"])
+    job = scheduler._save(request, ([2, 3],), 128)
+    assert job is not None and job.end == 128
+    for count in (2, 5):
+        scheduler.update_connector_output(
+            SimpleNamespace(
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    {job.save_id: count}
+                )
+            )
+        )
+        scheduler.pool.free_blocks.assert_not_called()
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata({job.save_id: 1})
+        )
+    )
+    scheduler.pool.free_blocks.assert_called_once_with([3, 2])
+    assert not scheduler.pins
+    # Send one final resource snapshot so idle-engine gauges return to zero.
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Metadata,
+    )
+
+    assert scheduler.has_pending_push_work()
+    scheduler._with_resources(Metadata())
+    assert not scheduler.has_pending_push_work()
+
+
+@pytest.mark.parametrize(
+    "computed,inflight,accepted,stale,expected",
+    [
+        (134, 6, 129, 0, 128),  # An in-flight DSpark verify must not publish drafts.
+        (131, 0, 132, 0, 131),  # Rejected drafts were rolled back before this snapshot.
+        (134, 0, 129, 0, 129),  # Token history also caps the publication boundary.
+        (134, 6, 129, 6, 0),  # Stale preemption output cannot establish a new boundary.
+    ],
+)
+def test_canonical_decode_save_uses_confirmed_prefix(
+    computed, inflight, accepted, stale, expected
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Dsv41StoreScheduler,
+    )
+
+    request = SimpleNamespace(
+        num_computed_tokens=computed,
+        num_in_flight_tokens=inflight,
+        num_tokens=accepted,
+        num_stale_output_tokens=stale,
+    )
+    assert Dsv41StoreScheduler.stable_end(request) == expected
+
+
+def test_canonical_finish_snapshot_survives_request_block_table_cleanup():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Dsv41StoreScheduler,
+    )
+
+    scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
+    scheduler.hash_tokens = scheduler.chunk_tokens = 64
+    scheduler.prefill, scheduler.save_decode = False, True
+    scheduler.saved, scheduler.pins, scheduler.bypass = {}, {}, set()
+    scheduler.requests = {}
+    scheduler.next_id, scheduler.workers = 0, 1
+    scheduler.admitted, scheduler.pending_finish = {"r"}, []
+    scheduler.cache_config = SimpleNamespace(
+        prefix_cacheable_group_ids=(0,),
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
+    )
+    scheduler.max_jobs, scheduler.max_blocks, scheduler.max_bytes = 32, 4096, 2**30
+    scheduler.stall_seconds, scheduler.bytes_per_block, scheduler.pin_times = (
+        30,
+        128,
+        {},
+    )
+    scheduler.pool = Mock(blocks=list(range(10)))
+    request = SimpleNamespace(
+        request_id="r",
+        block_hashes=[b"a", b"b"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+        num_stale_output_tokens=0,
+        num_computed_tokens=128,
+        num_in_flight_tokens=0,
+        num_tokens=129,
+    )
+    blocks = ([2, 3],)
+    scheduler.request_finished(request, blocks)
+    blocks[0].clear()
+    (job,) = scheduler.pending_finish
+    assert job.block_ids == ([2, 3],) and job.end == 128
+    assert not job.after_forward
+    assert scheduler.has_pending_push_work()
+    scheduler.pool.touch.assert_called_once_with([2, 3])
+
+
+def test_canonical_failed_load_is_bypassed_on_recompute():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Dsv41StoreScheduler,
+    )
+
+    scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
+    scheduler.bypass = set()
+    scheduler.requests = {"r": None}
+    scheduler.client = Mock()
+    scheduler.update_connector_output(
+        SimpleNamespace(failed_recving={"r"}, kv_connector_worker_meta=None)
+    )
+    request = SimpleNamespace(
+        request_id="r", mm_features=[], lora_request=None, prompt_embeds=None
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    scheduler.client.lookup.assert_not_called()
+
+
+def test_canonical_pin_budget_only_advances_through_the_admitted_chunks():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Dsv41StoreScheduler,
+    )
+
+    scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
+    scheduler.hash_tokens = scheduler.chunk_tokens = 64
+    scheduler.prefill, scheduler.workers, scheduler.next_id = True, 8, 0
+    scheduler.saved, scheduler.pins, scheduler.pin_times = {}, {}, {}
+    scheduler.max_jobs, scheduler.max_blocks, scheduler.max_bytes = 1, 1, 128
+    scheduler.bytes_per_block, scheduler.stall_seconds = 128, 30
+    scheduler.cache_config = SimpleNamespace(
+        prefix_cacheable_group_ids=(0,),
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
+    )
+    scheduler.pool = Mock(blocks=list(range(10)))
+    request = SimpleNamespace(request_id="r", block_hashes=[b"a", b"b"])
+    job = scheduler._save(request, ([2, 3],), 128)
+    assert job.end == scheduler.saved["r"] == 64
+    scheduler.pool.touch.assert_called_once_with([2])
+    assert scheduler._save(request, ([2, 3],), 128) is None
+    assert scheduler.saved["r"] == 64

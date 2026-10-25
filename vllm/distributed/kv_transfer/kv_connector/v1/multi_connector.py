@@ -180,6 +180,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
         )
 
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        if "pd_store_profile" in extra:
+            from .mooncake.store.dsv41_profile import validate_composition
+
+            validate_composition(vllm_config)
         self._connectors: list[KVConnectorBase_V1] = []
         self._ktc_kv_transfer_config = []
         for connector_cls, temp_config in self._get_connector_classes_and_configs(

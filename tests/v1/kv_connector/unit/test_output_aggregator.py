@@ -145,3 +145,18 @@ def test_directional_quorums_do_not_complete_receives_after_two_workers():
         ).kv_connector_output
         assert bool(result.finished_sending) == (rank == 1)
         assert bool(result.finished_recving) == (rank == 7)
+
+
+def test_directional_failed_receive_waits_for_all_eight_workers():
+    aggregator = KVOutputAggregator(8, sending_count=2, receiving_count=8)
+    for rank in range(8):
+        result = aggregator.aggregate(
+            [
+                DummyModelRunnerOutput(
+                    finished_recving={"r"},
+                    failed_recving={"r"} if rank == 0 else None,
+                )
+            ]
+        ).kv_connector_output
+        assert bool(result.failed_recving) == (rank == 7)
+        assert bool(result.finished_recving) == (rank == 7)
