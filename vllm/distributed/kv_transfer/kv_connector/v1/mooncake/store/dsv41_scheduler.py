@@ -65,6 +65,9 @@ class Dsv41StoreScheduler:
         self.load_specs = {}
         self.bypass = set()
         self.pending_loads = []
+        self.lookup_min_prompt_tokens = extra.get("lookup_min_prompt_tokens", 0)
+        self.lookup_skip_short_prompt = 0
+        self.lookup_skip_no_possible_increment = 0
         self.client = (
             LookupClient(config)
             if self.prefill and extra.get("enable_lookup", False)
@@ -92,8 +95,19 @@ class Dsv41StoreScheduler:
             or request.request_id in self.bypass
         ):
             return 0, False
+        if request.num_prompt_tokens < self.lookup_min_prompt_tokens:
+            self.lookup_skip_short_prompt += 1
+            return 0, False
         # A complete-page load must not overwrite a partly shared local page.
         if num_computed_tokens % self.chunk_tokens:
+            return 0, False
+        max_usable_hit = (
+            min(request.num_tokens - 1, len(request.block_hashes) * self.hash_tokens)
+            // self.chunk_tokens
+            * self.chunk_tokens
+        )
+        if max_usable_hit <= max(num_computed_tokens, 128):
+            self.lookup_skip_no_possible_increment += 1
             return 0, False
         result = self.client.lookup(
             request.request_id, request.num_tokens, request.block_hashes
@@ -270,6 +284,7 @@ class Dsv41StoreScheduler:
                 assert remaining == 0, (
                     "Canonical save received duplicate acknowledgments"
                 )
+                assert self.pool is not None
                 self.pool.free_blocks([self.pool.blocks[b] for b in reversed(ids)])
                 del self.pins[job_id]
                 del self.pin_times[job_id]

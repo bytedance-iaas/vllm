@@ -26,6 +26,15 @@ def validate_store(config: Any) -> None:
         raise ValueError("Decode Store lookup must remain disabled")
     if extra.get("enable_lookup", False) and not extra.get("load_async", True):
         raise ValueError("Canonical Store requires asynchronous loading")
+    lookup_min_prompt_tokens = extra.get("lookup_min_prompt_tokens", 0)
+    if (
+        isinstance(lookup_min_prompt_tokens, bool)
+        or not isinstance(lookup_min_prompt_tokens, int)
+        or lookup_min_prompt_tokens < 0
+    ):
+        raise ValueError(
+            "Canonical Store lookup_min_prompt_tokens must be a nonnegative integer"
+        )
     for key, default in {
         "max_pending_jobs": 32,
         "max_pending_lookups": 32,

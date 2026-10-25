@@ -1719,6 +1719,49 @@ def test_canonical_failed_load_is_bypassed_on_recompute():
     scheduler.client.lookup.assert_not_called()
 
 
+def test_canonical_lookup_skips_when_no_external_increment_is_possible():
+    from unittest.mock import Mock
+
+    scheduler = _make_canonical_scheduler("prefill")
+    scheduler.client = Mock()
+    scheduler.lookup_skip_no_possible_increment = 0
+    request = SimpleNamespace(
+        request_id="r",
+        num_tokens=512,
+        block_hashes=[b"a", b"b", b"c"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 192) == (0, False)
+    scheduler.client.lookup.assert_not_called()
+    assert scheduler.lookup_skip_no_possible_increment == 1
+    assert scheduler.load_specs == {}
+
+
+def test_canonical_lookup_runs_when_external_increment_is_possible():
+    from unittest.mock import Mock
+
+    scheduler = _make_canonical_scheduler("prefill")
+    scheduler.client = Mock()
+    scheduler.client.lookup.return_value = MooncakeLookupResult(192)
+    scheduler.lookup_skip_no_possible_increment = 0
+    request = SimpleNamespace(
+        request_id="r",
+        num_tokens=512,
+        block_hashes=[b"a", b"b", b"c", b"d"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 128) == (64, True)
+    scheduler.client.lookup.assert_called_once_with("r", 512, request.block_hashes)
+    assert scheduler.lookup_skip_no_possible_increment == 0
+    assert scheduler.load_specs == {"r": (128, 192)}
+
+
 def test_canonical_pin_budget_only_advances_through_the_admitted_chunks():
     from unittest.mock import Mock
 

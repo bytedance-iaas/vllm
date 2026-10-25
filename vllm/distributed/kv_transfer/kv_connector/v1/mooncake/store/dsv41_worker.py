@@ -41,7 +41,7 @@ class Dsv41StoreWorker:
         store_config = MooncakeStoreConfig.load_from_config()
         if store_config.enable_offload:
             raise ValueError("Canonical L2 profile requires a DRAM-only Mooncake Store")
-        self.device = torch.cuda.current_device()
+        self.device = torch.accelerator.current_device_index()
         try:
             self.store = MooncakeDistributedStore()
             setup_mooncake_store(
@@ -51,7 +51,7 @@ class Dsv41StoreWorker:
             )
         finally:
             # Native transport initialization may change the thread's device.
-            torch.cuda.set_device(self.device)
+            torch.accelerator.set_device_index(self.device)
         self.replication = ReplicateConfig()
         preferred = rdma_utils.get_configured_preferred_segment(self.extra)
         if preferred is not None:
@@ -140,7 +140,7 @@ class Dsv41StoreWorker:
             for b in self.bindings
         }
         for address, storage in storages.items():
-            with torch.cuda.device(self.device):
+            with torch.accelerator.device_index(self.device):
                 result = self.store.register_buffer(address, storage.nbytes())
             if result != 0:
                 raise RuntimeError(
@@ -270,7 +270,7 @@ class Dsv41StoreWorker:
         started = time.monotonic()
         total_keys = total_bytes = 0
         try:
-            with torch.cuda.device(self.device):
+            with torch.accelerator.device_index(self.device):
                 if ready is not None:
                     ready.synchronize()
                 # Limit native RPC descriptor size without changing object identity.
@@ -360,7 +360,7 @@ class Dsv41StoreWorker:
         try:
             ready = None
             if saving:
-                with torch.cuda.device(self.device):
+                with torch.accelerator.device_index(self.device):
                     ready = torch.cuda.Event()
                     ready.record(torch.cuda.current_stream(self.device))
             executor = self.put_executor if saving else self.get_executor
