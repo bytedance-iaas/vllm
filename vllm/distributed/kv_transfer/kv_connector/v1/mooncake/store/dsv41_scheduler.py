@@ -36,6 +36,7 @@ class Dsv41StoreScheduler:
         extra = config.kv_transfer_config.kv_connector_extra_config
         self.prefill = extra["pd_role"] == "prefill"
         self.save_decode = not self.prefill and extra.get("save_decode_cache", False)
+        self.capacity_only = not self.prefill and not self.save_decode
         self.pending_finish = []
         self.admitted = set()
         _, self.hash_tokens = resolve_kv_cache_block_sizes(cache_config, config)
@@ -57,6 +58,7 @@ class Dsv41StoreScheduler:
         self.pin_times = {}
         self.resource_flush = False
         self.requests = {}
+        self._pending_admissions = {}
         self.saved = {}
         self.pins = {}
         self.next_id = 0
@@ -107,8 +109,11 @@ class Dsv41StoreScheduler:
         return hit - num_computed_tokens, True
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        if self.capacity_only:
+            assert num_external_tokens == 0
+            return
         if self.eligible(request):
-            self.requests[request.request_id] = request
+            self._pending_admissions[request.request_id] = request
         spec = self.load_specs.pop(request.request_id, None)
         if num_external_tokens:
             assert spec is not None and num_external_tokens == spec[1] - spec[0]
@@ -122,6 +127,8 @@ class Dsv41StoreScheduler:
             )
 
     def _save(self, request, blocks, end):
+        if not self.eligible(request):
+            return None
         end = min(end, len(request.block_hashes) * self.hash_tokens)
         end = end // self.chunk_tokens * self.chunk_tokens
         start = self.saved.get(request.request_id, 0)
@@ -172,6 +179,8 @@ class Dsv41StoreScheduler:
 
     def build_connector_meta(self, output):
         meta = Metadata()
+        if self.capacity_only:
+            return self._with_resources(meta)
         meta.loads, self.pending_loads = self.pending_loads, []
         meta.saves, self.pending_finish = self.pending_finish, []
         for rid in output.finished_req_ids | (output.preempted_req_ids or set()):
@@ -183,6 +192,13 @@ class Dsv41StoreScheduler:
                 self.bypass.discard(rid)
             if self.client:
                 self.client.discard(rid)
+        # Allocation can re-admit a preempted request in this same step.
+        self.requests.update(
+            (rid, request)
+            for rid, request in self._pending_admissions.items()
+            if rid not in output.finished_req_ids
+        )
+        self._pending_admissions.clear()
         if not self.prefill and not self.save_decode:
             return self._with_resources(meta)
         state = output.kv_connector_block_state
@@ -237,6 +253,8 @@ class Dsv41StoreScheduler:
             self.pending_finish.append(job)
 
     def update_connector_output(self, output):
+        if self.capacity_only:
+            return
         self.bypass.update(
             rid for rid in getattr(output, "failed_recving", ()) if rid in self.requests
         )

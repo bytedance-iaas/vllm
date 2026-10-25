@@ -4844,6 +4844,7 @@ def test_canonical_queue_rejection_acknowledges_saves_and_fails_loads_without_dm
     )
 
     canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.capacity_only = False
     canonical.lock = threading.Lock()
     canonical.pending = {(True, 0): (1, time.monotonic())}
     canonical.bindings, canonical.writer = [], True
@@ -4859,3 +4860,142 @@ def test_canonical_queue_rejection_acknowledges_saves_and_fails_loads_without_dm
     assert results.finished_recving == results.failed_recving == {"r"}
     assert canonical.get_block_ids_with_load_errors() == set()
     assert set(canonical.pending) == {(True, 0)}
+
+
+@pytest.mark.parametrize("devices", [("cuda:3",), ("cuda:3", "cuda:4"), ("cpu",)])
+def test_canonical_transfer_uses_kv_tensor_device_after_native_setup(
+    monkeypatch, devices
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+        dsv41_worker,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+
+    current = {"device": 0}
+
+    def set_device(device):
+        current["device"] = device
+
+    @contextlib.contextmanager
+    def device_context(device):
+        previous = current["device"]
+        set_device(device)
+        try:
+            yield
+        finally:
+            set_device(previous)
+
+    def setup(*args, **kwargs):
+        set_device(2)  # Model the native initializer changing the caller's device.
+        return 0
+
+    store = MagicMock()
+    store.setup.side_effect = setup
+    _install_fake_mooncake(monkeypatch, store)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current["device"])
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(
+        dsv41_worker.MooncakeStoreConfig, "load_from_config", _make_config
+    )
+    monkeypatch.setattr(dsv41_worker, "get_ip", lambda: "127.0.0.1")
+    group = SimpleNamespace(rank_in_group=0, world_size=1, cpu_group=None)
+    for name in ("get_pp_group", "get_pcp_group", "get_world_group"):
+        monkeypatch.setattr(dsv41_worker, name, lambda: group)
+    monkeypatch.setattr(
+        dsv41_worker, "resolve_kv_cache_block_sizes", lambda *args: (64, 64)
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(0, value),
+    )
+    config = _make_vllm_config(
+        extra_config={
+            "pd_role": "decode",
+            "save_decode_cache": True,
+            "cache_prefix": "test",
+            "model_revision": "revision",
+        }
+    )
+    canonical = dsv41_worker.Dsv41StoreWorker(config, _make_kv_cache_config())
+    assert current["device"] == 0
+    try:
+        storage = SimpleNamespace(data_ptr=lambda: 0x1000, nbytes=lambda: 16384)
+        components = [
+            Component(f"layer_{layer}/{kind}", 64, 128, 2, "uint8")
+            for layer in (2, 8, 14, 20)
+            for kind in ("main_kv", "indexer_k")
+        ]
+        bindings = [
+            Binding(
+                component,
+                0,
+                0x1000 + i * 512,
+                4096,
+                4,
+                tensor=SimpleNamespace(
+                    device=torch.device(devices[i % len(devices)]),
+                    untyped_storage=lambda: storage,
+                ),
+            )
+            for i, component in enumerate(components)
+        ]
+        monkeypatch.setattr(
+            dsv41_worker, "build_bindings", lambda *args, **kwargs: bindings
+        )
+        if len(devices) != 1 or devices[0] == "cpu":
+            with pytest.raises(ValueError, match="CUDA"):
+                canonical.register_kv_caches({})
+            store.register_buffer.assert_not_called()
+            return
+
+        def register(*args):
+            assert current["device"] == 3
+            return 0
+
+        store.register_buffer.side_effect = register
+        canonical.register_kv_caches({})
+        assert canonical.device == 3
+        assert current["device"] == 0
+        stream = object()
+        event = MagicMock()
+
+        def current_stream(device):
+            assert device == current["device"] == 3
+            return stream
+
+        def record(selected_stream):
+            assert selected_stream is stream and current["device"] == 3
+
+        def put(keys, *args):
+            assert current["device"] == 3
+            return [0] * len(keys)
+
+        event.record.side_effect = record
+        monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+        monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+        # Run the transfer on the caller for a deterministic CPU-only device probe.
+        monkeypatch.setattr(
+            canonical.put_executor, "submit", lambda fn, *args: fn(*args)
+        )
+        store.batch_is_exist.return_value = [0] * 8
+        store.batch_put_from_multi_buffers.side_effect = put
+        metadata = Metadata()
+        metadata.saves = [Job("r", ([1],), (b"a",), 0, 64, save_id=7)]
+        canonical.start_load_kv(metadata)
+        store.batch_put_from_multi_buffers.assert_called_once()
+        event.record.assert_called_once_with(stream)
+        event.synchronize.assert_called_once()
+        assert canonical.get_kv_connector_stats().data["save_put"][0]["status"] == "ok"
+        assert canonical.build_connector_worker_meta().completed_saves == {7: 1}
+        assert current["device"] == 0
+    finally:
+        canonical.close()

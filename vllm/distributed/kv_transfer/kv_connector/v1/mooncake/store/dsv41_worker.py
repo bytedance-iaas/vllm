@@ -35,34 +35,51 @@ class Dsv41StoreWorker:
         self.cache_config = cache_config
         self.extra = config.kv_transfer_config.kv_connector_extra_config
         self.prefill = self.extra["pd_role"] == "prefill"
+        self.capacity_only = not self.prefill and not self.extra.get(
+            "save_decode_cache", False
+        )
         store_config = MooncakeStoreConfig.load_from_config()
         if store_config.enable_offload:
             raise ValueError("Canonical L2 profile requires a DRAM-only Mooncake Store")
-        self.store = MooncakeDistributedStore()
-        setup_mooncake_store(
-            self.store, store_config, rdma_utils.get_requester_local_hostname(get_ip())
-        )
+        self.device = torch.cuda.current_device()
+        try:
+            self.store = MooncakeDistributedStore()
+            setup_mooncake_store(
+                self.store,
+                store_config,
+                rdma_utils.get_requester_local_hostname(get_ip()),
+            )
+        finally:
+            # Native transport initialization may change the thread's device.
+            torch.cuda.set_device(self.device)
         self.replication = ReplicateConfig()
         preferred = rdma_utils.get_configured_preferred_segment(self.extra)
         if preferred is not None:
             self.replication.preferred_segment = preferred
         self.writer = not self.prefill or get_pcp_group().rank_in_group == 0
-        self.put_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="CanonicalPut"
+        self.put_executor = (
+            None
+            if self.capacity_only
+            else ThreadPoolExecutor(max_workers=1, thread_name_prefix="CanonicalPut")
         )
-        self.get_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="CanonicalGet"
+        self.get_executor = (
+            None
+            if self.capacity_only
+            else ThreadPoolExecutor(max_workers=1, thread_name_prefix="CanonicalGet")
         )
         self.lock = threading.Lock()
         self.completed = {}
         self.bindings = []
         self.manifest = None
-        self.device = torch.cuda.current_device()
         self.server = None
         self.report_resources = (
             get_pp_group().rank_in_group == 0 and get_pcp_group().rank_in_group == 0
         )
-        self.scheduler_resources = {}
+        self.scheduler_resources = (
+            {"pinned_jobs": 0, "pinned_blocks": 0, "pinned_bytes": 0}
+            if self.capacity_only
+            else {}
+        )
         self.received = set()
         self.failed = set()
         self.max_jobs = int(self.extra.get("max_pending_jobs", 32))
@@ -72,14 +89,30 @@ class Dsv41StoreWorker:
         self.pending = {}
         self.unhealthy_until = 0.0
         self.stats = MooncakeStoreConnectorStats()
+        self.next_capacity_stats = 0.0
 
     def register_kv_caches(self, caches):
+        if self.capacity_only:
+            logger.info(
+                "Canonical Store capacity-only: role=decode device=%s "
+                "GPU KV registration disabled module=%s",
+                self.device,
+                __file__,
+            )
+            return
         # All workers participate even if a local layout is invalid.
         error = None
         try:
             self.bindings = build_bindings(
                 self.cache_config, caches, prefill=self.prefill
             )
+            devices = {binding.tensor.device for binding in self.bindings}
+            if len(devices) != 1:
+                raise ValueError("Canonical KV tensors must share one CUDA device")
+            device = devices.pop()
+            if device.type != "cuda" or device.index is None:
+                raise ValueError("Canonical KV tensors must reside on CUDA")
+            self.device = device.index
         except Exception as exc:
             error = str(exc)
         _, hash_tokens = resolve_kv_cache_block_sizes(self.cache_config, self.config)
@@ -107,11 +140,23 @@ class Dsv41StoreWorker:
             for b in self.bindings
         }
         for address, storage in storages.items():
-            result = self.store.register_buffer(address, storage.nbytes())
+            with torch.cuda.device(self.device):
+                result = self.store.register_buffer(address, storage.nbytes())
             if result != 0:
                 raise RuntimeError(
                     f"Canonical GPU buffer registration failed: {result}"
                 )
+        logger.info(
+            "Canonical Store registered: role=%s device=%s writer=%s "
+            "chunk_tokens=%s manifest=%s local_components=%s module=%s",
+            self.extra["pd_role"],
+            self.device,
+            self.writer,
+            self.manifest.chunk_tokens,
+            self.manifest.prefix,
+            [binding.component.name for binding in self.bindings],
+            __file__,
+        )
 
         if (
             self.prefill
@@ -285,6 +330,7 @@ class Dsv41StoreWorker:
             self._finish(job, saving, failed)
 
     def _submit(self, job, *, saving):
+        assert not self.capacity_only
         size = sum(
             (job.end - job.start) // b.component.block_tokens * b.component.page_bytes
             for b in self.bindings
@@ -314,8 +360,9 @@ class Dsv41StoreWorker:
         try:
             ready = None
             if saving:
-                ready = torch.cuda.Event()
-                ready.record()
+                with torch.cuda.device(self.device):
+                    ready = torch.cuda.Event()
+                    ready.record(torch.cuda.current_stream(self.device))
             executor = self.put_executor if saving else self.get_executor
             executor.submit(self._transfer, job, ready, saving)
         except Exception:
@@ -324,6 +371,9 @@ class Dsv41StoreWorker:
             logger.exception("Canonical transfer submission failed")
 
     def start_load_kv(self, metadata):
+        if self.capacity_only:
+            assert not metadata.loads and not metadata.saves
+            return
         if self.report_resources:
             with self.lock:
                 self.scheduler_resources = metadata.resources
@@ -344,6 +394,8 @@ class Dsv41StoreWorker:
         return results.finished_sending or set(), results.finished_recving or set()
 
     def get_transfer_results(self, finished_req_ids, metadata):
+        if self.capacity_only:
+            return KVConnectorTransferResults()
         with self.lock:
             received, self.received = self.received, set()
             failed, self.failed = self.failed, set()
@@ -357,6 +409,8 @@ class Dsv41StoreWorker:
         return set()
 
     def build_connector_worker_meta(self):
+        if self.capacity_only:
+            return None
         with self.lock:
             completed, self.completed = self.completed, {}
         return (
@@ -366,6 +420,23 @@ class Dsv41StoreWorker:
         )
 
     def get_kv_connector_stats(self):
+        if self.capacity_only:
+            now = time.monotonic()
+            if now < self.next_capacity_stats:
+                return None
+            self.next_capacity_stats = now + 1.0
+            return MooncakeStoreConnectorStats(
+                data={
+                    "resources": [
+                        {
+                            "pending_jobs": 0,
+                            "pending_bytes": 0,
+                            "unhealthy_workers": 0,
+                            **self.scheduler_resources,
+                        }
+                    ]
+                }
+            )
         with self.lock:
             self.stats.data["resources"] = [
                 {

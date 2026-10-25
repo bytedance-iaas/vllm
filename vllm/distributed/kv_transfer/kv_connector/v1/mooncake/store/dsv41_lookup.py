@@ -3,6 +3,7 @@
 """Canonical lookup channel. It deliberately exposes no shared-store reset RPC."""
 
 import hashlib
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,9 +16,11 @@ from .worker import get_zmq_rpc_path_lookup
 
 
 def _path(config):
-    engine = config.kv_transfer_config.engine_id.encode()
-    suffix = hashlib.sha256(engine).hexdigest()[:12]
-    return f"{get_zmq_rpc_path_lookup(config)}_canonical_{suffix}"
+    address = get_zmq_rpc_path_lookup(config)
+    identity = json.dumps([address, config.kv_transfer_config.engine_id]).encode()
+    suffix = hashlib.sha256(identity).hexdigest()[:32]
+    directory = address.rsplit("/", 1)[0]
+    return f"{directory}/canonical_lookup_{suffix}"
 
 
 class LookupClient:
