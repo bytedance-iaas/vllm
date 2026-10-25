@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     CopyBlocksOp,
+    KVCompletionCounts,
     KVConnectorBase_V1,
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
@@ -369,6 +370,24 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(kv_connector_metadata, MultiKVConnectorMetadata)
         for c, cm in zip(self._connectors, kv_connector_metadata.metadata):
             c.handle_preemptions(cm)
+
+    def get_completion_counts(self) -> KVCompletionCounts | None:
+        config = self._vllm_config.kv_transfer_config
+        if config.kv_connector_extra_config.get("pd_store_profile") != "dsv41_flash_v1":
+            return None
+        world_size = self._vllm_config.parallel_config.world_size
+        return KVCompletionCounts(
+            self._connectors[0].get_finished_count() or world_size, world_size
+        )
+
+    def requires_async_block_protection(self) -> bool | None:
+        config = self._vllm_config.kv_transfer_config
+        if config.kv_connector_extra_config.get("pd_store_profile") != "dsv41_flash_v1":
+            return None
+        return config.is_kv_consumer or any(
+            child.kv_connector_extra_config.get("enable_lookup", True)
+            for child in self._ktc_kv_transfer_config[1:]
+        )
 
     def get_finished_count(self) -> int | None:
         child_counts = [

@@ -79,16 +79,31 @@ class KVOutputAggregator:
     """Utility class to aggregate the output of all workers into a single
     output corresponding to Rank 0 for scheduler."""
 
-    def __init__(self, expected_finished_count: int):
+    def __init__(
+        self,
+        expected_finished_count: int,
+        *,
+        sending_count: int | None = None,
+        receiving_count: int | None = None,
+    ):
         # Complete transfer tracker. Used to track finished requests
         # [req_id -> n_remaining_workers]
         self._recv_remaining_count = dict[str, int]()
         self._send_remaining_count = dict[str, int]()
         self._failed_recving_pending = set[str]()
         self._expected_finished_count = expected_finished_count
+        self._sending_count = sending_count
+        self._receiving_count = receiving_count
 
     @classmethod
     def from_connector(cls, connector: "KVConnectorBase", world_size: int):
+        counts = connector.get_completion_counts()
+        if counts is not None:
+            return cls(
+                world_size,
+                sending_count=counts.sending,
+                receiving_count=counts.receiving,
+            )
         return cls(connector.get_finished_count() or world_size)
 
     def aggregate(
@@ -103,10 +118,11 @@ class KVOutputAggregator:
             req_ids: set[str] | None,
             remaining_count_dict: dict[str, int],
             finished_set: set[str],
+            count: int | None,
         ) -> None:
             for req_id in req_ids or ():
                 remaining_count = remaining_count_dict.get(
-                    req_id, self._expected_finished_count
+                    req_id, count or self._expected_finished_count
                 )
                 remaining_count_dict[req_id] = remaining_count - 1
                 if remaining_count_dict[req_id] == 0:
@@ -138,10 +154,16 @@ class KVOutputAggregator:
                 self._expected_finished_count = kv_output.expected_finished_count
 
             update_finished_set(
-                kv_output.finished_sending, self._send_remaining_count, finished_sending
+                kv_output.finished_sending,
+                self._send_remaining_count,
+                finished_sending,
+                self._sending_count,
             )
             update_finished_set(
-                kv_output.finished_recving, self._recv_remaining_count, finished_recving
+                kv_output.finished_recving,
+                self._recv_remaining_count,
+                finished_recving,
+                self._receiving_count,
             )
 
             # Aggregate kv_connector_stats from all workers.

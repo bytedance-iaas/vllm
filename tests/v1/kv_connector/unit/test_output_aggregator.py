@@ -130,3 +130,18 @@ def test_aggregate_workers_output_with_expected_finished_count():
     # NOTE: This is to showcase dynamic update. Workers are responsible for
     # ensuring "req1" termination in this case
     assert aggregator._send_remaining_count["req1"] == 2
+
+
+def test_directional_quorums_do_not_complete_receives_after_two_workers():
+    aggregator = KVOutputAggregator(8, sending_count=2, receiving_count=8)
+    for rank in range(8):
+        result = aggregator.aggregate(
+            [
+                DummyModelRunnerOutput(
+                    finished_sending={"send"} if rank < 2 else None,
+                    finished_recving={"recv"},
+                )
+            ]
+        ).kv_connector_output
+        assert bool(result.finished_sending) == (rank == 1)
+        assert bool(result.finished_recving) == (rank == 7)
