@@ -358,6 +358,17 @@ Supported models:
 
 Flags: `--tool-call-parser deepseek_v31 --chat-template {see_above}`
 
+### DeepSeek-V4 and V4.1 Models (`deepseek_v4`, `deepseek_v41`)
+
+Use the matching tokenizer, reasoning parser, and tool parser for the model.
+For DeepSeek-V4.1, set `--tokenizer-mode deepseek_v41`,
+`--reasoning-parser deepseek_v41`, and `--tool-call-parser deepseek_v41`
+with `--enable-auto-tool-choice`.
+
+When generation ends before the last DSML parameter closes, the parser preserves
+its generated value and completes the argument JSON. This recovery does not
+reconstruct missing argument text or establish that the tool call is complete.
+
 ### OpenAI OSS Models (`openai`)
 
 Supported models:

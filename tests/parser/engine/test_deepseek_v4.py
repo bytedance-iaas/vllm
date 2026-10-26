@@ -1461,3 +1461,54 @@ class TestMalformedDsmlNoise:
         assert output.tool_calls[0]["name"] == "get_weather"
         assert json.loads(output.tool_calls[0]["arguments"]) == {"city": "Seoul"}
         assert "DSML" not in (output.content or "")
+
+
+# ── Truncated and unclosed parameters ────────────────────────────────
+
+
+class TestUnclosedParameters:
+    def test_truncated_and_unclosed_parameter_parity(
+        self, mock_tokenizer, mock_request
+    ):
+        """Regression test for #62051: when ``</｜DSML｜parameter>`` is omitted
+        before ``</｜DSML｜invoke>`` or truncated at stream end, both streaming
+        (with ``finish_streaming()``) and non-streaming must emit valid JSON
+        preserving the parameter value."""
+        cases = [
+            (
+                f"{DSML_TOOL_START}\n"
+                f"{DSML_INVOKE_PREFIX}WebFetch{DSML_INVOKE_NAME_END}\n"
+                f"<{_PARAM_OPEN.format(name='url', is_str='true')}https://example.com",
+                "WebFetch",
+                {"url": "https://example.com"},
+            ),
+            (
+                f"{DSML_TOOL_START}\n"
+                f"{DSML_INVOKE_PREFIX}Read{DSML_INVOKE_NAME_END}\n"
+                f"<{_PARAM_OPEN.format(name='file_path', is_str='true')}/tmp/a"
+                f"{DSML_INVOKE_END}\n{DSML_TOOL_END}",
+                "Read",
+                {"file_path": "/tmp/a"},
+            ),
+        ]
+        for text, expected_name, expected_args in cases:
+            parser = DeepSeekV4Parser(
+                mock_tokenizer, chat_template_kwargs={"thinking": False}
+            )
+            extracted = parser.extract_tool_calls(text, mock_request)
+            assert extracted.tools_called is True
+            assert len(extracted.tool_calls) == 1
+            assert extracted.tool_calls[0].function.name == expected_name
+            assert json.loads(extracted.tool_calls[0].function.arguments) == (
+                expected_args
+            )
+
+            stream_parser = DeepSeekV4Parser(
+                mock_tokenizer, chat_template_kwargs={"thinking": False}
+            )
+            results = simulate_tool_streaming(stream_parser, mock_request, list(text))
+            finish_delta = stream_parser.finish_streaming()
+            if finish_delta is not None:
+                results.append((finish_delta, text))
+            assert collect_function_name(results) == expected_name
+            assert json.loads(collect_tool_arguments(results)) == expected_args
