@@ -2238,7 +2238,13 @@ async def test_tool_choice_validation_without_parser():
 
 
 @pytest.mark.asyncio
-async def test_streaming_n_gt1_independent_tool_parsers():
+@pytest.mark.parametrize(
+    ("engine_finish_reason", "expected_finish_reason"),
+    [("stop", "tool_calls"), ("length", "length")],
+)
+async def test_streaming_n_gt1_independent_tool_parsers(
+    engine_finish_reason: str, expected_finish_reason: str
+):
     """n>1 streaming must use independent parser instances
     and token-id histories per choice.
     """
@@ -2343,7 +2349,7 @@ async def test_streaming_n_gt1_independent_tool_parsers():
                     token_ids=[],
                     cumulative_logprob=0.0,
                     logprobs=None,
-                    finish_reason="stop",
+                    finish_reason=engine_finish_reason,
                 )
                 for choice_idx in range(num_choices)
             ],
@@ -2407,8 +2413,8 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         assert len(reasons) == 1, (
             f"Choice {choice_idx}: expected exactly 1 finish_reason, got {reasons}"
         )
-        assert reasons[0] == "tool_calls", (
-            f"Choice {choice_idx}: expected finish_reason='tool_calls', "
+        assert reasons[0] == expected_finish_reason, (
+            f"Choice {choice_idx}: expected finish_reason={expected_finish_reason!r}, "
             f"got '{reasons[0]}'"
         )
 
@@ -2442,3 +2448,126 @@ def test_make_request_with_harmony_reuses_kv_transfer_prompt_token_ids():
     assert engine_input["prompt_token_ids"] == [10, 20, 30]
     # The reuse key is consumed and other kv_transfer_params are preserved.
     assert request.kv_transfer_params == {"do_remote_prefill": True}
+
+
+_TOOL_FINISH_REASON_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+_HERMES_TOOL_CALL_TEXT = (
+    '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n</tool_call>'
+)
+
+
+_NAMED_WEATHER_TOOL_CHOICE = {"type": "function", "function": {"name": "get_weather"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "tool_choice",
+        "text",
+        "engine_finish_reason",
+        "expected_finish_reason",
+        "tool_parser",
+    ),
+    [
+        ("auto", _HERMES_TOOL_CALL_TEXT, "stop", "tool_calls", "hermes"),
+        ("auto", _HERMES_TOOL_CALL_TEXT, "length", "length", "hermes"),
+        (
+            "auto",
+            '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+            '<｜DSML｜ parameter name="city" string="true">Tokyo',
+            "length",
+            "length",
+            "deepseek_v41",
+        ),
+        ("required", "Hello, how are you?", "stop", "stop", "hermes"),
+        (_NAMED_WEATHER_TOOL_CHOICE, _HERMES_TOOL_CALL_TEXT, "stop", "stop", "hermes"),
+    ],
+)
+async def test_non_streaming_finish_reason_matches_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_choice,
+    text: str,
+    engine_finish_reason: str,
+    expected_finish_reason: str,
+    tool_parser: str,
+):
+    """Non-streaming ``finish_reason`` must agree with ``message.tool_calls``
+    and never hide a ``length`` truncation (#53255, #58228)."""
+    engine = MockEngine()
+    engine.renderer = _build_renderer(engine.model_config)
+    serving_chat = _build_serving_chat(
+        engine, tool_parser=tool_parser, enable_auto_tools=True
+    )
+    # Parse required/named calls from the native <tool_call> format regardless
+    # of VLLM_ENFORCE_STRICT_TOOL_CALLING, so one text serves every case.
+    monkeypatch.setattr(
+        serving_chat.parser_cls.tool_parser_cls, "supports_required_and_named", False
+    )
+
+    tokenizer = get_tokenizer(MODEL_NAME)
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "test"}],
+        tools=_TOOL_FINISH_REASON_TOOLS,
+        tool_choice=tool_choice,
+    )
+    parser = serving_chat.parser_cls(
+        tokenizer,
+        request.tools,
+        chat_template_kwargs=serving_chat._effective_chat_template_kwargs(request),
+        model_config=serving_chat.model_config,
+    )
+    request_output = RequestOutput(
+        request_id="test-req",
+        prompt="test",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text=text,
+                token_ids=tokenizer.encode(text, add_special_tokens=False),
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason=engine_finish_reason,
+            )
+        ],
+        finished=True,
+    )
+
+    response = await serving_chat.chat_completion_full_generator(
+        request=request,
+        result_generator=_single_request_output(request_output),
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req", model_name=MODEL_NAME
+        ),
+        parser=parser,
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    choice = response.choices[0]
+    assert choice.finish_reason == expected_finish_reason
+    assert bool(choice.message.tool_calls) == (text != "Hello, how are you?"), (
+        "finish_reason must reflect whether tool calls were emitted"
+    )
+    if choice.message.tool_calls:
+        assert json.loads(choice.message.tool_calls[0].function.arguments) == {
+            "city": "Tokyo"
+        }

@@ -369,6 +369,9 @@ The V4.1 parser also accepts the mixed `<｜DSML｜ tool_calls>` opener.
 When generation ends before the last DSML parameter closes, the parser preserves
 its generated value and completes the argument JSON. This recovery does not
 reconstruct missing argument text or establish that the tool call is complete.
+Chat responses cut by the token limit retain `finish_reason="length"`, even
+when tool arguments form valid JSON. Clients should check this before executing
+a recovered tool call.
 
 ### OpenAI OSS Models (`openai`)
 
