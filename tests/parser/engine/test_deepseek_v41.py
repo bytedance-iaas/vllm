@@ -279,3 +279,92 @@ def test_truncated_and_unclosed_parameter_streaming_and_non_streaming(
     assert calls is not None and len(calls) == 1
     assert calls[0].name == expected_name
     assert json.loads(calls[0].arguments) == expected_args
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+@pytest.mark.parametrize(
+    ("value", "closer"),
+    [
+        ("Paris", "</｜DSML｜>"),
+        ('print("</｜DSML｜>")', "</｜DSML｜ parameter>"),
+        ("text </｜DSML｜> literal", "</｜DSML｜ parameter>"),
+        ("</｜DSML｜>", "</｜DSML｜ parameter>"),
+    ],
+)
+@pytest.mark.parametrize("string_mode", ["true", "false", None])
+@pytest.mark.parametrize("has_schema", [False, True])
+def test_parameter_closer_recovery_preserves_argument_text(
+    chunk_size, value, closer, string_mode, has_schema
+):
+    attr = "" if string_mode is None else f' string="{string_mode}"'
+    raw_value = (
+        value if string_mode == "true" else json.dumps(value, ensure_ascii=False)
+    )
+    parameters: dict[str, object] = {"type": "object"}
+    if has_schema:
+        parameters["properties"] = {
+            "city": {"type": "string"},
+            "count": {"type": "integer"},
+        }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": parameters},
+        }
+    ]
+    text = (
+        '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+        f'<｜DSML｜ parameter name="city"{attr}>{raw_value}{closer}\n'
+        '<｜DSML｜ parameter name="count" string="false">2</｜DSML｜ parameter>'
+        "</｜DSML｜ invoke></｜DSML｜ calls>"
+    )
+    tokenizer, tokens = tokenizer_for(text, False)
+    expected = {"city": value, "count": 2}
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": False}),
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=tools,
+        )
+    )
+    assert json.loads(output.tool_calls[0]["arguments"]) == expected
+    _, _, calls = parser_for(tokenizer, {"thinking": False}).parse(
+        text,
+        _test_request(tools=tools),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert calls is not None and len(calls) == 1
+    assert json.loads(calls[0].arguments) == expected
+
+
+@pytest.mark.parametrize("string_mode", ["true", "false", None])
+@pytest.mark.parametrize("after_closer", [0, 2, 8, 20])
+@pytest.mark.parametrize("next_parameter", [False, True])
+def test_bare_closer_waits_for_parameter_boundary(
+    string_mode, after_closer, next_parameter
+):
+    attr = "" if string_mode is None else f' string="{string_mode}"'
+    text = (
+        '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+        f'<｜DSML｜ parameter name="city"{attr}>Paris</｜DSML｜>\n'
+    )
+    expected: dict[str, object] = {"city": "Paris"}
+    if next_parameter:
+        text += '<｜DSML｜ parameter name="count" string="false">2</｜DSML｜ parameter>'
+        expected["count"] = 2
+    text += "</｜DSML｜ invoke></｜DSML｜ calls>"
+    tokenizer, tokens = tokenizer_for(text, False)
+    split = text.index("</｜DSML｜>") + len("</｜DSML｜>") + after_closer
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": False}),
+            tokens,
+            chunk_size=split,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+        )
+    )
+    assert json.loads(output.tool_calls[0]["arguments"]) == expected

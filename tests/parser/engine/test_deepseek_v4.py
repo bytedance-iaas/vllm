@@ -204,6 +204,26 @@ class TestArgConverter:
             "unit": "celsius",
         }
 
+    @pytest.mark.parametrize("next_parameter", [False, True])
+    @pytest.mark.parametrize("string_mode", ["true", "false", None])
+    def test_bare_parameter_closer_at_argument_boundary(
+        self, next_parameter, string_mode
+    ):
+        attr = "" if string_mode is None else f' string="{string_mode}"'
+        raw = f'<｜DSML｜parameter name="alpha"{attr}>first</｜DSML｜>'
+        expected = {"alpha": "first"}
+        if next_parameter:
+            raw += "\n" + _param("beta", "true", "second")
+            expected["beta"] = "second"
+        assert json.loads(_dsml_arg_converter(raw, partial=False)) == expected
+
+    @pytest.mark.parametrize(
+        "value", ['print("</｜DSML｜>")', "text </｜DSML｜> literal", "</｜DSML｜>"]
+    )
+    def test_literal_bare_closer_inside_completed_parameter(self, value):
+        raw = _param("code", "true", value)
+        assert json.loads(_dsml_arg_converter(raw, partial=False)) == {"code": value}
+
     def test_null_string_false(self):
         raw = self._raw(("val", "false", "null"))
         result = json.loads(_dsml_arg_converter(raw, partial=False))
