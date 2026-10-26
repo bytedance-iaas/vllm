@@ -217,10 +217,42 @@ class ParserEngine(Parser):
         self._content_has_nonws = False
         self._prompt_streaming_prepared = False
 
+    @property
+    def tool_call_stop(self) -> str | None:
+        """The literal that closes a tool-call block, if the format has one.
+
+        Formats whose tool payload is delimited expose this marker so the
+        request path can hand it to the sampler as a stop string.
+        """
+        return self.parser_engine_config.terminal_literal("TOOL_END")
+
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
+        return self._add_tool_call_stop(request)
+
+    def _add_tool_call_stop(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Stop generation once a tool-call block is closed."""
+        closer = self.tool_call_stop
+        if not closer or not getattr(request, "tools", None):
+            return request
+        stop = getattr(request, "stop", None)
+        if stop is None:
+            request.stop = [closer]
+        elif isinstance(stop, str):
+            if stop == closer:
+                return request
+            request.stop = [stop, closer]
+        elif closer in stop:
+            return request
+        else:
+            stop.append(closer)
+        # The parser must still see the closer to finish the tool call.
+        if hasattr(request, "include_stop_str_in_output"):
+            request.include_stop_str_in_output = True
         return request
 
     def _preprocess_feed(

@@ -1483,6 +1483,40 @@ class TestMalformedDsmlNoise:
         assert "DSML" not in (output.content or "")
 
 
+class TestToolCallStop:
+    def _engine(self, mock_tokenizer):
+        return DeepSeekV4Parser(mock_tokenizer)
+
+    def test_exposes_the_block_closer(self, mock_tokenizer):
+        assert self._engine(mock_tokenizer).tool_call_stop == DSML_TOOL_END
+
+    def test_adjust_request_sets_the_stop(self, mock_tokenizer):
+        req = _test_request(tools=DUMMY_TOOLS)
+        req.stop = []
+        out = self._engine(mock_tokenizer).adjust_request(req)
+        assert out.stop == [DSML_TOOL_END]
+        assert out.include_stop_str_in_output is True
+
+    def test_preserves_caller_supplied_stops(self, mock_tokenizer):
+        req = _test_request(tools=DUMMY_TOOLS)
+        req.stop = ["A"]
+        out = self._engine(mock_tokenizer).adjust_request(req)
+        assert out.stop == ["A", DSML_TOOL_END]
+
+    def test_idempotent(self, mock_tokenizer):
+        req = _test_request(tools=DUMMY_TOOLS)
+        req.stop = [DSML_TOOL_END]
+        out = self._engine(mock_tokenizer).adjust_request(req)
+        assert out.stop == [DSML_TOOL_END]
+
+    def test_untouched_without_tools(self, mock_tokenizer):
+        req = _test_request(tools=None)
+        req.stop = []
+        out = self._engine(mock_tokenizer).adjust_request(req)
+        assert out.stop == []
+        assert out.include_stop_str_in_output is False
+
+
 # ── Truncated and unclosed parameters ────────────────────────────────
 
 
