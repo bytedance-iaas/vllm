@@ -136,6 +136,13 @@ class KVTransferConfig:
     SWA/draft state.
     """
 
+    dsv41_encoder_only_prune_weights: bool = False
+    """Skip unused backbone layers on a dedicated encoder-only producer.
+
+    Preserve the logical layer count, PP partition and global cache sources.
+    The boundary cache writer is retained. Consumers must keep full weights.
+    """
+
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
@@ -152,10 +159,19 @@ class KVTransferConfig:
             if self.dsv41_encoder_only_prefill
             else []
         )
+        if self.dsv41_encoder_only_prune_weights:
+            factors.append(self.dsv41_encoder_only_prune_weights)
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
     def __post_init__(self) -> None:
+        if self.dsv41_encoder_only_prune_weights and (
+            not self.dsv41_encoder_only_prefill or self.kv_role != "kv_producer"
+        ):
+            raise ValueError(
+                "dsv41_encoder_only_prune_weights requires a dedicated "
+                "encoder-only kv_producer."
+            )
         if self.engine_id is None:
             self.engine_id = str(uuid.uuid4())
 

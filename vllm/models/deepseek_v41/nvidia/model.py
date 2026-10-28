@@ -684,6 +684,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.encoder_only_boundary_layer: int | None = None
         if self.encoder_only_prefill:
             self.encoder_only_boundary_layer = dsv41_encoder_only_boundary_layer(config)
+        kv_config = getattr(vllm_config, "kv_transfer_config", None)
+        self.prune_encoder_only_weights = bool(
+            self.encoder_only_prefill
+            and kv_config
+            and kv_config.dsv41_encoder_only_prune_weights
+        )
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention._run_parallel_input_projections
@@ -761,9 +767,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.engram_layout = EngramLayout.from_config(config)
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(
+        def make_layer(prefix: str) -> nn.Module:
+            if (
+                self.prune_encoder_only_weights
+                and self.encoder_only_boundary_layer is not None
+                and extract_layer_index(prefix) > self.encoder_only_boundary_layer
+            ):
+                return PPMissingLayer()
+            return DeepseekV4DecoderLayer(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
@@ -784,9 +795,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     in self.pipeline_cache_relay.consumer_layers
                     else None
                 ),
-            ),
+            )
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            make_layer,
             prefix=f"{prefix}.layers",
         )
+        if self.prune_encoder_only_weights:
+            assert self.encoder_only_boundary_layer is not None
+            logger.info(
+                "Encoder-only weight pruning: PP%d retains local layers %d-%d "
+                "through the L%d cache writer; logical partition remains %d-%d.",
+                get_pp_group().rank_in_group,
+                self.start_layer,
+                min(self.end_layer - 1, self.encoder_only_boundary_layer),
+                self.encoder_only_boundary_layer,
+                self.start_layer,
+                self.end_layer - 1,
+            )
 
         # Decoder-side SWA bounded replay: layers past the last KV source
         # prefill only each request's trailing window.
@@ -794,7 +821,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
         if (
-            cut < self.end_layer - 1
+            not self.prune_encoder_only_weights
+            and cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
@@ -1518,7 +1546,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer.ffn.finalize_mega_moe_weights()
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mega_attn_weights(self) -> None:
         """Permute wq_b / wo_a into FlashMLA's mega-attention layouts.
@@ -1527,6 +1556,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         post-load pass cannot permute twice.
         """
         for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if not isinstance(layer, DeepseekV4DecoderLayer):
+                continue
             finalize = getattr(layer.attn, "finalize_loaded_weights", None)
             if finalize is not None:
                 finalize()
