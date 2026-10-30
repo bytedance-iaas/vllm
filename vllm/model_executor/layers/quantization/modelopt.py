@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -2558,6 +2559,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         # so the front-end marlin poke stays dormant here — same as the old
         # NVFP4 methods.
         self.kernel: Any = None
+        self._humming_dense: Any = None
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -2645,6 +2647,23 @@ class ModelOptLinearMethod(LinearMethodBase):
                 persistent=False,
             )
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
+        # Prepare from checkpoint-format tensors before the fallback kernel
+        # repacks them. Dispatch remains limited to the validated projections.
+        if (
+            os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") == "1"
+            and self.spec.weight == kMxfp8Static
+            and self.spec.activation == kMxfp8Dynamic
+            and type(self.fmt) is FormatScheme
+            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+        ):
+            from vllm.model_executor.layers.quantization.utils.dsv41_humming_dense import (  # noqa: E501
+                Dsv41HummingDense,
+            )
+
+            self._humming_dense = Dsv41HummingDense.from_layer(layer)
+            if self._humming_dense is not None:
+                layer.add_module("_humming_dense", self._humming_dense)
+                logger.info("Prepared ordered Humming Decode for %s", layer.prefix)
         self.kernel.process_weights_after_loading(layer)
 
     def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
@@ -2659,11 +2678,20 @@ class ModelOptLinearMethod(LinearMethodBase):
             )
 
     def apply(self, layer, x, bias=None):
+        def apply_kernel(lyr, inp, b):
+            if (
+                self._humming_dense is not None
+                and b is None
+                and self._humming_dense.supports(inp)
+            ):
+                return self._humming_dense(inp)
+            return self.kernel.apply_weights(layer=lyr, x=inp, bias=b)
+
         return self.fmt.apply(
             layer,
             x,
             bias,
-            lambda lyr, inp, b: self.kernel.apply_weights(layer=lyr, x=inp, bias=b),
+            apply_kernel,
         )
 
 
