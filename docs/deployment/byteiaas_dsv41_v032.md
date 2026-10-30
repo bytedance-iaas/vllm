@@ -51,8 +51,8 @@ with those two paths cleared:
 helm template dsv41-flash \
   vllm/deepseek/deepseek-v4.1-flash-offload -n wyc \
   --set-string global.image="$BUILT_IMAGE" \
-  --set-string 'prefill.env.PYTHONPATH=' \
-  --set-string 'decode.env.PYTHONPATH='
+  --set-json 'prefill.extraEnv.PYTHONPATH=null' \
+  --set-json 'decode.extraEnv.PYTHONPATH=null'
 ```
 
 Keep the encoder-only Prefill, weight pruning, PP layer split, PCP alignment,
