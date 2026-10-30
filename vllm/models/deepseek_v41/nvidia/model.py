@@ -813,6 +813,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.encoder_only_boundary_layer: int | None = None
         if self.encoder_only_prefill:
             self.encoder_only_boundary_layer = dsv41_encoder_only_boundary_layer(config)
+        kv_config = vllm_config.kv_transfer_config
+        self.prune_encoder_only_weights = bool(
+            self.encoder_only_prefill
+            and kv_config
+            and kv_config.dsv41_encoder_only_prune_weights
+        )
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention._run_parallel_input_projections
@@ -889,9 +895,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks to belong to one NVLink domain. Collective: run before layers.
         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(
+        def make_layer(prefix: str) -> nn.Module:
+            if (
+                self.prune_encoder_only_weights
+                and self.encoder_only_boundary_layer is not None
+                and extract_layer_index(prefix) > self.encoder_only_boundary_layer
+            ):
+                return PPMissingLayer()
+            return DeepseekV4DecoderLayer(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
@@ -909,9 +920,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     in self.pipeline_cache_relay.consumer_layers
                     else None
                 ),
-            ),
+            )
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            make_layer,
             prefix=f"{prefix}.layers",
         )
+        if self.prune_encoder_only_weights:
+            assert self.encoder_only_boundary_layer is not None
+            logger.info(
+                "Encoder-only weight pruning: PP%d retains local layers %d-%d "
+                "through the L%d cache writer; logical partition remains %d-%d.",
+                get_pp_group().rank_in_group,
+                self.start_layer,
+                min(self.end_layer - 1, self.encoder_only_boundary_layer),
+                self.encoder_only_boundary_layer,
+                self.start_layer,
+                self.end_layer - 1,
+            )
         self.engram_batch = EngramBatch.create(
             [
                 layer.engram
@@ -926,8 +953,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # replaces with its own all-reduce.
             local_layers = list(islice(self.layers, self.start_layer, self.end_layer))
             for layer, successor in zip(local_layers, local_layers[1:]):
-                assert isinstance(layer, DeepseekV4DecoderLayer)
-                assert isinstance(successor, DeepseekV4DecoderLayer)
+                if not isinstance(layer, DeepseekV4DecoderLayer) or not isinstance(
+                    successor, DeepseekV4DecoderLayer
+                ):
+                    continue
                 if successor.engram is None:
                     layer.ffn.defer_finalize()
 
@@ -1661,7 +1690,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer.ffn.finalize_mega_moe_weights()
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
@@ -1928,7 +1958,7 @@ class DeepseekV41LLMForCausalLM(
             for layer in islice(
                 self.model.layers, self.model.start_layer, self.model.end_layer
             ):
-                if layer.engram is not None:
+                if getattr(layer, "engram", None) is not None:
                     layer.engram.embed_tokens.collapse_huge_pages()
         return loaded_params
 
