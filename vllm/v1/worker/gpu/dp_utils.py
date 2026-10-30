@@ -38,6 +38,8 @@ class DPSyncState:
     eager: bool
     # Largest real request count scheduled on any rank before graph padding.
     num_reqs: int
+    # Whether any rank has a request still in prefill.
+    has_prefill: bool = False
 
 
 def sync_cudagraph_and_dp_padding(
@@ -49,6 +51,7 @@ def sync_cudagraph_and_dp_padding(
     dp_size: int,
     dp_rank: int,
     max_query_len: int | None = None,
+    has_prefill: bool = False,
     num_active_loras: int = 0,
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
@@ -63,13 +66,14 @@ def sync_cudagraph_and_dp_padding(
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(6, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
+    tensor[6][dp_rank] = int(has_prefill)
     if should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
@@ -81,6 +85,7 @@ def sync_cudagraph_and_dp_padding(
     max_query_lens_across_dp = tensor[3]
     allow_ubatching_across_dp = tensor[4]
     num_reqs_across_dp = tensor[5]
+    synced_has_prefill = bool(torch.any(tensor[6] != 0).item())
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -145,6 +150,7 @@ def sync_cudagraph_and_dp_padding(
                 uniform_token_count=synced_uniform_token_count,
                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
                 num_reqs=int(num_reqs_across_dp.max()),
+                has_prefill=synced_has_prefill,
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
@@ -163,6 +169,7 @@ def sync_cudagraph_and_dp_padding(
                 uniform_token_count=synced_uniform_token_count,
                 eager=True,
                 num_reqs=int(num_reqs_across_dp.max()),
+                has_prefill=synced_has_prefill,
             ),
         )
 
@@ -197,6 +204,7 @@ def sync_cudagraph_and_dp_padding(
         uniform_token_count=synced_uniform_token_count,
         eager=False,
         num_reqs=int(num_reqs_across_dp.max()),
+        has_prefill=synced_has_prefill,
     )
 
 
@@ -208,6 +216,7 @@ def dispatch_cg_and_sync_dp(
     dp_size: int,
     dp_rank: int,
     max_query_len: int | None = None,
+    has_prefill: bool = False,
     need_eager: bool = False,
     num_active_loras: int = 0,
     parallel_config: ParallelConfig | None = None,
@@ -235,6 +244,7 @@ def dispatch_cg_and_sync_dp(
         max_query_len: Upper bound on per-request query length, for selecting
             varlen decode graphs. None, as for a batch with a prefill, keeps
             the batch out of graphs that constrain it.
+        has_prefill: Whether this rank has a request still in prefill.
         need_eager: Force `CUDAGraphMode.NONE` instead of dispatching.
         num_active_loras: Active LoRA count for this rank. Does not need
             cross-rank agreement; it never changes a bucket's token count.
@@ -288,6 +298,9 @@ def dispatch_cg_and_sync_dp(
             dp_sync_state.uniform_token_count is None
             or uniform_token_count == dp_sync_state.uniform_token_count
         ), "reusing a DP sync taken over a different batch"
+        assert not has_prefill or dp_sync_state.has_prefill, (
+            "reusing a DP sync that omitted this rank's prefill phase"
+        )
         if not dp_sync_state.eager and batch_desc.num_tokens != num_tokens:
             # Capture sizes can differ between managers, so this one may
             # pad further. Every rank pads alike, so report what will run.
@@ -308,6 +321,7 @@ def dispatch_cg_and_sync_dp(
         dp_size,
         dp_rank,
         max_query_len=max_query_len,
+        has_prefill=has_prefill,
         num_active_loras=num_active_loras,
         parallel_config=parallel_config,
         allow_ubatching=allow_ubatching,
