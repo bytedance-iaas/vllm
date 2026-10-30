@@ -6,7 +6,7 @@ import logging
 import queue
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -452,6 +452,25 @@ def _align_transfer_regions(
     return aligned_local, aligned_remote, None
 
 
+def _validate_dsv41_cache_only_regions(
+    producer_regions: list[TransferRegion],
+    consumer_regions: list[TransferRegion],
+) -> str | None:
+    """Require matching global cache layer identities on both Mooncake roles."""
+    producer_layers = Counter(
+        (region.layer_name, region.layer_index) for region in producer_regions
+    )
+    consumer_layers = Counter(
+        (region.layer_name, region.layer_index) for region in consumer_regions
+    )
+    if producer_layers != consumer_layers:
+        return (
+            "DeepSeek-V4.1 cache-only Mooncake handoff requires matching "
+            "Main-KV/Indexer-K regions on producer and consumer."
+        )
+    return None
+
+
 def _coalesce_contiguous_transfer_regions(
     local_regions: list[TransferRegion],
     remote_regions: list[TransferRegion],
@@ -885,6 +904,7 @@ class MooncakeConnectorScheduler:
         self.is_kv_consumer: bool = (
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
+        self.is_dsv41_encoder_only_prefill = vllm_config.is_dsv41_encoder_only_prefill
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
         self._is_hma_required = (
@@ -1147,7 +1167,22 @@ class MooncakeConnectorScheduler:
 
         assert not self.is_kv_consumer
 
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        cache_only_ready = (
+            self.is_dsv41_encoder_only_prefill
+            and params.get("cache_only")
+            and request.status == RequestStatus.FINISHED_STOPPED
+            and request.num_computed_tokens >= request.num_prompt_tokens
+            and request.num_output_tokens == 0
+        )
+        conventional_stopped = (
+            not self.is_dsv41_encoder_only_prefill
+            and request.status == RequestStatus.FINISHED_STOPPED
+        )
+        if (
+            request.status != RequestStatus.FINISHED_LENGTH_CAPPED
+            and not cache_only_ready
+            and not conventional_stopped
+        ):
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(params["transfer_id"])
@@ -2686,6 +2721,12 @@ class MooncakeConnectorWorker:
         )
         pre_align_local = local_regions
         pre_align_remote = remote_regions
+        if self.vllm_config.is_dsv41_encoder_only_prefill:
+            profile_error = _validate_dsv41_cache_only_regions(
+                local_regions, remote_regions
+            )
+            if profile_error is not None:
+                return finish([], [], profile_error)
         local_regions, remote_regions, align_err = _align_transfer_regions(
             local_regions,
             remote_regions,

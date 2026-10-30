@@ -86,6 +86,7 @@ from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
+    AsyncCacheOnlyOutput,
     AsyncOutput,
     AsyncPoolingOutput,
     StepTimingCollector,
@@ -200,6 +201,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
+        self.is_dsv41_encoder_only_prefill = vllm_config.is_dsv41_encoder_only_prefill
         self.speculative_config = vllm_config.speculative_config
         self._draft_workspace_lane = int(
             self.speculative_config is not None and self.speculative_config.use_dspark()
@@ -2091,7 +2093,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @step_eplb_after()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> AsyncOutput | ModelRunnerOutput | None:
+    ) -> AsyncOutput | AsyncCacheOnlyOutput | ModelRunnerOutput | None:
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -2129,6 +2131,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
+
+        if self.is_dsv41_encoder_only_prefill:
+            self.postprocess_num_computed_tokens(input_batch)
+            self.model_state.postprocess_state(
+                input_batch.idx_mapping, 0, self.req_states.num_computed_tokens.gpu
+            )
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            output = ModelRunnerOutput(
+                req_ids=input_batch.req_ids,
+                req_id_to_index={
+                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
+                },
+                sampled_token_ids=[[] for _ in input_batch.req_ids],
+                kv_connector_output=kv_connector_output,
+                ec_connector_output=ec_connector_output,
+                cudagraph_stats=cudagraph_stats,
+            )
+            return AsyncCacheOnlyOutput(output, self.main_stream)
 
         # Last rank: sample tokens
         assert hidden_states is not None
