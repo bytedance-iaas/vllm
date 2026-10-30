@@ -931,6 +931,17 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
                 router_logits,
             )
+            if (
+                self.moe_config.pcp_size > 1
+                and not self.moe_config.moe_parallel_config.use_all2all_kernels
+                and input_ids is not None
+                and input_ids.shape != (hidden_states.shape[0],)
+            ):
+                # V4.1 gathers IDs at the model/replay entry, once per batch.
+                raise RuntimeError(
+                    "PCP routing IDs must match gathered hidden rows: "
+                    f"{input_ids.shape=} {hidden_states.shape[0]=}."
+                )
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
