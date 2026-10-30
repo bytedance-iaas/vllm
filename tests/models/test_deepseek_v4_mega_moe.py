@@ -66,6 +66,67 @@ def test_sm90_mega_moe_alignment_rejects_invalid_or_stale_shim(alignment):
         get_sm90_mega_moe_token_alignment(module)
 
 
+@pytest.mark.parametrize(
+    "alignment,decode,full,expected",
+    [
+        (384, 384, 2048, [384, 768, 2304]),
+        (1920, 576, 2048, [1920, 3840]),
+        (1920, 576, 1024, [1920]),
+    ],
+)
+def test_sm90_mega_moe_prepares_only_distinct_physical_capacities(
+    alignment, decode, full, expected
+):
+    """Logical Decode/replay sizes sharing one native allocation reuse it."""
+    experts = DeepseekV4MegaMoEExperts.__new__(DeepseekV4MegaMoEExperts)
+    torch.nn.Module.__init__(experts)
+    experts._capacity_buffers = None
+    experts._decode_capacity = decode
+    experts.max_num_batched_tokens = full
+    experts._ensure_backend = lambda: SimpleNamespace(
+        get_token_alignment=lambda: alignment
+    )
+    allocations = []
+
+    def allocate(capacity):
+        allocations.append(capacity)
+        return SimpleNamespace(num_max_tokens_per_rank=capacity)
+
+    experts.get_symm_buffer = allocate
+    experts.prepare_capacity_buckets()
+    experts.prepare_capacity_buckets()
+    assert allocations == expected
+    assert [limit for limit, _ in experts._capacity_buffers] == [
+        min(capacity, full) for capacity in expected
+    ]
+
+
+def test_sm90_mega_moe_capacity_uses_dp_max_before_local_rows(monkeypatch):
+    """An idle rank must select the same remote workspace as its busy peers."""
+    experts = DeepseekV4MegaMoEExperts.__new__(DeepseekV4MegaMoEExperts)
+    torch.nn.Module.__init__(experts)
+    experts._token_alignment = 1920
+    experts.max_num_batched_tokens = 2048
+    experts.sequence_parallel_size = 1
+    small, full = object(), object()
+    experts._capacity_buffers = ((1920, small), (2048, full))
+    context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([0, 2000]))
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.model.is_forward_context_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.model.get_forward_context", lambda: context
+    )
+    assert experts.get_symm_buffer_for_num_tokens(0) is full
+    assert experts.get_symm_buffer_for_num_tokens(2000) is full
+    context.dp_metadata.num_tokens_across_dp_cpu[1] = 2049
+    with pytest.raises(ValueError):
+        experts.get_symm_buffer_for_num_tokens(0)
+
+
 @pytest.fixture
 def v41_moe_config(dist_init):
     return SimpleNamespace(
@@ -352,6 +413,7 @@ def test_deep_gemm_mega_moe_capture_precedes_eplb(monkeypatch, use_kimi):
         experts.synchronize_first_launch = lambda: None
     experts.prefix = "model.layers.3.ffn.experts"
     experts.max_num_tokens = 4
+    experts.max_num_batched_tokens = 4
     experts.capture_fn = None
     experts.get_symm_buffer = lambda: object()
     experts.eplb_state = SimpleNamespace(

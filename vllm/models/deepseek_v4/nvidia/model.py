@@ -227,6 +227,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         num_shared_experts: int = 0,
         prefix: str = "",
         num_logical_experts: int | None = None,
+        sequence_parallel_size: int = 1,
     ):
         super().__init__()
         self.prefix = prefix
@@ -239,7 +240,22 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_shared_experts = num_shared_experts
+        self.sequence_parallel_size = sequence_parallel_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_batched_tokens = cdiv(self.max_num_tokens, sequence_parallel_size)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        tokens_per_seq = 1 + (
+            speculative_config.num_speculative_tokens if speculative_config else 0
+        )
+        max_num_seqs = getattr(
+            vllm_config.scheduler_config, "max_num_seqs", self.max_num_tokens
+        )
+        self._decode_capacity = min(
+            self.max_num_batched_tokens,
+            cdiv(max_num_seqs * tokens_per_seq, sequence_parallel_size),
+        )
+        self._token_alignment: int | None = None
+        self._capacity_buffers: tuple[tuple[int, object], ...] | None = None
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -464,19 +480,22 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     def has_fused_shared_experts(self) -> bool:
         return self._transformed_shared_l1_weights is not None
 
-    def get_symm_buffer(self):
+    def get_symm_buffer(self, max_num_tokens: int | None = None):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
 
         backend = self._ensure_backend()
+        capacity = self.max_num_tokens if max_num_tokens is None else max_num_tokens
+        if self._token_alignment is not None:
+            capacity = cdiv(capacity, self._token_alignment) * self._token_alignment
         group = get_ep_group().device_group
         device = torch.accelerator.current_device_index()
         key = (
             id(group),
             device,
             self.num_experts,
-            self.max_num_tokens,
+            capacity,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
@@ -488,7 +507,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
                 self.num_experts,
-                self.max_num_tokens,
+                capacity,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
@@ -499,6 +518,67 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
+
+    def prepare_capacity_buckets(self) -> None:
+        """Allocate distinct SM90 physical capacities before warmup/capture."""
+        if self._capacity_buffers is not None:
+            return
+        alignment = self._ensure_backend().get_token_alignment()
+        if alignment is None:
+            return
+        self._token_alignment = alignment
+        self.max_num_tokens = self._decode_capacity
+        full_capacity = self.max_num_batched_tokens
+        requests = (
+            self._decode_capacity,
+            min(cdiv(self._decode_capacity + 1, alignment) * alignment, full_capacity),
+            full_capacity,
+        )
+        physical_capacities = sorted({cdiv(n, alignment) * alignment for n in requests})
+        buffers = []
+        for capacity in physical_capacities:
+            buffer = self.get_symm_buffer(capacity)
+            if buffer.num_max_tokens_per_rank != capacity:
+                raise RuntimeError(
+                    "DeepGEMM SM90 allocator disagrees with its token alignment: "
+                    f"requested {capacity}, allocated {buffer.num_max_tokens_per_rank}."
+                )
+            buffers.append((min(capacity, full_capacity), buffer))
+        self._capacity_buffers = tuple(buffers)
+        logger.info_once(
+            "DeepSeek V4 SM90 MegaMoE capacities: decode=%d full=%d physical=%s.",
+            self._decode_capacity,
+            full_capacity,
+            physical_capacities,
+        )
+
+    def get_symm_buffer_for_num_tokens(self, num_tokens: int):
+        alignment = self._token_alignment
+        if alignment is None:
+            return self.get_symm_buffer()
+        required = num_tokens
+        if is_forward_context_available():
+            metadata = get_forward_context().dp_metadata
+            if metadata is not None:
+                required = cdiv(
+                    int(metadata.num_tokens_across_dp_cpu.max().item()),
+                    self.sequence_parallel_size,
+                )
+                if required < num_tokens:
+                    raise RuntimeError(
+                        "MegaMoE DP metadata does not cover the local token count."
+                    )
+        if required > self.max_num_batched_tokens:
+            raise ValueError(
+                f"MegaMoE DP-wide token count {required} exceeds capacity "
+                f"{self.max_num_batched_tokens}."
+            )
+        if self._capacity_buffers is None:
+            raise RuntimeError("MegaMoE capacities must be prepared before forward.")
+        for capacity, buffer in self._capacity_buffers:
+            if required <= capacity:
+                return buffer
+        raise RuntimeError(f"MegaMoE has no prepared capacity for {required} tokens.")
 
     def set_eplb_state(
         self,
@@ -559,10 +639,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         activation_clamp: float | None,
         fast_math: bool = True,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] > self.max_num_tokens:
+        if hidden_states.shape[0] > self.max_num_batched_tokens:
             raise ValueError(
                 f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
-                f"but the symmetric buffer was sized for {self.max_num_tokens}."
+                f"but the symmetric buffer was sized for {self.max_num_batched_tokens}."
             )
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
@@ -602,7 +682,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             )
 
         backend = self._ensure_backend()
-        symm_buffer = self.get_symm_buffer()
+        symm_buffer = self.get_symm_buffer_for_num_tokens(num_tokens)
         shared_x_sf = None
         shared_block_m = None
         if self.has_fused_shared_experts:
@@ -843,6 +923,7 @@ class DeepseekV4MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             num_shared_experts=(self.n_shared_experts if fuse_shared_experts else 0),
             prefix=f"{prefix}.experts",
+            sequence_parallel_size=self.tp_size if self.use_sequence_parallel else 1,
         )
         self.experts = DeepseekV4MegaMoEExperts(vllm_config, **expert_kwargs)
 
@@ -1008,6 +1089,7 @@ class DeepseekV4MoE(nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         if self.use_native_mega_moe:
             self.experts.finalize_weights(self.shared_experts)
+            self.experts.prepare_capacity_buckets()
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
