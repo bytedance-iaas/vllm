@@ -1768,6 +1768,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     batch_req_state.num_scheduled_tokens,
                     batch_req_state.is_prefilling_np,
                 )
+        has_prefill = (
+            batch_req_state.has_prefill if batch_req_state is not None else False
+        )
 
         num_active_loras = 0
         if self.lora_config:
@@ -1791,6 +1794,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
+            has_prefill=has_prefill,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
@@ -1799,6 +1803,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )
+        if (
+            batch_req_state is not None
+            and batch_req_state.num_tokens == num_toks
+            and self.pcp_manager is None
+            and batch_desc.num_ubatches == 1
+            and self.adaptive_verification is not None
+            and self.adaptive_verification.post_dp_refill_enabled
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            dp_eager = (
+                dp_sync_state.eager
+                if dp_sync_state is not None
+                else batch_desc.cg_mode == CUDAGraphMode.NONE
+            )
+            dp_has_prefill = (
+                dp_sync_state.has_prefill if dp_sync_state is not None else has_prefill
+            )
+            dp_num_reqs_unpadded = (
+                dp_sync_state.num_reqs if dp_sync_state is not None else num_reqs
+            )
+            refilled_num_toks = self.adaptive_verification.maybe_refill_post_dp_budget(
+                local_dispatch_tokens=num_toks,
+                graph_mode=batch_desc.cg_mode,
+                graph_num_tokens=batch_desc.num_tokens,
+                graph_num_reqs=batch_desc.num_reqs,
+                graph_max_query_len=batch_desc.max_query_len,
+                dp_eager=dp_eager,
+                dp_has_prefill=dp_has_prefill,
+                dp_num_reqs_unpadded=dp_num_reqs_unpadded,
+            )
+            batch_req_state, num_toks = _apply_post_dp_refill_num_tokens(
+                batch_req_state,
+                local_dispatch_tokens=num_toks,
+                refilled_num_tokens=refilled_num_toks,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -2462,6 +2501,23 @@ class BatchReqState(NamedTuple):
     has_prefill: bool
     prefill_runs_as_decode_np: np.ndarray | None  # [num_reqs]
     decode_graph_eligible: bool
+
+
+def _apply_post_dp_refill_num_tokens(
+    batch_req_state: BatchReqState,
+    *,
+    local_dispatch_tokens: int,
+    refilled_num_tokens: int,
+) -> tuple[BatchReqState, int]:
+    if (
+        batch_req_state.num_tokens != local_dispatch_tokens
+        or refilled_num_tokens <= local_dispatch_tokens
+    ):
+        return batch_req_state, local_dispatch_tokens
+    return (
+        batch_req_state._replace(num_tokens=refilled_num_tokens),
+        refilled_num_tokens,
+    )
 
 
 def sort_batch_req_ids(
