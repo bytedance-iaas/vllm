@@ -138,6 +138,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         - Module class names: "Linear" -> preserved (no ".")
         - Regex patterns: "re:.*proj" -> preserved (starts with "re:")
         """
+        self.hf_to_vllm_mapper = hf_to_vllm_mapper
 
         def _map_target(target: str) -> str | None:
             is_layer_path = "." in target and not target.startswith("re:")

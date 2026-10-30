@@ -278,7 +278,9 @@ def resolve_humming_moe_activation_keys(
     if parent is None:
         parent = default_input_schema or HummingInputSchema()
     if allow_fallback is None:
-        allow_fallback = True
+        # Checkpoint activation formats are strict unless the user explicitly
+        # enables fallback in the parent or sublayer environment override.
+        allow_fallback = False
     keys = []
     for name in ("w13", "w2"):
         config = sublayers.get(name, {})

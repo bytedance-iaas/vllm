@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Union
 
@@ -745,7 +746,11 @@ def select_mxfp4_moe_backend(
 
 def select_deepseek_v4_mxfp4_moe_backend(
     config: FusedMoEConfig,
-    humming_activation_keys: tuple[QuantKey | None, QuantKey | None] | None = None,
+    humming_activation_keys: (
+        tuple[QuantKey | None, QuantKey | None]
+        | Callable[[], tuple[QuantKey | None, QuantKey | None]]
+        | None
+    ) = None,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the MXFP4 MoE backend with MXFP8 activation as top priority.
     Falls back through BF16 and other backends.
@@ -755,6 +760,15 @@ def select_deepseek_v4_mxfp4_moe_backend(
         if config.moe_parallel_config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
+
+    def get_activation_keys(backend):
+        if backend == Mxfp4MoeBackend.HUMMING and humming_activation_keys is not None:
+            return (
+                humming_activation_keys()
+                if callable(humming_activation_keys)
+                else humming_activation_keys
+            )
+        return (_backend_activation_key(backend),)
 
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
@@ -775,12 +789,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
         last_error: Exception | None = None
         for requested_backend in requested_backends:
             try:
-                activation_keys = (
-                    humming_activation_keys
-                    if requested_backend == Mxfp4MoeBackend.HUMMING
-                    and humming_activation_keys is not None
-                    else (_backend_activation_key(requested_backend),)
-                )
+                activation_keys = get_activation_keys(requested_backend)
                 return _return_or_raise(
                     requested_backend,
                     config,
@@ -809,12 +818,13 @@ def select_deepseek_v4_mxfp4_moe_backend(
 
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
     for backend in priority_backends:
-        activation_keys = (
-            humming_activation_keys
-            if backend == Mxfp4MoeBackend.HUMMING
-            and humming_activation_keys is not None
-            else (_backend_activation_key(backend),)
-        )
+        try:
+            activation_keys = get_activation_keys(backend)
+        except (ValueError, ImportError) as error:
+            if backend != Mxfp4MoeBackend.HUMMING:
+                raise
+            logger.debug_once(_make_log_unsupported(backend, str(error)), scope="local")
+            continue
         for k_cls in backend_to_kernel_cls(backend):
             for activation_key in activation_keys:
                 supported, reason = k_cls.is_supported_config(

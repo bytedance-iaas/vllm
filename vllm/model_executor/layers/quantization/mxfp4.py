@@ -586,24 +586,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.layer_name = layer_name
         self.humming_input_layer_skipped = humming_input_layer_skipped
         self.humming_activation_keys = None
+        humming_keys_resolver = None
         if moe.moe_backend == "humming" or (
-            moe.moe_backend == "auto" and envs.VLLM_HUMMING_INPUT_QUANT_CONFIG
+            moe.moe_backend == "auto"
+            and (envs.VLLM_HUMMING_INPUT_QUANT_CONFIG or activation_key is not None)
         ):
-            from vllm.model_executor.layers.quantization.utils.humming.moe import (
-                resolve_humming_moe_activation_keys,
-            )
-            from vllm.model_executor.layers.quantization.utils.humming.schema import (
-                quant_key_to_input_schema,
-            )
-            from vllm.utils.humming import BaseWeightSchema
-
-            self.humming_activation_keys = resolve_humming_moe_activation_keys(
-                layer_name,
-                BaseWeightSchema.from_config({"quant_method": "mxfp4"}),
-                moe.in_dtype,
-                layer_skipped=humming_input_layer_skipped,
-                default_input_schema=quant_key_to_input_schema(activation_key),
-            )
+            humming_keys_resolver = self._resolve_humming_activation_keys
         self.is_k3_situ_aiter = _use_k3_situ_aiter(moe)
         self.is_k3_situ_int4_gfx942 = _use_k3_situ_int4_gfx942(moe)
         self.experts_cls: type[mk.FusedMoEExperts] | None
@@ -628,7 +616,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
         else:
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
-                moe, humming_activation_keys=self.humming_activation_keys
+                moe, humming_activation_keys=humming_keys_resolver
             )
 
         self.max_capture_size = moe.max_capture_size
@@ -639,6 +627,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Used for triton kernel precision configs
         self.w13_precision_config = None
         self.w2_precision_config = None
+
+    def _resolve_humming_activation_keys(self):
+        from vllm.model_executor.layers.quantization.utils.humming.moe import (
+            resolve_humming_moe_activation_keys,
+        )
+        from vllm.model_executor.layers.quantization.utils.humming.schema import (
+            quant_key_to_input_schema,
+        )
+        from vllm.utils.humming import BaseWeightSchema
+
+        self.humming_activation_keys = resolve_humming_moe_activation_keys(
+            self.layer_name,
+            BaseWeightSchema.from_config({"quant_method": "mxfp4"}),
+            self.moe.in_dtype,
+            layer_skipped=self.humming_input_layer_skipped,
+            default_input_schema=quant_key_to_input_schema(self.activation_key),
+        )
+        return self.humming_activation_keys
 
     @property
     def supports_eplb(self) -> bool:
