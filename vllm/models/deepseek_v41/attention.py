@@ -3,6 +3,7 @@
 """DeepseekV4 MLA Attention Layer"""
 
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
@@ -29,6 +30,7 @@ from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
 from vllm.models.deepseek_v41.common.ops import (
     MXFP4_BLOCK_SIZE,
+    compute_global_topk_indices_and_lens,
     fused_indexer_q_rope_quant,
     indexer_k_norm_rope_store,
 )
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.rocm_paged_mxfp4_indexer import (
         RocmSparseMQAIndexer,
     )
+    from vllm.models.deepseek_v41.sparse_mla import DeepseekV4FlashMLAMetadata
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
@@ -367,6 +370,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 "DeepSeek V4.1 cross-stage KV relay requires a ratio-2 "
                 "consumer at or after its receiver layer."
             )
+        reuse_decode_global_topk = os.environ.get(
+            "VLLM_DSV41_REUSE_DECODE_GLOBAL_TOPK", "0"
+        )
+        if reuse_decode_global_topk not in ("0", "1"):
+            raise ValueError(
+                "VLLM_DSV41_REUSE_DECODE_GLOBAL_TOPK must be 0 or 1, "
+                f"got {reuse_decode_global_topk!r}."
+            )
+        self.reuse_decode_global_topk = reuse_decode_global_topk == "1"
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
@@ -1345,6 +1357,43 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert self.compressed_cache_prefix is not None
         source = self._static_forward_context[self.compressed_cache_prefix]
         return source.kv_cache
+
+    def _decode_global_topk(
+        self,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+        attn_metadata: "DeepseekV4FlashMLAMetadata",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map this index source's local decode top-k to global cache slots."""
+        assert self.index_source_layer_id is not None
+        assert self.kv_source_layer_id is not None
+        assert self.topk_indices_buffer is not None
+        assert swa_metadata.is_valid_token is not None
+        cache_key = (
+            self.index_source_layer_id,
+            self.kv_source_layer_id,
+            self.compress_ratio,
+        )
+        if self.reuse_decode_global_topk:
+            if self.is_index_source:
+                # Capture warmups reuse metadata; refresh each source on every forward.
+                for key in tuple(attn_metadata.decode_global_topk_cache):
+                    if key[0] == self.index_source_layer_id:
+                        del attn_metadata.decode_global_topk_cache[key]
+            cached = attn_metadata.decode_global_topk_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        result = compute_global_topk_indices_and_lens(
+            self.topk_indices_buffer[:num_decode_tokens],
+            swa_metadata.token_to_req_indices,
+            attn_metadata.block_table[: swa_metadata.num_decodes],
+            attn_metadata.block_size // self.compress_ratio,
+            swa_metadata.is_valid_token[:num_decode_tokens],
+        )
+        if self.reuse_decode_global_topk:
+            attn_metadata.decode_global_topk_cache[cache_key] = result
+        return result
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
