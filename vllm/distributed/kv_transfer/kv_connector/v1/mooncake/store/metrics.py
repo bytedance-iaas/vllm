@@ -190,6 +190,7 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
                     self._resource_gauge = self._gauge_cls(
                         name="vllm:mooncake_store_resources",
                         documentation="Store queue and pins per engine.",
+                        multiprocess_mode="mostrecent",
                         labelnames=self._labelnames + ["resource"],
                     )
                 for resource in (

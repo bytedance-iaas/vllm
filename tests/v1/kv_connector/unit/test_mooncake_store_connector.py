@@ -1122,3 +1122,43 @@ def test_store_resource_samples_reduce_as_gauges_instead_of_rpc_counts():
     assert reduced["pending_jobs_worker_max"] == 3
     assert reduced["pinned_blocks_worker_max"] == 4
     assert "resources_count" not in reduced
+
+
+@pytest.mark.parametrize("identity", ["engine", "dp_rank", "port", "hostname"])
+def test_canonical_lookup_path_binds_with_long_hostname_and_isolates_peers(
+    monkeypatch, identity
+):
+    import uuid
+    from types import SimpleNamespace
+
+    import zmq
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+        dsv41_lookup,
+    )
+
+    monkeypatch.setattr(worker.envs, "VLLM_RPC_BASE_PATH", "/tmp")
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "p" * 63)
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            engine_id=uuid.uuid4().hex, kv_connector_extra_config={}
+        ),
+        parallel_config=SimpleNamespace(data_parallel_index=0),
+    )
+    endpoint = dsv41_lookup._path(config)
+    assert endpoint == dsv41_lookup._path(config)
+    assert len(endpoint.removeprefix("ipc://").encode()) <= 107
+    with zmq.Context() as context, context.socket(zmq.REP) as sock:
+        sock.bind(endpoint)
+        if identity == "engine":
+            config.kv_transfer_config.engine_id += "-other"
+        elif identity == "dp_rank":
+            config.parallel_config.data_parallel_index += 1
+        elif identity == "port":
+            config.kv_transfer_config.kv_connector_extra_config["lookup_rpc_port"] = 1
+        else:
+            monkeypatch.setattr(worker.socket, "gethostname", lambda: "q" * 63)
+        other_endpoint = dsv41_lookup._path(config)
+        assert other_endpoint != endpoint
+        with context.socket(zmq.REP) as other:
+            other.bind(other_endpoint)

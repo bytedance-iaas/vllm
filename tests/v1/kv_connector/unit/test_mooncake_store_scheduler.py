@@ -1774,6 +1774,7 @@ def test_canonical_save_keeps_blocks_until_every_worker_acknowledges():
     )
 
     scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
+    scheduler.capacity_only = False
     scheduler.hash_tokens = scheduler.chunk_tokens = 64
     scheduler.prefill = True
     scheduler.saved, scheduler.pins, scheduler.bypass = {}, {}, set()
@@ -1790,7 +1791,13 @@ def test_canonical_save_keeps_blocks_until_every_worker_acknowledges():
         {},
     )
     scheduler.pool = Mock(blocks=list(range(10)))
-    request = SimpleNamespace(request_id="r", block_hashes=[b"a", b"b"])
+    request = SimpleNamespace(
+        request_id="r",
+        block_hashes=[b"a", b"b"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+    )
     job = scheduler._save(request, ([2, 3],), 128)
     assert job is not None and job.end == 128
     for count in (2, 5):
@@ -1898,6 +1905,7 @@ def test_canonical_failed_load_is_bypassed_on_recompute():
     )
 
     scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
+    scheduler.capacity_only = False
     scheduler.bypass = set()
     scheduler.requests = {"r": None}
     scheduler.client = Mock()
@@ -1929,9 +1937,146 @@ def test_canonical_pin_budget_only_advances_through_the_admitted_chunks():
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
     )
     scheduler.pool = Mock(blocks=list(range(10)))
-    request = SimpleNamespace(request_id="r", block_hashes=[b"a", b"b"])
+    request = SimpleNamespace(
+        request_id="r",
+        block_hashes=[b"a", b"b"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+    )
     job = scheduler._save(request, ([2, 3],), 128)
     assert job.end == scheduler.saved["r"] == 64
     scheduler.pool.touch.assert_called_once_with([2])
     assert scheduler._save(request, ([2, 3],), 128) is None
     assert scheduler.saved["r"] == 64
+
+
+def _make_canonical_scheduler(pd_role):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Dsv41StoreScheduler,
+    )
+
+    spec = FullAttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=1, dtype=torch.float16
+    )
+    cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["model.layers.2.attn"], spec)],
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={
+                "pd_role": pd_role,
+                "save_decode_cache": True,
+            }
+        ),
+        parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(block_size=64),
+    )
+    scheduler = Dsv41StoreScheduler(config, cache_config)
+    pool = BlockPool(num_gpu_blocks=16, enable_caching=True, hash_block_size=64)
+    scheduler.bind_gpu_block_pool(pool)
+    return scheduler
+
+
+@pytest.mark.parametrize("pd_role", ["prefill", "decode"])
+def test_canonical_same_step_readmission_keeps_saving_after_preemption(pd_role):
+    from unittest.mock import Mock
+
+    scheduler = _make_canonical_scheduler(pd_role)
+    pool = scheduler.pool
+    blocks = KVCacheBlocks((pool.get_new_blocks(4),))
+    block_ids = blocks.get_block_ids()
+    request = SimpleNamespace(
+        request_id="req-0",
+        block_hashes=[b"a", b"b", b"c", b"d"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+        num_computed_tokens=0,
+        num_in_flight_tokens=0,
+        num_stale_output_tokens=0,
+        num_prompt_tokens=256,
+        num_tokens=257,
+    )
+    scheduler.requests.update({"req-0": request, "retired": request})
+    scheduler.saved["req-0"] = 128
+    scheduler.admitted.add("req-0")
+    external_tokens = 192 if pd_role == "prefill" else 0
+    if external_tokens:
+        scheduler.client = Mock()
+        scheduler.client.lookup.return_value = MooncakeLookupResult(external_tokens)
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (
+            external_tokens,
+            True,
+        )
+    scheduler.update_state_after_alloc(request, blocks, external_tokens)
+    output = _make_decode_scheduler_output(
+        num_computed_tokens=0, num_scheduled_tokens=64
+    )
+    output.preempted_req_ids = {"req-0", "retired"}
+    output.kv_connector_block_state = _make_connector_block_state(block_ids=block_ids)
+    if external_tokens:
+        output.num_scheduled_tokens = {}
+    meta = scheduler.build_connector_meta(output)
+    assert scheduler.requests == {"req-0": request}
+    assert "req-0" not in scheduler.saved
+    assert not meta.saves
+    if external_tokens:
+        assert [(job.start, job.end) for job in meta.loads] == [(0, external_tokens)]
+    request.num_computed_tokens = external_tokens or 64
+    output.preempted_req_ids = set()
+    output.num_scheduled_tokens = {"req-0": 64}
+    (job,) = scheduler.build_connector_meta(output).saves
+    assert (job.start, job.end) == (0, 256 if external_tokens else 64)
+    if pd_role == "decode":
+        request.num_computed_tokens = 128
+        scheduler.request_finished(request, block_ids)
+        assert [(job.start, job.end) for job in scheduler.pending_finish] == [(64, 128)]
+
+
+@pytest.mark.parametrize("pd_role", ["prefill", "decode"])
+def test_canonical_append_image_skips_new_saves_but_drains_existing_jobs(pd_role):
+    scheduler = _make_canonical_scheduler(pd_role)
+    pool = scheduler.pool
+    blocks = KVCacheBlocks((pool.get_new_blocks(4),))
+    block_ids = blocks.get_block_ids()
+    request = SimpleNamespace(
+        request_id="req-0",
+        block_hashes=[b"a", b"b", b"c", b"d"],
+        mm_features=[],
+        lora_request=None,
+        prompt_embeds=None,
+        num_computed_tokens=64,
+        num_in_flight_tokens=0,
+        num_stale_output_tokens=0,
+        num_prompt_tokens=256,
+        num_tokens=257,
+    )
+    scheduler.update_state_after_alloc(request, blocks, 0)
+    output = _make_decode_scheduler_output(
+        num_computed_tokens=64, num_scheduled_tokens=1
+    )
+    output.kv_connector_block_state = _make_connector_block_state(block_ids=block_ids)
+    (job,) = scheduler.build_connector_meta(output).saves
+    assert (job.start, job.end) == (0, 64)
+    assert blocks.blocks[0][0].ref_cnt == 2
+
+    # StreamingUpdate mutates the existing Request instead of creating a new ID.
+    request.mm_features.append(object())
+    request.num_computed_tokens = 128
+    scheduler.update_state_after_alloc(request, blocks, 0)
+    assert scheduler.build_connector_meta(output).saves == []
+    assert scheduler.saved[request.request_id] == 64
+    scheduler.request_finished(request, block_ids)
+    assert not scheduler.pending_finish
+    assert blocks.blocks[0][0].ref_cnt == 2
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            failed_recving=set(),
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata({job.save_id: 1}),
+        )
+    )
+    assert not scheduler.pins
+    assert all(block.ref_cnt == 1 for block in blocks.blocks[0])
