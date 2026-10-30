@@ -64,6 +64,8 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
     - Symptom when left unset on such a host: `Failed to register memory <addr>: Bad address [14]` from `rdma_context.cpp`, and KV transfers fail
 
 - `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`: Timeout (in seconds) for automatically releasing the prefiller’s KV cache for a particular request. (Optional)
+    - Default: 480
+    - If a request is aborted and the decoder has not yet notified the prefiller, the prefill instance will release its KV-cache blocks after this timeout to avoid holding them indefinitely.
 - `VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT`: Lifetime of an unclaimed decoder-first transfer placeholder, in seconds (default: 60). Producer admission claims the placeholder; the existing claimed-transfer timeout remains in effect after Prefill completes.
 
 The connector option `max_pending_transfers` limits pending metadata batches
@@ -71,8 +73,6 @@ The connector option `max_pending_transfers` limits pending metadata batches
 transfer slots. A cancelled producer wakes its waiters with a terminal error.
 An empty producer send completes without notifying an already freed scheduler
 request. Native RDMA already in progress remains pinned until it finishes.
-    - Default: 480
-    - If a request is aborted and the decoder has not yet notified the prefiller, the prefill instance will release its KV-cache blocks after this timeout to avoid holding them indefinitely.
 
 ## KV Transfer Config
 
