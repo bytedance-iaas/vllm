@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "repository": "https://github.com/vllm-project/humming.git",
+  "base_commit": "f970d0b3a97c59481436a542ed8c0d73a731ace5",
+  "source_commit": "596bb8994572d6ce6151abc63508112a0cc24a84",
+  "source_tree": "aefd6e12763735bbccf22b3f3dd71b5217aaeaf5",
+  "package_version": "0.1.18+unified.g596bb89",
+  "patches": [
+    {
+      "file": "01-997a2e586d2a.patch",
+      "sha256": "a39048df00d99341d06ec1f242c0ed59e7b3a41a086fe68ea59ddc7cecac5a39",
+      "commit": "997a2e586d2adafe7d984c543f48d00436daea0a"
+    },
+    {
+      "file": "02-596bb8994572.patch",
+      "sha256": "3a5d2b0ce20731b6e567bb1acaa1742cbee15c17a4f565bdeef6fc822ef06b30",
+      "commit": "596bb8994572d6ce6151abc63508112a0cc24a84"
+    }
+  ]
+}

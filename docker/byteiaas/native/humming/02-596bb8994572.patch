@@ -1,0 +1,51 @@
+From 596bb8994572d6ce6151abc63508112a0cc24a84 Mon Sep 17 00:00:00 2001
+From: wangyicong <wangyicong@bytedance.com>
+Date: Fri, 30 Oct 2026 12:44:47 +0800
+Subject: [PATCH] perf(moe): use mixed Humming inputs for DSV4.1 prefill
+
+Port to vLLM v0.32.0 (5df63a7203cdb9328d824a27b682e77c7b9928be).
+Original optimization: 064f7a106360f2e5449858c94fc1e0e2e3a1625f (audit #53).
+Apply dependency finding from the single Round20 review. Based on latest Humming f970d0b plus internal scheduler997a2e5, allow SM90 INT8 GS128/FP32 with MXFP4 GS32 through the schema matcher. Native WGMMA conversion, channel secondary scaling and pipeline remain upstream. No repeat review; rebuild the unified P/D wheel and run numerical/graph checkpoint.
+Performance and validation claims in the original description below
+refer to the original environment; they are not new release validation.
+
+Original commit description and attribution:
+
+Configure grouped W13 with INT8 dynamic GS128/FP32 scales and keep W2 BF16, with fail-closed schema selection and PCP-sized scratch.
+
+Performance: the legal PCP4 boundary improved 17.39% in 30/100 H20 qualification. Fixed-RPS service Mean TTFT improved 27.49%/39.28%/32.57%/12.47% at 8K/16K/32K/128K, with 12.39% higher 8K Input TPS; AIME26 repeat8 remained in the qualified stochastic band.
+
+Co-authored-by: TRAE (GPT-6) <traecli@bytedance.com>
+Signed-off-by: trae-solo-agent <solo-agent@trae.ai>
+---
+ humming/schema/humming.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/humming/schema/humming.py b/humming/schema/humming.py
+index 2090c9596bc35f95388eefd4a59d1dc1b3623629..aa84f311f9c506c5062e7b0d28d61676a934f0cc 100644
+--- a/humming/schema/humming.py
++++ b/humming/schema/humming.py
+@@ -567,9 +567,9 @@ def is_humming_schema_compatible(
+         if has_e0m3_operand and (input_group_size or weight_group_size or 16) != 16:
+             return False
+ 
+-    is_fp8_gs128_mxfp4_gs32 = (
++    is_a8_gs128_mxfp4_gs32 = (
+         sm_version == 90
+-        and a_dtype == dtypes.float8e4m3
++        and a_dtype in (dtypes.float8e4m3, dtypes.int8)
+         and is_mxfp4_weight
+         and input_group_size == 128
+         # On SM90, LayerConfig resolves an unspecified group-scale dtype to
+@@ -581,7 +581,7 @@ def is_humming_schema_compatible(
+         if input_group_size != weight_group_size:
+             if not is_mxfp4_weight or sm_version >= 120:
+                 return False
+-            has_compatible_input_scale = input_schema.input_scale_dtype == bs_dtype or is_fp8_gs128_mxfp4_gs32
++            has_compatible_input_scale = input_schema.input_scale_dtype == bs_dtype or is_a8_gs128_mxfp4_gs32
+             if a_dtype.num_bits == 8 and not has_compatible_input_scale:
+                 return False
+ 
+-- 
+2.50.1 (Apple Git-155)
+
