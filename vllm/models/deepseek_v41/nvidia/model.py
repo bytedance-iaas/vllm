@@ -1092,7 +1092,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         relay = self.pipeline_cache_relay
         if relay is None or get_pp_group().rank_in_group != relay.receiver_stage:
             return
-        if get_forward_context().is_profile:
+        if get_forward_context().attn_metadata is None:
             return
         receiver = self.layers[relay.receiver_layer]
         assert isinstance(receiver, DeepseekV4DecoderLayer)
@@ -1116,7 +1116,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return {}
         source = self.layers[relay.source_layer]
         assert isinstance(source, DeepseekV4DecoderLayer)
-        if get_forward_context().is_profile:
+        if get_forward_context().attn_metadata is None:
             packed_kv = torch.zeros(
                 (positions.shape[0], SM90_PACKED_KV_RECORD_BYTES),
                 dtype=torch.uint8,
