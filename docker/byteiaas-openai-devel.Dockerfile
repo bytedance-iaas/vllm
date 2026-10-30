@@ -1,5 +1,6 @@
 ARG VLLM_OPENAI_DEVEL_BASE_IMAGE=local/vllm-openai:dev
 FROM ${VLLM_OPENAI_DEVEL_BASE_IMAGE}
+ARG VLLM_OPENAI_DEVEL_BASE_IMAGE
 
 ARG CUDA_VERSION=13.0.3
 ARG CUDA_PACKAGE_VERSION=13.0.3-1
@@ -58,6 +59,8 @@ ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG}
+RUN python3 /opt/byteiaas/tools/image_metadata.py \
+    --derive-base "${VLLM_OPENAI_DEVEL_BASE_IMAGE}"
 LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
