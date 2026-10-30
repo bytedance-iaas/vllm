@@ -1102,7 +1102,10 @@ def test_canonical_decode_cannot_lookup_from_the_shared_store():
             }
         ),
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=1, decode_context_parallel_size=1
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
         ),
     )
     with pytest.raises(ValueError, match="Decode Store lookup"):
