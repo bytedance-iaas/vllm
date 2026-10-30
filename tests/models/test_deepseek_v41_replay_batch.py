@@ -197,9 +197,7 @@ def test_replay_batch_keeps_each_request_window(state):
     }
     assert torch.equal(context.slot_mapping["mla"], _slot_mappings(401)[1, rows])
     assert context.dp_metadata is None
-    assert context.is_padding is not None
-    assert context.is_padding.shape == (len(REPLAY_ROWS),)
-    assert not context.is_padding.any().item()
+    assert context.is_padding is None
 
 
 def test_replay_batch_keeps_device_decode_boundaries(state):
@@ -284,6 +282,36 @@ def test_mixed_replay_graph_is_default_off(state):
 
     assert _prepare(state, batch, CUDAGraphMode.NONE) == (None, None)
     state.replay_cudagraphs.dispatch.assert_not_called()
+
+
+def test_mixed_replay_graph_initializes_with_full_decode_mode(state, monkeypatch):
+    import vllm.models.deepseek_v41.nvidia.model_state as module
+
+    config = state.vllm_config
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    config.compilation_config.cudagraph_decoder_replay = True
+    config.compilation_config.decoder_replay_trim_threshold = 256
+    config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.pipeline_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    config.lora_config = None
+    manager = _replay_manager()
+    constructor = MagicMock(return_value=manager)
+    monkeypatch.setenv("VLLM_DSV41_MIXED_REPLAY_GRAPH", "1")
+    monkeypatch.setattr(module, "is_breakable_cudagraph_enabled", lambda: True)
+    monkeypatch.setattr(
+        module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    monkeypatch.setattr(module, "DecoderReplayCudaGraphManager", constructor)
+    model = SimpleNamespace(
+        token_lookback_depth=0, decoder_replay_layers=state.decoder_replay_layers
+    )
+
+    initialized = DeepseekV41ModelState(config, model, None, DEVICE)
+
+    constructor.assert_called_once()
+    assert initialized.replay_cudagraphs is manager
+    assert initialized.decoder_replay_layers.trim_threshold is None
 
 
 def test_mixed_replay_graph_forces_untrimmed_batch_and_clears_next_step(state):
