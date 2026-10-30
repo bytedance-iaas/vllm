@@ -622,6 +622,7 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
 FROM base AS build
 ARG TARGETPLATFORM
 ARG INSTALL_RUBIN_PRERELEASE
+ARG BYTEIAAS_BUILD_NATIVE
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -691,6 +692,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Build the vLLM wheel
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=.git,target=.git \
+    if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+        humming_version=$(python3 -c \
+            "import json; print(json.load(open('docker/byteiaas/native/humming/source-lock.json'))['package_version'])"); \
+        sed -i "s/^humming-kernels\\[cu13\\]==.*/humming-kernels[cu13]==${humming_version}/" requirements/cuda.txt; \
+    fi && \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \
         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \
@@ -1021,6 +1027,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # ============================================================
 
 FROM vllm-runtime-base AS vllm-base
+ARG BYTEIAAS_BUILD_NATIVE
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1038,18 +1045,26 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 # image. Without this the bind mount is not part of the layer cache key, so a
 # warm BuildKit agent can skip the install and ship a stale wheel.
 COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+    --mount=type=bind,from=byteiaas-native-build,source=/workspace/byteiaas-native/humming-dist,target=/tmp/byteiaas-humming-dist,ro \
     --mount=type=cache,target=/opt/uv/cache \
+    set -eu; \
+    set -- dist/*.whl; \
+    if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+        (cd /tmp/byteiaas-humming-dist && sha256sum --check --strict /tmp/byteiaas-humming-wheels.sha256); \
+        set -- "$@" /tmp/byteiaas-humming-dist/*.whl; \
+    fi; \
     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         && echo "Installing vLLM..." \
-        && uv pip install --system dist/*.whl --verbose \
+        && uv pip install --system "$@" --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
         echo "Installing vLLM..." \
-        && uv pip install --system dist/*.whl --verbose \
+        && uv pip install --system "$@" --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
@@ -1343,6 +1358,29 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             ext = glob.glob(os.path.join(spec.submodule_search_locations[0], 'nixl_ep_cpp_torch' + mm + '.*')) if spec else []; \
             assert ext, 'NIXL EP has no build for torch ' + torch.__version__; \
             print('NIXL EP extension:', ext[0])"; \
+    fi
+
+# Restore the locked native packages after every dependency resolver. Retain
+# small provenance reports in the image; mount the wheels only during install.
+ARG BYTEIAAS_BUILD_NATIVE
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/deepgemm-dist/wheels.sha256 /tmp/byteiaas-deepgemm-wheels.sha256
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
+COPY docker/byteiaas/native/deepgemm/source-lock.json /opt/byteiaas/provenance/deepgemm-source-lock.json
+COPY docker/byteiaas/native/humming/source-lock.json /opt/byteiaas/provenance/humming-source-lock.json
+COPY tools/byteiaas/native_wheel.py /opt/byteiaas/tools/native_wheel.py
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=byteiaas-native-build,source=/workspace/byteiaas-native/deepgemm-dist,target=/tmp/byteiaas-deepgemm-dist,ro \
+    --mount=type=bind,from=byteiaas-native-build,source=/workspace/byteiaas-native/humming-dist,target=/tmp/byteiaas-humming-dist,ro \
+    set -eu; \
+    if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+        for kind in deepgemm humming; do \
+            (cd "/tmp/byteiaas-${kind}-dist" && sha256sum --check --strict "/tmp/byteiaas-${kind}-wheels.sha256"); \
+            uv pip install --system --no-deps --reinstall "/tmp/byteiaas-${kind}-dist/"*.whl; \
+            python3 /opt/byteiaas/tools/native_wheel.py verify \
+                --lock "/opt/byteiaas/provenance/${kind}-source-lock.json" \
+                --manifest "/tmp/byteiaas-${kind}-dist/native-manifest.json" \
+                --report "/opt/byteiaas/provenance/${kind}-installed.json"; \
+        done; \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
