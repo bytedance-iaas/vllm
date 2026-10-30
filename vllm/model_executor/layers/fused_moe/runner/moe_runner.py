@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -826,6 +827,16 @@ class MoERunner(MoERunnerInterface):
         ):
             hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
             router_logits = get_pcp_group().all_gather(router_logits, dim=0)
+            is_padding = get_forward_context().is_padding
+            if (
+                envs.VLLM_MOE_SKIP_PADDING
+                and is_padding is not None
+                and is_padding.shape != (hidden_states.shape[0],)
+            ):
+                raise RuntimeError(
+                    "PCP MoE padding mask does not match gathered token rows: "
+                    f"{is_padding.shape=} {hidden_states.shape[0]=}."
+                )
 
         return hidden_states, router_logits
 
