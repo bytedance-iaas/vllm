@@ -726,6 +726,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     latent, cache_positions, self.indexer_rotary_emb
                 )
 
+    def write_global_cache(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> None:
+        """Publish this source layer's global KV without SWA, queries or attention."""
+        compressor = self.compressor
+        indexer = self.indexer
+        if (
+            not self.is_kv_source
+            or compressor is None
+            or indexer is None
+            or not indexer.owns_k
+        ):
+            raise RuntimeError(
+                f"Layer {self.layer_id} is not a complete global-cache producer."
+            )
+        latent = compressor(self._compressor_kv_score(hidden_states), positions)
+        aux_stream = self.aux_stream_list[0] if self.aux_stream_list else None
+        maybe_execute_in_parallel(
+            lambda: indexer.insert_cache(latent, positions, self.indexer_rotary_emb),
+            lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+            self.ln_events[0],
+            self.ln_events[1],
+            aux_stream,
+        )
+
     def bind_gemm_rs(self) -> None:
         """Fuse ``wo_b`` with the sequence-parallel TP reduce-scatter.
 
@@ -978,17 +1003,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_fns: list[Callable[[], Any] | None] = [None, None]
 
         if self.compressor is not None:
-            # Local ref so the closure keeps a non-None type for mypy.
-            compressor = self.compressor
-
-            def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
-
-            aux_fns[0] = compressor_kv_score
+            aux_fns[0] = lambda: self._compressor_kv_score(hidden_states)
 
         if self.indexer is not None:
             indexer = self.indexer
@@ -1011,6 +1026,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
 
         return qr_kv, kv_score, indexer_weights
+
+    def _compressor_kv_score(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        compressor = self.compressor
+        assert compressor is not None
+        return torch.mm(
+            hidden_states,
+            compressor.fused_wkv_wgate.weight.T,
+            out_dtype=torch.float32,
+        )
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
@@ -1484,6 +1508,17 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             self.use_fp4_kv,
         )
+
+    def insert_cache(
+        self,
+        latent: torch.Tensor | None,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> None:
+        """Publish Indexer K without constructing query/scoring inputs."""
+        if not self.owns_k:
+            raise RuntimeError("Only a KV-source indexer can publish Indexer K.")
+        self._produce_k(latent, positions, rotary_emb)
 
     def forward_q(
         self,
