@@ -127,6 +127,32 @@ def test_sm90_mega_moe_capacity_uses_dp_max_before_local_rows(monkeypatch):
         experts.get_symm_buffer_for_num_tokens(0)
 
 
+@pytest.mark.parametrize(
+    "counts,local,target",
+    [([48] * 8, 48, 76), ([48, 56] * 4, 48, 0), ([96] * 8, 96, 0)],
+)
+def test_sm90_mega_moe_target_budget_requires_uniform_validated_rows(
+    monkeypatch, counts, local, target
+):
+    """A generic SM override must not enable overlap for an unvalidated batch."""
+    experts = DeepseekV4MegaMoEExperts.__new__(DeepseekV4MegaMoEExperts)
+    torch.nn.Module.__init__(experts)
+    experts._target_mega_moe_num_sms = 76
+    experts._mega_moe_num_sms = 72
+    context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor(counts))
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.model.is_forward_context_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.model.get_forward_context", lambda: context
+    )
+    assert experts.get_target_mega_moe_num_sms(local) == target
+    assert experts.get_mega_moe_num_sms(local) == (target or 72)
+
+
 @pytest.fixture
 def v41_moe_config(dist_init):
     return SimpleNamespace(

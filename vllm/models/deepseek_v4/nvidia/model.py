@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
+from inspect import signature
 from itertools import islice
 
 import regex as re
@@ -34,6 +36,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     DeepGemmMegaMoEBackend,
+    DeepGemmSm90MegaMoEBackend,
     get_deep_gemm_mega_moe_backend,
     ue8m0_uint8_to_float,
 )
@@ -91,12 +94,25 @@ from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_i
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import aux_stream
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 
 logger = init_logger(__name__)
+
+
+def _read_nonnegative_int_env(name: str) -> int:
+    raw = os.environ.get(name, "0")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}.") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative, got {value}.")
+    return value
 
 
 class MegaGateRoutingMetadata(typing.NamedTuple):
@@ -226,6 +242,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     _symm_buffer_cache: dict[
         tuple[int, int, int, int, int, int, int, int, str], object
     ] = {}
+    _validated_sm_budgets: set[tuple[int, int, int, int]] = set()
 
     def __init__(
         self,
@@ -269,6 +286,21 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         )
         self._token_alignment: int | None = None
         self._capacity_buffers: tuple[tuple[int, object], ...] | None = None
+        self._mega_moe_num_sms = _read_nonnegative_int_env("VLLM_DSV4_MEGAMOE_NUM_SMS")
+        target = (
+            hidden_size == 5120
+            and intermediate_size == 2304
+            and num_experts == 384
+            and top_k == 6
+            and sequence_parallel_size == 1
+            and extract_layer_index(prefix)
+            < vllm_config.model_config.hf_config.num_hidden_layers
+        )
+        self._target_mega_moe_num_sms = (
+            _read_nonnegative_int_env("VLLM_DSV41_TARGET_MEGAMOE_NUM_SMS")
+            if target
+            else 0
+        )
 
         self.num_logical_experts = (
             num_logical_experts if num_logical_experts is not None else num_experts
@@ -411,12 +443,73 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             "_ensure_backend() must be called before finalize_weights() "
             "releases the loader-side parameters."
         )
-        self._backend = get_deep_gemm_mega_moe_backend(
+        backend = get_deep_gemm_mega_moe_backend(
             self.w13_weight.device,
             self.hidden_size,
             self.intermediate_size,
         )
+        if isinstance(backend, DeepGemmSm90MegaMoEBackend):
+            self._validate_ep_sm_budgets(self.w13_weight.device)
+        self._backend = backend
         return self._backend
+
+    def _validate_ep_sm_budgets(self, device: torch.device) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        group = get_ep_group()
+        key = (
+            id(group.device_group),
+            device.index or 0,
+            self._mega_moe_num_sms,
+            self._target_mega_moe_num_sms,
+        )
+        if key in self._validated_sm_budgets:
+            return
+        local = torch.tensor(
+            [
+                self._mega_moe_num_sms,
+                self._target_mega_moe_num_sms,
+                torch.cuda.get_device_properties(device).multi_processor_count,
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        gathered = torch.empty(group.world_size * 3, dtype=torch.int32, device=device)
+        torch.distributed.all_gather_into_tensor(
+            gathered, local, group=group.device_group
+        )
+        values = gathered.view(group.world_size, 3).cpu()
+        if not bool((values[:, :2] == values[0, :2]).all()):
+            raise RuntimeError(
+                f"MegaMoE SM budgets must agree across EP ranks: {values.tolist()}."
+            )
+        limit = int(values[:, 2].min().item())
+        for budget in values[0, :2].tolist():
+            if budget and (budget < 2 or budget > limit or budget % 2):
+                raise ValueError(
+                    f"MegaMoE SM budget must be even and in [2, {limit}]: {budget}."
+                )
+        if bool(values[0, :2].any()) and (
+            "num_sms" not in signature(_import_deep_gemm().fp8_fp4_mega_moe).parameters
+        ):
+            raise RuntimeError("The installed SM90 MegaMoE API lacks num_sms.")
+        self._validated_sm_budgets.add(key)
+
+    def get_target_mega_moe_num_sms(self, num_tokens: int) -> int:
+        if (
+            self._target_mega_moe_num_sms
+            and num_tokens in (48, 56, 64)
+            and is_forward_context_available()
+        ):
+            metadata = get_forward_context().dp_metadata
+            if metadata is not None:
+                counts = metadata.num_tokens_across_dp_cpu
+                if counts.numel() and bool((counts == num_tokens).all()):
+                    return self._target_mega_moe_num_sms
+        return 0
+
+    def get_mega_moe_num_sms(self, num_tokens: int) -> int:
+        return self.get_target_mega_moe_num_sms(num_tokens) or self._mega_moe_num_sms
 
     def _check_runtime_supported(self) -> None:
         """Preserved for API compatibility; delegates to the backend check."""
@@ -744,6 +837,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 symm_buffer=symm_buffer,
                 activation_clamp=activation_clamp,
                 fast_math=fast_math,
+                num_sms=(
+                    self.get_mega_moe_num_sms(num_tokens)
+                    if isinstance(backend, DeepGemmSm90MegaMoEBackend)
+                    else 0
+                ),
             )
         return y
 
@@ -886,6 +984,30 @@ class DeepseekV4MoE(nn.Module):
             self._init_mega_moe_experts(vllm_config, config, prefix)
         else:
             self._init_fused_moe_experts(vllm_config, config, quant_config, prefix)
+
+        overlap = _read_nonnegative_int_env("VLLM_DSV41_MEGAMOE_SHARED_OVERLAP")
+        if overlap > 1:
+            raise ValueError("VLLM_DSV41_MEGAMOE_SHARED_OVERLAP must be 0 or 1.")
+        self._shared_overlap_enabled = bool(
+            overlap
+            and self.use_native_mega_moe
+            and self.shared_experts is not None
+            and self.tp_size == 1
+            and self.ep_size == 8
+            and vllm_config.parallel_config.data_parallel_size == 8
+            and not self.use_sequence_parallel
+            and current_platform.is_device_capability_family(90)
+            and os.environ.get("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
+            and self.experts._target_mega_moe_num_sms in (72, 76)
+        )
+        self._shared_overlap_stream = (
+            aux_stream() if self._shared_overlap_enabled else None
+        )
+        self._shared_overlap_events = (
+            (torch.cuda.Event(), torch.cuda.Event())
+            if self._shared_overlap_stream is not None
+            else None
+        )
 
     def _init_mega_moe_experts(
         self,
@@ -1071,17 +1193,39 @@ class DeepseekV4MoE(nn.Module):
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
-
-        if (
+        has_serial_shared_experts = (
             self.shared_experts is not None
             and not self.experts.has_fused_shared_experts
-        ):
+        )
+        use_shared_overlap = (
+            getattr(self, "_shared_overlap_enabled", False)
+            and has_serial_shared_experts
+            and self.experts.get_target_mega_moe_num_sms(hidden_states.shape[0])
+            in (72, 76)
+        )
+        if use_shared_overlap:
+            assert self._shared_overlap_events is not None
+            final_hidden_states, shared_output = maybe_execute_in_parallel(
+                lambda: self.experts(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    activation_clamp=activation_clamp,
+                ),
+                lambda: self.shared_experts(hidden_states),
+                self._shared_overlap_events[0],
+                self._shared_overlap_events[1],
+                self._shared_overlap_stream,
+            )
+            final_hidden_states += shared_output
+        else:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
+        if has_serial_shared_experts and not use_shared_overlap:
             shared_output = self.shared_experts(hidden_states)
             final_hidden_states += shared_output
 
