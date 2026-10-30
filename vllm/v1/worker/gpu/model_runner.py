@@ -2111,6 +2111,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         if self.is_dsv41_encoder_only_prefill:
+            if self.pcp_manager is not None:
+                input_batch = self.pcp_manager.global_batch
             self.postprocess_num_computed_tokens(input_batch)
             self.model_state.postprocess_state(
                 input_batch.idx_mapping, 0, self.req_states.num_computed_tokens.gpu

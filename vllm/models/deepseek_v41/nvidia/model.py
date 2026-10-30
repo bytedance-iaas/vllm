@@ -768,12 +768,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
         if self.parallel_config.prefill_context_parallel_size > 1 and (
-            self.parallel_config.pipeline_parallel_size != 1
+            (
+                self.parallel_config.pipeline_parallel_size != 1
+                and not vllm_config.is_dsv41_encoder_only_prefill
+            )
             or self.parallel_config.data_parallel_size != 1
             or self.parallel_config.decode_context_parallel_size != 1
             or self.parallel_config.use_ubatching
             or vllm_config.speculative_config is not None
-            or vllm_config.kv_transfer_config is not None
+            or (
+                vllm_config.kv_transfer_config is not None
+                and not vllm_config.is_dsv41_encoder_only_prefill
+            )
             or (
                 vllm_config.cache_config.enable_prefix_caching
                 and not vllm_config.cache_config.swa_bounded_replay
@@ -1063,7 +1069,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         assert isinstance(receiver, DeepseekV4DecoderLayer)
         packed_kv = intermediate_tensors[_relay_kv_key(relay.source_layer)]
         topk = intermediate_tensors[_relay_topk_key(relay.source_layer)]
-        if topk.shape != (positions.shape[0], self.config.index_topk):
+        if topk.dtype != torch.int32 or topk.shape != (
+            positions.shape[0],
+            self.config.index_topk,
+        ):
             raise RuntimeError(
                 "DeepSeek V4.1 relay top-k payload has an invalid shape."
             )
@@ -1084,14 +1093,27 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 dtype=torch.uint8,
                 device=positions.device,
             )
-            topk = torch.zeros(
+            topk = torch.full(
                 (positions.shape[0], self.config.index_topk),
+                -1,
                 dtype=torch.int32,
                 device=positions.device,
             )
         else:
             packed_kv = source.attn.export_cross_stage_kv(positions)
-            topk = self.topk_indices_buffer[: positions.shape[0]]
+            attn_metadata = get_forward_context().attn_metadata
+            if not isinstance(attn_metadata, dict):
+                raise RuntimeError("Cross-stage top-k export requires metadata.")
+            num_actual_tokens = int(attn_metadata[source.attn.prefix].num_actual_tokens)
+            if not 0 <= num_actual_tokens <= positions.shape[0]:
+                raise RuntimeError("Cross-stage top-k export has invalid token counts.")
+            topk = torch.full(
+                (positions.shape[0], self.config.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=positions.device,
+            )
+            topk[:num_actual_tokens].copy_(self.topk_indices_buffer[:num_actual_tokens])
         return {
             _relay_kv_key(relay.source_layer): packed_kv,
             _relay_topk_key(relay.source_layer): topk,
