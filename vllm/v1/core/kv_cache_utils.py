@@ -2694,7 +2694,13 @@ def get_kv_cache_configs(
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec,
+                # Keep the block containing the first replay token even when
+                # a partial hit starts replay at that block's final slot.
+                extra_retained_tokens=max(
+                    extra_retained_tokens,
+                    int(layer_spec.prefix_replay_tokens > 0),
+                ),
             )
 
     # Get global KV cache groups. This also handles spec unification for

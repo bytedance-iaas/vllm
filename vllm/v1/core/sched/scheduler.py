@@ -57,6 +57,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -304,6 +305,20 @@ class Scheduler(SchedulerInterface):
             f"Prefix replay windows should agree: {sorted(replay_windows)}"
         )
         self.prefix_replay_tokens = replay_windows.pop() if replay_windows else 0
+        replay_specs = []
+        for group in kv_cache_config.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                replay_specs.extend(
+                    group_spec.kv_cache_specs[name] for name in group.layer_names
+                )
+            else:
+                replay_specs.append(group_spec)
+        self.prefix_replay_boundary_retained = all(
+            getattr(spec, "extra_retained_tokens", 0) > 0
+            for spec in replay_specs
+            if spec.prefix_replay_tokens > 0
+        )
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config is not None:
@@ -1034,17 +1049,17 @@ class Scheduler(SchedulerInterface):
                             skip_request(request_queue)
                             continue
 
-                        if self.prefix_replay_tokens and not (
-                            ext_tokens and self._load_restores_replay_window(request)
+                        if (
+                            self.prefix_replay_tokens
+                            and not self.prefix_replay_boundary_retained
+                            and not (
+                                ext_tokens
+                                and self._load_restores_replay_window(request)
+                            )
                         ):
-                            # DSV41 SWA bounded replay recomputes the hit's last
-                            # window, from the block holding its first
-                            # token; the sliding-window groups retire
-                            # whole blocks below the window of the hit's
-                            # next token. Hits end on a block boundary, or
-                            # a hit ending one token short of one would
-                            # retire the block the replay starts in. A load
-                            # that carries the window replays nothing.
+                            # Legacy/direct cache configs may not retain the
+                            # replay boundary block. A load that carries the
+                            # window replays nothing and needs no rounding.
                             ext_tokens -= ext_tokens % self.block_size
                             load_kv_async = load_kv_async and ext_tokens > 0
 
