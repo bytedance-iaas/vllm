@@ -101,6 +101,7 @@ ARG BUILD_NIXL=false
 # remains opt-in; internal workflows enable this immutable source contract.
 ARG BYTEIAAS_BUILD_NATIVE=false
 ARG BYTEIAAS_BUILD_TOKENIZERS=false
+ARG BYTEIAAS_BUILD_ROUTER=false
 
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
@@ -359,6 +360,30 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         (cd /workspace/byteiaas-tokenizers-dist && sha256sum build-state > wheels.sha256); \
     fi
 #################### BYTEIAAS TOKENIZERS BUILD IMAGE ####################
+
+#################### BYTEIAAS ROUTER BUILD IMAGE ####################
+FROM rust-build-cache AS byteiaas-router-build
+ARG BYTEIAAS_BUILD_ROUTER
+COPY tools/byteiaas/router_wheel.py /workspace/byteiaas-router-wheel.py
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    set -eu; \
+    if [ "${BYTEIAAS_BUILD_ROUTER}" = "true" ]; then \
+        . /root/.cargo/env; \
+        dnf install -y --setopt=install_weak_deps=False openssl-devel protobuf-compiler protobuf-devel; \
+        dnf clean all; \
+        uv pip install --python /opt/venv/bin/python3 \
+            "auditwheel==6.5.0" "build==1.3.0" "patchelf==0.17.2.4"; \
+        python3 /workspace/byteiaas-router-wheel.py build \
+            --source /workspace/byteiaas-router-source \
+            --output /workspace/byteiaas-router-dist; \
+    else \
+        mkdir -p /workspace/byteiaas-router-dist; \
+        printf '%s\n' disabled > /workspace/byteiaas-router-dist/build-state; \
+        (cd /workspace/byteiaas-router-dist && sha256sum build-state > wheels.sha256); \
+    fi
+#################### BYTEIAAS ROUTER BUILD IMAGE ####################
 
 #################### BYTEIAAS NATIVE BUILD IMAGE ####################
 FROM base AS byteiaas-native-build
@@ -1381,6 +1406,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             ext = glob.glob(os.path.join(spec.submodule_search_locations[0], 'nixl_ep_cpp_torch' + mm + '.*')) if spec else []; \
             assert ext, 'NIXL EP has no build for torch ' + torch.__version__; \
             print('NIXL EP extension:', ext[0])"; \
+    fi
+
+ARG BYTEIAAS_BUILD_ROUTER
+COPY --from=byteiaas-router-build /workspace/byteiaas-router-dist/wheels.sha256 /tmp/byteiaas-router-wheels.sha256
+COPY tools/byteiaas/router_wheel.py /opt/byteiaas/tools/router_wheel.py
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=byteiaas-router-build,source=/workspace/byteiaas-router-dist,target=/tmp/byteiaas-router-dist,ro \
+    set -eu; \
+    if [ "${BYTEIAAS_BUILD_ROUTER}" = "true" ]; then \
+        mkdir -p /opt/byteiaas/provenance; \
+        (cd /tmp/byteiaas-router-dist && sha256sum --check --strict /tmp/byteiaas-router-wheels.sha256); \
+        uv pip install --system --no-deps --reinstall /tmp/byteiaas-router-dist/*.whl; \
+        python3 /opt/byteiaas/tools/router_wheel.py verify \
+            --manifest /tmp/byteiaas-router-dist/router-manifest.json \
+            --report /opt/byteiaas/provenance/router-installed.json; \
     fi
 
 # Restore the locked native packages after every dependency resolver. Retain
