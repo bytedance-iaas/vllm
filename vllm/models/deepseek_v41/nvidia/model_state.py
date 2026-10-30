@@ -250,6 +250,11 @@ class DeepseekV41ModelState(DefaultModelState):
             self._kept_positions = torch.zeros(
                 self.max_num_tokens, dtype=torch.int64, device=device
             )
+            # Replay CUDA graphs pad the kept rows to a capture bucket. Keep a
+            # persistent mask so captured MoE staging can skip the padded tail.
+            self._kept_is_padding = torch.empty(
+                self.max_num_tokens, dtype=torch.bool, device=device
+            )
             self._kept_slot_mappings: torch.Tensor | None = None
             self._kept_kv_start = torch.zeros(
                 max_local_reqs, dtype=torch.int32, device=device
@@ -632,9 +637,16 @@ class DeepseekV41ModelState(DefaultModelState):
             dp_metadata = DPMetadata.make(
                 self.vllm_config.parallel_config, num_padded, dp_tokens
             )
+        replay_is_padding = None
+        if self.pcp_size == 1:
+            replay_is_padding = self._kept_is_padding[:num_padded]
+            replay_is_padding[:num_tokens].fill_(False)
+            replay_is_padding[num_tokens:].fill_(True)
         kept_batch, kept_slot_mappings = self._kept_input_batch(
             input_batch, slot_mappings, kept_replay_start, kept_lens, num_padded
         )
+        if self.pcp_size > 1:
+            replay_is_padding = kept_batch.is_padding
         if self._replay_attn_groups is None:
             self._replay_attn_groups = (
                 self._copy_attn_groups(attn_groups, layers.metadata_prefixes),
@@ -675,7 +687,7 @@ class DeepseekV41ModelState(DefaultModelState):
                 slot_mapping=build_slot_mappings_by_layer(
                     kept_slot_mappings, kv_cache_config
                 ),
-                is_padding=kept_batch.is_padding if self.pcp_size > 1 else None,
+                is_padding=replay_is_padding,
             ),
             run_graph,
             num_padded if self.pcp_size > 1 else None,

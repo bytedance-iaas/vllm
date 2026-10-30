@@ -197,7 +197,9 @@ def test_replay_batch_keeps_each_request_window(state):
     }
     assert torch.equal(context.slot_mapping["mla"], _slot_mappings(401)[1, rows])
     assert context.dp_metadata is None
-    assert context.is_padding is None
+    assert context.is_padding is not None
+    assert context.is_padding.shape == (len(REPLAY_ROWS),)
+    assert not context.is_padding.any().item()
 
 
 def test_replay_batch_keeps_device_decode_boundaries(state):
@@ -326,6 +328,9 @@ def test_mixed_replay_graph_forces_untrimmed_batch_and_clears_next_step(state):
     assert replay.rows.tolist() == list(range(101))
     assert replay.run_graph is manager.run
     assert replay.forward_context.batch_descriptor.num_tokens == 256
+    assert replay.forward_context.is_padding is not None
+    assert not replay.forward_context.is_padding[:101].any().item()
+    assert replay.forward_context.is_padding[101:].all().item()
 
     assert _prepare(state, batch, CUDAGraphMode.FULL) == (None, None)
     assert state.decoder_replay_layers.replay_batch is None
@@ -501,3 +506,6 @@ def test_dp_ranks_pad_to_one_replay_graph(dp_state):
     assert replay.forward_context.batch_descriptor.num_tokens == 512
     dp_metadata = replay.forward_context.dp_metadata
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [512, 512]
+    assert replay.forward_context.is_padding is not None
+    assert not replay.forward_context.is_padding[: len(REPLAY_ROWS)].any().item()
+    assert replay.forward_context.is_padding[len(REPLAY_ROWS) :].all().item()
