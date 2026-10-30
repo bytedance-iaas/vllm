@@ -121,6 +121,7 @@ class DeepGemmMegaMoEBackend:
         symm_buffer,
         activation_clamp: float | None,
         fast_math: bool,
+        num_sms: int = 0,
         activation: str | None = None,
         activation_alpha: float | None = None,
         activation_beta: float | None = None,
@@ -232,6 +233,7 @@ class DeepGemmSm90MegaMoEBackend(DeepGemmMegaMoEBackend):
         symm_buffer,
         activation_clamp: float | None,
         fast_math: bool,
+        num_sms: int = 0,
         activation: str | None = None,
         activation_alpha: float | None = None,
         activation_beta: float | None = None,
@@ -259,6 +261,7 @@ class DeepGemmSm90MegaMoEBackend(DeepGemmMegaMoEBackend):
             symm_buffer,
             activation_clamp=activation_clamp,
             fast_math=fast_math,
+            num_sms=num_sms,
             **kwargs,
         )
 
@@ -502,6 +505,7 @@ class DeepGemmSm100MegaMoEBackend(DeepGemmMegaMoEBackend):
         symm_buffer,
         activation_clamp: float | None,
         fast_math: bool,
+        num_sms: int = 0,
         activation: str | None = None,
         activation_alpha: float | None = None,
         activation_beta: float | None = None,
@@ -510,6 +514,8 @@ class DeepGemmSm100MegaMoEBackend(DeepGemmMegaMoEBackend):
     ) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
 
+        if num_sms:
+            raise ValueError("Per-call MegaMoE SM budgets require the SM90 backend.")
         deep_gemm = _import_deep_gemm()
         kwargs: dict[str, Any] = {
             name: value
