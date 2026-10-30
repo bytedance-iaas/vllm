@@ -64,6 +64,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         format = scheme_dict.get("format")
 
         if quant_config._is_mxfp4_w4a8_fp8(weight_quant, input_quant):
+            from vllm.model_executor.layers.quantization.mxfp4 import (
+                humming_input_layer_skipped,
+            )
+
             from .compressed_tensors_moe_w4a8_mxfp4 import (
                 CompressedTensorsW4A8Mxfp4MoEMethod,
             )
@@ -71,6 +75,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsW4A8Mxfp4MoEMethod(
                 layer.moe_config,
                 activation_key=quant_config._fp8_dynamic_input_key(input_quant),
+                layer_name=layer_name,
+                humming_input_layer_skipped=humming_input_layer_skipped(
+                    layer_name, getattr(quant_config, "hf_to_vllm_mapper", None)
+                ),
             )
 
         if quant_config._is_mxfp4(weight_quant):
