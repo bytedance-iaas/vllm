@@ -5318,9 +5318,11 @@ def test_canonical_transfer_uses_kv_tensor_device_after_native_setup(
     store = MagicMock()
     store.setup.side_effect = setup
     _install_fake_mooncake(monkeypatch, store)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: current["device"])
-    monkeypatch.setattr(torch.cuda, "set_device", set_device)
-    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(
+        torch.accelerator, "current_device_index", lambda: current["device"]
+    )
+    monkeypatch.setattr(torch.accelerator, "set_device_index", set_device)
+    monkeypatch.setattr(torch.accelerator, "device_index", device_context)
     monkeypatch.setattr(
         dsv41_worker.MooncakeStoreConfig, "load_from_config", _make_config
     )

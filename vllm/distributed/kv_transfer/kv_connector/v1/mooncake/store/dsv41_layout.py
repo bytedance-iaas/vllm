@@ -5,10 +5,11 @@
 import hashlib
 import json
 import math
-import re
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any
+
+import regex as re
 
 FORMAT = "dsv41_canonical_v1"
 PROFILE = "dsv41_flash_v1"

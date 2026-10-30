@@ -96,7 +96,7 @@ def test_canonical_real_store_round_trip_into_relay_pages():
         )
         for tensor in (source, destination):
             assert store.register_buffer(tensor.data_ptr(), tensor.numel()) == 0
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         keys, addresses, sizes = producer._batch(job, saving=True)
         assert all(
             r >= 0
@@ -110,7 +110,7 @@ def test_canonical_real_store_round_trip_into_relay_pages():
         assert all(
             r >= 0 for r in store.batch_get_into_multi_buffers(keys, addresses, sizes)
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert torch.equal(destination, expected)
     finally:
         # Unique keys are left to the isolated test Store's eviction policy.

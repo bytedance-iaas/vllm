@@ -42,18 +42,37 @@ class LookupClient:
         self.unhealthy_until = 0.0
         self.futures = {}
         self.started = {}
+        self._context = None
+        self._socket = None
+        self._closed = False
+
+    def _get_socket(self):
+        if self._context is None:
+            self._context = zmq.Context()
+        if self._socket is None:
+            self._socket = self._context.socket(zmq.REQ)
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+            self._socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            self._socket.connect(self.path)
+        return self._socket
+
+    def _reset_socket(self):
+        if self._socket is not None:
+            self._socket.close(linger=0)
+            self._socket = None
+
+    def _close_transport(self):
+        self._reset_socket()
+        if self._context is not None:
+            self._context.term()
+            self._context = None
 
     def _query(self, num_tokens, hashes):
-        # Each RPC owns its socket; a timeout cannot poison the next REQ/REP exchange.
         if time.monotonic() < self.unhealthy_until:
             return MooncakeLookupResult(0)
-        context = zmq.Context()
-        sock = context.socket(zmq.REQ)
         try:
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
-            sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            sock.connect(self.path)
+            sock = self._get_socket()
             sock.send_multipart(
                 [
                     LOOKUP_MSG,
@@ -64,13 +83,14 @@ class LookupClient:
             )
             return decode_lookup_response(sock.recv())
         except (zmq.ZMQError, ValueError):
+            # Failed REQ exchanges must not consume a subsequent request's reply.
+            self._reset_socket()
             self.unhealthy_until = time.monotonic() + self.cooldown
             return MooncakeLookupResult(0)
-        finally:
-            sock.close()
-            context.term()
 
     def lookup(self, request_id, num_tokens, hashes):
+        if self._closed:
+            return MooncakeLookupResult(0)
         future = self.futures.get(request_id)
         if future is None:
             if (
@@ -97,7 +117,16 @@ class LookupClient:
             future.cancel()
 
     def close(self):
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        if self._closed:
+            return
+        self._closed = True
+        for request_id in list(self.futures):
+            self.discard(request_id)
+        try:
+            # Cleanup runs on the socket owner after the active query completes.
+            self.executor.submit(self._close_transport).result()
+        finally:
+            self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 class LookupServer:

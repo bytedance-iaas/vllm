@@ -1,15 +1,34 @@
 # DSv4.1 encoder-only PD with a canonical DRAM Store
 
 This opt-in profile composes direct `MooncakeConnector` P→D transfer with
-`MooncakeStoreConnector` prefix persistence. It is an experimental implementation
-for the DSv4.1-Flash fork. Execution tests, model quality, RDMA behavior and
-performance have not been validated yet.
+`MooncakeStoreConnector` prefix persistence in the DSv4.1-Flash fork. Its canonical
+source includes the validated Store changes through `62f9fa293d`. This integration
+preserves the generic Store no-increment lookup path and uses the repository's
+`regex` and `torch.accelerator` APIs.
 
 The initial boundary is P TP1/PP2/PCP4 with the `10,30` PP split, and D
 TP1/PP1/PCP1 with one scheduler per DP engine (including DP8/EP8). Keep the
 existing MRV2, FP8 DS MLA, 128-token SWA bounded replay and DSpark configuration.
 Existing encoder-only checks still apply. The original direct-only and legacy
 Store configurations use their existing paths.
+
+## Module responsibilities
+
+All profile-specific modules live under
+`vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/`.
+
+| Module | Responsibility |
+| --- | --- |
+| `dsv41_profile.py` | Validate the role, topology, canonical format and resource limits. |
+| `dsv41_layout.py` | Build rank-independent keys and rank-local KV component views. |
+| `dsv41_lookup.py` | Coordinate asynchronous existence checks with reusable IPC and byte limits. |
+| `dsv41_scheduler.py` | Select contiguous hits, schedule save/load ranges and retain block references. |
+| `dsv41_worker.py` | Register buffers, execute native GET/PUT, track completion and expose telemetry. |
+| `connector.py` | Select canonical or legacy scheduler/worker implementations. |
+
+Directional completion contracts in `base.py`, `utils.py` and
+`multi_connector.py` distinguish direct-transfer quorums from Store quorums.
+The legacy `scheduler.py` and `worker.py` retain their existing data path.
 
 ## Data flow
 
@@ -70,6 +89,7 @@ granularity.
           "cache_prefix": "dsv41-flash-prod-v1",
           "model_revision": "replace-with-immutable-model-and-code-revision",
           "enable_lookup": true,
+          "lookup_min_prompt_tokens": 2048,
           "load_async": true,
           "save_decode_cache": false,
           "max_pending_jobs": 32,
@@ -96,6 +116,10 @@ For D, make these changes to the same structure:
 
 For shadow writes, set P `enable_lookup=false`; initially leave D
 `save_decode_cache=false`, then enable it after P writes and reads are validated.
+Keeping D saves disabled makes it a capacity-only owner: its Store still
+registers a DRAM segment, while KV buffer descriptors and transfer executors
+are omitted. P prompts below `lookup_min_prompt_tokens` skip lookup but can
+still save complete chunks. Zero allows lookup for all eligible prompts.
 Do not add `--kv-offloading-size`. The new profile requires explicit
 `--kv-cache-dtype fp8_ds_mla` and the existing encoder-only parallelism settings.
 Custom connector modules and external-launcher DP execution are rejected.
@@ -164,10 +188,23 @@ No request IDs or hashes become metric labels. Operation samples are bounded;
 under sustained overload the oldest unreported samples can be discarded.
 GPU/Store hit tokens remain visible through existing prefix-cache statistics.
 
-## Deferred validation
+## Validation scope
 
-The following commands are future validation entry points. They were not run
-while writing this implementation. Install the repository's test dependencies
+The existing 8P+8D deployment has exercised P reload after GPU-prefix eviction,
+cross-turn D-generated KV reload, and sustained mixed-length traffic. Its current
+encoder-only configuration uses P lookup threshold 2048 and capacity-only D.
+The two-hour Bailian Trace A comparison measured Prefill duration -15.92%,
+Mean TTFT -5.36%, weighted TPOT +1.91%, and Mean TPOT +2.13% versus L1-only.
+These workload-specific results do not establish a GET-saturation limit,
+bounded master memory growth, or every injected-failure case below.
+
+This source migration used syntax, style and source-equivalence checks; it did
+not rerun local unit tests, model evaluation or GPU performance A/B. The serving
+deployment still loads prepared role-local runtimes; migrating source does not
+update a serving image or those runtimes.
+
+The following commands are targeted validation entry points. Install the
+repository's test dependencies
 in the target GPU environment first.
 
 ```bash
@@ -196,6 +233,7 @@ Then validate the current 8P+8D deployment in this order:
    workloads. Measure quality, TTFT, p99 TPOT, throughput, transfer bytes, host
    memory and pin/queue peaks. Do not infer performance from static checks.
 
-Helm integration, owner/master deployment and image publication are separate
-follow-up stages. Roll back by draining and restoring the direct-only connector
+The matching Helm chart is `vllm/deepseek/deepseek-v4.1-flash-offload` in
+ServingKit. Image publication remains a separate stage. Roll back by draining
+and restoring the direct-only connector
 configuration; shared DRAM objects may expire independently.
