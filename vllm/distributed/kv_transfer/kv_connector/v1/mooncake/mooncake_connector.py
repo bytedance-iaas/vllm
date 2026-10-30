@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -764,6 +765,23 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        parallel = vllm_config.parallel_config
+        if parallel.prefill_context_parallel_size > 1 and not (
+            vllm_config.is_dsv41_encoder_only_prefill
+            and vllm_config.kv_transfer_config.kv_role == "kv_producer"
+            and (
+                parallel.pipeline_parallel_size,
+                parallel.tensor_parallel_size,
+                parallel.prefill_context_parallel_size,
+                parallel.decode_context_parallel_size,
+                parallel.data_parallel_size,
+            )
+            == (2, 1, 4, 1, 1)
+        ):
+            raise NotImplementedError(
+                "Mooncake PCP transfer requires an encoder-only DeepSeek V4.1 "
+                "pure producer with PP2/TP1/PCP4/DCP1/DP1."
+            )
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
@@ -847,6 +865,14 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def get_finished_count(self) -> int | None:
+        parallel = self._vllm_config.parallel_config
+        if parallel.prefill_context_parallel_size > 1:
+            # Native V4.1 PCP at DCP=1 publishes the gathered KV on every rank.
+            # Only rank 0 of each PCP group serves the replicated cache.
+            return parallel.world_size // parallel.prefill_context_parallel_size
+        return None
 
     ############################################################
     # Worker Side Methods
@@ -1297,6 +1323,13 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        parallel_config = vllm_config.parallel_config
+        self.pcp_rank = (
+            get_pcp_group().rank_in_group
+            if parallel_config.prefill_context_parallel_size > 1
+            else 0
+        )
+        self.is_sender_worker = not self.is_kv_consumer and self.pcp_rank == 0
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -1327,7 +1360,7 @@ class MooncakeConnectorWorker:
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
 
         # For kv_both, we will act both prefiller and decoder.
-        if not self.is_kv_consumer:
+        if self.is_sender_worker:
             # Background threads for sending kvcaches to D.
             # Each pool thread must be bound to the correct CUDA device
             # because CUDA device selection is thread-local.
@@ -1442,7 +1475,7 @@ class MooncakeConnectorWorker:
     def shutdown(self):
         """Cleanup background threads on destruction."""
         self.async_zmq_ctx.term()
-        if not self.is_kv_consumer:
+        if self.is_sender_worker:
             self._sender_executor.shutdown(wait=False)
             if self.sender_loop.is_running():
                 self.sender_loop.call_soon_threadsafe(self.sender_loop.stop)
@@ -1456,6 +1489,8 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.join()
 
     async def register_worker_with_bootstrap(self):
+        if not self.is_sender_worker:
+            return
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
         url = make_zmq_path("http", host, port) + "/register"
         worker_addr = make_zmq_path("tcp", self.hostname, self.side_channel_port)
@@ -2092,6 +2127,9 @@ class MooncakeConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
+        if self.is_kv_producer and not self.is_sender_worker:
+            self.device_kv_caches = kv_caches
+            return
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
 
         kv_data_ptrs: list[int] = []
@@ -2300,7 +2338,7 @@ class MooncakeConnectorWorker:
         )
 
         # No need to launch server for D node.
-        if self.is_kv_consumer:
+        if not self.is_sender_worker:
             return
 
         # httpx applies the timeout to each phase (connect, read, write, pool)
@@ -2373,7 +2411,7 @@ class MooncakeConnectorWorker:
                 self.fetch_finished_recving_reqs(), self.receiver_loop
             )
 
-        if not self.is_kv_consumer:
+        if self.is_sender_worker:
             send_fut = asyncio.run_coroutine_threadsafe(
                 self.fetch_finished_sending_reqs(), self.sender_loop
             )
@@ -2675,6 +2713,8 @@ class MooncakeConnectorWorker:
                 self.receive_kv(remote_engine_id, pull_metas)
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+        if not self.is_sender_worker:
+            return
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
@@ -2720,7 +2760,7 @@ class MooncakeConnectorWorker:
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
             )
 
-        if not self.is_kv_consumer and (
+        if self.is_sender_worker and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
             asyncio.run_coroutine_threadsafe(
@@ -3009,6 +3049,11 @@ def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    if (
+        parallel_config.prefill_context_parallel_size > 1
+        and get_pcp_group().rank_in_group != 0
+    ):
         return False
 
     # In hybrid or external LB mode,
