@@ -85,12 +85,14 @@ def _calibrate_dsv41_c128_budget(
     scheduled_drafts: int,
     max_draft_budget: int,
     draft_budget: int,
+    is_steady_five_draft_batch: bool,
 ) -> int:
     """Select an opt-in ordered dense row target for steady five-draft batches."""
     if target_rows not in (80, 88, 96, 104, 108, 112):
         return draft_budget
     if (
-        num_reqs not in (15, 16, 17, 18)
+        not is_steady_five_draft_batch
+        or num_reqs not in (15, 16, 17, 18)
         or num_non_draft_tokens != num_reqs
         or scheduled_drafts != num_reqs * 5
     ):
@@ -371,6 +373,14 @@ class AdaptiveVerificationManager:
             scheduled_drafts=int(scheduled_drafts.sum()),
             max_draft_budget=max_draft_budget,
             draft_budget=draft_budget,
+            is_steady_five_draft_batch=bool(
+                self._dsv41_c128_target_rows in (80, 88, 96, 104, 108, 112)
+                and np.all(scheduled_drafts == 5)
+                and np.all(
+                    self.req_states.num_computed_tokens_np[slots]
+                    >= self.req_states.prefill_len.np[slots]
+                )
+            ),
         )
         self._batch_budget = (
             num_drafts_per_req,
