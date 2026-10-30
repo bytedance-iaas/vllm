@@ -11,6 +11,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kFp8Dynamic128Sym,
     kMxfp8Dynamic,
 )
 from vllm.platforms import current_platform
@@ -125,6 +126,103 @@ class DeepGemmMegaMoEBackend:
         unmapped_topk_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
+
+
+class DeepGemmSm90MegaMoEBackend(DeepGemmMegaMoEBackend):
+    """Hopper FP8 activations with GS32 FP4 routed-expert weights.
+
+    SM90 uses FP32 activation scales and separate shared experts. The native
+    DeepGEMM packer and kernel share an immutable SS/RS selection.
+    """
+
+    mma_type = "fp8xfp4"
+    hidden_quant = kFp8Dynamic128Sym
+
+    def transform_weights(
+        self,
+        *,
+        w13_weight: torch.Tensor,
+        w13_weight_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_scale: torch.Tensor,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: str | None = None,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        if activation not in (None, "swiglu", "situ"):
+            raise ValueError(f"Unsupported SM90 MegaMoE activation: {activation!r}")
+        expected = (
+            (num_local_experts, 2 * intermediate_size, hidden_size // 2),
+            (num_local_experts, 2 * intermediate_size, hidden_size // 32),
+            (num_local_experts, hidden_size, intermediate_size // 2),
+            (num_local_experts, hidden_size, intermediate_size // 32),
+        )
+        for tensor, shape in zip(
+            (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
+            expected,
+        ):
+            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != shape:
+                raise ValueError(
+                    "SM90 MegaMoE requires packed FP4 weights and uint8 "
+                    f"GS32 scales: expected {shape}, got "
+                    f"{tuple(tensor.shape)}/{tensor.dtype}."
+                )
+        deep_gemm = _import_deep_gemm()
+        return deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
+            (
+                w13_weight.view(torch.int8).contiguous(),
+                ue8m0_uint8_to_float(w13_weight_scale).contiguous(),
+            ),
+            (
+                w2_weight.view(torch.int8).contiguous(),
+                ue8m0_uint8_to_float(w2_weight_scale).contiguous(),
+            ),
+        )
+
+    def run_mega_moe(
+        self,
+        *,
+        y: torch.Tensor,
+        l1_weights: tuple[torch.Tensor, torch.Tensor],
+        l2_weights: tuple[torch.Tensor, torch.Tensor],
+        symm_buffer,
+        activation_clamp: float | None,
+        fast_math: bool,
+        activation: str | None = None,
+        activation_alpha: float | None = None,
+        activation_beta: float | None = None,
+        shared_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        shared_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        if shared_l1_weights is not None or shared_l2_weights is not None:
+            raise ValueError("SM90 MegaMoE uses separately computed shared experts.")
+        if symm_buffer.x_sf.dtype != torch.float32:
+            raise ValueError("SM90 MegaMoE requires FP32 activation scales.")
+        deep_gemm = _import_deep_gemm()
+        kwargs = {}
+        if activation is not None:
+            kwargs["activation"] = activation
+        if activation_alpha is not None:
+            kwargs["activation_alpha"] = activation_alpha
+        if activation_beta is not None:
+            kwargs["activation_beta"] = activation_beta
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            l1_weights,
+            l2_weights,
+            symm_buffer,
+            activation_clamp=activation_clamp,
+            fast_math=fast_math,
+            **kwargs,
+        )
 
 
 class DeepGemmSm100MegaMoEBackend(DeepGemmMegaMoEBackend):
@@ -445,22 +543,47 @@ def get_deep_gemm_mega_moe_backend(
     checks (arch + shape divisibility) live here; there is no separate check
     on the returned backend.
 
-    Currently only the SM100 deep_gemm backend is registered here. SM90 and
-    other backends are expected to be provided by new backends or plugins
-    that override this factory.
+    SM90 uses the internal DeepGEMM FP4 backend with FP32 activation scales;
+    SM100 uses the release backend with packed E8M0 activation scales.
 
     Raises:
         NotImplementedError: If the device architecture is unsupported.
         ValueError: If the shapes are unsupported.
 
     """
-    if not current_platform.is_device_capability_family(
-        100, device_id=device.index or 0
+    device_id = device.index or 0
+    sm90 = current_platform.is_device_capability_family(90, device_id=device_id)
+    sm100 = current_platform.is_device_capability_family(100, device_id=device_id)
+    if not (sm90 or sm100):
+        raise NotImplementedError("DeepGEMM MegaMoE requires SM90 or SM100 GPUs.")
+    if (
+        hidden_size <= 0
+        or intermediate_size <= 0
+        or hidden_size % 128 != 0
+        or intermediate_size % 128 != 0
     ):
-        raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
-    if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
         raise ValueError(
             "DeepGEMM MegaMoE requires hidden and intermediate sizes "
-            "to be multiples of 128."
+            "to be positive multiples of 128."
         )
+    if sm90:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        if intermediate_size > 4096:
+            raise ValueError("SM90 MegaMoE requires intermediate_size <= 4096.")
+        deep_gemm = _import_deep_gemm()
+        required = (
+            "get_symm_buffer_for_mega_moe",
+            "transform_weights_for_mega_moe_sm90_fp4",
+            "fp8_fp4_mega_moe",
+        )
+        missing = [
+            name for name in required if not callable(getattr(deep_gemm, name, None))
+        ]
+        if missing:
+            raise NotImplementedError(
+                f"DeepGEMM is missing SM90 MegaMoE APIs: {missing}. "
+                "Install the release-compatible SM90 DeepGEMM wheel."
+            )
+        return DeepGemmSm90MegaMoEBackend()
     return DeepGemmSm100MegaMoEBackend()
