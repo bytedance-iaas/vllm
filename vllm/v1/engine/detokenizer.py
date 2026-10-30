@@ -21,6 +21,40 @@ logger = init_logger(__name__)
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+DETOKENIZATION_OFFSET = 32
+MIN_SAFE_SUFFIX_TOKENS = 4
+INVALID_UTF8_REPLACEMENT_CHAR = "\ufffd"
+_BOUNDED_PROMPT_SUFFIX_DECODERS = frozenset({"ByteLevel"})
+
+
+def _supports_bounded_prompt_suffix(tokenizer: Tokenizer) -> bool:
+    decoder = getattr(tokenizer, "decoder", None)
+    return (
+        decoder is not None
+        and decoder.__class__.__name__ in _BOUNDED_PROMPT_SUFFIX_DECODERS
+    )
+
+
+def _get_safe_decode_stream_prompt_suffix(
+    tokenizer: Tokenizer,
+    prompt_token_ids: list[int] | None,
+    skip_special_tokens: bool,
+) -> list[int] | None:
+    if prompt_token_ids is None or len(prompt_token_ids) <= DETOKENIZATION_OFFSET:
+        return prompt_token_ids
+    if not _supports_bounded_prompt_suffix(tokenizer):
+        return prompt_token_ids
+
+    for suffix_len in range(DETOKENIZATION_OFFSET, MIN_SAFE_SUFFIX_TOKENS - 1, -1):
+        suffix = prompt_token_ids[-suffix_len:]
+        try:
+            decoded = tokenizer.decode(suffix, skip_special_tokens=skip_special_tokens)
+        except Exception:
+            return prompt_token_ids
+        if decoded and INVALID_UTF8_REPLACEMENT_CHAR not in decoded:
+            return suffix
+
+    return prompt_token_ids
 
 
 def uses_fast_detokenizer(tokenizer: TokenizerLike) -> bool:
@@ -188,12 +222,17 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
-        # Use native prefill to prime the decode stream with prompt tokens.
+        # Prime with a UTF-8-safe ByteLevel suffix to bound first-step work.
         # Look up DecodeStream on the module so backend patches (e.g. the
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
+        prompt_suffix = _get_safe_decode_stream_prompt_suffix(
+            self.tokenizer,
+            request.prompt_token_ids,
+            self.skip_special_tokens,
+        )
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=prompt_suffix,
             skip_special_tokens=self.skip_special_tokens,
         )
 
