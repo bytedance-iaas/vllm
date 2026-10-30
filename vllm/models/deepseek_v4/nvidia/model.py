@@ -656,7 +656,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             "DeepSeek V4 SM90 MegaMoE capacities: decode=%d full=%d physical=%s.",
             self._decode_capacity,
             full_capacity,
-            physical_capacities,
+            tuple(physical_capacities),
         )
 
     def get_symm_buffer_for_num_tokens(self, num_tokens: int):
