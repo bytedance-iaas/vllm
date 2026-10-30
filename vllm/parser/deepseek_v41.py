@@ -44,11 +44,20 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
         terminals={
             **config.terminals,
             **terminal_overrides,
-            "TOOL_START": (DSML_TOOL_START, *DSML_TOOL_START_VARIANTS),
+            # Keep the text alias independent of the canonical special token.
+            "TOOL_START_VARIANT": DSML_TOOL_START_VARIANTS,
         },
         token_id_terminals={
             key: terminal_overrides.get(key, value)
             for key, value in config.token_id_terminals.items()
+        },
+        transitions={
+            **config.transitions,
+            **{
+                (state, "TOOL_START_VARIANT"): transition
+                for (state, terminal), transition in config.transitions.items()
+                if terminal == "TOOL_START"
+            },
         },
         arg_converter=functools.partial(
             _dsml_arg_converter,

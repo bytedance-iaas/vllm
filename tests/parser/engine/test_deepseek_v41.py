@@ -99,10 +99,11 @@ def test_registered_adapters_parse_complete_output(thinking):
 
 
 @pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("special_calls", [False, True])
 @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
-def test_v4_wrapper_name_opens_tool_block(thinking, chunk_size):
+def test_v4_wrapper_name_opens_tool_block(thinking, special_calls, chunk_size):
     text = ("Plan.</think>" if thinking else "") + "Checking." + V4_NAMED_CALLS
-    tokenizer, tokens = tokenizer_for(text, False)
+    tokenizer, tokens = tokenizer_for(text, special_calls)
     output = collect_output(
         replay_streaming(
             parser_for(tokenizer, {"thinking": thinking}),
@@ -130,9 +131,10 @@ def test_v4_wrapper_name_opens_tool_block(thinking, chunk_size):
     )
 
 
-def test_v4_wrapper_name_ends_reasoning():
+@pytest.mark.parametrize("special_calls", [False, True])
+def test_v4_wrapper_name_ends_reasoning(special_calls):
     text = "Plan." + V4_NAMED_CALLS
-    tokenizer, tokens = tokenizer_for(text, False)
+    tokenizer, tokens = tokenizer_for(text, special_calls)
     output = collect_output(
         replay_streaming(
             parser_for(tokenizer, {"thinking": True}),
