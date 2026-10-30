@@ -144,6 +144,29 @@ def _prepare(state, batch, cg_mode):
     return (None, None) if replay is None else (replay, state.builds[-2])
 
 
+def _replay_manager(
+    descriptor_tokens: int = 256, graph_segments: int | None = 1
+) -> MagicMock:
+    manager = MagicMock()
+    manager.dispatch.return_value = BatchExecutionDescriptor(
+        CUDAGraphMode.PIECEWISE, descriptor_tokens, None
+    )
+    entry = (
+        None
+        if graph_segments is None
+        else SimpleNamespace(
+            capture=SimpleNamespace(
+                num_graphs=graph_segments,
+                num_eager_breaks=1,
+            )
+        )
+    )
+    manager.breakable_cg_runner.entries = (
+        {} if entry is None else {BatchDescriptor(num_tokens=descriptor_tokens): entry}
+    )
+    return manager
+
+
 def test_replay_batch_keeps_each_request_window(state):
     state._replay_start_np[2] = 50  # the encoder-side replay start of request 2
     batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING)
@@ -173,7 +196,10 @@ def test_replay_batch_keeps_each_request_window(state):
         "swa_first": first.attn_metadata,
     }
     assert torch.equal(context.slot_mapping["mla"], _slot_mappings(401)[1, rows])
-    assert context.dp_metadata is None and context.is_padding is None
+    assert context.dp_metadata is None
+    assert context.is_padding is not None
+    assert context.is_padding.shape == (len(REPLAY_ROWS),)
+    assert not context.is_padding.any().item()
 
 
 def test_replay_batch_keeps_device_decode_boundaries(state):
@@ -251,6 +277,43 @@ def test_whole_batch_forwards_get_no_replay_batch(state):
     assert _prepare(state, dummy, CUDAGraphMode.NONE) == (None, None)
 
 
+def test_mixed_replay_graph_is_default_off(state):
+    state.replay_cudagraphs = _replay_manager()
+    state._replay_start_np[1] = 50
+    batch = _input_batch([1, 100], [500, 300], [False, True])
+
+    assert _prepare(state, batch, CUDAGraphMode.NONE) == (None, None)
+    state.replay_cudagraphs.dispatch.assert_not_called()
+
+
+def test_mixed_replay_graph_forces_untrimmed_batch_and_clears_next_step(state):
+    manager = _replay_manager()
+    state.replay_cudagraphs = manager
+    state._mixed_replay_graph_enabled = True
+    state._replay_start_np[1] = 50
+    batch = _input_batch([1, 100], [500, 300], [False, True])
+
+    replay, _ = _prepare(state, batch, CUDAGraphMode.NONE)
+    assert replay is not None
+    assert replay.rows.tolist() == list(range(101))
+    assert replay.run_graph is manager.run
+    assert replay.forward_context.batch_descriptor.num_tokens == 256
+
+    assert _prepare(state, batch, CUDAGraphMode.FULL) == (None, None)
+    assert state.decoder_replay_layers.replay_batch is None
+
+
+@pytest.mark.parametrize("graph_segments", [None, 0])
+def test_mixed_replay_graph_falls_back_when_graph_is_not_ready(state, graph_segments):
+    state.replay_cudagraphs = _replay_manager(graph_segments=graph_segments)
+    state._mixed_replay_graph_enabled = True
+    state._replay_start_np[1] = 50
+    batch = _input_batch([1, 100], [500, 300], [False, True])
+
+    assert _prepare(state, batch, CUDAGraphMode.NONE) == (None, None)
+    assert state.decoder_replay_layers.replay_batch is None
+
+
 @pytest.fixture
 def dp_state(state, monkeypatch):
     """`state` on DP rank 0 of 2; `state.other` sets what rank 1 reports
@@ -261,9 +324,16 @@ def dp_state(state, monkeypatch):
     state.vllm_config.parallel_config.data_parallel_rank = 0
     state.vllm_config.parallel_config.is_moe_model = True
     state.other = (False, 0)  # type: ignore[attr-defined]
+    state.other_mixed = (False, False, True, 0)  # type: ignore[attr-defined]
+    state.other_ready = True  # type: ignore[attr-defined]
 
     def all_reduce(tensor, group):
-        tensor[:, 1] = torch.tensor(state.other, dtype=torch.int32)
+        if tensor.ndim == 1:
+            tensor[1] = int(state.other_ready)
+        elif tensor.shape[0] == 4:
+            tensor[:, 1] = torch.tensor(state.other_mixed, dtype=torch.int32)
+        else:
+            tensor[:, 1] = torch.tensor(state.other, dtype=torch.int32)
 
     monkeypatch.setattr(module.dist, "all_reduce", all_reduce)
     monkeypatch.setattr(module, "get_dp_group", lambda: SimpleNamespace(cpu_group=None))
@@ -348,6 +418,46 @@ def test_idle_dp_rank_dummy_trims_with_its_peers(dp_state):
     assert replay is not None and replay.rows.shape[0] == 1
     dp_metadata = replay.forward_context.dp_metadata
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [1, 129]
+
+
+def test_idle_dp_rank_joins_peer_mixed_replay_graph(dp_state):
+    manager = _replay_manager()
+    dp_state.replay_cudagraphs = manager
+    dp_state._mixed_replay_graph_enabled = True
+    dp_state.other_mixed = (False, True, True, 129)
+    dummy = _input_batch([256, 256], [256, 256], [False, False])
+
+    replay, _ = _prepare(dp_state, dummy, CUDAGraphMode.NONE)
+    assert replay is not None
+    assert replay.rows.shape[0] == 1
+    assert replay.run_graph is manager.run
+    assert replay.forward_context.dp_metadata is not None
+    assert replay.forward_context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [
+        256,
+        256,
+    ]
+
+
+def test_mixed_replay_graph_falls_back_when_dp_peer_is_ineligible(dp_state):
+    dp_state.replay_cudagraphs = _replay_manager()
+    dp_state._mixed_replay_graph_enabled = True
+    dp_state._replay_start_np[2] = 50
+    dp_state.other_mixed = (False, False, False, 1)
+    batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING)
+
+    assert _prepare(dp_state, batch, CUDAGraphMode.NONE) == (None, None)
+    dp_state.replay_cudagraphs.dispatch.assert_not_called()
+
+
+def test_mixed_replay_graph_falls_back_when_dp_peer_graph_is_not_ready(dp_state):
+    dp_state.replay_cudagraphs = _replay_manager()
+    dp_state._mixed_replay_graph_enabled = True
+    dp_state._replay_start_np[1] = 50
+    dp_state.other_mixed = (False, False, True, 1)
+    dp_state.other_ready = False
+    batch = _input_batch([1, 100], [500, 300], [False, True])
+
+    assert _prepare(dp_state, batch, CUDAGraphMode.NONE) == (None, None)
 
 
 def test_dp_ranks_pad_to_one_replay_graph(dp_state):

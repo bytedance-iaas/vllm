@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import replace
 from typing import Any
 
@@ -219,6 +220,9 @@ class DeepseekV41ModelState(DefaultModelState):
         # The replay window and the indices of the prefix-cacheable groups, from
         # the KV cache config on first use; None until then.
         self._replay: tuple[int, torch.Tensor] | None = None
+        self._mixed_replay_graph_enabled = (
+            os.environ.get("VLLM_DSV41_MIXED_REPLAY_GRAPH", "0") == "1"
+        )
 
         self.decoder_replay_layers: DecoderReplayLayers | None = getattr(
             model, "decoder_replay_layers", None
@@ -276,7 +280,28 @@ class DeepseekV41ModelState(DefaultModelState):
             self.replay_cudagraphs = DecoderReplayCudaGraphManager(
                 vllm_config, device, layers
             )
-            layers.trim_threshold = threshold
+            if compilation_config.cudagraph_mode.has_piecewise_cudagraphs():
+                layers.trim_threshold = threshold
+        if self._mixed_replay_graph_enabled:
+            parallel_config = vllm_config.parallel_config
+            blockers = []
+            if compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+                blockers.append("cudagraph_mode is not FULL_DECODE_ONLY")
+            if parallel_config.tensor_parallel_size != 1:
+                blockers.append("tensor_parallel_size is not 1")
+            if parallel_config.pipeline_parallel_size != 1:
+                blockers.append("pipeline_parallel_size is not 1")
+            if parallel_config.prefill_context_parallel_size != 1:
+                blockers.append("prefill_context_parallel_size is not 1")
+            if parallel_config.decode_context_parallel_size != 1:
+                blockers.append("decode_context_parallel_size is not 1")
+            if self.replay_cudagraphs is None:
+                blockers.append("dedicated replay CUDA graphs are unavailable")
+            if blockers:
+                raise ValueError(
+                    "VLLM_DSV41_MIXED_REPLAY_GRAPH cannot be enabled: "
+                    + "; ".join(blockers)
+                )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -490,7 +515,16 @@ class DeepseekV41ModelState(DefaultModelState):
             cudagraph_mode == CUDAGraphMode.PIECEWISE
             and layers.graph_uses_replay_batch(input_batch.num_tokens_after_padding)
         )
-        if cudagraph_mode != CUDAGraphMode.NONE and not force_replay_batch:
+        mixed_graph_coordination = (
+            self._mixed_replay_graph_enabled
+            and capture_desc is None
+            and cudagraph_mode == CUDAGraphMode.NONE
+        )
+        if (
+            not mixed_graph_coordination
+            and cudagraph_mode != CUDAGraphMode.NONE
+            and not force_replay_batch
+        ):
             return
 
         num_reqs = input_batch.num_reqs
@@ -534,10 +568,29 @@ class DeepseekV41ModelState(DefaultModelState):
         if num_padded is None:
             num_padded = num_tokens
         dp_tokens = None
+        force_mixed_graph = (
+            mixed_graph_coordination and self._is_mixed_replay_candidate(input_batch)
+        )
+        mixed_graph_eligible = (
+            mixed_graph_coordination and self.replay_cudagraphs is not None
+        )
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            needs_replay_batch, dp_tokens = self._agree_across_dp(
-                needs_replay_batch, num_padded
-            )
+            if mixed_graph_coordination:
+                needs_replay_batch, force_mixed_graph, dp_tokens = (
+                    self._agree_mixed_replay_across_dp(
+                        needs_replay_batch,
+                        force_mixed_graph,
+                        mixed_graph_eligible,
+                        num_padded,
+                    )
+                )
+            else:
+                needs_replay_batch, dp_tokens = self._agree_across_dp(
+                    needs_replay_batch, num_padded
+                )
+        elif force_mixed_graph:
+            force_mixed_graph = mixed_graph_eligible
+            needs_replay_batch = needs_replay_batch or force_mixed_graph
         if not needs_replay_batch:
             return
 
@@ -548,15 +601,25 @@ class DeepseekV41ModelState(DefaultModelState):
             )
         cudagraphs, run_graph = self.replay_cudagraphs, None
         cg_mode = CUDAGraphMode.NONE
+        desc: BatchExecutionDescriptor | None = None
         if cudagraphs is not None:
             # Every rank runs the graph that fits the largest rank's batch.
             dp_max_tokens = num_padded if dp_tokens is None else int(dp_tokens.max())
             desc = capture_desc or cudagraphs.dispatch(num_reqs, dp_max_tokens, None, 0)
-            if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+            if desc.cg_mode == CUDAGraphMode.PIECEWISE and (
+                not force_mixed_graph
+                or self._replay_graph_has_segments(cudagraphs, desc)
+            ):
                 num_padded, cg_mode = desc.num_tokens, desc.cg_mode
                 run_graph = cudagraphs.run
                 if dp_tokens is not None:
                     dp_tokens.fill_(num_padded)
+        if force_mixed_graph:
+            graph_ready = run_graph is not None
+            if self.vllm_config.parallel_config.data_parallel_size > 1:
+                graph_ready = self._all_dp_ranks(graph_ready)
+            if not graph_ready:
+                return
         dp_metadata = None
         if dp_tokens is not None:
             dp_metadata = DPMetadata.make(
@@ -730,6 +793,75 @@ class DeepseekV41ModelState(DefaultModelState):
         if not agreed[0].any():
             return False, None
         return True, agreed[1]
+
+    def _is_mixed_replay_candidate(self, input_batch: InputBatch) -> bool:
+        """Whether this step mixes Decode rows with resumed Prefill replay."""
+        num_reqs = input_batch.num_reqs
+        is_prefilling = input_batch.is_prefilling_np[:num_reqs]
+        if not is_prefilling.any() or is_prefilling.all():
+            return False
+        replay_starts = self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]]
+        return bool((is_prefilling & (replay_starts > 0)).any())
+
+    def _agree_mixed_replay_across_dp(
+        self,
+        needs_replay_batch: bool,
+        force_mixed_graph: bool,
+        mixed_graph_eligible: bool,
+        num_tokens: int,
+    ) -> tuple[bool, bool, torch.Tensor | None]:
+        """Agree whether an eager mixed step may force the dedicated replay graph."""
+        parallel_config = self.vllm_config.parallel_config
+        rank = parallel_config.data_parallel_rank
+        agreed = torch.zeros(4, parallel_config.data_parallel_size, dtype=torch.int32)
+        agreed[:, rank] = torch.tensor(
+            [
+                needs_replay_batch,
+                force_mixed_graph,
+                mixed_graph_eligible,
+                num_tokens,
+            ]
+        )
+        if should_skip_dp_coordination():
+            if force_mixed_graph and not mixed_graph_eligible:
+                return False, False, None
+            needs_replay_batch = needs_replay_batch or force_mixed_graph
+            return (
+                needs_replay_batch,
+                force_mixed_graph,
+                agreed[3] if needs_replay_batch else None,
+            )
+        dist.all_reduce(agreed, group=get_dp_group().cpu_group)
+        force_requested = bool(agreed[1].any())
+        if force_requested and not agreed[2].all():
+            return False, False, None
+        force_mixed_graph = force_requested
+        needs_replay_batch = bool(agreed[0].any()) or force_mixed_graph
+        return (
+            needs_replay_batch,
+            force_mixed_graph,
+            agreed[3] if needs_replay_batch else None,
+        )
+
+    def _all_dp_ranks(self, local_ready: bool) -> bool:
+        parallel_config = self.vllm_config.parallel_config
+        if should_skip_dp_coordination():
+            return local_ready
+        ready = torch.zeros(parallel_config.data_parallel_size, dtype=torch.int32)
+        ready[parallel_config.data_parallel_rank] = int(local_ready)
+        dist.all_reduce(ready, group=get_dp_group().cpu_group)
+        return bool(ready.all())
+
+    @staticmethod
+    def _replay_graph_has_segments(
+        manager: DecoderReplayCudaGraphManager,
+        descriptor: BatchExecutionDescriptor,
+    ) -> bool:
+        entry = manager.breakable_cg_runner.entries.get(
+            BatchDescriptor(num_tokens=descriptor.num_tokens)
+        )
+        capture = entry.capture if entry is not None else None
+        return capture is not None and capture.num_graphs >= 1
 
     def _copy_attn_groups(
         self, attn_groups: list[list[AttentionGroup]], prefixes: set[str]
