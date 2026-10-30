@@ -530,12 +530,16 @@ def _return_or_raise(
     activation_key: QuantKey | None,
     activation_format: mk.FusedMoEActivationFormat,
     scope: Literal["process", "global", "local"] = "local",
+    additional_activation_keys: tuple[QuantKey | None, ...] = (),
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts]]:
     reason: str | None = None
     for k_cls in backend_to_kernel_cls(backend):
-        supported, reason = k_cls.is_supported_config(
-            k_cls, config, weight_key, activation_key, activation_format
-        )
+        for current_key in (activation_key, *additional_activation_keys):
+            supported, reason = k_cls.is_supported_config(
+                k_cls, config, weight_key, current_key, activation_format
+            )
+            if not supported:
+                break
         if supported:
             logger.info_once(_make_log_backend(backend), scope=scope)
             return backend, k_cls
@@ -741,6 +745,7 @@ def select_mxfp4_moe_backend(
 
 def select_deepseek_v4_mxfp4_moe_backend(
     config: FusedMoEConfig,
+    humming_activation_keys: tuple[QuantKey | None, QuantKey | None] | None = None,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the MXFP4 MoE backend with MXFP8 activation as top priority.
     Falls back through BF16 and other backends.
@@ -770,12 +775,19 @@ def select_deepseek_v4_mxfp4_moe_backend(
         last_error: Exception | None = None
         for requested_backend in requested_backends:
             try:
+                activation_keys = (
+                    humming_activation_keys
+                    if requested_backend == Mxfp4MoeBackend.HUMMING
+                    and humming_activation_keys is not None
+                    else (_backend_activation_key(requested_backend),)
+                )
                 return _return_or_raise(
                     requested_backend,
                     config,
                     kMxfp4Static,
-                    _backend_activation_key(requested_backend),
+                    activation_keys[0],
                     activation_format,
+                    additional_activation_keys=activation_keys[1:],
                 )
             except ValueError as e:
                 last_error = e
@@ -797,11 +809,19 @@ def select_deepseek_v4_mxfp4_moe_backend(
 
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
     for backend in priority_backends:
-        activation_key = _backend_activation_key(backend)
+        activation_keys = (
+            humming_activation_keys
+            if backend == Mxfp4MoeBackend.HUMMING
+            and humming_activation_keys is not None
+            else (_backend_activation_key(backend),)
+        )
         for k_cls in backend_to_kernel_cls(backend):
-            supported, reason = k_cls.is_supported_config(
-                k_cls, config, kMxfp4Static, activation_key, activation_format
-            )
+            for activation_key in activation_keys:
+                supported, reason = k_cls.is_supported_config(
+                    k_cls, config, kMxfp4Static, activation_key, activation_format
+                )
+                if not supported:
+                    break
             if supported:
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
@@ -1481,6 +1501,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     activation: MoEActivation | None = None,
     use_separated_a4w4: bool = False,
     activation_key: QuantKey | None = None,
+    humming_activation_keys: tuple[QuantKey | None, QuantKey | None] | None = None,
+    humming_input_layer_skipped: bool | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1545,7 +1567,34 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         # The env override wins; otherwise use the checkpoint's activation
         # scheme instead of Humming's default BF16 activations.
         input_schema = None
-        if activation_key is not None and not envs.VLLM_HUMMING_INPUT_QUANT_CONFIG:
+        sublayer_configs = None
+        if humming_activation_keys is not None:
+            from vllm.model_executor.layers.quantization.utils.humming import (
+                quant_key_to_input_schema,
+            )
+
+            intermediate_size = layer.moe_config.intermediate_size_per_partition
+            sublayer_configs = {
+                "w13": {
+                    "shape_n": intermediate_size
+                    * (2 if layer.moe_config.activation.is_gated else 1),
+                    "shape_k": layer.moe_config.hidden_dim,
+                    "input_schema": quant_key_to_input_schema(
+                        humming_activation_keys[0]
+                    ),
+                    "allow_input_schema_fallback": False,
+                },
+                "w2": {
+                    "shape_n": layer.moe_config.hidden_dim,
+                    "shape_k": intermediate_size,
+                    "input_schema": quant_key_to_input_schema(
+                        humming_activation_keys[1]
+                    ),
+                    "allow_input_schema_fallback": False,
+                },
+            }
+            input_schema = sublayer_configs["w13"]["input_schema"]
+        elif activation_key is not None and not envs.VLLM_HUMMING_INPUT_QUANT_CONFIG:
             from vllm.model_executor.layers.quantization.utils.humming import (
                 quant_key_to_input_schema,
             )
@@ -1555,7 +1604,9 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             layer,
             quant_config={"quant_method": "mxfp4"},
             input_schema=input_schema,
+            sublayer_configs=sublayer_configs,
             allow_input_schema_fallback=False,
+            input_layer_skipped=humming_input_layer_skipped,
         )
         return (
             layer.w13_weight,

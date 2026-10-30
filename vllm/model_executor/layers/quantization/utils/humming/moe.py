@@ -24,9 +24,6 @@ from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
     HummingGroupedExperts,
     HummingIndexedExperts,
 )
-from vllm.model_executor.layers.quantization.utils.humming.schema import (
-    humming_is_layer_skipped,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
     GroupShape,
@@ -39,6 +36,8 @@ if TYPE_CHECKING:
     from vllm.utils.humming import LayerConfig
 
 logger = init_logger(__name__)
+
+_SAME_AS_W13 = object()
 
 
 @dataclass(kw_only=True)
@@ -70,20 +69,27 @@ def make_humming_moe_quant_config(
     gemm1_beta: float | None = None,
     gemm1_clamp_limit: float | None = None,
     humming_configs: dict[str, "LayerConfig"] | None = None,
+    w2_quant_dtype: torch.dtype | str | None | object = _SAME_AS_W13,
+    w2_activation_group_shape: GroupShape | None | object = _SAME_AS_W13,
 ) -> HummingMoEQuantConfig:
     assert humming_configs is not None
-    if quant_dtype is None:
-        a_quant_desc = FusedMoEQuantDesc(dtype=None)
-    elif activation_group_shape is not None:
-        # Pre-dispatch quantization.
-        a_quant_desc = FusedMoEQuantDesc(
-            dtype=quant_dtype, shape=activation_group_shape
+    if w2_quant_dtype is _SAME_AS_W13:
+        w2_quant_dtype = quant_dtype
+    if w2_activation_group_shape is _SAME_AS_W13:
+        w2_activation_group_shape = activation_group_shape
+
+    def activation_desc(dtype, group_shape):
+        if dtype is None:
+            return FusedMoEQuantDesc(dtype=None)
+        # A string dtype defers quantization to Humming; torch dtypes describe
+        # the activation quantized before the EP dispatch.
+        return FusedMoEQuantDesc(
+            dtype=dtype,
+            shape=group_shape if group_shape is not None else GroupShape(1, -1),
         )
-    else:
-        # Deferred path: Humming quantizes the activation internally, so the
-        # descriptor only needs a non-None dtype to mark it as quantized.
-        shape = GroupShape(row=1, col=-1)
-        a_quant_desc = FusedMoEQuantDesc(dtype=quant_dtype, shape=shape)
+
+    a1_quant_desc = activation_desc(quant_dtype, activation_group_shape)
+    a2_quant_desc = activation_desc(w2_quant_dtype, w2_activation_group_shape)
 
     w1_quant_desc = FusedMoEQuantDesc(
         dtype=weight_dtype,
@@ -104,8 +110,8 @@ def make_humming_moe_quant_config(
     )
 
     return HummingMoEQuantConfig(
-        _a1=a_quant_desc,
-        _a2=a_quant_desc,
+        _a1=a1_quant_desc,
+        _a2=a2_quant_desc,
         _w1=w1_quant_desc,
         _w2=w2_quant_desc,
         gemm1_alpha=gemm1_alpha,
@@ -125,30 +131,30 @@ def get_humming_moe_quant_config(
 ):
     if humming_configs is None:
         humming_configs = layer.humming_configs
-    input_schema = layer.input_schemas["w13"]
     weight_schema = layer.weight_schemas["w13"]
 
-    if input_schema.a_dtype is None or input_schema.a_dtype.num_bits == 16:
-        q_dtype = None
-    else:
-        q_dtype = str(input_schema.a_dtype)
+    def activation_config(name: str) -> tuple[Any, GroupShape | None]:
+        schema = layer.input_schemas[name]
+        if schema.a_dtype is None or schema.a_dtype.num_bits >= 16:
+            return None, None
+        dtype = str(schema.a_dtype)
+        # Only FP8 uses vLLM's pre-dispatch block quantizer. Grouped INT8
+        # remains deferred to Humming, which consumes float32 group scales.
+        group_size = schema.input_scale_group_size or 0
+        if (
+            dtype.startswith("float8")
+            and group_size == 128
+            and layer.weight_schemas[name].hadamard_block_size <= 1
+            and schema.input_quant_mode in (None, "dynamic_group")
+        ):
+            return (
+                humming_schema._HUMMING_TO_QUANT_DTYPE.get(schema.a_dtype, FP8_DTYPE),
+                GroupShape(1, group_size),
+            )
+        return dtype, None
 
-    # Block-FP8 (group-128) activations are quantized *before* the EP all-to-all
-    # dispatch (so FP8 rather than BF16 crosses the interconnect) and consumed by
-    # Humming as-is.
-    activation_group_shape: GroupShape | None = None
-    input_scale_group_size = getattr(input_schema, "input_scale_group_size", 0) or 0
-    if (
-        q_dtype is not None
-        and q_dtype.startswith("float8")
-        and input_scale_group_size == 128
-        and weight_schema.hadamard_block_size <= 1
-        and input_schema.input_quant_mode in (None, "dynamic_group")
-    ):
-        q_dtype = humming_schema._HUMMING_TO_QUANT_DTYPE.get(
-            input_schema.a_dtype, FP8_DTYPE
-        )
-        activation_group_shape = GroupShape(row=1, col=input_scale_group_size)
+    q_dtype, activation_group_shape = activation_config("w13")
+    w2_q_dtype, w2_activation_group_shape = activation_config("w2")
 
     weight_scale_group_size = weight_schema.weight_scale_group_size
     weight_scale_group_size_n = weight_schema.weight_scale_group_size_n
@@ -168,6 +174,8 @@ def get_humming_moe_quant_config(
         weight_dtype=str(weight_schema.b_dtype),
         weight_group_shape=weight_group_shape,
         activation_group_shape=activation_group_shape,
+        w2_quant_dtype=w2_q_dtype,
+        w2_activation_group_shape=w2_activation_group_shape,
         w1_scale=getattr(layer, "w13_weight_scale", None),
         w1_gscale=getattr(layer, "w13_weight_scale_2", None),
         w1_zp=getattr(layer, "w13_zero_point", None),
@@ -198,6 +206,7 @@ def select_humming_moe_experts(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
     activation_key: QuantKey | None,
+    additional_activation_keys: tuple[QuantKey | None, ...] = (),
 ) -> type[mk.FusedMoEExperts] | None:
     """Select the primary Humming MoE Experts class
     Note: Shape-specific fallbacks may still occur at runtime.
@@ -239,13 +248,12 @@ def select_humming_moe_experts(
             )
 
     for k_cls in AVAILABLE_EXPERTS:
-        supported, reason = k_cls.is_supported_config(
-            k_cls,
-            config,
-            weight_key,
-            activation_key,
-            activation_format,
-        )
+        for current_key in (activation_key, *additional_activation_keys):
+            supported, reason = k_cls.is_supported_config(
+                k_cls, config, weight_key, current_key, activation_format
+            )
+            if not supported:
+                break
         if supported:
             logger.info_once(_make_log_backend(k_cls))
             return k_cls
@@ -253,6 +261,35 @@ def select_humming_moe_experts(
             logger.debug_once(_make_log_unsupported(k_cls, reason))
 
     return None
+
+
+def resolve_humming_moe_activation_keys(
+    layer_name: str,
+    weight_schema: Any,
+    param_dtype: torch.dtype,
+    layer_skipped: bool | None = None,
+    default_input_schema: Any | None = None,
+) -> tuple[QuantKey | None, QuantKey | None]:
+    from vllm.utils.humming import HummingInputSchema
+
+    parent, allow_fallback, sublayers = humming_schema.resolve_humming_moe_input_config(
+        envs.VLLM_HUMMING_INPUT_QUANT_CONFIG or {}, layer_name, layer_skipped
+    )
+    if parent is None:
+        parent = default_input_schema or HummingInputSchema()
+    if allow_fallback is None:
+        allow_fallback = True
+    keys = []
+    for name in ("w13", "w2"):
+        config = sublayers.get(name, {})
+        schema = humming_schema.check_and_fallback_input_schema(
+            weight_schema=weight_schema,
+            input_schema=config.get("input_schema", parent),
+            param_dtype=param_dtype,
+            allow_fallback=config.get("allow_input_schema_fallback", allow_fallback),
+        )
+        keys.append(humming_schema.input_schema_to_quant_key(schema, param_dtype))
+    return keys[0], keys[1]
 
 
 def make_humming_moe_kernel(
@@ -521,6 +558,7 @@ def convert_to_humming_moe_kernel_format(
     input_schema: Any | None = None,
     force_weight_schema: Any | None = None,
     allow_input_schema_fallback: bool = True,
+    input_layer_skipped: bool | None = None,
 ) -> dict[str, "LayerConfig"]:
     """Convert MoE weights from checkpoint format to Humming kernel format.
 
@@ -544,6 +582,7 @@ def convert_to_humming_moe_kernel_format(
                      If None, built from quant_config or env vars.
         force_weight_schema: Optional schema to force requantization to
         allow_input_schema_fallback: Whether incompatible input schemas may be replaced.
+        input_layer_skipped: Optional caller-resolved layer exclusion decision.
 
     Side effects:
         - Modifies layer parameters in place
@@ -555,6 +594,7 @@ def convert_to_humming_moe_kernel_format(
     has_bias = layer.moe_config.has_bias
     num_experts = layer.moe_config.num_local_experts
     param_dtype = layer.params_dtype
+    resolved_sublayers: dict[str, dict[str, Any]] = {}
 
     if weight_schema is None or input_schema is None:
         if quant_config is None:
@@ -569,17 +609,17 @@ def convert_to_humming_moe_kernel_format(
 
         if input_schema is None:
             input_quant_config = (envs.VLLM_HUMMING_INPUT_QUANT_CONFIG or {}).copy()
-            if humming_is_layer_skipped(input_quant_config, layer.layer_name):
+            parent, allow_fallback, resolved_sublayers = (
+                humming_schema.resolve_humming_moe_input_config(
+                    input_quant_config, layer.layer_name, input_layer_skipped
+                )
+            )
+            if parent is None:
                 input_schema = HummingInputSchema()
             else:
-                # TODO: read input_quant_config from quant_config
-                input_quant_config = humming_schema.resolve_humming_layer_config(
-                    input_quant_config, layer.layer_name
-                )
-                allow_input_schema_fallback = input_quant_config.pop(
-                    "allow_fallback", False
-                )
-                input_schema = HummingInputSchema.from_config(input_quant_config)
+                input_schema = parent
+                assert allow_fallback is not None
+                allow_input_schema_fallback = allow_fallback
 
     # Build sublayer configs from layer properties if not provided
     if sublayer_configs is None:
@@ -595,6 +635,14 @@ def convert_to_humming_moe_kernel_format(
                 "shape_k": intermediate_size,
             },
         }
+    else:
+        sublayer_configs = {
+            name: config.copy() for name, config in sublayer_configs.items()
+        }
+
+    for name, config in resolved_sublayers.items():
+        for key, value in config.items():
+            sublayer_configs[name].setdefault(key, value)
 
     layer.weight_schemas = {}
     layer.input_schemas = {}
@@ -608,12 +656,14 @@ def convert_to_humming_moe_kernel_format(
                 shape_n=configs["shape_n"],
                 shape_k=configs["shape_k"],
                 weight_schema=weight_schema,
-                input_schema=input_schema,
+                input_schema=configs.get("input_schema", input_schema),
                 has_bias=has_bias,
                 num_experts=num_experts,
                 param_dtype=param_dtype,
                 force_weight_schema=force_weight_schema,
-                allow_input_schema_fallback=allow_input_schema_fallback,
+                allow_input_schema_fallback=configs.get(
+                    "allow_input_schema_fallback", allow_input_schema_fallback
+                ),
             )
         )
 
