@@ -2650,12 +2650,16 @@ class ModelOptLinearMethod(LinearMethodBase):
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         # Prepare from checkpoint-format tensors before the fallback kernel
         # repacks them. Dispatch remains limited to the validated projections.
+        supports_dsv41_dense_override = type(self.kernel).__name__ in (
+            "HummingMxfp8LinearKernel",
+            "MarlinMxfp8LinearKernel",
+        )
         if (
             os.getenv("VLLM_DSV41_DECODE_HUMMING_DENSE", "0") == "1"
             and self.spec.weight == kMxfp8Static
             and self.spec.activation == kMxfp8Dynamic
             and type(self.fmt) is FormatScheme
-            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+            and supports_dsv41_dense_override
         ):
             from vllm.model_executor.layers.quantization.utils.dsv41_humming_dense import (  # noqa: E501
                 Dsv41HummingDense,
@@ -2670,7 +2674,7 @@ class ModelOptLinearMethod(LinearMethodBase):
             and self.spec.weight == kMxfp8Static
             and self.spec.activation == kMxfp8Dynamic
             and type(self.fmt) is FormatScheme
-            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+            and supports_dsv41_dense_override
         ):
             from vllm.model_executor.layers.quantization.utils.dense_mxfp8_triton import (  # noqa: E501
                 Dsv41DenseMxfp8,
