@@ -123,7 +123,20 @@ def test_adaptive_verification_sizes_only_batches_with_drafts():
 
 def test_skipped_post_dp_refill_preserves_pcp_global_batch_count():
     empty = np.empty(0, dtype=np.int32)
-    batch_state = BatchReqState([], empty, 46, empty, empty, empty, empty, True)
+    batch_state = BatchReqState(
+        req_ids=[],
+        num_scheduled_tokens=empty,
+        num_tokens=46,
+        num_draft_tokens_np=empty,
+        idx_mapping_np=empty,
+        prefill_len_np=empty,
+        num_computed_prefill_tokens_np=empty,
+        is_prefilling_np=np.empty(0, dtype=np.bool_),
+        max_seq_len_np=None,
+        has_prefill=True,
+        prefill_runs_as_decode_np=None,
+        decode_graph_eligible=False,
+    )
 
     unchanged_state, local_tokens = _apply_post_dp_refill_num_tokens(
         batch_state,
