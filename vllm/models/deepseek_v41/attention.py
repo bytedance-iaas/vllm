@@ -33,6 +33,7 @@ from vllm.models.deepseek_v41.common.ops import (
     indexer_k_norm_rope_store,
 )
 from vllm.models.deepseek_v41.common.ops.cache_relay import (
+    SM90_PACKED_KV_RECORD_BYTES,
     gather_packed_kv_cache_rows,
     scatter_packed_kv_cache_rows,
 )
@@ -763,10 +764,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 f"Layer {self.layer_id} is not a complete global-cache producer."
             )
         latent = compressor(self._compressor_kv_score(hidden_states), positions)
-        aux_stream = self.aux_stream_list[0] if self.aux_stream_list else None
+        cache_positions = positions
+        if self.use_pcp and latent is not None:
+            # The native metadata already addresses rank-major gathered rows.
+            latent = get_pcp_group().all_gather(latent, dim=0)
+            cache_positions = get_pcp_group().all_gather(positions, dim=0)
+        aux_stream = (
+            self.aux_stream_list[0]
+            if self.aux_stream_list and not self.use_pcp
+            else None
+        )
         maybe_execute_in_parallel(
-            lambda: indexer.insert_cache(latent, positions, self.indexer_rotary_emb),
-            lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+            lambda: indexer.insert_cache(
+                latent, cache_positions, self.indexer_rotary_emb
+            ),
+            lambda: compressor.insert_cache(latent, cache_positions, self.rotary_emb),
             self.ln_events[0],
             self.ln_events[1],
             aux_stream,
@@ -1235,15 +1247,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if not isinstance(attn_metadata, dict):
             raise RuntimeError("Cross-stage KV export requires attention metadata.")
         metadata = cast(Any, attn_metadata[self.prefix])
-        if metadata.num_actual_tokens != positions.shape[0]:
-            raise NotImplementedError("Cross-stage KV relay requires unpadded rows.")
-        return gather_packed_kv_cache_rows(
-            self.kv_cache,
-            positions,
-            metadata.req_id_per_token,
-            metadata.block_table,
-            self.compress_ratio,
+        num_actual_tokens = int(metadata.num_actual_tokens)
+        num_padded_tokens = positions.shape[0]
+        if not 0 <= num_actual_tokens <= num_padded_tokens:
+            raise RuntimeError("Cross-stage KV export has invalid token counts.")
+        packed_rows = torch.zeros(
+            (num_padded_tokens, SM90_PACKED_KV_RECORD_BYTES),
+            dtype=torch.uint8,
+            device=self.kv_cache.device,
         )
+        if num_actual_tokens:
+            packed_rows[:num_actual_tokens].copy_(
+                gather_packed_kv_cache_rows(
+                    self.kv_cache,
+                    positions[:num_actual_tokens].contiguous(),
+                    metadata.req_id_per_token[:num_actual_tokens].contiguous(),
+                    metadata.block_table,
+                    self.compress_ratio,
+                )
+            )
+        return packed_rows
 
     def import_cross_stage_kv(
         self, packed_rows: torch.Tensor, positions: torch.Tensor
@@ -1256,14 +1279,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if not isinstance(attn_metadata, dict):
             raise RuntimeError("Cross-stage KV import requires attention metadata.")
         metadata = cast(Any, attn_metadata[self.prefix])
-        if (
-            metadata.num_actual_tokens != positions.shape[0]
-            or packed_rows.shape[0] != positions.shape[0]
+        if not 0 <= metadata.num_actual_tokens <= positions.shape[0]:
+            raise RuntimeError("Cross-stage KV import has invalid token counts.")
+        if packed_rows.dtype != torch.uint8 or packed_rows.shape != (
+            positions.shape[0],
+            SM90_PACKED_KV_RECORD_BYTES,
         ):
-            raise NotImplementedError("Cross-stage KV relay requires unpadded rows.")
+            raise RuntimeError("Cross-stage KV relay has an invalid packed payload.")
+        cache_positions = positions
+        if self.use_pcp:
+            packed_rows = get_pcp_group().all_gather(packed_rows.contiguous(), dim=0)
+            swa_metadata = cast(
+                "DeepseekSparseSWAMetadata",
+                attn_metadata[self.swa_cache_layer.prefix],
+            )
+            assert swa_metadata.cache_positions is not None
+            cache_positions = swa_metadata.cache_positions
+        # Compressed metadata owns the native gathered mapping; gathering it
+        # again would multiply the PCP rows and corrupt the destination order.
+        if metadata.slot_mapping.numel() != packed_rows.shape[0]:
+            raise RuntimeError("Cross-stage KV relay disagrees with cache row order.")
         scatter_packed_kv_cache_rows(
-            packed_rows,
-            positions,
+            packed_rows.contiguous(),
+            cache_positions.contiguous(),
             self.kv_cache,
             metadata.slot_mapping,
             self.compress_ratio,

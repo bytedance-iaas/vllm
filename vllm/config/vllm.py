@@ -2838,6 +2838,8 @@ class VllmConfig:
             raise NotImplementedError("dsv41_encoder_only_prefill requires CUDA.")
         dsv41_encoder_only_boundary_layer(model_config.hf_text_config)
         pp_size = self.parallel_config.pipeline_parallel_size
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        uses_pcp_l8_cache_relay = False
         if pp_size != 1:
             from vllm.distributed.utils import get_pp_indices
 
@@ -2853,16 +2855,48 @@ class VllmConfig:
                     "executor (--distributed-executor-backend mp)."
                 )
             _, cut = get_pp_indices(40, 0, pp_size)
-            if cut not in sources[1:-1]:
+            uses_pcp_l8_cache_relay = (
+                cut == 10
+                and (
+                    self.parallel_config.tensor_parallel_size,
+                    pcp_size,
+                    self.parallel_config.decode_context_parallel_size,
+                    self.parallel_config.data_parallel_size,
+                )
+                == (1, 4, 1, 1)
+                and sources == (2, 8, 14, 20)
+                and tuple(model_config.hf_text_config.index_source_layer_ids)
+                == (2, 8, 14, 20, 24, 28, 32, 36)
+                and tuple(model_config.hf_text_config.compress_ratios[8:14]) == (2,) * 6
+            )
+            if cut not in sources[1:-1] and not uses_pcp_l8_cache_relay:
                 raise ValueError(
                     "dsv41_encoder_only_prefill PP cut must start a local "
-                    "sharing group before L20 (for example 8,32 or 14,26)."
+                    "sharing group before L20, except for the PP2/TP1/PCP4 "
+                    "10,30 layer-8 cache relay."
                 )
-        if self.parallel_config.prefill_context_parallel_size != 1:
+        if pcp_size != 1 and not uses_pcp_l8_cache_relay:
             raise ValueError(
-                "dsv41_encoder_only_prefill does not support prefill context "
-                "parallelism."
+                "dsv41_encoder_only_prefill PCP requires the validated "
+                "PP2/TP1/PCP4/DCP1/DP1 layer-8 cache relay."
             )
+        if uses_pcp_l8_cache_relay:
+            from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+            capability = current_platform.get_device_capability()
+            if not model_config.use_mla or capability is None or capability.major != 9:
+                raise NotImplementedError(
+                    "The PCP layer-8 cache relay requires SM90 MLA."
+                )
+            if self.cache_config.cache_dtype != "fp8_ds_mla":
+                raise ValueError("The PCP layer-8 cache relay requires fp8_ds_mla.")
+            if self.attention_config.backend not in (
+                None,
+                AttentionBackendEnum.FLASHMLA_SPARSE_DSV41,
+            ):
+                raise NotImplementedError(
+                    "The PCP layer-8 cache relay requires FLASHMLA_SPARSE_DSV41."
+                )
         if self.parallel_config.use_ubatching:
             raise ValueError(
                 "dsv41_encoder_only_prefill does not support DBO or microbatching."
