@@ -3,6 +3,7 @@
 """Build and identify the locked ByteIAAS native wheel against release PyTorch."""
 
 import argparse
+import dataclasses
 import email
 import hashlib
 import importlib
@@ -51,15 +52,25 @@ def build(args: argparse.Namespace) -> None:
     if extras:
         raise ValueError(f"Unexpected native source build inputs: {extras}")
     contract = torch_contract()
-    env = dict(os.environ, DG_FORCE_BUILD="1", DG_USE_LOCAL_VERSION="1")
-    subprocess.run(
-        [
+    env = dict(os.environ)
+    if args.kind == "deepgemm":
+        env.update(DG_FORCE_BUILD="1", DG_USE_LOCAL_VERSION="1")
+        command = [sys.executable, "setup.py", "bdist_wheel", "--dist-dir", str(output)]
+    else:
+        env["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_HUMMING_KERNELS"] = lock[
+            "package_version"
+        ]
+        command = [
             sys.executable,
-            "setup.py",
-            "bdist_wheel",
-            "--dist-dir",
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
             str(output),
-        ],
+        ]
+    subprocess.run(
+        command,
         cwd=source,
         env=env,
         check=True,
@@ -81,6 +92,7 @@ def build(args: argparse.Namespace) -> None:
             )
     report = {
         "format_version": 1,
+        "kind": args.kind,
         "repository": lock["repository"],
         "base_commit": lock["base_commit"],
         "source_commit": lock["source_commit"],
@@ -130,20 +142,50 @@ def verify(args: argparse.Namespace) -> None:
             if digest(installed.read_bytes()) != digest(archive.read(name)):
                 raise ValueError(f"Installed native file differs from wheel: {name}")
             verified += 1
-    importlib.import_module("deep_gemm")
-    import torch
+    if manifest["kind"] == "deepgemm":
+        importlib.import_module("deep_gemm")
+        import torch
 
-    schemas = {
-        name: str(getattr(torch.ops.deep_gemm, name).default._schema)
-        for name in (
-            "fp8_fp4_mega_moe_sm90",
-            "fp8_fp4_mega_moe_sm90_rs",
-            "fp8_mega_moe",
-            "_slice_symm_buffer_for_sm90_mega_moe",
-            "get_symm_buffer_size_for_sm90_mega_moe",
+        capabilities = {
+            name: str(getattr(torch.ops.deep_gemm, name).default._schema)
+            for name in (
+                "fp8_fp4_mega_moe_sm90",
+                "fp8_fp4_mega_moe_sm90_rs",
+                "fp8_mega_moe",
+                "_slice_symm_buffer_for_sm90_mega_moe",
+                "get_symm_buffer_size_for_sm90_mega_moe",
+            )
+        }
+    elif manifest["kind"] == "humming":
+        from humming.config import TuningConfig
+        from humming.schema import HummingInputSchema, Mxfp4WeightSchema
+
+        fields = {field.name: field for field in dataclasses.fields(TuningConfig)}
+        if fields["stream_k_max_slices"].default != 10:
+            raise ValueError("Humming ordered scheduler contract differs from lock")
+        HummingInputSchema.from_config(
+            {
+                "quant_method": "humming",
+                "dtype": "int8",
+                "input_quant_mode": "dynamic_group",
+                "input_scale_group_size": 128,
+                "input_scale_dtype": "float32",
+            }
         )
+        Mxfp4WeightSchema()
+        capabilities = {
+            "ordered_scheduler_max_slices": 10,
+            "int8_group128_fp32_descriptor": "PASS",
+            "mx_fp4_descriptor": "PASS",
+            "scope": "Package bytes and descriptors; GPU numerics checked separately.",
+        }
+    else:
+        raise ValueError("Unsupported native dependency kind")
+    report = {
+        **manifest,
+        "installed_files_verified": verified,
+        "capabilities": capabilities,
     }
-    report = {**manifest, "installed_files_verified": verified, "schemas": schemas}
     if args.report:
         args.report.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
@@ -156,6 +198,7 @@ def main() -> None:
     builder.add_argument("--lock", type=Path, required=True)
     builder.add_argument("--source", type=Path, required=True)
     builder.add_argument("--output", type=Path, required=True)
+    builder.add_argument("--kind", choices=["deepgemm", "humming"], default="deepgemm")
     builder.set_defaults(func=build)
     verifier = commands.add_parser("verify")
     verifier.add_argument("--lock", type=Path, required=True)
