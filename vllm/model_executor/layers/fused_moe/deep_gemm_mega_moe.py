@@ -138,6 +138,11 @@ class DeepGemmSm90MegaMoEBackend(DeepGemmMegaMoEBackend):
     mma_type = "fp8xfp4"
     hidden_quant = kFp8Dynamic128Sym
 
+    def supports_bf16_mega_gate(self) -> bool:
+        # DeepGEMM exports this symbol on both architectures, but its fused
+        # bf16 gate kernel is SM100-only. SM90 keeps the vLLM routing path.
+        return False
+
     def transform_weights(
         self,
         *,
