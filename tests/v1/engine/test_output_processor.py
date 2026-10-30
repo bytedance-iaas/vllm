@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, Mock
 
 import numpy as np
@@ -38,6 +41,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
     RequestOutputCollector,
@@ -48,6 +52,110 @@ from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import IterationStats, PrefillStats, SchedulerStats
 from vllm.v1.outputs import SamplingMaskLists
+
+
+class _BlockingFirstUpdateDetokenizer(IncrementalDetokenizer):
+    def __init__(self, started: threading.Event, release: threading.Event):
+        super().__init__()
+        self.started = started
+        self.release = release
+        self.worker_threads: list[int] = []
+
+    def needs_async_update(
+        self, new_token_ids: list[int], stop_terminated: bool
+    ) -> bool:
+        return not self.token_ids and bool(new_token_ids)
+
+    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
+        self.worker_threads.append(threading.get_ident())
+        self.started.set()
+        assert self.release.wait(timeout=2)
+        return super().update(new_token_ids, stop_terminated)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_and_replace", [False, True])
+async def test_async_detokenization_preserves_request_lifecycle_and_weight_span(
+    abort_and_replace: bool,
+):
+    """First decode leaves the event loop responsive and cannot resurrect aborts."""
+    request = EngineCoreRequest(
+        request_id="request",
+        external_req_id="external",
+        prompt_token_ids=[1],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(
+            detokenize=False, output_kind=RequestOutputKind.DELTA
+        ),
+        pooling_params=None,
+    )
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    queue = RequestOutputCollector(RequestOutputKind.DELTA, request.request_id)
+    processor.add_request(request, None, queue=queue)
+    started, release = threading.Event(), threading.Event()
+    detokenizer = _BlockingFirstUpdateDetokenizer(started, release)
+    state = processor.request_states[request.request_id]
+    state.detokenizer = detokenizer
+    output = EngineCoreOutput(request_id=request.request_id, new_token_ids=[2])
+    loop_thread = threading.get_ident()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        task = asyncio.create_task(
+            processor.process_outputs_async(
+                [output], weight_version="v1", executor=executor
+            )
+        )
+        try:
+            async with asyncio.timeout(2):
+                while not started.is_set():
+                    await asyncio.sleep(0)
+            assert not task.done()
+            assert detokenizer.token_ids == []
+            if abort_and_replace:
+                assert processor.abort_requests(
+                    [request.request_id], internal=True
+                ) == [request.request_id]
+                replacement_queue = RequestOutputCollector(
+                    RequestOutputKind.DELTA, request.request_id
+                )
+                processor.add_request(request, None, queue=replacement_queue)
+                replacement = processor.request_states[request.request_id]
+        finally:
+            release.set()
+        result = await task
+
+    assert detokenizer.worker_threads == [detokenizer.worker_threads[0]]
+    assert detokenizer.worker_threads[0] != loop_thread
+    assert not result.request_outputs
+    assert not result.reqs_to_abort
+    if abort_and_replace:
+        assert processor.request_states[request.request_id] is replacement
+        assert replacement.detokenizer.num_output_tokens() == 0
+        assert replacement_queue.get_nowait() is None
+        assert (await queue.get()).finished
+    else:
+        assert state.detokenizer.output_token_ids == [2]
+        assert state.weight_version_starts == [("v1", 0)]
+        assert (await queue.get()).outputs[0].token_ids == [2]
+        final = processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[3],
+                    finish_reason=FinishReason.LENGTH,
+                )
+            ],
+            weight_version="v2",
+        )
+        assert not final.request_outputs
+        assert (await queue.get()).outputs[0].weight_versions == [
+            WeightVersionSpan("v1", 0, 1),
+            WeightVersionSpan("v2", 1, 2),
+        ]
 
 
 @pytest.mark.parametrize("flat_logprobs", [False, True])
