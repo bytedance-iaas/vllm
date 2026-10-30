@@ -1,0 +1,33 @@
+From 38b83dd94eae64cad26c24dc300980769b4d98d1 Mon Sep 17 00:00:00 2001
+From: wangyicong <wangyicong@bytedance.com>
+Date: Fri, 30 Oct 2026 12:28:52 +0800
+Subject: [PATCH] fix(sm90): align GPU fixture with buffer-based dispatch API
+
+Follow up the e77d501bf FP4 backend port. Use the public SymmBuffer
+pre-dispatch facade while retaining int32 input routes, int64 output
+routes, SS/RS numerical comparisons and interleaved CUDA Graph checks.
+Kernel and numerical reference behavior are unchanged.
+
+Co-authored-by: TRAE (GPT-6) <traecli@bytedance.com>
+Signed-off-by: trae-solo-agent <solo-agent@trae.ai>
+---
+ tests/test_sm90_fp4_backends.py | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/tests/test_sm90_fp4_backends.py b/tests/test_sm90_fp4_backends.py
+index d45a478778d2f17d4d6b639750e78d4d1808e9fd..c6998b7a71e85054e265ea6b6c2ed6257ad66544 100644
+--- a/tests/test_sm90_fp4_backends.py
++++ b/tests/test_sm90_fp4_backends.py
+@@ -101,8 +101,7 @@ def run(args):
+                 topk[::7, 0] = -1
+             weights = torch.rand(n, args.topk, device='cuda', dtype=torch.float32)
+             weights /= weights.sum(-1, keepdim=True)
+-            mega_moe_pre_dispatch_sm90(x, topk, weights, buf.x, buf.x_sf,
+-                                      buf.topk_idx, buf.topk_weights, n)
++            mega_moe_pre_dispatch_sm90(x, topk, weights, buf, n)
+             expected = reference(buf, w1, w2, n, args.activation, args.clamp, world, rank)
+             kwargs = dict(activation=args.activation,
+                           activation_clamp=None if args.activation == 'situ' else args.clamp,
+-- 
+2.50.1 (Apple Git-155)
+

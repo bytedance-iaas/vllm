@@ -1,0 +1,178 @@
+From 4c5e191626eb3df7e3394c505d05d4e9da699949 Mon Sep 17 00:00:00 2001
+From: wangyicong <wangyicong@bytedance.com>
+Date: Fri, 30 Oct 2026 12:05:08 +0800
+Subject: [PATCH] fix(jit): normalize CUDA hex float literals
+
+Port to the vLLM v0.32.0 DeepGEMM pin 1e1842a83.
+Original optimization: 45a95bac4d70abf3a66780922ee65ca0cdaddc3b.
+Preserve exactly one 0x prefix regardless of the standard library's
+hexadecimal formatting convention, including negative zero and finite
+extremes. Keep the release infinity/NaN behavior.
+
+Co-authored-by: TRAE (GPT-6) <traecli@bytedance.com>
+Signed-off-by: trae-solo-agent <solo-agent@trae.ai>
+---
+ csrc/jit_kernels/impls/float_literal.hpp |  20 +++++
+ csrc/jit_kernels/impls/runtime_utils.hpp |   3 +-
+ tests/test_jit_float_literal.py          | 101 +++++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 1 deletion(-)
+ create mode 100644 csrc/jit_kernels/impls/float_literal.hpp
+ create mode 100644 tests/test_jit_float_literal.py
+
+diff --git a/csrc/jit_kernels/impls/float_literal.hpp b/csrc/jit_kernels/impls/float_literal.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..69c18c95713fd5b344a9b2de7a9c9fd6eacd1a38
+--- /dev/null
++++ b/csrc/jit_kernels/impls/float_literal.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cmath>
++#include <format>
++#include <string>
++
++namespace deep_gemm::detail {
++
++static std::string normalize_cuda_hex_float_magnitude(std::string magnitude) {
++    if (magnitude.compare(0, 2, "0x") != 0)
++        magnitude.insert(0, "0x");
++    return magnitude;
++}
++
++static std::string to_cuda_hex_float_literal(const float& v) {
++    auto magnitude = normalize_cuda_hex_float_magnitude(std::format("{:a}", std::abs(v)));
++    return std::format("{}{}f", std::signbit(v) ? "-" : "", magnitude);
++}
++
++}  // namespace deep_gemm::detail
+diff --git a/csrc/jit_kernels/impls/runtime_utils.hpp b/csrc/jit_kernels/impls/runtime_utils.hpp
+index 5d73246f96e4107041d6bdd467213cf5d36c3631..51e609256d3fb3587a8f8209cf64244877506836 100644
+--- a/csrc/jit_kernels/impls/runtime_utils.hpp
++++ b/csrc/jit_kernels/impls/runtime_utils.hpp
+@@ -14,6 +14,7 @@
+ #include <deep_jit/utils/env.hpp>
+ 
+ #include "../heuristics/sm90.hpp"
++#include "float_literal.hpp"
+ #include "../../utils/math.hpp"
+ #include "../../utils/exception.hpp"
+ 
+@@ -73,7 +74,7 @@ static std::string to_string(const at::ScalarType& dtype, const bool& fp4_unpack
+ 
+ static std::string to_string(const float& v) {
+     if (std::isfinite(v)) {
+-        return std::format("{}0x{:a}f", std::signbit(v) ? "-" : "", std::abs(v));
++        return detail::to_cuda_hex_float_literal(v);
+     } else if (std::isinf(v)) {
+         return v > 0 ? "cute::numeric_limits<float>::infinity()"
+                      : "-cute::numeric_limits<float>::infinity()";
+diff --git a/tests/test_jit_float_literal.py b/tests/test_jit_float_literal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ffa64bfbfd68f863248dc438eb82819000d140a
+--- /dev/null
++++ b/tests/test_jit_float_literal.py
+@@ -0,0 +1,101 @@
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++
++class JitFloatLiteralTest(unittest.TestCase):
++    def test_cuda_hex_float_literal_is_portable(self) -> None:
++        compiler = os.environ.get("CXX") or shutil.which("c++")
++        if compiler is None:
++            self.skipTest("C++ compiler is unavailable")
++
++        with tempfile.TemporaryDirectory() as tmp_dir:
++            tmp_path = Path(tmp_dir)
++            source = tmp_path / "test_float_literal.cpp"
++            binary = tmp_path / "test_float_literal"
++            source.write_text(
++                """
++#include <cassert>
++#include <iostream>
++#include <limits>
++#include <string>
++
++#include "csrc/jit_kernels/impls/float_literal.hpp"
++
++int main() {
++    using deep_gemm::detail::normalize_cuda_hex_float_magnitude;
++    using deep_gemm::detail::to_cuda_hex_float_literal;
++
++    assert(normalize_cuda_hex_float_magnitude("1p+0") == "0x1p+0");
++    assert(normalize_cuda_hex_float_magnitude("0x1p+0") == "0x1p+0");
++
++    for (const float value : {
++             0.0f,
++             -0.0f,
++             1.0f,
++             -1.0f,
++             10.0f,
++             std::numeric_limits<float>::denorm_min(),
++             std::numeric_limits<float>::max(),
++         }) {
++        const std::string literal = to_cuda_hex_float_literal(value);
++        const auto prefix = literal.find("0x");
++        assert(prefix == 0 || (prefix == 1 && literal.front() == '-'));
++        assert(literal.find("0x", prefix + 2) == std::string::npos);
++        assert(literal.back() == 'f');
++        std::cout << literal << '\\n';
++    }
++}
++""".lstrip()
++            )
++
++            result = subprocess.run(
++                [
++                    compiler,
++                    "-std=c++20",
++                    "-I",
++                    str(Path(__file__).parents[1]),
++                    str(source),
++                    "-o",
++                    str(binary),
++                ],
++                capture_output=True,
++                text=True,
++            )
++            if result.returncode != 0 and (
++                "'format' file not found" in result.stderr
++                or "no member named 'format'" in result.stderr
++            ):
++                self.skipTest(f"{compiler} does not provide C++20 std::format")
++            self.assertEqual(result.returncode, 0, result.stderr)
++            literals = subprocess.run(
++                [str(binary)],
++                check=True,
++                capture_output=True,
++                text=True,
++            ).stdout.splitlines()
++
++            compile_check = tmp_path / "compile_literals.cpp"
++            compile_check.write_text(
++                "constexpr float values[] = {\n"
++                + "".join(f"    {literal},\n" for literal in literals)
++                + "};\n"
++            )
++            subprocess.run(
++                [
++                    compiler,
++                    "-std=c++20",
++                    "-c",
++                    str(compile_check),
++                    "-o",
++                    str(tmp_path / "compile_literals.o"),
++                ],
++                check=True,
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.50.1 (Apple Git-155)
+
