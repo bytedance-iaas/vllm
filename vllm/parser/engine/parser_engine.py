@@ -226,12 +226,8 @@ class ParserEngine(Parser):
 
     @property
     def tool_call_stop(self) -> str | None:
-        """The literal that closes a tool-call block, if the format has one.
-
-        Formats whose tool payload is delimited expose this marker so the
-        request path can hand it to the sampler as a stop string.
-        """
-        return self.parser_engine_config.terminal_literal("TOOL_END")
+        """An opt-in marker that ends the whole tool-call turn."""
+        return None
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -244,9 +240,19 @@ class ParserEngine(Parser):
     ) -> ChatCompletionRequest | ResponsesRequest:
         """Stop generation once a tool-call block is closed."""
         closer = self.tool_call_stop
-        if not closer or not getattr(request, "tools", None):
+        if (
+            not closer
+            or not getattr(request, "tools", None)
+            or request.tool_choice == "none"
+            or self.skip_tool_parsing
+        ):
             return request
         stop = getattr(request, "stop", None)
+        stops = [stop] if isinstance(stop, str) else stop or []
+        # The sampler has one inclusion flag for all stops. Preserve a caller's
+        # hidden stops instead of exposing them to retain our internal closer.
+        if not request.include_stop_str_in_output and any(s != closer for s in stops):
+            return request
         if stop is None:
             request.stop = [closer]
         elif isinstance(stop, str):

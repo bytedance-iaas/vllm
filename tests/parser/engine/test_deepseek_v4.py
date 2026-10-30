@@ -40,6 +40,7 @@ from vllm.parser.engine.registered_adapters import (
     DeepSeekV4ParserReasoningAdapter,
     DeepSeekV4ParserToolAdapter,
 )
+from vllm.parser.qwen3 import Qwen3Parser
 
 _THINK_START_ID = 50
 _THINK_END_ID = 51
@@ -1501,11 +1502,14 @@ class TestToolCallStop:
         assert out.stop == [DSML_TOOL_END]
         assert out.include_stop_str_in_output is True
 
-    def test_preserves_caller_supplied_stops(self, mock_tokenizer):
+    @pytest.mark.parametrize("include_stop", [False, True])
+    def test_preserves_caller_supplied_stops(self, mock_tokenizer, include_stop):
         req = _test_request(tools=DUMMY_TOOLS)
         req.stop = ["A"]
+        req.include_stop_str_in_output = include_stop
         out = self._engine(mock_tokenizer).adjust_request(req)
-        assert out.stop == ["A", DSML_TOOL_END]
+        assert out.stop == (["A", DSML_TOOL_END] if include_stop else ["A"])
+        assert out.include_stop_str_in_output is include_stop
 
     @pytest.mark.parametrize("stop", [DSML_TOOL_END, [DSML_TOOL_END]])
     def test_idempotent(self, mock_tokenizer, stop):
@@ -1519,6 +1523,19 @@ class TestToolCallStop:
         req = _test_request(tools=None)
         req.stop = []
         out = self._engine(mock_tokenizer).adjust_request(req)
+        assert out.stop == []
+        assert out.include_stop_str_in_output is False
+
+    def test_untouched_when_tool_choice_is_none(self, mock_tokenizer):
+        req = _test_request(tools=DUMMY_TOOLS)
+        req.tool_choice = "none"
+        out = self._engine(mock_tokenizer).adjust_request(req)
+        assert out.stop == []
+        assert out.include_stop_str_in_output is False
+
+    def test_other_formats_do_not_opt_in(self, mock_tokenizer):
+        req = _test_request(tools=DUMMY_TOOLS)
+        out = Qwen3Parser(mock_tokenizer).adjust_request(req)
         assert out.stop == []
         assert out.include_stop_str_in_output is False
 
