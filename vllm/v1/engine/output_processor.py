@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import copy
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -705,131 +707,201 @@ class OutputProcessor:
         If you need to touch every element of the batch, do it from
         within the loop below.
         """
-        request_outputs: list[RequestOutput | PoolingRequestOutput] = []
-        reqs_to_abort: list[str] = []
+        result = OutputProcessorOutput(request_outputs=[], reqs_to_abort=[])
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
-
-            # 1) Compute stats for this iteration.
-            self._update_stats_from_output(
-                req_state, engine_core_output, engine_core_timestamp, iteration_stats
+            self._process_output(
+                engine_core_output,
+                req_state,
+                result,
+                engine_core_timestamp,
+                iteration_stats,
+                weight_version,
             )
+        return result
 
-            new_token_ids = engine_core_output.new_token_ids
-            pooling_output = engine_core_output.pooling_output
-            finish_reason = engine_core_output.finish_reason
-            stop_reason = engine_core_output.stop_reason
-            kv_transfer_params = engine_core_output.kv_transfer_params
-            ec_transfer_params = engine_core_output.ec_transfer_params
-            if engine_core_output.routed_experts is not None:
-                req_state.routed_experts_chunks.append(
-                    engine_core_output.routed_experts
+    async def process_outputs_async(
+        self,
+        engine_core_outputs: list[EngineCoreOutput],
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
+        weight_version: str | None = None,
+        *,
+        executor: Executor,
+    ) -> OutputProcessorOutput:
+        result = OutputProcessorOutput(request_outputs=[], reqs_to_abort=[])
+        loop = asyncio.get_running_loop()
+        for engine_core_output in engine_core_outputs:
+            req_id = engine_core_output.request_id
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                continue
+
+            detokenized = None
+            detokenizer = req_state.detokenizer
+            if engine_core_output.pooling_output is None and detokenizer is not None:
+                stop_terminated = engine_core_output.finish_reason == FinishReason.STOP
+                if detokenizer.needs_async_update(
+                    engine_core_output.new_token_ids, stop_terminated
+                ):
+                    worker = copy.copy(detokenizer)
+                    worker.token_ids = detokenizer.token_ids.copy()
+                    try:
+                        stop_string = await loop.run_in_executor(
+                            executor,
+                            worker.update,
+                            engine_core_output.new_token_ids,
+                            stop_terminated,
+                        )
+                    except Exception:
+                        if (
+                            self.request_states.get(req_id) is req_state
+                            and req_state.detokenizer is detokenizer
+                        ):
+                            raise
+                        continue
+                    if (
+                        self.request_states.get(req_id) is not req_state
+                        or req_state.detokenizer is not detokenizer
+                    ):
+                        continue
+                    detokenized = (worker, stop_string)
+
+            self._process_output(
+                engine_core_output,
+                req_state,
+                result,
+                engine_core_timestamp,
+                iteration_stats,
+                weight_version,
+                detokenized=detokenized,
+            )
+        return result
+
+    def _process_output(
+        self,
+        engine_core_output: EngineCoreOutput,
+        req_state: RequestState,
+        result: OutputProcessorOutput,
+        engine_core_timestamp: float | None,
+        iteration_stats: IterationStats | None,
+        weight_version: str | None,
+        *,
+        detokenized: tuple[IncrementalDetokenizer, str | None] | None = None,
+    ) -> None:
+        # 1) Compute stats for this iteration.
+        self._update_stats_from_output(
+            req_state, engine_core_output, engine_core_timestamp, iteration_stats
+        )
+
+        new_token_ids = engine_core_output.new_token_ids
+        pooling_output = engine_core_output.pooling_output
+        finish_reason = engine_core_output.finish_reason
+        stop_reason = engine_core_output.stop_reason
+        kv_transfer_params = engine_core_output.kv_transfer_params
+        ec_transfer_params = engine_core_output.ec_transfer_params
+        if engine_core_output.routed_experts is not None:
+            req_state.routed_experts_chunks.append(engine_core_output.routed_experts)
+
+        if req_state.is_prefilling:
+            if engine_core_output.prefill_stats is not None:
+                req_state.num_cached_tokens = (
+                    engine_core_output.prefill_stats.num_cached_tokens
                 )
-
-            if req_state.is_prefilling:
-                if engine_core_output.prefill_stats is not None:
-                    req_state.num_cached_tokens = (
-                        engine_core_output.prefill_stats.num_cached_tokens
-                    )
-                    req_state.num_cache_creation_tokens = (
-                        engine_core_output.prefill_stats.num_cache_creation_tokens
-                    )
-                if req_state.remote_prefill_cached_tokens is not None:
-                    req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
-                req_state.is_prefilling = False
-
-            if engine_core_output.spec_decode_metrics is not None:
-                req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
-
-            request_error = None
-            if (
-                req_state.detokenizer is None
-                and engine_core_output.mm_cache_miss_hashes
-                and finish_reason == FinishReason.ERROR
-            ):
-                request_error = RequestError(
-                    code="multimodal_cache_miss",
-                    message="Multi-modal processor cache miss.",
-                    retryable=True,
+                req_state.num_cache_creation_tokens = (
+                    engine_core_output.prefill_stats.num_cache_creation_tokens
                 )
-                pooling_output = EMPTY_CPU_TENSOR
+            if req_state.remote_prefill_cached_tokens is not None:
+                req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
+            req_state.is_prefilling = False
 
-            if pooling_output is None:
-                assert req_state.detokenizer is not None
-                assert req_state.logprobs_processor is not None
-                if new_token_ids and weight_version is not None:
-                    req_state.track_weight_version(weight_version)
-                # 2) Detokenize the token ids into text and perform stop checks.
-                num_prev_tokens = req_state.detokenizer.num_output_tokens()
+        if engine_core_output.spec_decode_metrics is not None:
+            req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
+
+        request_error = None
+        if (
+            req_state.detokenizer is None
+            and engine_core_output.mm_cache_miss_hashes
+            and finish_reason == FinishReason.ERROR
+        ):
+            request_error = RequestError(
+                code="multimodal_cache_miss",
+                message="Multi-modal processor cache miss.",
+                retryable=True,
+            )
+            pooling_output = EMPTY_CPU_TENSOR
+
+        if pooling_output is None:
+            assert req_state.detokenizer is not None
+            assert req_state.logprobs_processor is not None
+            if new_token_ids and weight_version is not None:
+                req_state.track_weight_version(weight_version)
+            # Record offsets before adopting the worker's updated detokenizer.
+            num_prev_tokens = req_state.detokenizer.num_output_tokens()
+            if detokenized is None:
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP
                 )
-                if stop_string:
-                    finish_reason = FinishReason.STOP
-                    stop_reason = stop_string
-                    self._trim_surplus_tokens(
-                        req_state, engine_core_output, num_prev_tokens
-                    )
+            else:
+                req_state.detokenizer, stop_string = detokenized
+            if stop_string:
+                finish_reason = FinishReason.STOP
+                stop_reason = stop_string
+                self._trim_surplus_tokens(
+                    req_state, engine_core_output, num_prev_tokens
+                )
 
-                if engine_core_output.new_sampling_mask is not None:
-                    req_state.sampling_mask_chunks.append(
-                        engine_core_output.new_sampling_mask
-                    )
+            if engine_core_output.new_sampling_mask is not None:
+                req_state.sampling_mask_chunks.append(
+                    engine_core_output.new_sampling_mask
+                )
 
-                # 3) Compute sample and prompt logprobs for request,
-                # if required.
-                req_state.logprobs_processor.update_from_output(engine_core_output)
+            # 3) Compute sample and prompt logprobs for request, if required.
+            req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            # 4) Create and handle RequestOutput objects.
-            if request_output := req_state.make_request_output(
-                new_token_ids,
-                pooling_output,
-                finish_reason,
-                stop_reason,
-                kv_transfer_params,
-                ec_transfer_params,
-                error=request_error,
-            ):
-                if req_state.streaming_input:
-                    request_output.finished = False
+        # 4) Create and handle RequestOutput objects.
+        if request_output := req_state.make_request_output(
+            new_token_ids,
+            pooling_output,
+            finish_reason,
+            stop_reason,
+            kv_transfer_params,
+            ec_transfer_params,
+            error=request_error,
+        ):
+            if req_state.streaming_input:
+                request_output.finished = False
 
-                if req_state.queue is not None:
-                    # AsyncLLM: put into queue for handling by generate().
-                    req_state.queue.put(request_output)
+            if req_state.queue is not None:
+                # AsyncLLM: put into queue for handling by generate().
+                req_state.queue.put(request_output)
+            else:
+                # LLMEngine: return list of RequestOutputs.
+                result.request_outputs.append(request_output)
+
+        # Free completed requests.
+        if finish_reason is not None:
+            if req_state.streaming_input:
+                if req_state.input_chunk_queue:
+                    update = req_state.input_chunk_queue.popleft()
+                    req_state.apply_streaming_update(update)
                 else:
-                    # LLMEngine: return list of RequestOutputs.
-                    request_outputs.append(request_output)
+                    req_state.input_chunk_queue = None
+            else:
+                self._finish_request(req_state)
+                if not engine_core_output.finished:
+                    # Detokenizer detected a stop before EngineCore finished.
+                    result.reqs_to_abort.append(req_state.request_id)
 
-            # Free completed requests.
-            if finish_reason is not None:
-                if req_state.streaming_input:
-                    if req_state.input_chunk_queue:
-                        update = req_state.input_chunk_queue.popleft()
-                        req_state.apply_streaming_update(update)
-                    else:
-                        req_state.input_chunk_queue = None
-                else:
-                    self._finish_request(req_state)
-                    if not engine_core_output.finished:
-                        # If req not finished in EngineCore, but Detokenizer
-                        # detected stop string, abort needed in EngineCore.
-                        reqs_to_abort.append(req_id)
-
-                    # Track per-request stats
-                    self._update_stats_from_finished(
-                        req_state, finish_reason, iteration_stats
-                    )
-                    if self.tracing_enabled:
-                        self.do_tracing(engine_core_output, req_state, iteration_stats)
-
-        return OutputProcessorOutput(
-            request_outputs=request_outputs,
-            reqs_to_abort=reqs_to_abort,
-        )
+                self._update_stats_from_finished(
+                    req_state, finish_reason, iteration_stats
+                )
+                if self.tracing_enabled:
+                    self.do_tracing(engine_core_output, req_state, iteration_stats)
 
     @staticmethod
     def _trim_surplus_tokens(
