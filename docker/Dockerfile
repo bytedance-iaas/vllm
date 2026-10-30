@@ -344,18 +344,29 @@ ARG max_jobs=2
 ENV MAX_JOBS=${max_jobs}
 WORKDIR /workspace/byteiaas-native
 COPY docker/byteiaas/native/deepgemm /workspace/byteiaas-native/locks/deepgemm
+COPY docker/byteiaas/native/humming /workspace/byteiaas-native/locks/humming
+COPY requirements/build/cuda.txt /workspace/requirements/build/cuda.txt
 COPY tools/byteiaas/prepare_native_source.py tools/byteiaas/native_wheel.py /workspace/byteiaas-native/tools/
-RUN mkdir -p deepgemm-source deepgemm-dist && \
+RUN mkdir -p deepgemm-source deepgemm-dist humming-source humming-dist && \
     if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
-        rmdir deepgemm-source && \
+        rmdir deepgemm-source humming-source && \
+        uv pip install --python /opt/venv/bin/python3 \
+            -r /workspace/requirements/build/cuda.txt && \
         python3 tools/prepare_native_source.py \
             --lock locks/deepgemm/source-lock.json --source deepgemm-source && \
         python3 tools/native_wheel.py build \
             --lock locks/deepgemm/source-lock.json --source deepgemm-source \
-            --output deepgemm-dist; \
+            --output deepgemm-dist && \
+        python3 tools/prepare_native_source.py \
+            --lock locks/humming/source-lock.json --source humming-source && \
+        python3 tools/native_wheel.py build --kind humming \
+            --lock locks/humming/source-lock.json --source humming-source \
+            --output humming-dist; \
     else \
         printf '%s\n' disabled > deepgemm-dist/build-state && \
-        (cd deepgemm-dist && sha256sum build-state > wheels.sha256); \
+        (cd deepgemm-dist && sha256sum build-state > wheels.sha256) && \
+        printf '%s\n' disabled > humming-dist/build-state && \
+        (cd humming-dist && sha256sum build-state > wheels.sha256); \
     fi
 #################### BYTEIAAS NATIVE BUILD IMAGE ####################
 
