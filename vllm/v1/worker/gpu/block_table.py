@@ -340,7 +340,11 @@ def _compute_slot_mappings_kernel(
 
         block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)
         block_offsets = local_positions % kv_block_size
-        in_range = (block_indices >= 0) & (block_indices < block_table_stride)
+        in_range = (
+            (positions >= 0)
+            & (block_indices >= 0)
+            & (block_indices < block_table_stride)
+        )
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
             mask=(

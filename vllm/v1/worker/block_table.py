@@ -366,8 +366,10 @@ class ComputeSlotMappingKernel(
                 virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
             )
 
-            in_range = (virtual_block_indices >= 0) & (
-                virtual_block_indices < block_table_stride
+            in_range = (
+                (pos >= 0)
+                & (virtual_block_indices >= 0)
+                & (virtual_block_indices < block_table_stride)
             )
             block_numbers = tl.load(
                 block_table_ptr + row_offset + virtual_block_indices,
