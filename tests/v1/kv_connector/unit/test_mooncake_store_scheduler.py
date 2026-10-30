@@ -1928,6 +1928,7 @@ def test_canonical_lookup_skips_when_no_external_increment_is_possible():
     request = SimpleNamespace(
         request_id="r",
         num_tokens=512,
+        num_prompt_tokens=512,
         block_hashes=[b"a", b"b", b"c"],
         mm_features=[],
         lora_request=None,
@@ -1950,6 +1951,7 @@ def test_canonical_lookup_runs_when_external_increment_is_possible():
     request = SimpleNamespace(
         request_id="r",
         num_tokens=512,
+        num_prompt_tokens=512,
         block_hashes=[b"a", b"b", b"c", b"d"],
         mm_features=[],
         lora_request=None,
