@@ -3039,7 +3039,12 @@ class MooncakeConnectorWorker:
         # gating on use_mla alone would promote and then fail the length check
         # for a non-replicated MLA rank with tp_ratio != 1.
         tp_ratio = _get_tp_ratio(self.tp_size, meta.remote_tp_size)
-        if tp_ratio == 1 or self._producer_cache_is_replicated():
+        # The consumer packs both producer stages' layers into its rows.
+        # Matching names need not have matching relative byte offsets, so
+        # retain the per-layer spans for this partial PP layout.
+        if not cache_only_prefill_pp and (
+            tp_ratio == 1 or self._producer_cache_is_replicated()
+        ):
             covered_both_sides = len(local_regions) == len(pre_align_local) and len(
                 remote_regions
             ) == len(pre_align_remote)
