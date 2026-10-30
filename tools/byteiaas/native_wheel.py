@@ -10,6 +10,7 @@ import importlib
 import importlib.metadata
 import json
 import os
+import platform
 import subprocess
 import sys
 import zipfile
@@ -60,6 +61,13 @@ def build(args: argparse.Namespace) -> None:
         env["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_HUMMING_KERNELS"] = lock[
             "package_version"
         ]
+        env["HUMMING_DISABLE_PARALLEL_BUILD"] = "1"
+        subprocess.run(
+            [sys.executable, "tools/build_native.py"],
+            cwd=source,
+            env=env,
+            check=True,
+        )
         command = [
             sys.executable,
             "-m",
@@ -75,11 +83,43 @@ def build(args: argparse.Namespace) -> None:
         env=env,
         check=True,
     )
+    if args.kind == "humming":
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "wheel",
+                "tags",
+                "--remove",
+                "--python-tag",
+                "cp310",
+                "--abi-tag",
+                "abi3",
+                "--platform-tag",
+                f"manylinux_2_28_{platform.machine()}",
+                *map(str, output.glob("*.whl")),
+            ],
+            check=True,
+        )
     wheels = list(output.glob("*.whl"))
     if len(wheels) != 1:
         raise ValueError(f"Expected one native wheel, found {wheels}")
     wheel = wheels[0]
     with zipfile.ZipFile(wheel) as archive:
+        if args.kind == "humming":
+            native_root = f"humming/_native/{platform.machine()}/"
+            expected = {
+                native_root + name
+                for name in (
+                    "libhumming_launcher.so",
+                    "libcubinpatch.so",
+                    "_device_info.abi3.so",
+                    "manifest.json",
+                    "nvrtc_compile",
+                )
+            }
+            if not expected.issubset(archive.namelist()):
+                raise ValueError("Humming wheel is missing native build artifacts")
         metadata_files = [
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         ]
@@ -157,6 +197,7 @@ def verify(args: argparse.Namespace) -> None:
             )
         }
     elif manifest["kind"] == "humming":
+        os.environ["HUMMING_DISABLE_PARALLEL_BUILD"] = "1"
         from humming.config import TuningConfig
         from humming.schema import HummingInputSchema, Mxfp4WeightSchema
 
