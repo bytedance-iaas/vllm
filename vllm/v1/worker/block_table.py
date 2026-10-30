@@ -366,13 +366,16 @@ class ComputeSlotMappingKernel(
                 virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
             )
 
+            in_range = (virtual_block_indices >= 0) & (
+                virtual_block_indices < block_table_stride
+            )
             block_numbers = tl.load(
                 block_table_ptr + row_offset + virtual_block_indices,
-                mask=mask & is_local,
+                mask=mask & is_local & in_range,
                 other=0,
             ).to(tl.int64)
             slot_ids = block_numbers * KV_CACHE_BLOCK_SIZE + local_block_offsets
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+            slot_ids = tl.where(is_local & in_range, slot_ids, PAD_ID)
             tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
     def dispatch(  # type: ignore[override]
