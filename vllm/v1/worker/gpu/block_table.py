@@ -340,14 +340,16 @@ def _compute_slot_mappings_kernel(
 
         block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)
         block_offsets = local_positions % kv_block_size
+        in_range = (block_indices >= 0) & (block_indices < block_table_stride)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local & is_real_req,
+            mask=(
+                mapping_enabled & is_local & is_real_req & in_range & (offset < end_idx)
+            ),
             other=0,
         )
         slot_ids = block_numbers * kv_block_size + block_offsets
-        if CP_SIZE != 1:
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
-
-        slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
+        slot_ids = tl.where(
+            mapping_enabled & is_real_req & is_local & in_range, slot_ids, PAD_ID
+        )
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
