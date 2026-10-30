@@ -362,6 +362,8 @@ def test_v41_context_wkv_loads_each_layer_into_both_projections(monkeypatch):
 
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 3)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(dsv41_dspark, "get_tensor_model_parallel_rank", lambda: 3)
+    monkeypatch.setattr(dsv41_dspark, "get_tensor_model_parallel_world_size", lambda: 4)
     projections = [
         MergedColumnParallelLinear(
             5, sizes, bias=False, disable_tp=True, params_dtype=torch.float32
@@ -376,7 +378,7 @@ def test_v41_context_wkv_loads_each_layer_into_both_projections(monkeypatch):
     }
     params["model.context_wkv_proj.weight"] = projections[3].weight
     draft = SimpleNamespace(
-        config=SimpleNamespace(n_routed_experts=1),
+        config=SimpleNamespace(n_routed_experts=1, num_attention_heads=4),
         linear_scale_name="weight_scale",
         pad_shared_expert=False,
         model=SimpleNamespace(
@@ -387,6 +389,7 @@ def test_v41_context_wkv_loads_each_layer_into_both_projections(monkeypatch):
             confidence_head=None,
         ),
         named_parameters=lambda: params.items(),
+        process_weights_after_loading=lambda: None,
     )
     draft._remap_dspark_name = lambda name: (
         dsv41_dspark.DSparkDeepseekV4ForCausalLM._remap_dspark_name(draft, name)
