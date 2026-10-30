@@ -777,6 +777,10 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 
 #################### WHEEL BUILD IMAGE ####################
 
+FROM build AS byteiaas-wheel-artifacts
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/deepgemm-dist /workspace/byteiaas-native-dist/deepgemm
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist /workspace/byteiaas-native-dist/humming
+
 #################### DEV IMAGE ####################
 FROM base AS dev
 
@@ -1288,6 +1292,7 @@ ARG VLLM_BUILD_COMMIT
 ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
+ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1467,14 +1472,23 @@ ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
     VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-openai:dev}
-LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+COPY tools/byteiaas/image_metadata.py /opt/byteiaas/tools/image_metadata.py
+RUN BYTEIAAS_BUILD_NATIVE="${BYTEIAAS_BUILD_NATIVE}" \
+    BYTEIAAS_BUILD_TOKENIZERS="${BYTEIAAS_BUILD_TOKENIZERS}" \
+    BYTEIAAS_BUILD_ROUTER="${BYTEIAAS_BUILD_ROUTER}" \
+    python3 /opt/byteiaas/tools/image_metadata.py
+LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
       org.opencontainers.image.url="${VLLM_BUILD_URL}" \
       ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
-      ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
+      ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
+      ai.vllm.byteiaas.native="${BYTEIAAS_BUILD_NATIVE}" \
+      ai.vllm.byteiaas.tokenizers="${BYTEIAAS_BUILD_TOKENIZERS}" \
+      ai.vllm.byteiaas.router="${BYTEIAAS_BUILD_ROUTER}" \
+      ai.vllm.byteiaas.provenance="/opt/byteiaas/image-metadata.json"
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
