@@ -190,7 +190,11 @@ class Scheduler(SchedulerInterface):
             # Connector can reallocate and fill those blocks via a load that
             # isn't ordered against that write, so defer freeing them.
             multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
-            if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
+            protection = self.connector.requires_async_block_protection()
+            can_load = (
+                kv_transfer_config.is_kv_consumer if protection is None else protection
+            )
+            if multiple_inflight_batches and can_load:
                 self.defer_block_free = True
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery

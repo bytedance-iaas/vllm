@@ -84,6 +84,18 @@ CopyBlocksOp = Callable[
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class KVCompletionCounts:
+    """Worker completion quorums for independent transfer directions."""
+
+    sending: int
+    receiving: int
+
+    def __post_init__(self) -> None:
+        if self.sending <= 0 or self.receiving <= 0:
+            raise ValueError("KV completion counts must be positive")
+
+
 @dataclass
 class KVConnectorTransferResults:
     """Asynchronous transfer completions from one worker snapshot.
@@ -712,6 +724,14 @@ class KVConnectorBase_V1(ABC):
 
         """
         return False
+
+    def get_completion_counts(self) -> KVCompletionCounts | None:
+        """Return independent quorums, or preserve the legacy uniform quorum."""
+        return None
+
+    def requires_async_block_protection(self) -> bool | None:
+        """Override role-based block protection for an opt-in composite loader."""
+        return None
 
     def get_finished_count(self) -> int | None:
         """Get the count of requests expected to complete send/receive operations
