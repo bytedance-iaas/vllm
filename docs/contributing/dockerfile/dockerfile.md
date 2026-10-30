@@ -6,16 +6,16 @@ More information about deploying with Docker can be found [here](../../deploymen
 Below is a visual representation of the multi-stage Dockerfile. The build graph contains the following nodes:
 
 - All build stages
-- The default build target (highlighted in grey)
-- External images (with dashed borders)
+- Runtime and test targets (green)
+- External images (grey)
 
 The edges of the build graph represent:
 
 - `FROM ...` dependencies (with a solid line and a full arrow head)
 
-- `COPY --from=...` dependencies (with a dashed line and an empty arrow head)
+- `COPY --from=...` dependencies (with a dashed line)
 
-- `RUN --mount=(.\*)from=...` dependencies (with a dotted line and an empty diamond arrow head)
+- `RUN --mount=(.\*)from=...` dependencies (with a dotted line)
 
 The `test-deps` stage branches from `vllm-runtime-base` so Git and the test
 requirements remain cached independently of per-commit vLLM wheels and source.
@@ -62,11 +62,15 @@ publication with digest and format verification. Run
 `tools/byteiaas/validate_build_contract.py` before an internal build to reject
 stale source locks or release defaults.
 
+See [the ByteIAAS deployment guide](../../deployment/byteiaas_dsv41_v032.md)
+for source identity, unified Humming configuration, and runtime checks.
+
   > <figure markdown="span">
   >   ![](../../assets/contributing/dockerfile-stages-dependency.png){ align="center" alt="query" width="100%" }
   > </figure>
   >
-  > Made using: <https://github.com/patrickhoefler/dockerfilegraph>
+  > The checked-in graph reflects the current stage dependencies. An equivalent
+  > graph can be regenerated using <https://github.com/patrickhoefler/dockerfilegraph>.
   >
   > Commands to regenerate the build graph (make sure to run it **from the \`root\` directory of the vLLM repository** where the dockerfile is present):
   >
