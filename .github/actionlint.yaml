@@ -3,6 +3,10 @@
 self-hosted-runner:
   labels:
     - vllm-runners
+    - x64-vllm-wheel-build-node
+    - vllm-byteiaas-build-01
+    - x64-vllm-docker-build-node
+    - vllm-byteiaas-build-02
     # Not yet in actionlint's known-label set.
     - macos-26
     - ubuntu-slim

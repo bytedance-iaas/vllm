@@ -40,6 +40,15 @@
     "BUILD_NIXL": {
       "default": "false"
     },
+    "BYTEIAAS_BUILD_NATIVE": {
+      "default": "false"
+    },
+    "BYTEIAAS_BUILD_TOKENIZERS": {
+      "default": "false"
+    },
+    "BYTEIAAS_BUILD_ROUTER": {
+      "default": "false"
+    },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
     },
@@ -84,6 +93,9 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
+    },
+    "VLLM_IMAGE_SOURCE": {
+      "default": "https://github.com/vllm-project/vllm"
     }
   }
 }
