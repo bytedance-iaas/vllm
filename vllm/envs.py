@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_HUMMING_DSV41_W2_N128_TUNING: bool = False
+    VLLM_HUMMING_DSV41_W13_SPLIT_ISSUE_WAIT: bool = False
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1607,6 +1608,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HUMMING_DSV41_W2_N128_TUNING": lambda: maybe_convert_bool(
         os.environ.get("VLLM_HUMMING_DSV41_W2_N128_TUNING", "0")
+    ),
+    "VLLM_HUMMING_DSV41_W13_SPLIT_ISSUE_WAIT": lambda: maybe_convert_bool(
+        os.environ.get("VLLM_HUMMING_DSV41_W13_SPLIT_ISSUE_WAIT", "0")
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
