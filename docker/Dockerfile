@@ -100,6 +100,7 @@ ARG BUILD_NIXL=false
 # Build the release-pinned ByteIAAS native source overlays. The public build
 # remains opt-in; internal workflows enable this immutable source contract.
 ARG BYTEIAAS_BUILD_NATIVE=false
+ARG BYTEIAAS_BUILD_TOKENIZERS=false
 
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
@@ -336,6 +337,28 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=bind,source=.git,target=.git \
     SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash tools/build_rust.sh
 #################### RUST BUILD IMAGE ####################
+
+#################### BYTEIAAS TOKENIZERS BUILD IMAGE ####################
+FROM rust-build-cache AS byteiaas-tokenizers-build
+ARG BYTEIAAS_BUILD_TOKENIZERS
+COPY tools/byteiaas/tokenizers_wheel.py /workspace/byteiaas-tokenizers-wheel.py
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    set -eu; \
+    mkdir -p /workspace/byteiaas-tokenizers-dist; \
+    if [ "${BYTEIAAS_BUILD_TOKENIZERS}" = "true" ]; then \
+        . /root/.cargo/env; \
+        uv pip install --python /opt/venv/bin/python3 "maturin>=1.0,<2.0"; \
+        python3 /workspace/byteiaas-tokenizers-wheel.py build \
+            --source-dir /workspace/byteiaas-tokenizers-source \
+            --wheel-dir /workspace/byteiaas-tokenizers-dist \
+            --python /opt/venv/bin/python3 --compatibility manylinux_2_28; \
+    else \
+        printf '%s\n' disabled > /workspace/byteiaas-tokenizers-dist/build-state; \
+        (cd /workspace/byteiaas-tokenizers-dist && sha256sum build-state > wheels.sha256); \
+    fi
+#################### BYTEIAAS TOKENIZERS BUILD IMAGE ####################
 
 #################### BYTEIAAS NATIVE BUILD IMAGE ####################
 FROM base AS byteiaas-native-build
@@ -1381,6 +1404,22 @@ RUN --mount=type=cache,target=/opt/uv/cache \
                 --manifest "/tmp/byteiaas-${kind}-dist/native-manifest.json" \
                 --report "/opt/byteiaas/provenance/${kind}-installed.json"; \
         done; \
+    fi
+
+# Install patched tokenizers last, including its DecodeStream behavior probe.
+ARG BYTEIAAS_BUILD_TOKENIZERS
+COPY --from=byteiaas-tokenizers-build /workspace/byteiaas-tokenizers-dist/wheels.sha256 /tmp/byteiaas-tokenizers-wheels.sha256
+COPY tools/byteiaas/tokenizers_wheel.py /opt/byteiaas/tools/tokenizers_wheel.py
+RUN --mount=type=cache,target=/opt/uv/cache \
+    --mount=type=bind,from=byteiaas-tokenizers-build,source=/workspace/byteiaas-tokenizers-dist,target=/tmp/byteiaas-tokenizers-dist,ro \
+    set -eu; \
+    if [ "${BYTEIAAS_BUILD_TOKENIZERS}" = "true" ]; then \
+        mkdir -p /opt/byteiaas/provenance; \
+        (cd /tmp/byteiaas-tokenizers-dist && sha256sum --check --strict /tmp/byteiaas-tokenizers-wheels.sha256); \
+        uv pip install --system --no-deps --reinstall /tmp/byteiaas-tokenizers-dist/*.whl; \
+        python3 /opt/byteiaas/tools/tokenizers_wheel.py verify \
+            --manifest /tmp/byteiaas-tokenizers-dist/tokenizers-manifest.json \
+            --report /opt/byteiaas/provenance/tokenizers-installed.json; \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
