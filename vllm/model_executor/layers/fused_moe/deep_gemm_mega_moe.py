@@ -24,6 +24,30 @@ def ue8m0_uint8_to_float(sf: torch.Tensor) -> torch.Tensor:
     return (sf.to(torch.int32) << 23).view(torch.float32)
 
 
+def get_sm90_mega_moe_token_alignment(deep_gemm) -> int:
+    """Resolve the Python or native API without assuming an old block layout."""
+    alignments = []
+    for module in (deep_gemm, getattr(deep_gemm, "_C", None)):
+        accessor = getattr(module, "get_token_alignment_for_sm90_mega_moe", None)
+        if accessor is None:
+            continue
+        if not callable(accessor):
+            raise RuntimeError("DeepGEMM SM90 token alignment API is not callable.")
+        alignment = accessor()
+        if type(alignment) is not int or alignment <= 0:
+            raise RuntimeError(
+                f"DeepGEMM returned an invalid SM90 token alignment: {alignment!r}."
+            )
+        alignments.append(alignment)
+    if not alignments:
+        raise RuntimeError("DeepGEMM is missing the SM90 token alignment API.")
+    if len(set(alignments)) != 1:
+        raise RuntimeError(
+            f"DeepGEMM Python and native SM90 token alignments disagree: {alignments}."
+        )
+    return alignments[0]
+
+
 class DeepGemmMegaMoEBackend:
     """Abstract MegaMoE backend that hides deep_gemm-specific details.
 
@@ -39,6 +63,10 @@ class DeepGemmMegaMoEBackend:
     # Human-readable MMA type tag used by deep_gemm helpers. SM100 default.
     mma_type: str = "fp8xfp4"
     hidden_quant: QuantKey = kMxfp8Dynamic
+
+    def get_token_alignment(self) -> int | None:
+        """Return an alignment for prepared capacity buckets, if supported."""
+        return None
 
     def transform_weights(
         self,
@@ -137,6 +165,11 @@ class DeepGemmSm90MegaMoEBackend(DeepGemmMegaMoEBackend):
 
     mma_type = "fp8xfp4"
     hidden_quant = kFp8Dynamic128Sym
+
+    def get_token_alignment(self) -> int:
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        return get_sm90_mega_moe_token_alignment(_import_deep_gemm())
 
     def supports_bf16_mega_gate(self) -> bool:
         # DeepGEMM exports this symbol on both architectures, but its fused

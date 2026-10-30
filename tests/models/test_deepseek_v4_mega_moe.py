@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     DeepGemmSm100MegaMoEBackend,
+    get_sm90_mega_moe_token_alignment,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
@@ -41,6 +42,28 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="DeepSeek V4 MegaMoE requires CUDA",
 )
+
+
+@pytest.mark.parametrize("python_api", [False, True])
+def test_sm90_mega_moe_alignment_accepts_native_only_api(python_api):
+    """A Python shim is optional; the native allocator's alignment is required."""
+    module = SimpleNamespace(
+        _C=SimpleNamespace(get_token_alignment_for_sm90_mega_moe=lambda: 1920)
+    )
+    if python_api:
+        module.get_token_alignment_for_sm90_mega_moe = lambda: 1920
+    assert get_sm90_mega_moe_token_alignment(module) == 1920
+
+
+@pytest.mark.parametrize("alignment", [True, 0, -384, 1920.0, 384])
+def test_sm90_mega_moe_alignment_rejects_invalid_or_stale_shim(alignment):
+    """A stale Python shim must not select a capacity the allocator cannot use."""
+    module = SimpleNamespace(
+        get_token_alignment_for_sm90_mega_moe=lambda: alignment,
+        _C=SimpleNamespace(get_token_alignment_for_sm90_mega_moe=lambda: 1920),
+    )
+    with pytest.raises(RuntimeError):
+        get_sm90_mega_moe_token_alignment(module)
 
 
 @pytest.fixture
