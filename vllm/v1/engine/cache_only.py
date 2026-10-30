@@ -35,10 +35,6 @@ def validate_dsv41_cache_only_request(
             "A dsv41_encoder_only_prefill producer requires a cache-only "
             "remote decode request with a Mooncake transfer_id."
         )
-    if has_mm_features:
-        raise VLLMValidationError(
-            "dsv41_encoder_only_prefill initially supports text-only requests."
-        )
     if sampling_params.prompt_logprobs is not None:
         raise VLLMValidationError(
             "dsv41_encoder_only_prefill does not support prompt logprobs; use "

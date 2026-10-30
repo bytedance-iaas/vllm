@@ -27,6 +27,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     TransferTopology,
     get_current_attn_backends,
     get_current_attn_backends_and_specs,
+    get_prefill_stop,
+    truncate_prompt_for_prefill,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -963,6 +965,9 @@ class MooncakeConnectorScheduler:
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
         self.is_dsv41_encoder_only_prefill = vllm_config.is_dsv41_encoder_only_prefill
+        self.uses_dsv41_encoder_only_handoff = (
+            vllm_config.uses_dsv41_encoder_only_handoff
+        )
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
         self._is_hma_required = (
@@ -1061,10 +1066,20 @@ class MooncakeConnectorScheduler:
     def on_new_request(self, request: "Request") -> None:
         params = request.kv_transfer_params
         if (
-            params is not None
-            and params.get("do_remote_decode")
-            and (self._has_mamba or self._bounded_replay)
+            params is None
+            or not params.get("do_remote_decode")
+            or params.get("_p_side_truncated")
         ):
+            return
+        if self.uses_dsv41_encoder_only_handoff and request.mm_features:
+            if request.get_skip_reading_prefix_cache():
+                return
+            stop = get_prefill_stop(request, 1)
+            if 0 < stop < request.num_prompt_tokens:
+                truncate_prompt_for_prefill(request, stop)
+                request.max_tokens = 1
+                params["_p_side_truncated"] = True
+        elif self._has_mamba or self._bounded_replay:
             self._truncate_mamba_request_for_prefill(request)
 
     def get_num_new_matched_tokens(
@@ -1098,10 +1113,14 @@ class MooncakeConnectorScheduler:
         if params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
             assert not self.is_kv_producer
-            token_ids = request.prompt_token_ids or []
-            count = self._get_remote_prefill_token_count(len(token_ids)) - (
-                num_computed_tokens
-            )
+            if self.uses_dsv41_encoder_only_handoff and request.mm_features:
+                remote_prefill_tokens = get_prefill_stop(request, 1)
+            else:
+                token_ids = request.prompt_token_ids or []
+                remote_prefill_tokens = self._get_remote_prefill_token_count(
+                    len(token_ids)
+                )
+            count = remote_prefill_tokens - num_computed_tokens
             if count > 0:
                 return count, True
 
