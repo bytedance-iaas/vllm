@@ -1023,9 +1023,11 @@ def _apply_candidate_mask_strided(
     _candidate_flags_kernel[(rows,)](
         candidate_blocks,
         row_ks,
+        row_ke,
         flags,
         *candidate_blocks.stride(),
         start_stride,
+        row_ke.stride(0),
         width,
         nblocks,
         block_size,

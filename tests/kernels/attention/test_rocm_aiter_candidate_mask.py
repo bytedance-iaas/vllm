@@ -3,17 +3,10 @@
 """ROCm correctness tests for the strided DSA candidate mask.
 
 ``_apply_candidate_mask_strided`` is a decode-path variant of the shared
-``apply_candidate_mask``. It differs in two ways that need pinning down:
-
-* it launches a fixed number of programs that stride the column axis, rather
-  than one program per 1024-column tile, so at ``max_model_len`` widths the
-  grid no longer scales with a workspace that is mostly padding;
-* it stops at each row's ``end`` instead of sanitizing the whole width.
-
-The second is only sound because every consumer bounds its scan by the same
-ends -- ``top_k_per_row_decode`` takes ``rowEnd`` from ``seq_lens``. So the
-contract is agreement with the shared kernel over ``[0, end)`` and nothing
-beyond it, which is what these tests assert rather than comparing whole rows.
+``apply_candidate_mask``. Both use fixed grids and stop at each row's range.
+The strided variant may sanitize columns before ``start`` or after ``end`` up
+to a tile boundary. Every consumer bounds its scan by the same row bounds,
+so the contract is agreement over ``[start, min(end, width))``.
 """
 
 import pytest
@@ -71,19 +64,22 @@ def _run_both(logits, row_ks, row_ke, candidates, block_size, row_repeat):
     return ref, got
 
 
-def _assert_agrees_within_ends(ref, got, row_ke, row_repeat):
+def _assert_agrees_within_bounds(ref, got, row_ks, row_ke, row_repeat):
     """Compare only the region a consumer can read."""
     for row in range(ref.shape[0]):
-        end = int(row_ke[row // row_repeat])
-        if end <= 0:
+        start = int(row_ks[row // row_repeat]) if row_ks is not None else 0
+        end = min(int(row_ke[row // row_repeat]), ref.shape[1])
+        if end <= start:
             continue
         torch.testing.assert_close(
-            got[row, :end],
-            ref[row, :end],
+            got[row, start:end],
+            ref[row, start:end],
             rtol=0,
             atol=0,
             equal_nan=True,
-            msg=lambda m, r=row, e=end: f"row {r} differs within [0, {e}): {m}",
+            msg=lambda m, r=row, s=start, e=end: (
+                f"row {r} differs within [{s}, {e}): {m}"
+            ),
         )
 
 
@@ -102,7 +98,7 @@ def test_matches_shared_kernel_ragged_ends(width, col_stride):
         dtype=torch.int32,
     )
     ref, got = _run_both(logits, row_ks, row_ke, candidates, BLOCK_SIZE, 1)
-    _assert_agrees_within_ends(ref, got, row_ke, 1)
+    _assert_agrees_within_bounds(ref, got, row_ks, row_ke, 1)
 
 
 @pytest.mark.parametrize("block_size", [8, 16])
@@ -120,7 +116,7 @@ def test_matches_shared_kernel_with_starts(block_size):
         dtype=torch.int64,
     )
     ref, got = _run_both(logits, row_ks, row_ke, candidates, block_size, 1)
-    _assert_agrees_within_ends(ref, got, row_ke, 1)
+    _assert_agrees_within_bounds(ref, got, row_ks, row_ke, 1)
 
 
 def test_matches_shared_kernel_row_repeat():
@@ -137,11 +133,11 @@ def test_matches_shared_kernel_row_repeat():
         dtype=torch.int32,
     )
     ref, got = _run_both(logits, row_ks, row_ke, candidates, BLOCK_SIZE, row_repeat)
-    _assert_agrees_within_ends(ref, got, row_ke, row_repeat)
+    _assert_agrees_within_bounds(ref, got, row_ks, row_ke, row_repeat)
 
 
 def test_leaves_columns_past_end_untouched():
-    """The deliberate difference from the shared kernel, pinned explicitly.
+    """Columns past the last touched tile stay unchanged.
 
     Skipping the tail is where the speedup comes from, so a change that
     quietly restores full-width sanitizing should fail here rather than just
@@ -223,4 +219,4 @@ def test_cudagraph_replay_tracks_changing_ends():
 
         ref = base.clone()
         apply_candidate_mask(ref, row_ks, row_ke, candidates, BLOCK_SIZE, 1)
-        _assert_agrees_within_ends(ref, logits, row_ke, 1)
+        _assert_agrees_within_bounds(ref, logits, row_ks, row_ke, 1)
