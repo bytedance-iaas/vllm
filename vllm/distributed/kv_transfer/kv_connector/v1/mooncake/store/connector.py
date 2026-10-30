@@ -14,7 +14,7 @@ enabling prefix caching via hash-based deduplication.
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from contextlib import AbstractContextManager
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -52,6 +52,10 @@ from .data import MooncakeStoreConnectorMetadata
 from .metrics import MooncakeStoreConnectorStats, MooncakeStorePromMetrics
 from .scheduler import MooncakeStoreScheduler
 from .worker import MooncakeStoreWorker
+
+if TYPE_CHECKING:
+    from .dsv41_scheduler import Dsv41StoreScheduler as CanonicalScheduler
+    from .dsv41_worker import Dsv41StoreWorker as CanonicalWorker
 
 logger = init_logger(__name__)
 
@@ -179,20 +183,42 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             and not extra_config.get("enable_lookup", True)
             and not save_decode_cache
         )
-        if not self._capacity_only:
+        self._canonical = extra_config.get("store_format") == "dsv41_canonical_v1"
+        if self._canonical:
+            from .dsv41_profile import validate_store
+
+            validate_store(vllm_config)
+        elif not self._capacity_only:
             self._validate_kv_cache_config(vllm_config, kv_cache_config)
         self._kv_cache_config = kv_cache_config
         self._kv_cache_events: MooncakeStoreKVEvents | None = None
 
-        self.connector_scheduler: MooncakeStoreScheduler | None = None
-        self.connector_worker: MooncakeStoreWorker | None = None
+        self.connector_scheduler: MooncakeStoreScheduler | CanonicalScheduler | None = (
+            None
+        )
+        self.connector_worker: MooncakeStoreWorker | CanonicalWorker | None = None
+        if self._canonical:
+            from .dsv41_scheduler import Dsv41StoreScheduler
+            from .dsv41_worker import Dsv41StoreWorker
 
-        if role == KVConnectorRole.SCHEDULER:
+            if role == KVConnectorRole.SCHEDULER:
+                self.connector_scheduler = Dsv41StoreScheduler(
+                    vllm_config, kv_cache_config
+                )
+            else:
+                self.connector_worker = Dsv41StoreWorker(vllm_config, kv_cache_config)
+        elif role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = MooncakeStoreScheduler(
                 vllm_config, kv_cache_config
             )
         else:
             self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config)
+
+    @property
+    def requires_kv_delivery(self) -> bool:
+        if getattr(self, "_canonical", False):
+            return False
+        return super().requires_kv_delivery
 
     def shutdown(self):
         """Release connector resources on teardown.
@@ -202,6 +228,12 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         engine's explicit shutdown path and as a backstop from ``__del__``;
         a no-op on the scheduler role, which holds no store handle.
         """
+        scheduler = getattr(self, "connector_scheduler", None)
+        if getattr(self, "_canonical", False) and scheduler is not None:
+            from .dsv41_scheduler import Dsv41StoreScheduler
+
+            assert isinstance(scheduler, Dsv41StoreScheduler)
+            scheduler.close()
         worker = getattr(self, "connector_worker", None)
         if worker is not None:
             worker.close()
@@ -265,6 +297,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        if getattr(self, "_canonical", False):
+            from .dsv41_scheduler import Dsv41StoreScheduler
+
+            assert isinstance(self.connector_scheduler, Dsv41StoreScheduler)
+            self.connector_scheduler.request_finished(request, block_ids)
         # An in-flight store job holds its own reference on the blocks it reads,
         # so a finishing request never has to defer freeing them.
         return False, None
@@ -330,7 +367,7 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         cache is allocated from the Mooncake-managed pool when
         ``custom_mem_pool`` is set in ``kv_connector_extra_config``.
         """
-        if self.connector_worker is None:
+        if self.connector_worker is None or getattr(self, "_canonical", False):
             return None
         return self.connector_worker.get_mem_pool_context()
 
@@ -388,18 +425,16 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self,
     ) -> MooncakeStoreKVEvents | None:
         assert self.connector_worker is not None
-        if (
-            not self.connector_worker.enable_kv_events
-            or self.connector_worker.kv_send_thread is None
-        ):
+        if getattr(self, "_canonical", False):
             return None
-        events = self.connector_worker.get_kv_events()
+        worker = cast(MooncakeStoreWorker, self.connector_worker)
+        if not worker.enable_kv_events or worker.kv_send_thread is None:
+            return None
+        events = worker.get_kv_events()
         # Empty containers still count this worker toward the poll's quorum.
         kv_events = MooncakeStoreKVEvents(
             num_workers=1,
-            group_tp_replication_factors=(
-                self.connector_worker.group_tp_replication_factors
-            ),
+            group_tp_replication_factors=(worker.group_tp_replication_factors),
         )
         kv_events.add_events(events)
         return kv_events
