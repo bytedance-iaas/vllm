@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -32,6 +33,7 @@ def _prepare_dflash_inputs_to_capture(
     max_model_len: int,
     skip_attn: bool,
     causal: bool | Mapping[int, bool],
+    model_state: ModelState,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
@@ -53,22 +55,35 @@ def _prepare_dflash_inputs_to_capture(
                 block_tables.cp_interleave,
                 num_reqs_padded=input_batch.num_reqs_after_padding,
             )
-        attn_metadata = build_attn_metadata(
-            attn_groups=attn_groups,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=input_batch.query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=num_tokens // num_reqs,
-            seq_lens=input_batch.seq_lens,
-            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
-            max_seq_len=max_model_len,
-            block_tables=input_block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=kv_cache_config,
-            for_cudagraph_capture=True,
-            causal=causal,
-        )
+        all_causal = causal if isinstance(causal, bool) else all(causal.values())
+        if all_causal:
+            attn_metadata = model_state.prepare_attn(
+                input_batch,
+                CUDAGraphMode.NONE,
+                input_block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                for_capture=True,
+            )
+        else:
+            # ModelState has no per-group causal override for parallel drafters.
+            attn_metadata = build_attn_metadata(
+                attn_groups=attn_groups,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=input_batch.query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                max_query_len=num_tokens // num_reqs,
+                seq_lens=input_batch.seq_lens,
+                dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+                max_seq_len=max_model_len,
+                block_tables=input_block_tables,
+                slot_mappings=slot_mappings,
+                kv_cache_config=kv_cache_config,
+                for_cudagraph_capture=True,
+                causal=causal,
+            )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 
 
@@ -79,6 +94,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
     def capture(
         self,
         forward_fn: Callable,
+        model_state: ModelState,
         input_buffers: InputBuffers,
         block_tables: BlockTables,
         attn_groups: list[list[AttentionGroup]],
@@ -112,6 +128,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 max_model_len,
                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
                 causal=causal,
+                model_state=model_state,
             )
             attn_metadata, slot_mappings = attn_state
 
