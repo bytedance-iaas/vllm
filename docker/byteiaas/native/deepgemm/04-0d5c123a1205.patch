@@ -1,0 +1,44 @@
+From 0d5c123a1205c0bd67954e648d5392366a80e236 Mon Sep 17 00:00:00 2001
+From: wangyicong <wangyicong@bytedance.com>
+Date: Fri, 30 Oct 2026 12:18:51 +0800
+Subject: [PATCH] fix(sm90): restore module syntax and FP8 recipe contract
+
+Resolve both findings from the single Codex review of the release-pin SM90
+MegaMoE port. Keep the original transform_weights return inside its function,
+preserving package imports and SM100 behavior. Restore the original FP8 default
+recipe (128, 128, 128) required by the native SM90 API.
+
+Original optimization: 72586051f9d78e16fcd26af13bdcef1a74ac610f.
+Original source snapshot: 45a95bac4d70abf3a66780922ee65ca0cdaddc3b.
+
+Co-authored-by: TRAE (GPT-6) <traecli@bytedance.com>
+Signed-off-by: trae-solo-agent <solo-agent@trae.ai>
+---
+ deep_gemm/mega/__init__.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 23f178de673185faf099df56e3ce9a8b2c57700d..c77fe0749b0fdd4cccf5f9999cde350005398cf3 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -200,7 +200,7 @@ def transform_weights_for_mega_moe(
+         # BF16: L1 interleave gate/up, L2 unchanged
+         l1_transformed = _interleave_weights(l1_weights)
+         l2_transformed = l2_weights
+-return l1_transformed, l2_transformed
++    return l1_transformed, l2_transformed
+ 
+ 
+ def transform_weights_for_mega_moe_sm90(l1_weights, l2_weights):
+@@ -263,7 +263,7 @@ def mega_moe_pre_dispatch_sm90(
+ 
+ def fp8_mega_moe(
+     y, l1_weights, l2_weights, sym_buffer, cumulative_local_expert_recv_stats=None,
+-    recipe=(1, 1, 128), activation='swiglu', activation_clamp=None, fast_math=True,
++    recipe=(128, 128, 128), activation='swiglu', activation_clamp=None, fast_math=True,
+ ):
+     return _C.fp8_mega_moe(
+         y, l1_weights, l2_weights, cumulative_local_expert_recv_stats,
+-- 
+2.50.1 (Apple Git-155)
+

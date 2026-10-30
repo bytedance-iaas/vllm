@@ -1,0 +1,35 @@
+{
+  "format_version": 1,
+  "repository": "https://github.com/vllm-project/DeepGEMM.git",
+  "base_commit": "1e1842a833699298f7afc02eefb2ed168fff6938",
+  "source_commit": "38b83dd94eae64cad26c24dc300980769b4d98d1",
+  "source_tree": "29773edf2a5656a235c0d19e611f9ac1f7e06354",
+  "package_version": "2.8.0+local",
+  "patches": [
+    {
+      "file": "01-4c5e191626eb.patch",
+      "sha256": "ddab8217831ebdcd087665e8e9149f17c567e4af5c9421234253b3de76fb433e",
+      "commit": "4c5e191626eb3df7e3394c505d05d4e9da699949"
+    },
+    {
+      "file": "02-b39da5d7daff.patch",
+      "sha256": "1251a2919c63343888104b901420d5427a1074c62c2e4633ee074dd7d6d7ff8b",
+      "commit": "b39da5d7daffd1362270b7580af1b449cbc05bcf"
+    },
+    {
+      "file": "03-166940092f5a.patch",
+      "sha256": "09e7536215473305e979a58d8930a1c7fbd60001415faaecc8ebf820e89dfdfe",
+      "commit": "166940092f5af8bc1d621beb24de5cf79c89ecd2"
+    },
+    {
+      "file": "04-0d5c123a1205.patch",
+      "sha256": "001b38059def66ca8d4ebb90037ec4974fc1ea23e1af80cf2938359faf9fd635",
+      "commit": "0d5c123a1205c0bd67954e648d5392366a80e236"
+    },
+    {
+      "file": "05-38b83dd94eae.patch",
+      "sha256": "c1e68437e81dc6efefd07f2fb8cda09dccace0a39cb77ed4bd8b336bad0767b9",
+      "commit": "38b83dd94eae64cad26c24dc300980769b4d98d1"
+    }
+  ]
+}
