@@ -676,9 +676,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if mhc_stream is not None and (
             in_piecewise_cudagraph()
             or not 0 < positions.shape[0] <= MHC_OVERLAP_MAX_TOKENS
+            or not torch.cuda.is_current_stream_capturing()
         ):
             mhc_stream = None
-        *_, x, _, _ = mhc_shifted_post_pre(
+        boundary_outputs = mhc_shifted_post_pre(
             x,
             residual,
             post_mix,
@@ -698,11 +699,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
         )
+        x = boundary_outputs[3]
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
         self.attn.write_global_cache(positions, x)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
+        # Keep every auxiliary-stream output alive through the wait.
+        del boundary_outputs
         return x
 
     def write_kv(
