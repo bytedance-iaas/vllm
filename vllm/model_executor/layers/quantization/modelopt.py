@@ -2560,6 +2560,7 @@ class ModelOptLinearMethod(LinearMethodBase):
         # NVFP4 methods.
         self.kernel: Any = None
         self._humming_dense: Any = None
+        self._dense_mxfp8: Any = None
 
     @property
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
@@ -2664,6 +2665,20 @@ class ModelOptLinearMethod(LinearMethodBase):
             if self._humming_dense is not None:
                 layer.add_module("_humming_dense", self._humming_dense)
                 logger.info("Prepared ordered Humming Decode for %s", layer.prefix)
+        if (
+            os.getenv("VLLM_DSV41_DECODE_DENSE_TRITON", "0") == "1"
+            and self.spec.weight == kMxfp8Static
+            and self.spec.activation == kMxfp8Dynamic
+            and type(self.fmt) is FormatScheme
+            and type(self.kernel).__name__ == "MarlinMxfp8LinearKernel"
+        ):
+            from vllm.model_executor.layers.quantization.utils.dense_mxfp8_triton import (  # noqa: E501
+                Dsv41DenseMxfp8,
+            )
+
+            self._dense_mxfp8 = Dsv41DenseMxfp8.from_layer(layer)
+            if self._dense_mxfp8 is not None:
+                layer.add_module("_dense_mxfp8", self._dense_mxfp8)
         self.kernel.process_weights_after_loading(layer)
 
     def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
@@ -2685,6 +2700,12 @@ class ModelOptLinearMethod(LinearMethodBase):
                 and self._humming_dense.supports(inp)
             ):
                 return self._humming_dense(inp)
+            if (
+                self._dense_mxfp8 is not None
+                and b is None
+                and self._dense_mxfp8.supports(inp)
+            ):
+                return self._dense_mxfp8(inp)
             return self.kernel.apply_weights(layer=lyr, x=inp, bias=b)
 
         return self.fmt.apply(
