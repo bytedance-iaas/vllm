@@ -1879,14 +1879,21 @@ class MooncakeConnectorWorker:
                     dst_ptrs,
                     lengths,
                 )
-                try:
-                    ret_value = await asyncio.shield(transfer)
-                except asyncio.CancelledError:
-                    # Cancelling an asyncio waiter cannot stop native RDMA.
-                    # Keep KV pinned and its sender slot occupied until the
-                    # actual transfer is terminal.
-                    await asyncio.shield(transfer)
-                    raise
+                cancelled = False
+                while True:
+                    try:
+                        ret_value = await asyncio.shield(transfer)
+                        break
+                    except asyncio.CancelledError:
+                        # Repeated task.cancel() cannot stop native RDMA.
+                        # Keep KV and the slot pinned until its true terminal
+                        # state, then propagate the caller's cancellation.
+                        cancelled = True
+                        if transfer.done():
+                            transfer.result()
+                            raise
+                if cancelled:
+                    raise asyncio.CancelledError
 
                 if ret_value != 0:
                     transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"

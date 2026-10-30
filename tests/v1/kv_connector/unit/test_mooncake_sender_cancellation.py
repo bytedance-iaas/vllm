@@ -3,6 +3,7 @@
 """Sender lifecycle regressions without a GPU or Mooncake data plane."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -55,6 +56,15 @@ async def test_cancelled_native_send_keeps_kv_pinned_until_terminal():
     assert not task.done()
     assert meta.sending == 1
     assert worker._sender_semaphore.locked()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not native_transfer.cancelled()
+    assert not task.done()
+    assert meta.sending == 1
+    assert worker._sender_semaphore.locked()
+    meta.expire_time = time.perf_counter() - 1
+    assert not await worker.fetch_finished_sending_reqs()
+    assert worker.reqs_need_send[meta.transfer_id] is meta
     native_transfer.set_result(0)
     with pytest.raises(asyncio.CancelledError):
         await task
