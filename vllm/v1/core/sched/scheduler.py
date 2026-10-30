@@ -3297,9 +3297,14 @@ class Scheduler(SchedulerInterface):
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
-            else:
-                assert RequestStatus.is_finished(req.status)
+            elif RequestStatus.is_finished(req.status):
                 self._free_blocks(self.requests[req_id])
+            else:
+                logger.warning(
+                    "Ignoring finished_recving for live request %s in state %s.",
+                    req_id,
+                    req.status.name,
+                )
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
