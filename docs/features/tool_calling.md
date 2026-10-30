@@ -390,6 +390,11 @@ For DeepSeek-V4.1, set `--tokenizer-mode deepseek_v41`,
 `--reasoning-parser deepseek_v41`, and `--tool-call-parser deepseek_v41`
 with `--enable-auto-tool-choice`.
 The V4.1 parser also accepts the mixed `<｜DSML｜ tool_calls>` opener.
+A bare `</｜DSML｜>` can close a parameter when followed by the next parameter
+or the end of the argument block. A literal bare closer inside a normally closed
+parameter value is preserved.
+During streaming, an ambiguous bare closer is held until its boundary is known
+so that JSON-encoded string values keep the same contents across chunks.
 
 When generation ends before the last DSML parameter closes, the parser preserves
 its generated value and completes the argument JSON. This recovery does not

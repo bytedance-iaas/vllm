@@ -49,6 +49,7 @@ DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_START = f"<{_DSML}parameter"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+_BARE_PARAM_CLOSE = f"</{_DSML}>"
 
 # Spellings variants of ``DSML_TOOL_START`` observed in production.
 DSML_TOOL_START_VARIANTS: tuple[str, ...] = (
@@ -68,8 +69,13 @@ def _param_patterns(
     start, close = re.escape(param_start), re.escape(param_close)
     head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
     value_end = rf"{close}|{start}\s+name="
+    # A bare namespace closer is recoverable only at a parameter boundary.
+    bare_close = rf"{re.escape(_BARE_PARAM_CLOSE)}\s*(?={start}\s+name=|$)"
     return (
-        re.compile(rf"{head}(.*?)(?:{close}|(?={start}\s+name=))", re.DOTALL),
+        re.compile(
+            rf"{head}(.*?)(?:{close}|(?P<bare_close>{bare_close})|(?={start}\s+name=))",
+            re.DOTALL,
+        ),
         re.compile(rf"{head}(.*)$", re.DOTALL),
         re.compile(value_end),
     )
@@ -94,6 +100,9 @@ def _dsml_arg_converter(
     # A missing ``string`` attribute is treated like ``string="false"``: try
     # JSON, fall back to the literal text.
     for m in param_re.finditer(raw_args):
+        # A chunk can end inside a literal bare closer; final flush confirms it.
+        if partial and m.group("bare_close") and m.end() == len(raw_args):
+            break
         name, is_str, value = m.group(1), m.group(2), m.group(3)
         if is_str == "true":
             params[name] = value
@@ -110,6 +119,16 @@ def _dsml_arg_converter(
         pm = None
     if pm:
         name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
+        bare_start = value.rfind(_BARE_PARAM_CLOSE) if partial else -1
+        pending_bare = (
+            bare_start >= 0
+            and value_end_re.fullmatch(
+                value[bare_start + len(_BARE_PARAM_CLOSE) :].lstrip(), partial=True
+            )
+            is not None
+        )
+        if pending_bare:
+            value = value[:bare_start]
         # The trailing parameter is unclosed, so a suffix that can only be the
         # start of its close marker (or of the next parameter) is not part of
         # the value, including at the end of a truncated output.
@@ -121,8 +140,10 @@ def _dsml_arg_converter(
         if is_str == "true":
             params[name] = value
         elif partial:
-            with contextlib.suppress(json.JSONDecodeError, ValueError):
-                params[name] = json.loads(value)
+            # A pending closer can still be literal text inside a JSON value.
+            if not pending_bare:
+                with contextlib.suppress(json.JSONDecodeError, ValueError):
+                    params[name] = json.loads(value)
         else:
             try:
                 params[name] = json.loads(value)
