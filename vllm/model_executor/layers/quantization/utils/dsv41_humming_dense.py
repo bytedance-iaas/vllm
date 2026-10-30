@@ -21,6 +21,15 @@ _SHAPES = {
 }
 _TARGET_ROWS = (96, 104, 108, 112)
 _DRAFT_ROWS = (80, 88, 90, 96)
+_LEGACY_STREAM_K_PROJECTIONS = frozenset(
+    (
+        "attn.wq_b",
+        "attn.wo_b",
+        "engram.wkv",
+        "ffn.shared_experts.down_proj",
+        "main_proj",
+    )
+)
 
 
 @triton.jit
@@ -72,6 +81,31 @@ def _projection(prefix):
     if rows == _DRAFT_ROWS and name == "attn.fused_wqa_wkv":
         return None
     return name, rows
+
+
+def _legacy_stream_k_tuning(projection, m):
+    block_m = 40 if m == 80 else 48 if m <= 96 else 56
+    force_tma = projection == "attn.wq_b" or m != 80
+    raster_group_m = 1
+    if projection == "engram.wkv":
+        raster_group_m = {40: 153, 48: 128, 56: 109}[block_m]
+    elif projection == "main_proj":
+        raster_group_m = {40: 61, 48: 51, 56: 43}[block_m]
+    return {
+        "block_shape": (block_m, 128, 128),
+        "warp_shape": (block_m, 32, 128),
+        "use_stream_k": True,
+        "use_f16_accum": False,
+        "num_sms": 64 if projection == "attn.wq_b" else 78,
+        "num_stages": 3 if force_tma else 4,
+        "num_ctas_per_sm": 2,
+        "use_tma": force_tma,
+        "use_warp_spec": force_tma,
+        "mma_type": "wgmma",
+        "raster_group_m": raster_group_m,
+        "use_tma_c": False,
+        "stream_k_max_slices": 3,
+    }
 
 
 class Dsv41HummingDense(torch.nn.Module):
@@ -155,6 +189,8 @@ class Dsv41HummingDense(torch.nn.Module):
         for m in self.rows:
             tuning = dict(get_heuristics_config(self.layer_config, shape_m=m))
             tuning.update(use_tma_c=False, stream_k_max_slices=3)
+            if projection in _LEGACY_STREAM_K_PROJECTIONS:
+                tuning = _legacy_stream_k_tuning(projection, m)
             if projection in grid_caps:
                 tuning["num_sms"] = grid_caps[projection]
             if self.layer_config.use_block_scaled_mma:
