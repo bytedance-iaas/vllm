@@ -622,11 +622,14 @@ class DeepseekV41ModelState(DefaultModelState):
             # Capture reuses the runtime path on a dummy batch, so the graph reads
             # the buffers a real step fills.
             num_reqs = min(desc.num_tokens, self.max_num_reqs)
+            slot_mappings = block_tables.get_dummy_slot_mappings(desc.num_tokens)
+            if self.pcp_size > 1:
+                slot_mappings = slot_mappings.repeat(1, self.pcp_size)
             self._prepare_replay_batch(
                 InputBatch.make_dummy(num_reqs, desc.num_tokens, input_buffers),
                 CUDAGraphMode.NONE,
                 block_tables.get_dummy_block_tables(num_reqs),
-                block_tables.get_dummy_slot_mappings(desc.num_tokens),
+                slot_mappings,
                 attn_groups,
                 kv_cache_config,
                 self._replay_start[:num_reqs].zero_(),

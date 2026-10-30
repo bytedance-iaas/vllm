@@ -1071,9 +1071,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
                 hidden_states,
                 positions,
-                local_input_ids
-                if self.decoder_replay_layers.replay_batch is not None
-                else input_ids,
+                local_input_ids,
                 pre_mix,
                 post_mix,
                 res_mix,
@@ -1220,7 +1218,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids is not None
             and self.parallel_config.prefill_context_parallel_size > 1
             and not self.parallel_config.enable_expert_parallel
-            and self.decoder_replay_layers.replay_batch is not None
         ):
             input_ids = get_pcp_group().all_gather(input_ids, dim=0)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
