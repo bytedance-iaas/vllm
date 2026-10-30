@@ -264,7 +264,14 @@ class DeepseekV41ModelState(DefaultModelState):
         if (
             layers is not None
             and compilation_config.cudagraph_decoder_replay
-            and compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+            and (
+                compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+                or (
+                    self._mixed_replay_graph_enabled
+                    and compilation_config.cudagraph_mode
+                    == CUDAGraphMode.FULL_DECODE_ONLY
+                )
+            )
             and is_breakable_cudagraph_enabled()
             and get_pp_group().is_first_rank
             # The graphs' fixed inputs hold no LoRA mapping and no None input ids.
