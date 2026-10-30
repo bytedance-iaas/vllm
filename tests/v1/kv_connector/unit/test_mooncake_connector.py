@@ -843,6 +843,7 @@ def _make_bootstrap_vllm_config(
             data_parallel_rank_local=data_parallel_rank_local,
             data_parallel_index=data_parallel_index,
             nnodes_within_dp=nnodes_within_dp,
+            prefill_context_parallel_size=1,
             master_addr="model-parallel-master",
             data_parallel_master_ip="data-parallel-master",
         ),
@@ -851,6 +852,7 @@ def _make_bootstrap_vllm_config(
 
 def _make_local_register_worker_stub():
     return SimpleNamespace(
+        is_sender_worker=True,
         vllm_config=SimpleNamespace(
             kv_transfer_config=None,
             parallel_config=SimpleNamespace(
@@ -873,6 +875,7 @@ def _make_local_register_worker_stub():
 
 def _make_register_worker_stub():
     return SimpleNamespace(
+        is_sender_worker=True,
         vllm_config=_make_bootstrap_vllm_config(),
         hostname="127.0.0.1",
         side_channel_port=1234,
@@ -1558,15 +1561,19 @@ async def test_kv_producer(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("local_block_ids", "expected_finished"),
+    ("local_block_ids", "awaiting_kvs", "expected_finished"),
     [
-        ([], set()),
-        ([[]], set()),
-        ([[100]], {"d-req-1"}),
+        ([], False, set()),
+        ([[]], False, set()),
+        ([[100]], False, set()),
+        ([], True, {"d-req-1"}),
+        ([[]], True, {"d-req-1"}),
+        ([[100]], True, {"d-req-1"}),
     ],
 )
-def test_pull_completion_requires_local_blocks(
+def test_pull_completion_requires_awaited_load(
     local_block_ids: list[list[int]],
+    awaiting_kvs: bool,
     expected_finished: set[str],
 ):
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
@@ -1579,6 +1586,7 @@ def test_pull_completion_requires_local_blocks(
         remote_engine_id="p-engine",
         remote_bootstrap_addr="http://bootstrap:33333",
         pull_tasks_count=1,
+        awaiting_kvs=awaiting_kvs,
     )
     response = MooncakeXferResponse(
         status=MooncakeXferResponseStatus.FINISH,
