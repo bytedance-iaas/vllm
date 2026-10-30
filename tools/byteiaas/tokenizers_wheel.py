@@ -41,9 +41,22 @@ def build(args: argparse.Namespace) -> None:
     ).strip()
     if actual != COMMIT:
         raise ValueError(f"tokenizers source must be {COMMIT}, found {actual}")
-    subprocess.run(
-        ["git", "-C", str(source), "diff", "HEAD", "--exit-code"], check=True
+    status = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(source),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+        text=True,
     )
+    if status:
+        raise ValueError(
+            f"Use a clean source tree with no extra build inputs:\n{status}"
+        )
     wheels.mkdir(parents=True, exist_ok=True)
     if list(wheels.glob("*.whl")):
         raise ValueError("Use an empty wheel directory to avoid stale build artifacts")
