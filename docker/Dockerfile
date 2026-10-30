@@ -97,6 +97,10 @@ ARG INSTALL_KV_CONNECTORS=false
 # requirements
 ARG BUILD_NIXL=false
 
+# Build the release-pinned ByteIAAS native source overlays. The public build
+# remains opt-in; internal workflows enable this immutable source contract.
+ARG BYTEIAAS_BUILD_NATIVE=false
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
@@ -333,9 +337,33 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash tools/build_rust.sh
 #################### RUST BUILD IMAGE ####################
 
+#################### BYTEIAAS NATIVE BUILD IMAGE ####################
+FROM base AS byteiaas-native-build
+ARG BYTEIAAS_BUILD_NATIVE
+ARG max_jobs=2
+ENV MAX_JOBS=${max_jobs}
+WORKDIR /workspace/byteiaas-native
+COPY docker/byteiaas/native/deepgemm /workspace/byteiaas-native/locks/deepgemm
+COPY tools/byteiaas/prepare_native_source.py tools/byteiaas/native_wheel.py /workspace/byteiaas-native/tools/
+RUN mkdir -p deepgemm-source deepgemm-dist && \
+    if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+        rmdir deepgemm-source && \
+        python3 tools/prepare_native_source.py \
+            --lock locks/deepgemm/source-lock.json --source deepgemm-source && \
+        python3 tools/native_wheel.py build \
+            --lock locks/deepgemm/source-lock.json --source deepgemm-source \
+            --output deepgemm-dist; \
+    else \
+        printf '%s\n' disabled > deepgemm-dist/build-state && \
+        (cd deepgemm-dist && sha256sum build-state > wheels.sha256); \
+    fi
+#################### BYTEIAAS NATIVE BUILD IMAGE ####################
+
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
 
+ARG BYTEIAAS_BUILD_NATIVE
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/deepgemm-source /workspace/byteiaas-native/deepgemm-source
 ARG INSTALL_RUBIN_PRERELEASE
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -428,6 +456,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
+        && if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+            export DEEPGEMM_SRC_DIR=/workspace/byteiaas-native/deepgemm-source; \
+        fi \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
         && sccache --show-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
@@ -446,6 +477,9 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" && \
         export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" && \
         export VLLM_DOCKER_BUILD_CONTEXT=1 && \
+        if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+            export DEEPGEMM_SRC_DIR=/workspace/byteiaas-native/deepgemm-source; \
+        fi && \
         export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) && \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
