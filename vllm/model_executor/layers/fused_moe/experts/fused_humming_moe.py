@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
     kInt4Static,
+    kInt8Dynamic128Sym,
     kInt8DynamicTokenSym,
     kInt8Static,
     kInt8StaticChannelSym,
@@ -208,7 +209,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             and config.pad_shape_k == 0
             and config.sm_version == 90
             and config.num_experts == 384
-            and config.a_dtype == dtypes.float8e4m3
+            and config.a_dtype in (dtypes.float8e4m3, dtypes.int8)
             and config.as_dtype == dtypes.float32
             and config.input_scale_group_size == 128
             and config.b_dtype == dtypes.float4e2m1
@@ -370,6 +371,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             # (group-128 float32). Runs via WGMMA software dequant, so it
             # works on Hopper (SM90/H200) as well as Blackwell.
             (kMxfp4Static, kFp8Dynamic128Sym),
+            (kMxfp4Static, kInt8Dynamic128Sym),
             (kNvfp4Static, None),
             (kNvfp4Static, kFp8DynamicTokenSym),
             (kMxfp8Static, None),

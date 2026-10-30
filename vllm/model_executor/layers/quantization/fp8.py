@@ -151,6 +151,7 @@ class Fp8Config(QuantizationConfig):
         return []
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+        self.hf_to_vllm_mapper = hf_to_vllm_mapper
         if self.ignored_layers is not None:
             self.ignored_layers = hf_to_vllm_mapper.apply_list(self.ignored_layers)
 
@@ -199,9 +200,16 @@ class Fp8Config(QuantizationConfig):
             if self.store_dtype == "mxfp4":
                 from vllm.model_executor.layers.quantization.mxfp4 import (
                     Mxfp4MoEMethod,
+                    humming_input_layer_skipped,
                 )
 
-                return Mxfp4MoEMethod(layer.moe_config)
+                return Mxfp4MoEMethod(
+                    layer.moe_config,
+                    layer_name=prefix,
+                    humming_input_layer_skipped=humming_input_layer_skipped(
+                        prefix, getattr(self, "hf_to_vllm_mapper", None)
+                    ),
+                )
             return Fp8MoEMethod(self, layer)
         elif isinstance(layer, Attention):
             return Fp8KVCacheMethod(self)

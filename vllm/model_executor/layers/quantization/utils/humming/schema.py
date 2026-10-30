@@ -83,6 +83,21 @@ if has_humming():
 
 logger = init_logger(__name__)
 
+_HUMMING_INPUT_SCHEMA_KEYS = frozenset(
+    {
+        "a_dtype",
+        "input_dtype",
+        "dtype",
+        "input_scale_group_size",
+        "group_size",
+        "input_scale_dtype",
+        "scale_dtype",
+        "input_quant_mode",
+        "quant_mode",
+        "quantization_mode",
+    }
+)
+
 
 def _group_shape(group_size: int, group_size_n: int = 0) -> GroupShape:
     """Map humming group sizes to QuantKey GroupShape.
@@ -423,8 +438,12 @@ def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
             ignored_layers = candidate
             break
 
-    if any(module_name in prefix for module_name in ignored_layers):
-        return True
+    for module_name in ignored_layers:
+        if module_name.startswith("re:"):
+            if re.match(module_name[3:], prefix):
+                return True
+        elif module_name in prefix:
+            return True
     if "lm_head" in prefix:
         return True
 
@@ -435,3 +454,56 @@ def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
             return True
 
     return False
+
+
+def resolve_humming_moe_input_config(
+    config: dict[str, Any],
+    prefix: str,
+    layer_skipped: bool | None = None,
+) -> tuple[Any | None, bool | None, dict[str, dict[str, Any]]]:
+    """Resolve parent and per-GEMM activation overrides without mutation."""
+    if layer_skipped is None:
+        layer_skipped = humming_is_layer_skipped(config, prefix)
+    if layer_skipped:
+        return None, None, {}
+
+    from vllm.utils.humming import HummingInputSchema
+
+    layer_config = resolve_humming_layer_config(config, prefix)
+    raw_sublayers = layer_config.pop("sublayers", {})
+    if not isinstance(raw_sublayers, dict):
+        raise ValueError("Humming input config 'sublayers' must be an object")
+    unknown = set(raw_sublayers).difference({"w13", "w2"})
+    if unknown:
+        raise ValueError(f"Unsupported Humming MoE input sublayers: {sorted(unknown)}")
+    resolved = {}
+    for name, raw_config in raw_sublayers.items():
+        if not isinstance(raw_config, dict):
+            raise ValueError(f"Humming input config for {name} must be an object")
+        schema_config = raw_config.copy()
+        allow_fallback = schema_config.pop("allow_fallback", False)
+        if not isinstance(allow_fallback, bool):
+            raise ValueError(f"Humming input allow_fallback for {name} must be bool")
+        if schema_config.pop("quant_method", "humming") != "humming":
+            raise ValueError(f"Humming input quant_method for {name} must be 'humming'")
+        if not _HUMMING_INPUT_SCHEMA_KEYS.intersection(schema_config):
+            raise ValueError(f"Humming input config for {name} must define a schema")
+        resolved[name] = {
+            "input_schema": HummingInputSchema.from_config(schema_config),
+            "allow_input_schema_fallback": allow_fallback,
+        }
+
+    allow_fallback = layer_config.pop("allow_fallback", False)
+    if not isinstance(allow_fallback, bool):
+        raise ValueError("Humming input allow_fallback must be bool")
+    dynamic = config.get("dynamic", {})
+    contains_sublayers = "sublayers" in config or (
+        isinstance(dynamic, dict)
+        and any(
+            isinstance(overrides, dict) and "sublayers" in overrides
+            for overrides in dynamic.values()
+        )
+    )
+    if not _HUMMING_INPUT_SCHEMA_KEYS.intersection(layer_config) and contains_sublayers:
+        return None, None, resolved
+    return HummingInputSchema.from_config(layer_config), allow_fallback, resolved

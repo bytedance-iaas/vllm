@@ -5,6 +5,7 @@ import os
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -52,6 +53,18 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def humming_input_layer_skipped(prefix: str, hf_to_vllm_mapper=None) -> bool:
+    config = envs.VLLM_HUMMING_INPUT_QUANT_CONFIG
+    if not config:
+        return True
+    from vllm.model_executor.layers.quantization.humming import HummingConfig
+
+    checker = HummingConfig()
+    if hf_to_vllm_mapper is not None:
+        checker.apply_vllm_mapper(hf_to_vllm_mapper)
+    return checker.is_layer_skipped(config, prefix)
+
+
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -83,10 +96,21 @@ class Mxfp4Config(QuantizationConfig):
     def get_config_filenames(cls) -> list[str]:
         return []
 
-    def _make_moe_method(self, moe: FusedMoEConfig) -> FusedMoEMethodBase:
+    def apply_vllm_mapper(self, hf_to_vllm_mapper):
+        self.hf_to_vllm_mapper = hf_to_vllm_mapper
+
+    def _make_moe_method(
+        self, moe: FusedMoEConfig, prefix: str = ""
+    ) -> FusedMoEMethodBase:
         """MoE method for RoutedExperts. Subclasses override to pick a
         checkpoint-specific kernel family."""
-        return Mxfp4MoEMethod(moe)
+        return Mxfp4MoEMethod(
+            moe,
+            layer_name=prefix,
+            humming_input_layer_skipped=humming_input_layer_skipped(
+                prefix, getattr(self, "hf_to_vllm_mapper", None)
+            ),
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -104,7 +128,7 @@ class Mxfp4Config(QuantizationConfig):
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
-            return self._make_moe_method(layer.moe_config)
+            return self._make_moe_method(layer.moe_config, prefix)
         elif isinstance(layer, Attention):
             logger.debug_once(
                 "MXFP4 attention layer is not implemented. "
@@ -145,7 +169,9 @@ class GptOssMxfp4Config(Mxfp4Config):
             return None
         return "gpt_oss_mxfp4"
 
-    def _make_moe_method(self, moe: FusedMoEConfig) -> FusedMoEMethodBase:
+    def _make_moe_method(
+        self, moe: FusedMoEConfig, prefix: str = ""
+    ) -> FusedMoEMethodBase:
         return GptOssMxfp4MoEMethod(moe)
 
 
@@ -544,12 +570,40 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     supports_pre_processed_weights = True
 
-    def __init__(self, moe: FusedMoEConfig, activation_key: QuantKey | None = None):
+    def __init__(
+        self,
+        moe: FusedMoEConfig,
+        activation_key: QuantKey | None = None,
+        *,
+        layer_name: str = "",
+        humming_input_layer_skipped: bool | None = None,
+    ):
         super().__init__(moe)
         self.weight_dtype = "mxfp4"
         # Checkpoint-declared activation quantization. Only backends that pick
         # their activation format from the layer (Humming) consume it.
         self.activation_key = activation_key
+        self.layer_name = layer_name
+        self.humming_input_layer_skipped = humming_input_layer_skipped
+        self.humming_activation_keys = None
+        if moe.moe_backend == "humming" or (
+            moe.moe_backend == "auto" and envs.VLLM_HUMMING_INPUT_QUANT_CONFIG
+        ):
+            from vllm.model_executor.layers.quantization.utils.humming.moe import (
+                resolve_humming_moe_activation_keys,
+            )
+            from vllm.model_executor.layers.quantization.utils.humming.schema import (
+                quant_key_to_input_schema,
+            )
+            from vllm.utils.humming import BaseWeightSchema
+
+            self.humming_activation_keys = resolve_humming_moe_activation_keys(
+                layer_name,
+                BaseWeightSchema.from_config({"quant_method": "mxfp4"}),
+                moe.in_dtype,
+                layer_skipped=humming_input_layer_skipped,
+                default_input_schema=quant_key_to_input_schema(activation_key),
+            )
         self.is_k3_situ_aiter = _use_k3_situ_aiter(moe)
         self.is_k3_situ_int4_gfx942 = _use_k3_situ_int4_gfx942(moe)
         self.experts_cls: type[mk.FusedMoEExperts] | None
@@ -574,7 +628,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
         else:
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
-                moe
+                moe, humming_activation_keys=self.humming_activation_keys
             )
 
         self.max_capture_size = moe.max_capture_size
@@ -829,6 +883,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 activation=self.moe.activation,
                 use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
                 activation_key=self.activation_key,
+                humming_activation_keys=self.humming_activation_keys,
+                humming_input_layer_skipped=self.humming_input_layer_skipped,
             )
         )
 

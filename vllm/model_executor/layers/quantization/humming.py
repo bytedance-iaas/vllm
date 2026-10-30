@@ -41,6 +41,9 @@ from vllm.model_executor.layers.quantization.utils.humming import (
     select_humming_moe_experts,
     weight_schema_to_quant_key,
 )
+from vllm.model_executor.layers.quantization.utils.humming.schema import (
+    resolve_humming_moe_input_config,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
@@ -278,6 +281,7 @@ class HummingConfig(QuantizationConfig):
         if weight_schema is not None:
             input_schema = None
             force_input_schema = None
+            sublayer_input_configs: dict[str, dict[str, Any]] = {}
             allow_input_schema_fallback = True
 
             if self.full_config:
@@ -291,12 +295,19 @@ class HummingConfig(QuantizationConfig):
             if envs.VLLM_HUMMING_INPUT_QUANT_CONFIG:
                 quant_config = envs.VLLM_HUMMING_INPUT_QUANT_CONFIG.copy()
                 quant_config["quant_method"] = "humming"
-                input_config = self.get_layer_input_config(quant_config, prefix)
-                if input_config is not None:
-                    allow_input_schema_fallback = input_config.pop(
-                        "allow_fallback", False
+                parent_schema, parent_allow_fallback, resolved_sublayers = (
+                    resolve_humming_moe_input_config(
+                        quant_config,
+                        prefix,
+                        layer_skipped=self.is_layer_skipped(quant_config, prefix),
                     )
-                    force_input_schema = _hm.BaseInputSchema.from_config(input_config)
+                )
+                if layer_type == "moe":
+                    sublayer_input_configs = resolved_sublayers
+                if parent_schema is not None:
+                    assert parent_allow_fallback is not None
+                    allow_input_schema_fallback = parent_allow_fallback
+                    force_input_schema = parent_schema
                 if input_schema is None:
                     input_schema = force_input_schema
 
@@ -308,6 +319,7 @@ class HummingConfig(QuantizationConfig):
                 input_schema=input_schema,
                 force_weight_schema=force_weight_schema,
                 force_input_schema=force_input_schema,
+                sublayer_input_configs=sublayer_input_configs,
                 is_online_quant=is_online_quant,
                 allow_input_schema_fallback=allow_input_schema_fallback,
             )
@@ -349,6 +361,7 @@ class HummingLayerQuantizationConfig(HummingConfig):
         force_input_schema: "HummingInputSchema | None" = None,
         is_online_quant: bool = False,
         allow_input_schema_fallback: bool = True,
+        sublayer_input_configs: dict[str, dict[str, Any]] | None = None,
     ):
         self.weight_schema = weight_schema
         if input_schema is None:
@@ -356,6 +369,7 @@ class HummingLayerQuantizationConfig(HummingConfig):
         self.input_schema = input_schema
         self.force_weight_schema = force_weight_schema
         self.force_input_schema = force_input_schema
+        self.sublayer_input_configs = sublayer_input_configs or {}
         self.is_online_quant = is_online_quant
         self.allow_input_schema_fallback = allow_input_schema_fallback
 
@@ -647,26 +661,39 @@ class HummingMoEMethod(FusedMoEMethodBase):
         self.input_schema = quant_config.input_schema
         self.force_weight_schema = quant_config.force_weight_schema
         self.force_input_schema = quant_config.force_input_schema
+        self.sublayer_input_configs = quant_config.sublayer_input_configs
 
         # Derive QuantKeys from humming schemas.
         # Prefer force schemas (the final format after requant) over base.
         weight_key = weight_schema_to_quant_key(
             self.force_weight_schema or self.weight_schema, moe.in_dtype
         )
-        runtime_input_schema = check_and_fallback_input_schema(
-            weight_schema=self.force_weight_schema or self.weight_schema,
-            input_schema=self.force_input_schema or self.input_schema,
-            param_dtype=moe.in_dtype,
-            allow_fallback=quant_config.allow_input_schema_fallback,
-        )
-        activation_key = input_schema_to_quant_key(runtime_input_schema, moe.in_dtype)
+        base_input_schema = self.force_input_schema or self.input_schema
+        activation_keys = {}
+        for name in ("w13", "w2"):
+            config = self.sublayer_input_configs.get(name, {})
+            runtime_input_schema = check_and_fallback_input_schema(
+                weight_schema=self.force_weight_schema or self.weight_schema,
+                input_schema=config.get("input_schema", base_input_schema),
+                param_dtype=moe.in_dtype,
+                allow_fallback=config.get(
+                    "allow_input_schema_fallback",
+                    quant_config.allow_input_schema_fallback,
+                ),
+            )
+            activation_keys[name] = input_schema_to_quant_key(
+                runtime_input_schema, moe.in_dtype
+            )
 
         # Select Humming MoE experts
         self.experts_cls = select_humming_moe_experts(
             config=self.moe,
             weight_key=weight_key,
-            activation_key=activation_key,
+            activation_key=activation_keys["w13"],
+            additional_activation_keys=(activation_keys["w2"],),
         )
+        if self.experts_cls is None:
+            raise ValueError("No Humming MoE backend supports both W13 and W2 inputs")
 
     def prepare_weight_loader(self, layer, weight_loader):
         def new_weight_loader(
@@ -780,6 +807,9 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 ),
             },
         }
+
+        for name, config in self.sublayer_input_configs.items():
+            layer.sublayer_configs[name].update(config)
 
         for sublayer_name, configs in layer.sublayer_configs.items():
             for name, attrs in configs["tensors_attrs"].items():

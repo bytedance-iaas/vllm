@@ -392,7 +392,12 @@ class DeepseekV4HeterogeneousSharedRoutedExperts(RoutedExperts):
         quant_method = super()._get_quant_method(prefix, quant_config, moe_config)
         if not isinstance(quant_method, Mxfp4MoEMethod):
             raise ValueError("Heterogeneous fusion requires MXFP4 routed experts.")
-        return DeepseekV4HeterogeneousMxfp4MoEMethod(moe_config)
+        return DeepseekV4HeterogeneousMxfp4MoEMethod(
+            moe_config,
+            activation_key=quant_method.activation_key,
+            layer_name=quant_method.layer_name,
+            humming_input_layer_skipped=quant_method.humming_input_layer_skipped,
+        )
 
     @torch.no_grad()
     def prepare_heterogeneous_shared_expert(self) -> None:
