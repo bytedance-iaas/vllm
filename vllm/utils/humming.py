@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from humming.config import InputQuantizationMode as InputQuantizationMode
     from humming.config import LayerConfig as LayerConfig
     from humming.config import MmaType as MmaType
+    from humming.config import TuningConfig as TuningConfig
     from humming.config import WeightScale2Type as WeightScale2Type
     from humming.config import WeightScaleType as WeightScaleType
     from humming.dtypes import DataType as DataType
@@ -69,6 +70,7 @@ _EXPORTS: dict[str, str] = {
     "WeightScale2Type": "humming.config:WeightScale2Type",
     "InputQuantizationMode": "humming.config:InputQuantizationMode",
     "MmaType": "humming.config:MmaType",
+    "TuningConfig": "humming.config:TuningConfig",
     "humming_forward": "humming.forward:humming_forward",
     "may_process_input": "humming.forward:may_process_input",
     "process_input": "humming.ops:process_input",
