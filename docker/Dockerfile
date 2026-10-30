@@ -1422,7 +1422,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${BYTEIAAS_BUILD_ROUTER}" = "true" ]; then \
         mkdir -p /opt/byteiaas/provenance; \
         (cd /tmp/byteiaas-router-dist && sha256sum --check --strict /tmp/byteiaas-router-wheels.sha256); \
+        uv pip freeze --system > /tmp/byteiaas-router-constraints.txt; \
+        uv pip install --system -c /tmp/byteiaas-router-constraints.txt \
+            setproctitle aiohttp orjson uvicorn fastapi "requests>=2.25.0"; \
         uv pip install --system --no-deps --reinstall /tmp/byteiaas-router-dist/*.whl; \
+        rm /tmp/byteiaas-router-constraints.txt; \
         python3 /opt/byteiaas/tools/router_wheel.py verify \
             --manifest /tmp/byteiaas-router-dist/router-manifest.json \
             --report /opt/byteiaas/provenance/router-installed.json; \
