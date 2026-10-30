@@ -1695,12 +1695,14 @@ class MooncakeConnectorWorker:
             return
         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
             if transfer_id not in self.reqs_need_send:
-                # This req is not enqueued in P side yet, create it here.
                 self.reqs_need_send[transfer_id] = SendBlockMeta(
                     p_req_id="",
                     transfer_id=transfer_id,
                     local_block_ids=[],
                     ready=asyncio.Event(),
+                    expire_time=(
+                        time.perf_counter() + envs.VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT
+                    ),
                 )
             send_meta = self.reqs_need_send[transfer_id]
             pending_reqs[d_req_id] = send_meta
@@ -1711,45 +1713,60 @@ class MooncakeConnectorWorker:
             await send_meta.ready.wait()
             return d_req_id, send_meta
 
-        wait_tasks = [
-            asyncio.create_task(wait_and_ret(d_req_id, send_meta))
+        wait_tasks = {
+            d_req_id: asyncio.create_task(wait_and_ret(d_req_id, send_meta))
             for d_req_id, send_meta in pending_reqs.items()
-        ]
+        }
+        wait_deadline = time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
 
         while wait_tasks:
-            done, pending = await asyncio.wait(
-                wait_tasks,
-                timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+            min_expiry = min(
+                send_meta.expire_time for send_meta in pending_reqs.values()
+            )
+            wait_timeout = max(0, min(wait_deadline, min_expiry) - time.perf_counter())
+            done, _ = await asyncio.wait(
+                wait_tasks.values(),
+                timeout=wait_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
             if not done:
-                # Timeout, abort all pending requests.
-                for task in wait_tasks:
-                    task.cancel()
-                logger.warning(
-                    "Timeout waiting for P side ready: %s", list(pending_reqs)
-                )
+                now = time.perf_counter()
+                expired_reqs = [
+                    d_req_id
+                    for d_req_id, send_meta in pending_reqs.items()
+                    if min(wait_deadline, send_meta.expire_time) <= now
+                ]
+                if not expired_reqs:
+                    continue
+                for d_req_id in expired_reqs:
+                    wait_tasks.pop(d_req_id).cancel()
+                    send_meta = pending_reqs.pop(d_req_id)
+                    if (
+                        not send_meta.p_req_id
+                        and self.reqs_need_send.get(send_meta.transfer_id) is send_meta
+                    ):
+                        self.reqs_need_send.pop(send_meta.transfer_id, None)
+                logger.warning("Timeout waiting for P side ready: %s", expired_reqs)
                 response = MooncakeXferResponse(
-                    status=MooncakeXferResponseStatus.FINISH,
-                    err_reqs=list(pending_reqs),
+                    status=(
+                        MooncakeXferResponseStatus.CONTINUE
+                        if wait_tasks
+                        else MooncakeXferResponseStatus.FINISH
+                    ),
+                    err_reqs=expired_reqs,
                     err_msg="Timeout waiting for P side ready.",
                 )
                 await sock.send_multipart((identity, self._encoder.encode(response)))
-                break
+                continue
 
-            wait_tasks = list(pending)
-            response_status = (
-                MooncakeXferResponseStatus.CONTINUE
-                if wait_tasks
-                else MooncakeXferResponseStatus.FINISH
-            )
             ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
             for task in done:
                 d_req_id, send_meta = task.result()
+                wait_tasks.pop(d_req_id)
                 del pending_reqs[d_req_id]
                 # Do we still in reqs_need_send (not expired)?
-                if send_meta.transfer_id in self.reqs_need_send:
+                if self.reqs_need_send.get(send_meta.transfer_id) is send_meta:
                     # Mark it sending to avoid expiration.
                     send_meta.sending += 1
                     if not send_meta.need_send:
@@ -1763,6 +1780,11 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
+            response_status = (
+                MooncakeXferResponseStatus.CONTINUE
+                if wait_tasks
+                else MooncakeXferResponseStatus.FINISH
+            )
             (
                 src_ptrs,
                 dst_ptrs,
@@ -1826,6 +1848,9 @@ class MooncakeConnectorWorker:
                 err_msg=err_msg,
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
+            wait_deadline = (
+                time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+            )
 
     def resolve_need_send(
         self,
@@ -2407,11 +2432,9 @@ class MooncakeConnectorWorker:
 
         expired_transfer_id = []
         for transfer_id, send_meta in self.reqs_need_send.items():
-            if (
-                send_meta.p_req_id
-                and send_meta.expire_time < now
-                and send_meta.sending == 0
-            ):
+            if send_meta.sending != 0:
+                continue
+            if send_meta.p_req_id and send_meta.expire_time < now:
                 logger.warning(
                     "Request %s timed out after %d seconds without "
                     "being sent. Freeing its blocks on the producer side.",
@@ -2420,6 +2443,13 @@ class MooncakeConnectorWorker:
                 )
                 self.xfer_stats.record_kv_expired_req()
                 finished_sending_reqs.add(send_meta.p_req_id)
+                expired_transfer_id.append(transfer_id)
+            elif not send_meta.p_req_id and send_meta.expire_time < now:
+                logger.warning(
+                    "Ownerless transfer %s expired after %d seconds.",
+                    transfer_id,
+                    envs.VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT,
+                )
                 expired_transfer_id.append(transfer_id)
 
         for transfer_id in expired_transfer_id:
@@ -2775,9 +2805,13 @@ class MooncakeConnectorWorker:
                         local_block_ids=[],
                         ready=asyncio.Event(),
                     )
+                elif not self.reqs_need_send[transfer_id].p_req_id:
+                    send_meta = self.reqs_need_send[transfer_id]
+                    send_meta.p_req_id = p_req_id
+                    send_meta.expire_time = float("inf")
         for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id)
-            if send_meta:
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
