@@ -61,8 +61,23 @@
     "MOONCAKE_GIT_COMMIT": {
       "default": "ffd73707e9dbfe0997053f3d82eab86d1568337e"
     },
+    "BYTEIAAS_BUILD_ARTIFACTS": {
+      "default": "false"
+    },
+    "BYTEIAAS_DEEPGEMM_SOURCE": {
+      "default": "byteiaas-deepgemm-empty"
+    },
+    "BYTEIAAS_DEEPGEMM_WHEEL_SOURCE": {
+      "default": "byteiaas-deepgemm-empty"
+    },
     "BYTEIAAS_MOONCAKE_WHEEL_SOURCE": {
       "default": "mooncake-empty"
+    },
+    "BYTEIAAS_VLLM_ROUTER_SOURCE": {
+      "default": "vllm-router-build"
+    },
+    "BYTEIAAS_BUILD_ARTIFACTS_SOURCE": {
+      "default": "byteiaas-wheel-artifacts"
     },
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
@@ -110,10 +125,16 @@
       "default": "cuda"
     },
     "DEEPEP_COMMIT_HASH": {
-      "default": "d4f41e4e93"
+      "default": "d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb"
+    },
+    "NVSHMEM_VER": {
+      "default": "3.3.24"
     },
     "GIT_REPO_CHECK": {
       "default": "0"
+    },
+    "VLLM_BUILD_COMMIT": {
+      "default": "unknown"
     },
     "VLLM_MAX_SIZE_MB": {
       "default": "500"
@@ -149,6 +170,9 @@
       "default": "https://github.com/vllm-project/vllm"
     },
     "BYTEIAAS_REQUIRE_SOURCE_MOONCAKE": {
+      "default": "false"
+    },
+    "BYTEIAAS_REQUIRE_SOURCE_DEEPGEMM": {
       "default": "false"
     }
   }

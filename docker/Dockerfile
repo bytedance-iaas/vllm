@@ -78,7 +78,12 @@ ARG VLLM_ROUTER_GIT_COMMIT=ef339bc73a04872dc7999aebf761c5f86263af64
 ARG MOONCAKE_GIT_REPOSITORY=https://github.com/wangyicong52/Mooncake.git
 ARG MOONCAKE_GIT_REF=vllm-dsv4.1
 ARG MOONCAKE_GIT_COMMIT=ffd73707e9dbfe0997053f3d82eab86d1568337e
+ARG BYTEIAAS_BUILD_ARTIFACTS=false
+ARG BYTEIAAS_DEEPGEMM_SOURCE=byteiaas-deepgemm-empty
+ARG BYTEIAAS_DEEPGEMM_WHEEL_SOURCE=byteiaas-deepgemm-empty
 ARG BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-empty
+ARG BYTEIAAS_VLLM_ROUTER_SOURCE=vllm-router-build
+ARG BYTEIAAS_BUILD_ARTIFACTS_SOURCE=byteiaas-wheel-artifacts
 
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
@@ -376,11 +381,9 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
 
 #################### RUST BUILD IMAGE ####################
-# Build the Rust frontend (`vllm-rs`) in a dedicated stage so the main wheel
-# build stage doesn't need the rust toolchain or the rust source.
-# This stage reuses the Python environment from base and runs in parallel with
-# csrc-build/extensions-build.
-FROM base AS rust-build-cache
+# Keep source-independent Rust tooling separate so image-only builds can
+# compile tokenizers without rebuilding the vLLM Rust frontend.
+FROM base AS rust-toolchain
 ARG USE_SCCACHE
 ARG SCCACHE_ENDPOINT
 
@@ -395,10 +398,28 @@ COPY requirements/build/rust.txt requirements/build/rust.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --python /opt/venv/bin/python3 -r requirements/build/rust.txt
 
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN set -eux; \
+    rustup_installer="$(mktemp)"; \
+    trap 'rm -f "${rustup_installer}"' EXIT; \
+    curl --retry 5 --retry-all-errors --retry-delay 2 \
+        --retry-max-time 120 --connect-timeout 20 \
+        --proto '=https' --tlsv1.2 -sSf \
+        -o "${rustup_installer}" https://sh.rustup.rs; \
+    sh "${rustup_installer}" -y --default-toolchain none; \
+    . /root/.cargo/env; \
+    toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"; \
+    test -n "${toolchain}"; \
+    rustup toolchain install "${toolchain}"
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Build the Rust frontend (`vllm-rs`) in a dedicated stage so the main wheel
+# build stage doesn't need the rust toolchain or the rust source.
+FROM rust-toolchain AS rust-build-cache
+
 # Copy only the Rust build inputs; build_rust.sh publishes artifacts needed
 # by the wheel build stage.
 COPY rust rust
-COPY rust-toolchain.toml rust-toolchain.toml
 COPY tools/build_rust.py tools/build_rust.py
 COPY build_rust.sh build_rust.sh
 
@@ -435,7 +456,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 #################### RUST BUILD IMAGE ####################
 
 #################### TOKENIZERS BUILD IMAGE ####################
-FROM rust-build AS tokenizers-build
+FROM rust-toolchain AS tokenizers-build
 ARG TOKENIZERS_GIT_REPOSITORY
 ARG TOKENIZERS_GIT_REF
 ARG TOKENIZERS_GIT_COMMIT
@@ -470,7 +491,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 #################### TOKENIZERS BUILD IMAGE ####################
 
 #################### VLLM ROUTER BUILD IMAGE ####################
-FROM rust-build AS vllm-router-build
+FROM rust-toolchain AS vllm-router-build
 ARG INSTALL_VLLM_ROUTER
 ARG VLLM_ROUTER_GIT_REPOSITORY
 ARG VLLM_ROUTER_GIT_REF
@@ -487,6 +508,10 @@ RUN mkdir -p /tmp/vllm-router-dist \
             "auditwheel==6.5.0" \
             "build==1.3.0" \
             "patchelf==0.17.2.4"; \
+    else \
+        printf '%s\n' disabled > /tmp/vllm-router-dist/build-state; \
+        (cd /tmp/vllm-router-dist \
+            && sha256sum build-state > wheels.sha256); \
     fi
 
 WORKDIR /tmp/vllm-router-src
@@ -533,7 +558,67 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         auditwheel show "$1"; \
         sha256sum "$1" > /tmp/vllm-router-dist/wheels.sha256; \
     fi
+RUN printf '%s\n' \
+        "repository=${VLLM_ROUTER_GIT_REPOSITORY}" \
+        "ref=${VLLM_ROUTER_GIT_REF}" \
+        "commit=${VLLM_ROUTER_GIT_COMMIT}" \
+        > /tmp/vllm-router-dist/source.env
+
+FROM ${BYTEIAAS_VLLM_ROUTER_SOURCE} AS vllm-router-source
 #################### VLLM ROUTER BUILD IMAGE ####################
+
+#################### DEEPGEMM WHEEL BUILD IMAGE ####################
+FROM base AS byteiaas-deepgemm-checkout
+ARG DEEPGEMM_GIT_REPOSITORY
+ARG DEEPGEMM_GIT_COMMIT
+ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE
+
+WORKDIR /workspace/byteiaas-deepgemm-source
+RUN set -eux; \
+    test -n "${DEEPGEMM_GIT_REPOSITORY}"; \
+    test "${#DEEPGEMM_GIT_COMMIT}" -eq 40; \
+    case "${DEEPGEMM_GIT_COMMIT}" in *[!0-9a-f]*) exit 1;; esac; \
+    git init .; \
+    git remote add origin "${DEEPGEMM_GIT_REPOSITORY}"; \
+    git fetch --no-tags --depth 1 origin "${DEEPGEMM_GIT_COMMIT}"; \
+    test "$(git rev-parse FETCH_HEAD)" = "${DEEPGEMM_GIT_COMMIT}"; \
+    git checkout --detach FETCH_HEAD; \
+    git submodule update --init --recursive --depth 1
+
+COPY tools/check_deepgemm_source.py /workspace/check_deepgemm_source.py
+RUN if [ "${DEEPGEMM_REQUIRE_SM90_MEGA_MOE}" = "ON" ]; then \
+        python3 /workspace/check_deepgemm_source.py .; \
+    fi
+
+FROM byteiaas-deepgemm-checkout AS byteiaas-deepgemm-build
+RUN --mount=type=cache,target=/opt/uv/cache \
+    set -eux; \
+    rm -rf build dist *.egg-info; \
+    DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 \
+        python3 setup.py bdist_wheel \
+            --dist-dir /workspace/byteiaas-deepgemm-dist; \
+    set -- /workspace/byteiaas-deepgemm-dist/*.whl; \
+    test "$#" -eq 1; \
+    (cd /workspace/byteiaas-deepgemm-dist && \
+        sha256sum ./*.whl > wheels.sha256); \
+    printf '%s\n' \
+        "repository=${DEEPGEMM_GIT_REPOSITORY}" \
+        "commit=${DEEPGEMM_GIT_COMMIT}" \
+        > /workspace/byteiaas-deepgemm-dist/source.env
+
+FROM base AS byteiaas-deepgemm-empty
+RUN set -eux; \
+    mkdir -p \
+        /workspace/byteiaas-deepgemm-source \
+        /workspace/byteiaas-deepgemm-dist; \
+    printf '%s\n' disabled \
+        > /workspace/byteiaas-deepgemm-dist/build-state; \
+    (cd /workspace/byteiaas-deepgemm-dist \
+        && sha256sum build-state > wheels.sha256)
+
+FROM ${BYTEIAAS_DEEPGEMM_SOURCE} AS byteiaas-deepgemm-source
+FROM ${BYTEIAAS_DEEPGEMM_WHEEL_SOURCE} AS byteiaas-deepgemm-wheel-source
+#################### DEEPGEMM WHEEL BUILD IMAGE ####################
 
 #################### MOONCAKE BUILD IMAGE ####################
 FROM base AS mooncake-build
@@ -623,13 +708,21 @@ RUN set -eux; \
         > /tmp/mooncake-dist/source.env
 
 FROM base AS mooncake-empty
-RUN mkdir -p /tmp/mooncake-dist
+RUN set -eux; \
+    mkdir -p /tmp/mooncake-dist; \
+    printf '%s\n' disabled > /tmp/mooncake-dist/build-state; \
+    (cd /tmp/mooncake-dist \
+        && sha256sum build-state > wheel.sha256)
 
 FROM ${BYTEIAAS_MOONCAKE_WHEEL_SOURCE} AS mooncake-wheel-source
 #################### MOONCAKE BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
+ARG BYTEIAAS_BUILD_ARTIFACTS
+COPY --from=byteiaas-deepgemm-source \
+    /workspace/byteiaas-deepgemm-source \
+    /workspace/byteiaas-deepgemm-source
 
 ARG INSTALL_RUBIN_PRERELEASE
 ARG PIP_INDEX_URL UV_INDEX_URL
@@ -729,6 +822,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" \
         && export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION}" \
         && export VLLM_DOCKER_BUILD_CONTEXT=1 \
+        && if [ "${BYTEIAAS_BUILD_ARTIFACTS}" = "true" ]; then \
+            export DEEPGEMM_SRC_DIR=/workspace/byteiaas-deepgemm-source; \
+        fi \
         && export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) \
         && sccache --show-stats \
         && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
@@ -747,6 +843,9 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" && \
         export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" && \
         export VLLM_DOCKER_BUILD_CONTEXT=1 && \
+        if [ "${BYTEIAAS_BUILD_ARTIFACTS}" = "true" ]; then \
+            export DEEPGEMM_SRC_DIR=/workspace/byteiaas-deepgemm-source; \
+        fi && \
         export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) && \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
@@ -774,8 +873,8 @@ WORKDIR /workspace
 # Build DeepEP wheels
 COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
-ARG DEEPEP_COMMIT_HASH=d4f41e4e93
-ARG NVSHMEM_VER
+ARG DEEPEP_COMMIT_HASH=d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
+ARG NVSHMEM_VER=3.3.24
 ARG NCCL_VERSION
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
@@ -805,7 +904,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         --mode wheel \
         ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
         ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete && \
+    printf '%s\n' \
+        "repository=https://github.com/deepseek-ai/DeepEP" \
+        "commit=${DEEPEP_COMMIT_HASH}" \
+        "nvshmem_version=${NVSHMEM_VER}" \
+        "nccl_version=${NCCL_VERSION}" \
+        "cuda_version=${CUDA_VERSION}" \
+        > /tmp/ep_kernels_workspace/dist/source.env
 
 # Build Triton from source when a repository is configured. Triton 3.8 pins
 # ptxas-blackwell 13.3, which cannot assemble SM107. Rubin CUDA 13.4 and 13.5
@@ -946,10 +1052,14 @@ RUN sha256sum dist/*.whl > dist/wheel.sha256
 
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
+COPY --from=extensions-build /tmp/triton_from_source_workspace/dist /tmp/triton_from_source_workspace/dist
 
 # Record the EP kernels wheel checksum for the same cache-busting purpose.
 RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
     > /tmp/ep_kernels_workspace/dist/wheels.sha256
+
+ARG VLLM_BUILD_COMMIT=unknown
+RUN printf '%s\n' "${VLLM_BUILD_COMMIT}" > /source-commit
 
 # Check the size of the CUDA 13 wheel uploaded to PyPI
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
@@ -965,6 +1075,17 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
     fi
 
 #################### WHEEL BUILD IMAGE ####################
+
+FROM build AS byteiaas-wheel-artifacts
+COPY --from=mooncake-wheel-source \
+    /tmp/mooncake-dist /tmp/mooncake-dist
+COPY --from=byteiaas-deepgemm-wheel-source \
+    /workspace/byteiaas-deepgemm-dist \
+    /workspace/byteiaas-deepgemm-dist
+COPY --from=vllm-router-source \
+    /tmp/vllm-router-dist /tmp/vllm-router-dist
+
+FROM ${BYTEIAAS_BUILD_ARTIFACTS_SOURCE} AS vllm-build-artifacts
 
 #################### DEV IMAGE ####################
 FROM base AS dev
@@ -1372,8 +1493,8 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 # install layer. The wheel itself is bind-mounted below and never enters the
 # image. Without this the bind mount is not part of the layer cache key, so a
 # warm BuildKit agent can skip the install and ship a stale wheel.
-COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
-RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+COPY --from=vllm-build-artifacts /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv_extra_index_args="" \
     && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
@@ -1404,8 +1525,8 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 # Install EP kernels wheels (DeepEP) that have been built in the `build` stage.
 # As with the vLLM wheel above, copy only the checksum to bust the layer cache
 # and bind-mount the wheel for the actual install to keep it out of the image.
-COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
-RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
+COPY --from=vllm-build-artifacts /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv_extra_index_args="" \
     && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
@@ -1508,8 +1629,8 @@ ARG PYTORCH_NIGHTLY
 # Install vLLM and EP kernel wheels after the stable test dependencies so
 # source-only changes do not invalidate the dependency layers above.
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
-COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
-RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+COPY --from=vllm-build-artifacts /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv_extra_index_args="" \
     && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
@@ -1533,8 +1654,8 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
-RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
+COPY --from=vllm-build-artifacts /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv_extra_index_args="" \
     && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
@@ -1590,6 +1711,9 @@ ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
 ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
 ARG BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=false
+ARG BYTEIAAS_REQUIRE_SOURCE_DEEPGEMM=false
+ARG DEEPGEMM_GIT_REPOSITORY
+ARG DEEPGEMM_GIT_COMMIT
 ARG MOONCAKE_GIT_REPOSITORY
 ARG MOONCAKE_GIT_REF
 ARG MOONCAKE_GIT_COMMIT
@@ -1634,8 +1758,26 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         fi; \
     fi
 
-# ByteIAAS installs Mooncake from the pinned source build above. Generic
-# Docker builds retain the public dependency behavior.
+# ByteIAAS installs DeepGEMM and Mooncake from the wheel job. Generic Docker
+# builds retain the vendored/public dependency behavior.
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/workspace/byteiaas-deepgemm-dist,target=/tmp/deepgemm-dist,ro \
+    --mount=type=cache,target=/opt/uv/cache \
+    set -eux; \
+    set -- /tmp/deepgemm-dist/deep_gemm-*.whl; \
+    if [ "${BYTEIAAS_REQUIRE_SOURCE_DEEPGEMM}" = "true" ]; then \
+        test "$#" -eq 1; \
+        test -f "$1"; \
+        test "$(sed -n 's/^repository=//p' /tmp/deepgemm-dist/source.env)" = \
+            "${DEEPGEMM_GIT_REPOSITORY}"; \
+        test "$(sed -n 's/^commit=//p' /tmp/deepgemm-dist/source.env)" = \
+            "${DEEPGEMM_GIT_COMMIT}"; \
+        (cd /tmp/deepgemm-dist \
+            && sha256sum --check --strict wheels.sha256); \
+        uv pip install --system --no-deps --force-reinstall "$1"; \
+        python3 -c \
+            'from importlib.metadata import distribution; dist = distribution("deep_gemm"); source = dist.locate_file("deep_gemm/__init__.py").read_text(); assert "fp8_mega_moe" in source; print(dist.version)'; \
+    fi
+
 RUN --mount=type=bind,from=mooncake-wheel-source,src=/tmp/mooncake-dist,target=/tmp/mooncake-dist,ro \
     --mount=type=cache,target=/opt/uv/cache \
     set -eux; \
@@ -1677,12 +1819,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 # Install source-built Triton last so dependency resolution cannot restore the
 # previously installed version.
-COPY --from=extensions-build \
+COPY --from=vllm-build-artifacts \
     /tmp/triton_from_source_workspace/dist/wheel.sha256 \
     /tmp/triton-source-wheel.sha256
 COPY tools/install_triton_from_source.sh /tmp/install_triton_from_source.sh
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=extensions-build,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
+    --mount=type=bind,from=vllm-build-artifacts,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
     if [ -n "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
         CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2); \
         if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
@@ -1710,9 +1852,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         /tmp/triton-source-wheel.sha256
 
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=vllm-router-build,src=/tmp/vllm-router-dist,target=/tmp/vllm-router-dist,ro \
+    --mount=type=bind,from=vllm-router-source,src=/tmp/vllm-router-dist,target=/tmp/vllm-router-dist,ro \
     if [ "${INSTALL_VLLM_ROUTER}" = "true" ]; then \
-        sha256sum --check --strict /tmp/vllm-router-dist/wheels.sha256 && \
+        (cd /tmp/vllm-router-dist && \
+            sha256sum --check --strict wheels.sha256) && \
         set -- /tmp/vllm-router-dist/*.whl && \
         test "$#" -eq 1 && \
         test -f "$1" && \
@@ -1752,6 +1895,8 @@ LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
+      ai.vllm.deepgemm.repository="${DEEPGEMM_GIT_REPOSITORY}" \
+      ai.vllm.deepgemm.commit="${DEEPGEMM_GIT_COMMIT}" \
       ai.vllm.tokenizers.commit="${TOKENIZERS_GIT_COMMIT}" \
       ai.vllm.router.repository="${VLLM_ROUTER_GIT_REPOSITORY}" \
       ai.vllm.router.ref="${VLLM_ROUTER_GIT_REF}" \

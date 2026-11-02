@@ -13,7 +13,7 @@ on:
         type: string
         default: "13.0.3"
       artifact_name:
-        description: "Uploaded wheel artifact name"
+        description: "Uploaded same-run build artifact name"
         required: false
         type: string
         default: "vllm-cu130-wheel"
@@ -42,6 +42,18 @@ jobs:
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: 09f5008a04e4184b6e8e5da7d70c57c38aa91fac
+      BYTEIAAS_DEEPEP_GIT_REPOSITORY: https://github.com/deepseek-ai/DeepEP
+      BYTEIAAS_DEEPEP_GIT_COMMIT: d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
+      BYTEIAAS_NVSHMEM_VERSION: 3.3.24
+      BYTEIAAS_NCCL_VERSION: 2.30.7
+      BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY: https://github.com/wangyicong52/router.git
+      BYTEIAAS_VLLM_ROUTER_GIT_REF: dev/dsv4.1-flash
+      BYTEIAAS_VLLM_ROUTER_GIT_COMMIT: ef339bc73a04872dc7999aebf761c5f86263af64
+      BYTEIAAS_MOONCAKE_GIT_REPOSITORY: https://github.com/wangyicong52/Mooncake.git
+      BYTEIAAS_MOONCAKE_GIT_REF: vllm-dsv4.1
+      BYTEIAAS_MOONCAKE_GIT_COMMIT: ffd73707e9dbfe0997053f3d82eab86d1568337e
+      BYTEIAAS_MOONCAKE_CMAKE_JOBS: "8"
+      BYTEIAAS_MOONCAKE_EXTENSION_JOBS: "2"
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
     steps:
       - name: Validate immutable checkout ref
@@ -73,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "1"
+          test "$(cat .github/byteiaas-build-contract)" = "2"
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
@@ -106,6 +118,8 @@ jobs:
 
           echo "Using build parallelism: max_jobs=${build_max_jobs}, nvcc_threads=${build_nvcc_threads}, cpus=${build_cpus}"
           echo "DeepGEMM source: ${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}@${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
+          echo "vLLM Router source: ${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY} ${BYTEIAAS_VLLM_ROUTER_GIT_REF}@${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
+          echo "Mooncake source: ${BYTEIAAS_MOONCAKE_GIT_REPOSITORY} ${BYTEIAAS_MOONCAKE_GIT_REF}@${BYTEIAAS_MOONCAKE_GIT_COMMIT}"
           echo "Docker root: $(docker info --format '{{.DockerRootDir}}')"
           df -h /data /data/docker /data/buildkit || true
           mkdir -p "${cache_root}"
@@ -126,7 +140,7 @@ jobs:
             --builder "${BUILDX_BUILDER}" \
             "${cache_args[@]}" \
             --load \
-            --target build \
+            --target byteiaas-wheel-artifacts \
             --network=host \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}" \
@@ -140,6 +154,23 @@ jobs:
             --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
             --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
             --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON \
+            --build-arg DEEPEP_COMMIT_HASH="${BYTEIAAS_DEEPEP_GIT_COMMIT}" \
+            --build-arg NVSHMEM_VER="${BYTEIAAS_NVSHMEM_VERSION}" \
+            --build-arg NCCL_VERSION="${BYTEIAAS_NCCL_VERSION}" \
+            --build-arg BYTEIAAS_BUILD_ARTIFACTS=true \
+            --build-arg BYTEIAAS_DEEPGEMM_SOURCE=byteiaas-deepgemm-checkout \
+            --build-arg BYTEIAAS_DEEPGEMM_WHEEL_SOURCE=byteiaas-deepgemm-build \
+            --build-arg INSTALL_VLLM_ROUTER=true \
+            --build-arg VLLM_ROUTER_GIT_REPOSITORY="${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY}" \
+            --build-arg VLLM_ROUTER_GIT_REF="${BYTEIAAS_VLLM_ROUTER_GIT_REF}" \
+            --build-arg VLLM_ROUTER_GIT_COMMIT="${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}" \
+            --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-build \
+            --build-arg MOONCAKE_GIT_REPOSITORY="${BYTEIAAS_MOONCAKE_GIT_REPOSITORY}" \
+            --build-arg MOONCAKE_GIT_REF="${BYTEIAAS_MOONCAKE_GIT_REF}" \
+            --build-arg MOONCAKE_GIT_COMMIT="${BYTEIAAS_MOONCAKE_GIT_COMMIT}" \
+            --build-arg MOONCAKE_CMAKE_JOBS="${BYTEIAAS_MOONCAKE_CMAKE_JOBS}" \
+            --build-arg MOONCAKE_EXTENSION_JOBS="${BYTEIAAS_MOONCAKE_EXTENSION_JOBS}" \
+            --build-arg VLLM_BUILD_COMMIT="${{ inputs.checkout_ref }}" \
             --build-arg max_jobs="${build_max_jobs}" \
             --build-arg nvcc_threads="${build_nvcc_threads}" \
             --build-arg HTTP_PROXY="${HTTP_PROXY}" \
@@ -163,22 +194,87 @@ jobs:
             rm -rf "${cache_old}"
           fi
 
-      - name: Copy wheels from build stage
+      - name: Copy same-run build artifacts
         run: |
           set -euo pipefail
-          rm -rf byteiaas-wheel-dist
-          mkdir -p byteiaas-wheel-dist
+          rm -rf byteiaas-build-artifacts
+          mkdir -p \
+            byteiaas-build-artifacts/workspace \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace \
+            byteiaas-build-artifacts/tmp/triton_from_source_workspace
           container="$(docker create "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}")"
           trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
-          docker cp "${container}:/workspace/dist/." byteiaas-wheel-dist/
-          ls -lh byteiaas-wheel-dist
-          test -n "$(find byteiaas-wheel-dist -maxdepth 1 -name '*.whl' -print -quit)"
+          docker cp "${container}:/source-commit" \
+            byteiaas-build-artifacts/
+          docker cp "${container}:/workspace/dist" \
+            byteiaas-build-artifacts/workspace/
+          docker cp "${container}:/workspace/byteiaas-deepgemm-dist" \
+            byteiaas-build-artifacts/workspace/
+          docker cp "${container}:/tmp/ep_kernels_workspace/dist" \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/
+          docker cp "${container}:/tmp/triton_from_source_workspace/dist" \
+            byteiaas-build-artifacts/tmp/triton_from_source_workspace/
+          docker cp "${container}:/tmp/mooncake-dist" \
+            byteiaas-build-artifacts/tmp/
+          docker cp "${container}:/tmp/vllm-router-dist" \
+            byteiaas-build-artifacts/tmp/
+
+          test "$(cat byteiaas-build-artifacts/source-commit)" = \
+            "${{ inputs.checkout_ref }}"
+          (
+            cd byteiaas-build-artifacts/workspace/dist
+            sha256sum ./*.whl > wheel.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist
+            sha256sum ./*.whl > wheels.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist
+            sha256sum ./*.whl > wheels.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/triton_from_source_workspace/dist
+            shopt -s nullglob
+            triton_wheels=(./triton-*.whl)
+            if [ "${#triton_wheels[@]}" -eq 1 ]; then
+              test ! -e build-state
+              sha256sum "${triton_wheels[@]}" > wheel.sha256
+            else
+              test "${#triton_wheels[@]}" -eq 0
+              test "$(cat build-state)" = disabled
+              sha256sum build-state > wheel.sha256
+            fi
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/mooncake-dist
+            sha256sum ./*.whl > wheel.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/vllm-router-dist
+            sha256sum ./*.whl > wheels.sha256
+          )
+
+          test "$(find byteiaas-build-artifacts/workspace/dist \
+            -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test "$(find \
+            byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist \
+            -maxdepth 1 -name 'deep_gemm-*.whl' | wc -l)" -eq 1
+          test "$(find \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist \
+            -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test "$(find byteiaas-build-artifacts/tmp/mooncake-dist \
+            -maxdepth 1 -name 'mooncake_transfer_engine_cuda13-*.whl' \
+            | wc -l)" -eq 1
+          test "$(find byteiaas-build-artifacts/tmp/vllm-router-dist \
+            -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          find byteiaas-build-artifacts -maxdepth 4 -type f -print
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact_name }}
-          path: byteiaas-wheel-dist/*.whl
+          path: byteiaas-build-artifacts/
           if-no-files-found: error
           retention-days: 14
 

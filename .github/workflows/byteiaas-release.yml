@@ -72,8 +72,8 @@ jobs:
             exit 1
           fi
           contract="$(git show "${checkout_sha}:.github/byteiaas-build-contract")"
-          if [ "${contract}" != "1" ]; then
-            echo "::error::Release tag lacks ByteIAAS build contract 1"
+          if [ "${contract}" != "2" ]; then
+            echo "::error::Release tag lacks ByteIAAS build contract 2"
             exit 1
           fi
           python3 scripts/ci/get_byteiaas_image_tag.py \
@@ -97,13 +97,16 @@ jobs:
 
   build-image:
     if: github.repository == 'bytedance-iaas/vllm'
-    needs: resolve-release
+    needs:
+      - resolve-release
+      - build-wheel
     uses: ./.github/workflows/_byteiaas-build-and-publish-image.yml
     with:
       checkout_ref: ${{ needs.resolve-release.outputs.checkout_sha }}
       cuda_version: "13.0.3"
       tag_mode: release
       tag_value: ${{ needs.resolve-release.outputs.internal_tag }}
+      wheel_artifact_name: vllm-cu130-wheel-release-${{ needs.resolve-release.outputs.internal_tag }}
       image_formats: ${{ github.event_name == 'workflow_dispatch' && inputs.image_formats || 'oci,zstd,nydus' }}
     secrets:
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}

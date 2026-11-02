@@ -31,6 +31,10 @@ on:
         required: false
         type: string
         default: "oci,zstd,nydus"
+      wheel_artifact_name:
+        description: "Same-run ByteIAAS build artifact"
+        required: true
+        type: string
     secrets:
       VOLCENGINE_CR_USERNAME:
         required: true
@@ -66,6 +70,10 @@ jobs:
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
       BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
       BYTEIAAS_DEEPGEMM_GIT_COMMIT: 09f5008a04e4184b6e8e5da7d70c57c38aa91fac
+      BYTEIAAS_DEEPEP_GIT_REPOSITORY: https://github.com/deepseek-ai/DeepEP
+      BYTEIAAS_DEEPEP_GIT_COMMIT: d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
+      BYTEIAAS_NVSHMEM_VERSION: 3.3.24
+      BYTEIAAS_NCCL_VERSION: 2.30.7
       BYTEIAAS_TOKENIZERS_GIT_REPOSITORY: https://github.com/wangyicong52/tokenizers.git
       BYTEIAAS_TOKENIZERS_GIT_REF: vllm
       BYTEIAAS_TOKENIZERS_GIT_COMMIT: 441393c720fbd27a4faea02b7af18ebe08a65a01
@@ -117,7 +125,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "1"
+          test "$(cat .github/byteiaas-build-contract)" = "2"
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
@@ -130,6 +138,104 @@ jobs:
             echo "::error::tag_value is required in release mode"
             exit 1
           fi
+
+      - name: Download same-run build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.wheel_artifact_name }}
+          path: byteiaas-build-artifacts
+
+      - name: Validate same-run build artifacts
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          test "$(cat byteiaas-build-artifacts/source-commit)" = \
+            "${CHECKOUT_REF}"
+          test "$(find byteiaas-build-artifacts/workspace/dist \
+            -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test "$(find \
+            byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist \
+            -maxdepth 1 -name 'deep_gemm-*.whl' | wc -l)" -eq 1
+          test "$(find \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist \
+            -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test "$(find byteiaas-build-artifacts/tmp/mooncake-dist \
+            -maxdepth 1 -name 'mooncake_transfer_engine_cuda13-*.whl' \
+            | wc -l)" -eq 1
+          test "$(find byteiaas-build-artifacts/tmp/vllm-router-dist \
+            -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          (
+            cd byteiaas-build-artifacts/workspace/dist
+            sha256sum --check --strict wheel.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist
+            sha256sum --check --strict wheels.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist
+            sha256sum --check --strict wheels.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/triton_from_source_workspace/dist
+            shopt -s nullglob
+            triton_wheels=(./triton-*.whl)
+            if [ "${#triton_wheels[@]}" -eq 1 ]; then
+              test ! -e build-state
+            else
+              test "${#triton_wheels[@]}" -eq 0
+              test "$(cat build-state)" = disabled
+            fi
+            sha256sum --check --strict wheel.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/mooncake-dist
+            sha256sum --check --strict wheel.sha256
+          )
+          (
+            cd byteiaas-build-artifacts/tmp/vllm-router-dist
+            sha256sum --check --strict wheels.sha256
+          )
+          test "$(sed -n 's/^repository=//p' \
+            byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist/source.env)" = \
+            "${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
+          test "$(sed -n 's/^commit=//p' \
+            byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist/source.env)" = \
+            "${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
+          test "$(sed -n 's/^repository=//p' \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist/source.env)" = \
+            "${BYTEIAAS_DEEPEP_GIT_REPOSITORY}"
+          test "$(sed -n 's/^commit=//p' \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist/source.env)" = \
+            "${BYTEIAAS_DEEPEP_GIT_COMMIT}"
+          test "$(sed -n 's/^nvshmem_version=//p' \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist/source.env)" = \
+            "${BYTEIAAS_NVSHMEM_VERSION}"
+          test "$(sed -n 's/^nccl_version=//p' \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist/source.env)" = \
+            "${BYTEIAAS_NCCL_VERSION}"
+          test "$(sed -n 's/^cuda_version=//p' \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist/source.env)" = \
+            "${BYTEIAAS_CUDA_VERSION}"
+          test "$(sed -n 's/^repository=//p' \
+            byteiaas-build-artifacts/tmp/mooncake-dist/source.env)" = \
+            "${BYTEIAAS_MOONCAKE_GIT_REPOSITORY}"
+          test "$(sed -n 's/^ref=//p' \
+            byteiaas-build-artifacts/tmp/mooncake-dist/source.env)" = \
+            "${BYTEIAAS_MOONCAKE_GIT_REF}"
+          test "$(sed -n 's/^commit=//p' \
+            byteiaas-build-artifacts/tmp/mooncake-dist/source.env)" = \
+            "${BYTEIAAS_MOONCAKE_GIT_COMMIT}"
+          test "$(sed -n 's/^repository=//p' \
+            byteiaas-build-artifacts/tmp/vllm-router-dist/source.env)" = \
+            "${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY}"
+          test "$(sed -n 's/^ref=//p' \
+            byteiaas-build-artifacts/tmp/vllm-router-dist/source.env)" = \
+            "${BYTEIAAS_VLLM_ROUTER_GIT_REF}"
+          test "$(sed -n 's/^commit=//p' \
+            byteiaas-build-artifacts/tmp/vllm-router-dist/source.env)" = \
+            "${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
 
       - name: Resolve Volcengine publish target
         run: |
@@ -331,6 +437,7 @@ jobs:
             local image_label="$4"
             local build_args=(
               --target vllm-openai
+              --build-context byteiaas-prebuilt=byteiaas-build-artifacts
               --platform linux/amd64
               --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}"
               -f docker/Dockerfile
@@ -347,6 +454,7 @@ jobs:
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
               --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
+              --build-arg BYTEIAAS_REQUIRE_SOURCE_DEEPGEMM=true
               --build-arg TOKENIZERS_GIT_REPOSITORY="${BYTEIAAS_TOKENIZERS_GIT_REPOSITORY}"
               --build-arg TOKENIZERS_GIT_REF="${BYTEIAAS_TOKENIZERS_GIT_REF}"
               --build-arg TOKENIZERS_GIT_COMMIT="${BYTEIAAS_TOKENIZERS_GIT_COMMIT}"
@@ -355,7 +463,9 @@ jobs:
               --build-arg VLLM_ROUTER_GIT_REPOSITORY="${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY}"
               --build-arg VLLM_ROUTER_GIT_REF="${BYTEIAAS_VLLM_ROUTER_GIT_REF}"
               --build-arg VLLM_ROUTER_GIT_COMMIT="${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
-              --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-build
+              --build-arg BYTEIAAS_BUILD_ARTIFACTS_SOURCE=byteiaas-prebuilt
+              --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=byteiaas-prebuilt
+              --build-arg BYTEIAAS_VLLM_ROUTER_SOURCE=byteiaas-prebuilt
               --build-arg BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=true
               --build-arg MOONCAKE_GIT_REPOSITORY="${BYTEIAAS_MOONCAKE_GIT_REPOSITORY}"
               --build-arg MOONCAKE_GIT_REF="${BYTEIAAS_MOONCAKE_GIT_REF}"

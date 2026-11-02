@@ -109,8 +109,8 @@ jobs:
             exit 1
           fi
           contract="$(git show "${checkout_sha}:.github/byteiaas-build-contract")"
-          if [ "${contract}" != "1" ]; then
-            echo "::error::Requested source lacks ByteIAAS build contract 1"
+          if [ "${contract}" != "2" ]; then
+            echo "::error::Requested source lacks ByteIAAS build contract 2"
             exit 1
           fi
           echo "checkout_sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"
@@ -134,6 +134,7 @@ jobs:
       checkout_ref: ${{ needs.resolve-source.outputs.checkout_sha }}
       cuda_version: "13.0.3"
       tag_mode: dev
+      wheel_artifact_name: vllm-cu130-wheel-dev
       vllm_version: ${{ github.event_name == 'workflow_dispatch' && inputs.vllm_version || '' }}
       image_formats: ${{ github.event_name == 'workflow_dispatch' && inputs.image_formats || 'oci,zstd,nydus' }}
     secrets:
