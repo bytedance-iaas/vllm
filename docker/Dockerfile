@@ -73,6 +73,13 @@ ARG VLLM_ROUTER_GIT_REPOSITORY=https://github.com/wangyicong52/router.git
 ARG VLLM_ROUTER_GIT_REF=dev/dsv4.1-flash
 ARG VLLM_ROUTER_GIT_COMMIT=ef339bc73a04872dc7999aebf761c5f86263af64
 
+# Mooncake source used by ByteIAAS CUDA 13 images. Keep the branch for
+# provenance and the full commit for reproducible builds.
+ARG MOONCAKE_GIT_REPOSITORY=https://github.com/wangyicong52/Mooncake.git
+ARG MOONCAKE_GIT_REF=vllm-dsv4.1
+ARG MOONCAKE_GIT_COMMIT=ffd73707e9dbfe0997053f3d82eab86d1568337e
+ARG BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-empty
+
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
 # installation of the GPG key of the PPA, as done by add-apt-repository, so we
@@ -527,6 +534,99 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
         sha256sum "$1" > /tmp/vllm-router-dist/wheels.sha256; \
     fi
 #################### VLLM ROUTER BUILD IMAGE ####################
+
+#################### MOONCAKE BUILD IMAGE ####################
+FROM base AS mooncake-build
+ARG MOONCAKE_GIT_REPOSITORY
+ARG MOONCAKE_GIT_REF
+ARG MOONCAKE_GIT_COMMIT
+ARG MOONCAKE_CMAKE_JOBS=8
+ARG MOONCAKE_EXTENSION_JOBS=2
+
+WORKDIR /tmp/mooncake-src
+RUN set -eux; \
+    test -n "${MOONCAKE_GIT_REPOSITORY}"; \
+    test -n "${MOONCAKE_GIT_REF}"; \
+    test "${#MOONCAKE_GIT_COMMIT}" -eq 40; \
+    case "${MOONCAKE_GIT_COMMIT}" in *[!0-9a-f]*) exit 1;; esac; \
+    git init .; \
+    git remote add origin "${MOONCAKE_GIT_REPOSITORY}"; \
+    git ls-remote --exit-code origin \
+        "refs/heads/${MOONCAKE_GIT_REF}" >/dev/null; \
+    git fetch --no-tags --depth 1 origin "${MOONCAKE_GIT_COMMIT}"; \
+    test "$(git rev-parse FETCH_HEAD)" = "${MOONCAKE_GIT_COMMIT}"; \
+    git checkout --detach FETCH_HEAD
+
+RUN bash -x dependencies.sh -y
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --python /opt/venv/bin/python3 \
+        "cmake<4" auditwheel build numpy patchelf setuptools wheel
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${MOONCAKE_CMAKE_JOBS}
+ENV MAX_JOBS=${MOONCAKE_EXTENSION_JOBS}
+ENV TORCH_CUDA_ARCH_LIST="8.0;9.0;10.3"
+RUN set -eux; \
+    for dir in \
+        /usr/local/cuda/lib64/stubs \
+        /usr/local/cuda/targets/*/lib/stubs; do \
+        if [ -d "${dir}" ]; then \
+            export LIBRARY_PATH="${dir}:${LIBRARY_PATH:-}"; \
+        fi; \
+    done; \
+    cmake -S . -B build -G Ninja \
+        -DBUILD_UNIT_TESTS=OFF \
+        -DUSE_HTTP=ON \
+        -DUSE_ETCD=ON \
+        -DUSE_CUDA=ON \
+        -DUSE_INTRA_NVLINK=ON \
+        -DWITH_EP=ON \
+        -DSTORE_USE_ETCD=ON \
+        -DSTORE_USE_JEMALLOC=ON \
+        -DENABLE_SCCACHE=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1;2.13.0" \
+        -DPython3_EXECUTABLE=/opt/venv/bin/python3; \
+    cmake --build build -j"${MOONCAKE_CMAKE_JOBS}"
+
+RUN set -eux; \
+    export PATH="/usr/local/nvidia/bin:/usr/local/nvidia/lib64:${PATH}"; \
+    for dir in \
+        /usr/local/cuda/lib64/stubs \
+        /usr/local/cuda/targets/*/lib/stubs; do \
+        if [ -d "${dir}" ]; then \
+            export LD_LIBRARY_PATH="${dir}:${LD_LIBRARY_PATH:-}"; \
+            export LIBRARY_PATH="${dir}:${LIBRARY_PATH:-}"; \
+        fi; \
+    done; \
+    mkdir -p build/mooncake-transfer-engine/nvlink-allocator; \
+    cd mooncake-transfer-engine/nvlink-allocator; \
+    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+RUN set -eux; \
+    CU13_BUILD=1 \
+    PYTHON_VERSION=3.12 \
+    OUTPUT_DIR=/tmp/mooncake-dist \
+    BUILD_DIR=build \
+    PLATFORM_TAG=manylinux_2_28_x86_64 \
+        bash scripts/build_wheel.sh; \
+    set -- /tmp/mooncake-dist/mooncake_transfer_engine_cuda13-*.whl; \
+    test "$#" -eq 1; \
+    test -f "$1"; \
+    (cd /tmp/mooncake-dist && sha256sum ./*.whl > wheel.sha256); \
+    printf '%s\n' \
+        "repository=${MOONCAKE_GIT_REPOSITORY}" \
+        "ref=${MOONCAKE_GIT_REF}" \
+        "commit=${MOONCAKE_GIT_COMMIT}" \
+        > /tmp/mooncake-dist/source.env
+
+FROM base AS mooncake-empty
+RUN mkdir -p /tmp/mooncake-dist
+
+FROM ${BYTEIAAS_MOONCAKE_WHEEL_SOURCE} AS mooncake-wheel-source
+#################### MOONCAKE BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
@@ -1489,6 +1589,10 @@ ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
 ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
+ARG BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=false
+ARG MOONCAKE_GIT_REPOSITORY
+ARG MOONCAKE_GIT_REF
+ARG MOONCAKE_GIT_COMMIT
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1528,6 +1632,31 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             uv pip uninstall --system mooncake-transfer-engine 2>/dev/null || true; \
             uv pip install --system "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"; \
         fi; \
+    fi
+
+# ByteIAAS installs Mooncake from the pinned source build above. Generic
+# Docker builds retain the public dependency behavior.
+RUN --mount=type=bind,from=mooncake-wheel-source,src=/tmp/mooncake-dist,target=/tmp/mooncake-dist,ro \
+    --mount=type=cache,target=/opt/uv/cache \
+    set -eux; \
+    set -- /tmp/mooncake-dist/mooncake_transfer_engine_cuda13-*.whl; \
+    if [ "${BYTEIAAS_REQUIRE_SOURCE_MOONCAKE}" = "true" ]; then \
+        test "$#" -eq 1; \
+        test -f "$1"; \
+        test "$(sed -n 's/^repository=//p' /tmp/mooncake-dist/source.env)" = \
+            "${MOONCAKE_GIT_REPOSITORY}"; \
+        test "$(sed -n 's/^ref=//p' /tmp/mooncake-dist/source.env)" = \
+            "${MOONCAKE_GIT_REF}"; \
+        test "$(sed -n 's/^commit=//p' /tmp/mooncake-dist/source.env)" = \
+            "${MOONCAKE_GIT_COMMIT}"; \
+        (cd /tmp/mooncake-dist && sha256sum --check --strict wheel.sha256); \
+        uv pip uninstall --system \
+            mooncake-transfer-engine \
+            mooncake-transfer-engine-cuda13 2>/dev/null || true; \
+        uv pip install --system --no-deps "$1"; \
+        python3 -c \
+            'import importlib.metadata as m; print(m.version("mooncake-transfer-engine-cuda13"))'; \
+        mooncake_master --version; \
     fi
 
 # Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
@@ -1626,7 +1755,12 @@ LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       ai.vllm.tokenizers.commit="${TOKENIZERS_GIT_COMMIT}" \
       ai.vllm.router.repository="${VLLM_ROUTER_GIT_REPOSITORY}" \
       ai.vllm.router.ref="${VLLM_ROUTER_GIT_REF}" \
-      ai.vllm.router.commit="${VLLM_ROUTER_GIT_COMMIT}"
+      ai.vllm.router.commit="${VLLM_ROUTER_GIT_COMMIT}" \
+      ai.vllm.mooncake.repository="${MOONCAKE_GIT_REPOSITORY}" \
+      ai.vllm.mooncake.ref="${MOONCAKE_GIT_REF}" \
+      ai.vllm.mooncake.commit="${MOONCAKE_GIT_COMMIT}"
+
+ENV MALLOC_CONF=background_thread:true
 
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
