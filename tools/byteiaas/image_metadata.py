@@ -45,6 +45,25 @@ def main() -> None:
             if not path.is_file():
                 raise ValueError(f"Enabled dependency lacks installed proof: {kind}")
             dependencies[kind] = json.loads(path.read_text())
+    if (
+        not args.derive_base
+        and os.environ.get("BYTEIAAS_REQUIRE_SOURCE_MOONCAKE") == "true"
+    ):
+        provenance = args.root / "provenance"
+        source = dict(
+            line.split("=", 1)
+            for line in (provenance / "mooncake-source.env").read_text().splitlines()
+        )
+        checksum, wheel = (
+            (provenance / "mooncake-wheel.sha256").read_text().strip().split()
+        )
+        dependencies["mooncake"] = {
+            **source,
+            "wheel": wheel,
+            "sha256": checksum,
+            "version": importlib.metadata.version("mooncake-transfer-engine-cuda13"),
+            "malloc_conf": os.environ["MALLOC_CONF"],
+        }
     metadata = {
         "format_version": 2,
         "release": "v0.32.0",

@@ -29,7 +29,7 @@ EP extension for the installed PyTorch, with `tools/build_nixl_with_torch215_for
 `vllm-openai-base` then replaces the NIXL packages installed from the KV-connector
 requirements with these wheels.
 
-ByteIAAS builds use contract 2 on v0.32.0, Torch 2.13.0, CUDA 13.0.3,
+ByteIAAS builds use contract 3 on v0.32.0, Torch 2.13.0, CUDA 13.0.3,
 Python 3.12, and Ubuntu 24.04. The public build leaves the three flags below
 disabled. Internal dev/release workflows enable all three:
 
@@ -56,9 +56,30 @@ effective dependency source trees, wheel hashes, and build source identity.
 Native source commit IDs describe the local port; builds reconstruct their
 trees and do not require those IDs to be published to an upstream repository.
 
-`byteiaas-wheel-artifacts` exports the vLLM wheel and the two native wheels
-with manifests for the wheel CI job. The image CI retains OCI, zstd, and Nydus
-publication with digest and format verification. Run
+`byteiaas-wheel-artifacts` exports vLLM, DeepGEMM, unified Humming, DeepEP,
+patched tokenizers, router, and the source-built Mooncake wheel. An explicit
+disabled marker represents the optional Triton source build. The wheel job
+seals this artifact with the exact source commit, workflow run ID, native
+source locks, Torch/ABI contract, and file checksums. Both dev and release
+image jobs wait for that wheel job and download its artifact from the same
+workflow run.
+
+The image job passes the artifact as the `byteiaas-prebuilt` BuildKit context
+with `BYTEIAAS_BUILD_ARTIFACTS_SOURCE=byteiaas-prebuilt`. Every wheel install,
+including the initial joint vLLM/Humming dependency resolution and final native
+verification, reads that context, so image builds do not recompile these
+components. The default local build still uses the producer stages.
+
+Mooncake builds commit `ffd73707` with `STORE_USE_JEMALLOC=ON`, including the
+PR #4208 backport. Its builder uses Ubuntu 24.04 to match the runtime's system
+OpenSSL/curl libraries, and its wheel tag uses the detected glibc version.
+The runtime sets `MALLOC_CONF=background_thread:true` and records Mooncake
+provenance. Internal workflows set `BUILD_NIXL=false`, `INSTALL_NIXL=false`,
+and `BYTEIAAS_NIXL_WHEEL_SOURCE=nixl-empty`; they do not build, download, or
+export NIXL wheels.
+
+The image CI retains OCI, zstd, and Nydus publication with digest and format
+verification. Run
 `tools/byteiaas/validate_build_contract.py` before an internal build to reject
 stale source locks or release defaults.
 

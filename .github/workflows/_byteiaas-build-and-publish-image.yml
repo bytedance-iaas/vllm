@@ -31,6 +31,10 @@ on:
         required: false
         type: string
         default: "oci,zstd,nydus"
+      wheel_artifact_name:
+        description: "Same-run ByteIAAS component wheel artifact"
+        required: true
+        type: string
     secrets:
       VOLCENGINE_CR_USERNAME:
         required: true
@@ -58,9 +62,15 @@ jobs:
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-image-cache
+      BYTEIAAS_UBUNTU_MIRROR: http://mirrors.volces.com/ubuntu
+      BYTEIAAS_ALMALINUX_MIRROR: http://mirrors.volces.com/almalinux
+      BYTEIAAS_EPEL_MIRROR: http://mirrors.volces.com/epel
       BYTEIAAS_GET_PIP_URL: https://bootstrap.pypa.io/get-pip.py
       BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
+      BYTEIAAS_MOONCAKE_GIT_REPOSITORY: https://github.com/wangyicong52/Mooncake.git
+      BYTEIAAS_MOONCAKE_GIT_REF: vllm-dsv4.1
+      BYTEIAAS_MOONCAKE_GIT_COMMIT: ffd73707e9dbfe0997053f3d82eab86d1568337e
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
       BYTEIAAS_TAG_MODE: ${{ inputs.tag_mode }}
       BYTEIAAS_TAG_VALUE: ${{ inputs.tag_value }}
@@ -97,14 +107,21 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
+      - name: Set up uv for build input validation
+        timeout-minutes: 5
+        run: bash tools/byteiaas/setup_uv.sh
+
       - name: Validate build inputs
+        timeout-minutes: 5
         env:
           CHECKOUT_REF: ${{ inputs.checkout_ref }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "2"
-          python3 tools/byteiaas/validate_build_contract.py
+          test "$(cat .github/byteiaas-build-contract)" = "3"
+          uv venv --python python3 --no-python-downloads .venv
+          .venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), sys.version'
+          .venv/bin/python tools/byteiaas/validate_build_contract.py
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
@@ -117,6 +134,21 @@ jobs:
             echo "::error::tag_value is required in release mode"
             exit 1
           fi
+
+      - name: Download same-run build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.wheel_artifact_name }}
+          path: byteiaas-build-artifacts
+
+      - name: Validate same-run build artifacts
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          .venv/bin/python tools/byteiaas/build_artifacts.py validate \
+            --root byteiaas-build-artifacts \
+            --checkout-ref "${CHECKOUT_REF}" --run-id "${GITHUB_RUN_ID}"
 
       - name: Resolve Volcengine publish target
         run: |
@@ -308,19 +340,32 @@ jobs:
             local image_label="$4"
             local build_args=(
               --target vllm-openai
+              --build-context byteiaas-prebuilt=byteiaas-build-artifacts
               --platform linux/amd64
               --output "type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true${output_options}"
               -f docker/Dockerfile
               --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}"
               --build-arg UBUNTU_VERSION=24.04
+              --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}"
+              --build-arg ALMALINUX_MIRROR="${BYTEIAAS_ALMALINUX_MIRROR}"
+              --build-arg EPEL_MIRROR="${BYTEIAAS_EPEL_MIRROR}"
               --build-arg GET_PIP_URL="${BYTEIAAS_GET_PIP_URL}"
               --build-arg PIP_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}"
               --build-arg PIP_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}"
               --build-arg UV_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}"
               --build-arg UV_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}"
+              --build-arg UV_INDEX="${BYTEIAAS_PIP_EXTRA_INDEX_URL}"
               --build-arg BYTEIAAS_BUILD_NATIVE=true
               --build-arg BYTEIAAS_BUILD_TOKENIZERS=true
               --build-arg BYTEIAAS_BUILD_ROUTER=true
+              --build-arg BYTEIAAS_BUILD_ARTIFACTS_SOURCE=byteiaas-prebuilt
+              --build-arg BUILD_NIXL=false
+              --build-arg INSTALL_NIXL=false
+              --build-arg BYTEIAAS_NIXL_WHEEL_SOURCE=nixl-empty
+              --build-arg BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=true
+              --build-arg MOONCAKE_GIT_REPOSITORY="${BYTEIAAS_MOONCAKE_GIT_REPOSITORY}"
+              --build-arg MOONCAKE_GIT_REF="${BYTEIAAS_MOONCAKE_GIT_REF}"
+              --build-arg MOONCAKE_GIT_COMMIT="${BYTEIAAS_MOONCAKE_GIT_COMMIT}"
               --build-arg INSTALL_KV_CONNECTORS=true
               --build-arg VLLM_BUILD_COMMIT="${build_commit}"
               --build-arg VLLM_BUILD_PIPELINE="${GITHUB_WORKFLOW}"
@@ -360,6 +405,7 @@ jobs:
               -f docker/byteiaas-openai-devel.Dockerfile
               --build-arg "VLLM_OPENAI_DEVEL_BASE_IMAGE=${IMAGE_REPO}@${base_digest}"
               --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}"
+              --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}"
               --build-arg VLLM_BUILD_COMMIT="${build_commit}"
               --build-arg VLLM_BUILD_PIPELINE="${GITHUB_WORKFLOW}"
               --build-arg VLLM_BUILD_URL="${build_url}"

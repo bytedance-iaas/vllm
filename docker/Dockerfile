@@ -45,6 +45,11 @@ ARG BUILD_BASE_IMAGE=pytorch/manylinux2_28-builder:cuda13.0-78e737ad29420ffc4800
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
+# Internal workflows override the distribution sources with regional mirrors.
+ARG UBUNTU_MIRROR
+ARG ALMALINUX_MIRROR
+ARG EPEL_MIRROR
+
 # By parameterizing the Deadsnakes repository URL, we allow third-party to use
 # their own mirror. When doing so, we don't benefit from the transparent
 # installation of the GPG key of the PPA, as done by add-apt-repository, so we
@@ -75,6 +80,9 @@ ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_INDEX_URL=${PIP_INDEX_URL}
 ARG UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+# CLI --extra-index-url overrides UV_EXTRA_INDEX_URL; retain the fallback here.
+ARG UV_INDEX=${UV_EXTRA_INDEX_URL}
+ARG UV_VERSION=0.11.1
 
 # PyTorch provides its own indexes for standard and nightly builds
 ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
@@ -96,12 +104,19 @@ ARG INSTALL_KV_CONNECTORS=false
 # from source and installs it in place of the nixl packages from the KV-connector
 # requirements
 ARG BUILD_NIXL=false
+ARG INSTALL_NIXL=true
+ARG BYTEIAAS_NIXL_WHEEL_SOURCE=extensions-build
 
 # Build the release-pinned ByteIAAS native source overlays. The public build
 # remains opt-in; internal workflows enable this immutable source contract.
 ARG BYTEIAAS_BUILD_NATIVE=false
 ARG BYTEIAAS_BUILD_TOKENIZERS=false
 ARG BYTEIAAS_BUILD_ROUTER=false
+ARG BYTEIAAS_BUILD_ARTIFACTS_SOURCE=byteiaas-wheel-artifacts
+ARG BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-empty
+ARG MOONCAKE_GIT_REPOSITORY=https://github.com/wangyicong52/Mooncake.git
+ARG MOONCAKE_GIT_REF=vllm-dsv4.1
+ARG MOONCAKE_GIT_COMMIT=ffd73707e9dbfe0997053f3d82eab86d1568337e
 
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
@@ -111,6 +126,12 @@ ARG TARGETPLATFORM
 ARG INSTALL_RUBIN_PRERELEASE
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
+ARG ALMALINUX_MIRROR
+ARG EPEL_MIRROR
+ARG PIP_INDEX_URL UV_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
+ARG UV_INDEX
+ARG UV_VERSION
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
 ARG SCCACHE_ENDPOINT
@@ -137,7 +158,9 @@ ENV VIRTUAL_ENV="/opt/venv"
 
 # Install system dependencies including build tools. The PyTorch manylinux
 # image enables EPEL, which provides ccache.
-RUN dnf install -y --setopt=install_weak_deps=False \
+COPY tools/byteiaas/setup_package_mirrors.sh /usr/local/bin/setup_package_mirrors.sh
+RUN bash /usr/local/bin/setup_package_mirrors.sh \
+    && dnf install -y --setopt=install_weak_deps=False \
         ccache \
         git \
         curl \
@@ -172,13 +195,18 @@ ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 # the manylinux image.
 RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
     && chmod -R a+rX /opt/uv \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
     # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
     # pip` works regardless of how uv happens to link the venv back to the
     # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
     # doesn't always expose ensurepip via the default venv layout).
     && PYV_NODOT=$(echo ${PYTHON_VERSION} | tr -d '.') \
     && MANYLINUX_PY=/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin/python${PYTHON_VERSION} \
+    && MANYLINUX_BIN="$(dirname "${MANYLINUX_PY}")" \
+    && PIP_EXTRA_INDEX_URL= "${MANYLINUX_PY}" -m pip install \
+        --no-cache-dir --retries 5 --timeout 30 "uv==${UV_VERSION}" \
+    && ln -sf "${MANYLINUX_BIN}/uv" "${UV_INSTALL_DIR}/uv" \
+    && ln -sf "${MANYLINUX_BIN}/uvx" "${UV_INSTALL_DIR}/uvx" \
+    && uv --version \
     && uv venv --seed /opt/venv --python "$MANYLINUX_PY" \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -sf /opt/venv/bin/python3 /usr/bin/python3 \
@@ -285,7 +313,7 @@ ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 # build stage doesn't need the rust toolchain or the rust source.
 # This stage reuses the Python environment from base and runs in parallel with
 # csrc-build/extensions-build.
-FROM base AS rust-build-cache
+FROM base AS rust-toolchain
 ARG USE_SCCACHE
 ARG SCCACHE_ENDPOINT
 
@@ -300,16 +328,31 @@ COPY requirements/build/rust.txt requirements/build/rust.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --python /opt/venv/bin/python3 -r requirements/build/rust.txt
 
-# Copy only the Rust build inputs; tools/build_rust.sh publishes artifacts needed
-# by the wheel build stage.
-COPY rust rust
 COPY rust-toolchain.toml rust-toolchain.toml
+RUN set -eux; \
+    rustup_installer="$(mktemp)"; \
+    trap 'rm -f "${rustup_installer}"' EXIT; \
+    curl --retry 5 --retry-all-errors --retry-delay 2 \
+        --retry-max-time 120 --connect-timeout 20 \
+        --proto '=https' --tlsv1.2 -sSf \
+        -o "${rustup_installer}" https://sh.rustup.rs; \
+    sh "${rustup_installer}" -y --default-toolchain none; \
+    . /root/.cargo/env; \
+    toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"; \
+    test -n "${toolchain}"; \
+    rustup toolchain install "${toolchain}"
+ENV CARGO_HOME=/root/.cargo \
+    RUSTUP_HOME=/root/.rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Keep the frontend, tokenizers and router under the CI open-file limit.
+ENV CARGO_BUILD_JOBS=4
+
+# Keep tokenizers and router independent of the vLLM Rust frontend build.
+FROM rust-toolchain AS rust-build-cache
+COPY rust rust
 COPY tools/build_rust.py tools/build_rust.py
 COPY tools/build_rust.sh tools/build_rust.sh
-
-# Cap cargo parallelism to avoid exhausting the CI host's open-file limit
-# (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
-ENV CARGO_BUILD_JOBS=4
 
 # BuildKit can run this stage in parallel with csrc-build. Keep Rust on a
 # separate local sccache daemon while sharing the same remote cache backend.
@@ -340,7 +383,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 #################### RUST BUILD IMAGE ####################
 
 #################### BYTEIAAS TOKENIZERS BUILD IMAGE ####################
-FROM rust-build-cache AS byteiaas-tokenizers-build
+FROM rust-toolchain AS byteiaas-tokenizers-build
 ARG BYTEIAAS_BUILD_TOKENIZERS
 COPY tools/byteiaas/tokenizers_wheel.py /workspace/byteiaas-tokenizers-wheel.py
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -362,16 +405,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### BYTEIAAS TOKENIZERS BUILD IMAGE ####################
 
 #################### BYTEIAAS ROUTER BUILD IMAGE ####################
-FROM rust-build-cache AS byteiaas-router-build
+FROM rust-toolchain AS byteiaas-router-build
 ARG BYTEIAAS_BUILD_ROUTER
 COPY tools/byteiaas/router_wheel.py /workspace/byteiaas-router-wheel.py
+# Router protocol generation uses Rust protox/prost, not C++ protobuf headers.
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     set -eu; \
     if [ "${BYTEIAAS_BUILD_ROUTER}" = "true" ]; then \
         . /root/.cargo/env; \
-        dnf install -y --setopt=install_weak_deps=False openssl-devel protobuf-compiler protobuf-devel; \
+        dnf install -y --setopt=install_weak_deps=False openssl-devel protobuf-compiler; \
         dnf clean all; \
         uv pip install --python /opt/venv/bin/python3 \
             "auditwheel==6.5.0" "build==1.3.0" "patchelf==0.17.2.4"; \
@@ -417,6 +461,122 @@ RUN mkdir -p deepgemm-source deepgemm-dist humming-source humming-dist && \
         (cd humming-dist && sha256sum build-state > wheels.sha256); \
     fi
 #################### BYTEIAAS NATIVE BUILD IMAGE ####################
+
+#################### MOONCAKE BUILD IMAGE ####################
+# Mooncake excludes system OpenSSL/curl from auditwheel. Build on the runtime
+# distribution so those SONAMEs match Ubuntu, while vLLM/native use manylinux.
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS mooncake-system-deps
+ARG PYTHON_VERSION
+ARG UBUNTU_MIRROR
+ENV DEBIAN_FRONTEND=noninteractive
+COPY tools/byteiaas/setup_package_mirrors.sh /usr/local/bin/setup_package_mirrors.sh
+RUN bash /usr/local/bin/setup_package_mirrors.sh \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git curl python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM mooncake-system-deps AS mooncake-build
+ARG PYTHON_VERSION
+ARG PIP_INDEX_URL UV_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
+ARG UV_INDEX
+ARG MOONCAKE_GIT_REPOSITORY
+ARG MOONCAKE_GIT_REF
+ARG MOONCAKE_GIT_COMMIT
+ARG MOONCAKE_CMAKE_JOBS=8
+ARG MOONCAKE_EXTENSION_JOBS=2
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_HTTP_TIMEOUT=500 \
+    UV_INDEX_STRATEGY=unsafe-best-match \
+    UV_CACHE_DIR=/opt/uv/cache \
+    VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:/usr/local/cuda/bin:${PATH}"
+COPY --from=base /opt/uv/bin/uv /usr/local/bin/uv
+RUN uv venv --seed /opt/venv --python /usr/bin/python${PYTHON_VERSION}
+COPY requirements/build/cuda.txt /tmp/mooncake-build-requirements.txt
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --python /opt/venv/bin/python3 \
+        -r /tmp/mooncake-build-requirements.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu130
+
+WORKDIR /tmp/mooncake-src
+RUN set -eux; \
+    test -n "${MOONCAKE_GIT_REPOSITORY}"; \
+    test -n "${MOONCAKE_GIT_REF}"; \
+    test "${#MOONCAKE_GIT_COMMIT}" -eq 40; \
+    case "${MOONCAKE_GIT_COMMIT}" in *[!0-9a-f]*) exit 1;; esac; \
+    git init .; \
+    git remote add origin "${MOONCAKE_GIT_REPOSITORY}"; \
+    git ls-remote --exit-code origin "refs/heads/${MOONCAKE_GIT_REF}" >/dev/null; \
+    git fetch --no-tags --depth 1 origin "${MOONCAKE_GIT_COMMIT}"; \
+    test "$(git rev-parse FETCH_HEAD)" = "${MOONCAKE_GIT_COMMIT}"; \
+    git checkout --detach FETCH_HEAD
+
+RUN bash -x dependencies.sh -y
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --python /opt/venv/bin/python3 \
+        "cmake<4" auditwheel build numpy patchelf setuptools wheel
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${MOONCAKE_CMAKE_JOBS}
+ENV MAX_JOBS=${MOONCAKE_EXTENSION_JOBS}
+ENV TORCH_CUDA_ARCH_LIST="8.0;9.0;10.3"
+RUN set -eux; \
+    for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do \
+        if [ -d "${dir}" ]; then \
+            export LIBRARY_PATH="${dir}:${LIBRARY_PATH:-}"; \
+        fi; \
+    done; \
+    cmake -S . -B build -G Ninja \
+        -DBUILD_UNIT_TESTS=OFF \
+        -DUSE_HTTP=ON \
+        -DUSE_ETCD=ON \
+        -DUSE_CUDA=ON \
+        -DUSE_INTRA_NVLINK=ON \
+        -DWITH_EP=ON \
+        -DSTORE_USE_ETCD=ON \
+        -DSTORE_USE_JEMALLOC=ON \
+        -DENABLE_SCCACHE=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DEP_TORCH_VERSIONS="2.13.0" \
+        -DPython3_EXECUTABLE=/opt/venv/bin/python3; \
+    cmake --build build -j"${MOONCAKE_CMAKE_JOBS}"
+
+RUN set -eux; \
+    for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do \
+        if [ -d "${dir}" ]; then \
+            export LD_LIBRARY_PATH="${dir}:${LD_LIBRARY_PATH:-}"; \
+            export LIBRARY_PATH="${dir}:${LIBRARY_PATH:-}"; \
+        fi; \
+    done; \
+    mkdir -p build/mooncake-transfer-engine/nvlink-allocator; \
+    cd mooncake-transfer-engine/nvlink-allocator; \
+    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+RUN set -eux; \
+    CU13_BUILD=1 PYTHON_VERSION=3.12 OUTPUT_DIR=/tmp/mooncake-dist \
+    BUILD_DIR=build \
+        bash scripts/build_wheel.sh; \
+    set -- /tmp/mooncake-dist/mooncake_transfer_engine_cuda13-*.whl; \
+    test "$#" -eq 1; \
+    test -f "$1"; \
+    (cd /tmp/mooncake-dist && sha256sum ./*.whl > wheel.sha256); \
+    printf '%s\n' \
+        "repository=${MOONCAKE_GIT_REPOSITORY}" \
+        "ref=${MOONCAKE_GIT_REF}" \
+        "commit=${MOONCAKE_GIT_COMMIT}" \
+        "store_use_jemalloc=ON" \
+        > /tmp/mooncake-dist/source.env
+
+FROM base AS mooncake-empty
+RUN mkdir -p /tmp/mooncake-dist && \
+    printf '%s\n' disabled > /tmp/mooncake-dist/build-state && \
+    (cd /tmp/mooncake-dist && sha256sum build-state > wheel.sha256)
+
+FROM ${BYTEIAAS_MOONCAKE_WHEEL_SOURCE} AS mooncake-wheel-source
+#################### MOONCAKE BUILD IMAGE ####################
 
 #################### CSRC BUILD IMAGE ####################
 FROM base AS csrc-build
@@ -584,8 +744,8 @@ WORKDIR /workspace
 # Build DeepEP wheels
 COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.sh
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
-ARG DEEPEP_COMMIT_HASH=d4f41e4e93
-ARG NVSHMEM_VER
+ARG DEEPEP_COMMIT_HASH=d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
+ARG NVSHMEM_VER=3.3.24
 ARG NCCL_VERSION
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
@@ -601,7 +761,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         --mode wheel \
         ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
         ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete && \
+    printf '%s\n' \
+        "repository=https://github.com/deepseek-ai/DeepEP" \
+        "commit=${DEEPEP_COMMIT_HASH}" \
+        "nvshmem_version=${NVSHMEM_VER}" \
+        "nccl_version=${NCCL_VERSION}" \
+        "cuda_version=${CUDA_VERSION}" \
+        > /tmp/ep_kernels_workspace/dist/source.env
 
 # Build Triton from source when a repository is configured. Triton 3.8 pins
 # ptxas-blackwell 13.3, which cannot assemble SM107. Rubin CUDA 13.4 and 13.5
@@ -663,8 +830,19 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
         WHEELS_CACHE_HOME="${NIXL_WORKSPACE}/dist" \
         MAX_JOBS="${max_jobs:-}" \
             python3 /tmp/build_nixl_for_rubin.py --skip-system-deps --build-only; \
+        (cd "${NIXL_WORKSPACE}/dist" && sha256sum ./*.whl > wheels.sha256); \
+    else \
+        printf '%s\n' disabled > "${NIXL_WORKSPACE}/dist/build-state"; \
+        (cd "${NIXL_WORKSPACE}/dist" && sha256sum build-state > wheels.sha256); \
     fi
 #################### EXTENSIONS BUILD IMAGE ####################
+
+FROM base AS nixl-empty
+RUN mkdir -p /tmp/nixl_workspace/dist && \
+    printf '%s\n' disabled > /tmp/nixl_workspace/dist/build-state && \
+    (cd /tmp/nixl_workspace/dist && sha256sum build-state > wheels.sha256)
+
+FROM ${BYTEIAAS_NIXL_WHEEL_SOURCE} AS nixl-wheel-source
 
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
@@ -757,10 +935,14 @@ RUN sha256sum dist/*.whl > dist/wheel.sha256
 
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
+COPY --from=extensions-build /tmp/triton_from_source_workspace/dist /tmp/triton_from_source_workspace/dist
 
 # Record the EP kernels wheel checksum for the same cache-busting purpose.
 RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
     > /tmp/ep_kernels_workspace/dist/wheels.sha256
+
+ARG VLLM_BUILD_COMMIT=unknown
+RUN printf '%s\n' "${VLLM_BUILD_COMMIT}" > /source-commit
 
 # Check the size of the CUDA 13 wheel uploaded to PyPI
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
@@ -780,6 +962,11 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
 FROM build AS byteiaas-wheel-artifacts
 COPY --from=byteiaas-native-build /workspace/byteiaas-native/deepgemm-dist /workspace/byteiaas-native-dist/deepgemm
 COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist /workspace/byteiaas-native-dist/humming
+COPY --from=byteiaas-tokenizers-build /workspace/byteiaas-tokenizers-dist /workspace/byteiaas-tokenizers-dist
+COPY --from=byteiaas-router-build /workspace/byteiaas-router-dist /workspace/byteiaas-router-dist
+COPY --from=mooncake-wheel-source /tmp/mooncake-dist /tmp/mooncake-dist
+
+FROM ${BYTEIAAS_BUILD_ARTIFACTS_SOURCE} AS vllm-build-artifacts
 
 #################### DEV IMAGE ####################
 FROM base AS dev
@@ -844,9 +1031,17 @@ ARG NCCL_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
+ARG UBUNTU_MIRROR
+ARG PIP_INDEX_URL UV_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
+ARG UV_INDEX
+ARG UV_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
+
+COPY tools/byteiaas/setup_package_mirrors.sh /usr/local/bin/setup_package_mirrors.sh
+RUN bash /usr/local/bin/setup_package_mirrors.sh
 
 
 # Python version string for paths (e.g., "312" for 3.12)
@@ -870,6 +1065,9 @@ RUN apt-get update -y \
             sudo chmod 644 /etc/apt/keyrings/deadsnakes.gpg ; \
             echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list ; \
         fi ; \
+    elif apt-cache show "python${PYTHON_VERSION}-dev" >/dev/null 2>&1 \
+        && apt-cache show "python${PYTHON_VERSION}-venv" >/dev/null 2>&1; then \
+        echo "Using distribution Python ${PYTHON_VERSION}"; \
     else \
         for i in 1 2 3; do \
             add-apt-repository -y ppa:deadsnakes/ppa && break || \
@@ -882,12 +1080,21 @@ RUN apt-get update -y \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
         libibverbs-dev \
+    && if [ "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${PYTHON_VERSION}" ]; then \
+        apt-get install -y --no-install-recommends python3-pip; \
+    fi \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
     && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
     && rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED \
-    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
+    && if ! python${PYTHON_VERSION} -m pip --version; then \
+        curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 2 --retry-all-errors --retry-max-time 180 \
+            -o /tmp/get-pip.py "${GET_PIP_URL}" \
+        && python${PYTHON_VERSION} /tmp/get-pip.py \
+        && rm -f /tmp/get-pip.py; \
+    fi \
     && python3 --version && python3 -m pip --version
 
 # Install CUDA development tools for runtime JIT compilation
@@ -935,7 +1142,8 @@ RUN if [ "${TARGETPLATFORM}" = "linux/amd64" ] \
 ENV CRIU_CUDA_PLUGIN_DIR=/usr/local/lib/criu
 
 # Install uv for faster pip installs
-RUN python3 -m pip install uv
+RUN PIP_EXTRA_INDEX_URL= python3 -m pip install \
+    --no-cache-dir --retries 5 --timeout 30 "uv==${UV_VERSION}"
 
 # Environment for uv
 # Redirect uv's managed Python and download cache out of /root/ so downstream
@@ -1096,10 +1304,10 @@ COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 # install layer. The wheel itself is bind-mounted below and never enters the
 # image. Without this the bind mount is not part of the layer cache key, so a
 # warm BuildKit agent can skip the install and ship a stale wheel.
-COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
-COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
-RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
-    --mount=type=bind,from=byteiaas-native-build,source=/workspace/byteiaas-native/humming-dist,target=/tmp/byteiaas-humming-dist,ro \
+COPY --from=vllm-build-artifacts /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/humming/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/workspace/dist,target=/vllm-workspace/dist \
+    --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-native-dist/humming,target=/tmp/byteiaas-humming-dist,ro \
     --mount=type=cache,target=/opt/uv/cache \
     set -eu; \
     set -- dist/*.whl; \
@@ -1107,7 +1315,7 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         (cd /tmp/byteiaas-humming-dist && sha256sum --check --strict /tmp/byteiaas-humming-wheels.sha256); \
         set -- "$@" /tmp/byteiaas-humming-dist/*.whl; \
     fi; \
-    if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
+    if [ "${PYTORCH_NIGHTLY:-0}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
@@ -1134,8 +1342,8 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 # Install EP kernels wheels (DeepEP) that have been built in the `build` stage.
 # As with the vLLM wheel above, copy only the checksum to bust the layer cache
 # and bind-mount the wheel for the actual install to keep it out of the image.
-COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
-RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
+COPY --from=vllm-build-artifacts /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system ep_kernels/dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
@@ -1227,8 +1435,8 @@ ARG PYTORCH_NIGHTLY
 # Install vLLM and EP kernel wheels after the stable test dependencies so
 # source-only changes do not invalidate the dependency layers above.
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
-COPY --from=build /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
-RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+COPY --from=vllm-build-artifacts /workspace/dist/wheel.sha256 /tmp/vllm-wheel.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
@@ -1246,8 +1454,8 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
-RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
+COPY --from=vllm-build-artifacts /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-wheels.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system ep_kernels/dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
@@ -1293,6 +1501,11 @@ ARG VLLM_BUILD_PIPELINE
 ARG VLLM_BUILD_URL
 ARG VLLM_IMAGE_TAG
 ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
+ARG BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=false
+ARG INSTALL_NIXL
+ARG MOONCAKE_GIT_REPOSITORY
+ARG MOONCAKE_GIT_REF
+ARG MOONCAKE_GIT_COMMIT
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
@@ -1317,9 +1530,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
                 libcusolver-dev-${CUDA_VERSION_DASH}"; \
     if [ "$INSTALL_KV_CONNECTORS" = "true" ]; then \
         KV_REQUIREMENTS=/tmp/vllm-requirements/kv_connectors.txt; \
+        : > /tmp/kv-excludes.txt; \
         if [ "${CUDA_MAJOR}" = "12" ]; then \
             KV_REQUIREMENTS=/tmp/vllm-requirements/kv_connectors_cu12.txt; \
         fi; \
+        if [ "${BYTEIAAS_REQUIRE_SOURCE_MOONCAKE}" = "true" ]; then \
+            grep -v '^mooncake-transfer-engine' "${KV_REQUIREMENTS}" > /tmp/kv-without-mooncake.txt; \
+            KV_REQUIREMENTS=/tmp/kv-without-mooncake.txt; \
+            printf '%s\n' mooncake-transfer-engine mooncake-transfer-engine-cuda13 >> /tmp/kv-excludes.txt; \
+        fi; \
+        if [ "${INSTALL_NIXL}" = "false" ]; then \
+            grep -v '^nixl' "${KV_REQUIREMENTS}" > /tmp/kv-without-nixl.txt; \
+            KV_REQUIREMENTS=/tmp/kv-without-nixl.txt; \
+            printf '%s\n' nixl nixl-cu12 nixl-cu13 nixl-ep nixl-ep-cu12 nixl-ep-cu13 >> /tmp/kv-excludes.txt; \
+        fi; \
+        export UV_EXCLUDE=/tmp/kv-excludes.txt; \
         # Preserve the stack used to compile vLLM when resolving optional dependencies. \
         uv pip freeze --system > /tmp/kv-installed.txt; \
         grep -E '^(torch|torchaudio|torchvision|triton|cuda-bindings|cuda-python|cuda-toolkit)==' \
@@ -1341,7 +1566,29 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             uv pip uninstall --system mooncake-transfer-engine 2>/dev/null || true; \
             uv pip install --system -c /tmp/kv-constraints.txt "mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"; \
         fi; \
-        rm -f /tmp/kv-installed.txt /tmp/kv-constraints.txt; \
+        rm -f /tmp/kv-installed.txt /tmp/kv-constraints.txt /tmp/kv-without-mooncake.txt /tmp/kv-without-nixl.txt /tmp/kv-excludes.txt; \
+    fi
+
+COPY --from=vllm-build-artifacts /tmp/mooncake-dist/wheel.sha256 /tmp/mooncake-wheel.sha256
+RUN --mount=type=bind,from=vllm-build-artifacts,src=/tmp/mooncake-dist,target=/tmp/mooncake-dist,ro \
+    --mount=type=cache,target=/opt/uv/cache \
+    set -eux; \
+    if [ "${BYTEIAAS_REQUIRE_SOURCE_MOONCAKE}" = "true" ]; then \
+        test "${CUDA_VERSION%%.*}" = "13"; \
+        set -- /tmp/mooncake-dist/mooncake_transfer_engine_cuda13-*.whl; \
+        test "$#" -eq 1; \
+        test -f "$1"; \
+        test "$(sed -n 's/^repository=//p' /tmp/mooncake-dist/source.env)" = "${MOONCAKE_GIT_REPOSITORY}"; \
+        test "$(sed -n 's/^ref=//p' /tmp/mooncake-dist/source.env)" = "${MOONCAKE_GIT_REF}"; \
+        test "$(sed -n 's/^commit=//p' /tmp/mooncake-dist/source.env)" = "${MOONCAKE_GIT_COMMIT}"; \
+        test "$(sed -n 's/^store_use_jemalloc=//p' /tmp/mooncake-dist/source.env)" = "ON"; \
+        (cd /tmp/mooncake-dist && sha256sum --check --strict /tmp/mooncake-wheel.sha256); \
+        uv pip uninstall --system mooncake-transfer-engine mooncake-transfer-engine-cuda13; \
+        uv pip install --system --no-deps "$1"; \
+        mooncake_master --version; \
+        mkdir -p /opt/byteiaas/provenance; \
+        cp /tmp/mooncake-dist/source.env /opt/byteiaas/provenance/mooncake-source.env; \
+        cp /tmp/mooncake-wheel.sha256 /opt/byteiaas/provenance/mooncake-wheel.sha256; \
     fi
 
 # Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
@@ -1362,12 +1609,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 # Install source-built Triton last so dependency resolution cannot restore the
 # previously installed version.
-COPY --from=extensions-build \
+COPY --from=vllm-build-artifacts \
     /tmp/triton_from_source_workspace/dist/wheel.sha256 \
     /tmp/triton-source-wheel.sha256
 COPY tools/install_triton_from_source.sh /tmp/install_triton_from_source.sh
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=extensions-build,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
+    --mount=type=bind,from=vllm-build-artifacts,source=/tmp/triton_from_source_workspace/dist,target=/tmp/triton-source-dist,ro \
     if [ -n "${TRITON_INSTALL_FROM_SOURCE_REPO}" ]; then \
         CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2); \
         if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
@@ -1398,10 +1645,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # the image has a NIXL EP build for its PyTorch version. There is no GPU driver
 # at build time, so check for the extension instead of importing it.
 ARG BUILD_NIXL
+COPY --from=nixl-wheel-source /tmp/nixl_workspace/dist/wheels.sha256 /tmp/nixl-wheels.sha256
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=extensions-build,source=/tmp/nixl_workspace/dist,target=/tmp/nixl-dist,ro \
+    --mount=type=bind,from=nixl-wheel-source,source=/tmp/nixl_workspace/dist,target=/tmp/nixl-dist,ro \
     set -eu; \
     if [ "${BUILD_NIXL}" = "true" ]; then \
+        test "${INSTALL_NIXL}" = "true"; \
+        (cd /tmp/nixl-dist && sha256sum --check --strict /tmp/nixl-wheels.sha256); \
         ls /tmp/nixl-dist/*.whl; \
         uv pip uninstall --system nixl nixl-cu12 nixl-cu13; \
         uv pip install --system --no-deps /tmp/nixl-dist/*.whl; \
@@ -1414,10 +1664,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi
 
 ARG BYTEIAAS_BUILD_ROUTER
-COPY --from=byteiaas-router-build /workspace/byteiaas-router-dist/wheels.sha256 /tmp/byteiaas-router-wheels.sha256
+COPY --from=vllm-build-artifacts /workspace/byteiaas-router-dist/wheels.sha256 /tmp/byteiaas-router-wheels.sha256
 COPY tools/byteiaas/router_wheel.py /opt/byteiaas/tools/router_wheel.py
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=byteiaas-router-build,source=/workspace/byteiaas-router-dist,target=/tmp/byteiaas-router-dist,ro \
+    --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-router-dist,target=/tmp/byteiaas-router-dist,ro \
     set -eu; \
     if [ "${BYTEIAAS_BUILD_ROUTER}" = "true" ]; then \
         mkdir -p /opt/byteiaas/provenance; \
@@ -1435,14 +1685,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Restore the locked native packages after every dependency resolver. Retain
 # small provenance reports in the image; mount the wheels only during install.
 ARG BYTEIAAS_BUILD_NATIVE
-COPY --from=byteiaas-native-build /workspace/byteiaas-native/deepgemm-dist/wheels.sha256 /tmp/byteiaas-deepgemm-wheels.sha256
-COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
+COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/deepgemm/wheels.sha256 /tmp/byteiaas-deepgemm-wheels.sha256
+COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/humming/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
 COPY docker/byteiaas/native/deepgemm/source-lock.json /opt/byteiaas/provenance/deepgemm-source-lock.json
 COPY docker/byteiaas/native/humming/source-lock.json /opt/byteiaas/provenance/humming-source-lock.json
 COPY tools/byteiaas/native_wheel.py /opt/byteiaas/tools/native_wheel.py
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=byteiaas-native-build,source=/workspace/byteiaas-native/deepgemm-dist,target=/tmp/byteiaas-deepgemm-dist,ro \
-    --mount=type=bind,from=byteiaas-native-build,source=/workspace/byteiaas-native/humming-dist,target=/tmp/byteiaas-humming-dist,ro \
+    --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-native-dist/deepgemm,target=/tmp/byteiaas-deepgemm-dist,ro \
+    --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-native-dist/humming,target=/tmp/byteiaas-humming-dist,ro \
     set -eu; \
     if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
         for kind in deepgemm humming; do \
@@ -1457,10 +1707,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 # Install patched tokenizers last, including its DecodeStream behavior probe.
 ARG BYTEIAAS_BUILD_TOKENIZERS
-COPY --from=byteiaas-tokenizers-build /workspace/byteiaas-tokenizers-dist/wheels.sha256 /tmp/byteiaas-tokenizers-wheels.sha256
+COPY --from=vllm-build-artifacts /workspace/byteiaas-tokenizers-dist/wheels.sha256 /tmp/byteiaas-tokenizers-wheels.sha256
 COPY tools/byteiaas/tokenizers_wheel.py /opt/byteiaas/tools/tokenizers_wheel.py
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,from=byteiaas-tokenizers-build,source=/workspace/byteiaas-tokenizers-dist,target=/tmp/byteiaas-tokenizers-dist,ro \
+    --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-tokenizers-dist,target=/tmp/byteiaas-tokenizers-dist,ro \
     set -eu; \
     if [ "${BYTEIAAS_BUILD_TOKENIZERS}" = "true" ]; then \
         mkdir -p /opt/byteiaas/provenance; \
@@ -1472,6 +1722,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi
 
 ENV VLLM_USAGE_SOURCE production-docker-image
+ENV MALLOC_CONF=background_thread:true
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
     VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
     VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
@@ -1480,6 +1731,7 @@ COPY tools/byteiaas/image_metadata.py /opt/byteiaas/tools/image_metadata.py
 RUN BYTEIAAS_BUILD_NATIVE="${BYTEIAAS_BUILD_NATIVE}" \
     BYTEIAAS_BUILD_TOKENIZERS="${BYTEIAAS_BUILD_TOKENIZERS}" \
     BYTEIAAS_BUILD_ROUTER="${BYTEIAAS_BUILD_ROUTER}" \
+    BYTEIAAS_REQUIRE_SOURCE_MOONCAKE="${BYTEIAAS_REQUIRE_SOURCE_MOONCAKE}" \
     python3 /opt/byteiaas/tools/image_metadata.py
 LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
@@ -1492,6 +1744,10 @@ LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       ai.vllm.byteiaas.native="${BYTEIAAS_BUILD_NATIVE}" \
       ai.vllm.byteiaas.tokenizers="${BYTEIAAS_BUILD_TOKENIZERS}" \
       ai.vllm.byteiaas.router="${BYTEIAAS_BUILD_ROUTER}" \
+      ai.vllm.mooncake.repository="${MOONCAKE_GIT_REPOSITORY}" \
+      ai.vllm.mooncake.ref="${MOONCAKE_GIT_REF}" \
+      ai.vllm.mooncake.commit="${MOONCAKE_GIT_COMMIT}" \
+      ai.vllm.mooncake.source="${BYTEIAAS_REQUIRE_SOURCE_MOONCAKE}" \
       ai.vllm.byteiaas.provenance="/opt/byteiaas/image-metadata.json"
 
 # define sagemaker first, so it is not default from `docker build`

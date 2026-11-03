@@ -15,6 +15,11 @@ docker build --target vllm-openai -f docker/Dockerfile \
   --build-arg BYTEIAAS_BUILD_NATIVE=true \
   --build-arg BYTEIAAS_BUILD_TOKENIZERS=true \
   --build-arg BYTEIAAS_BUILD_ROUTER=true \
+  --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-build \
+  --build-arg BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=true \
+  --build-arg INSTALL_NIXL=false \
+  --build-arg BUILD_NIXL=false \
+  --build-arg BYTEIAAS_NIXL_WHEEL_SOURCE=nixl-empty \
   --build-arg VLLM_BUILD_COMMIT="$(git rev-parse HEAD)" \
   -t "$BUILT_IMAGE" .
 ```
@@ -29,13 +34,32 @@ These sources produce DeepGEMM `2.8.0+local` and Humming
 `0.1.18+unified.g596bb89`. The Humming build includes its launcher,
 device-info extension, cubin patcher, NVRTC binary, and native manifest.
 Tokenizers is fixed to `441393c7`; the encoder-only router is fixed to
-`ef339bc7`.
+`ef339bc7`. Mooncake is fixed to `ffd73707`, including the PR #4208 backport,
+and built with `STORE_USE_JEMALLOC=ON`. The image enables jemalloc's background
+purge thread with `MALLOC_CONF=background_thread:true`.
 
 The release manylinux_2_28 builder replaces earlier AlmaLinux and dependency
 bootstrap iterations. The runtime follows release Ubuntu 24.04 defaults.
-Internal workflows keep the HTTP/index configuration and local Docker Hub
-mirror, but no longer pass obsolete DeepGEMM fork pin or AlmaLinux/Ubuntu
-mirror arguments to the release Dockerfile.
+Internal workflows pass regional Ubuntu/AlmaLinux/EPEL and Python indexes
+to the build and runtime stages, together with the local Docker Hub mirror.
+The `mooncake-system-deps` target installs fresh Ubuntu dependencies before
+native compilation on the same CI builder. APT retries transient downloads
+and rejects incomplete index updates. Python bootstrap prefers distribution
+packages and installs pinned uv 0.11.1 from the configured Python index.
+Supplemental indexes use `UV_INDEX` so PyTorch's command-line
+`--extra-index-url` cannot hide the public PyPI fallback when the regional
+mirror has not yet synchronized a release. CI checks the known supplemental
+index requirement for Python 3.12/manylinux_2_28 before building images.
+Native source locks replace the obsolete DeepGEMM fork build arguments.
+
+Build contract 3 extends these source locks with same-run artifact reuse.
+The wheel workflow uploads vLLM, DeepGEMM, unified Humming, DeepEP, patched
+tokenizers, router, and Mooncake wheels with source/provenance manifests and
+checksums. The image workflows download that same run's artifact and install
+its wheels without invoking the component builders again. The optional
+Triton source build has an explicit disabled marker. NIXL is neither built
+nor included in the artifact; internal KV dependency resolution excludes
+NIXL and its transitive variants.
 
 ## Prefill and Decode use the same Humming package
 

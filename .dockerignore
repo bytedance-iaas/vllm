@@ -3,6 +3,7 @@
 /artifacts/vllm-rocm-install/
 /bake-config-build-*.json
 /wheel-export/
+/byteiaas-build-artifacts/
 dist
 vllm/*.so
 vllm/vllm-rs

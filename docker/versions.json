@@ -25,6 +25,9 @@
     "GET_PIP_URL": {
       "default": "https://bootstrap.pypa.io/get-pip.py"
     },
+    "UV_VERSION": {
+      "default": "0.11.1"
+    },
     "PYTORCH_CUDA_INDEX_BASE_URL": {
       "default": "https://download.pytorch.org/whl"
     },
@@ -40,6 +43,12 @@
     "BUILD_NIXL": {
       "default": "false"
     },
+    "INSTALL_NIXL": {
+      "default": "true"
+    },
+    "BYTEIAAS_NIXL_WHEEL_SOURCE": {
+      "default": "extensions-build"
+    },
     "BYTEIAAS_BUILD_NATIVE": {
       "default": "false"
     },
@@ -48,6 +57,21 @@
     },
     "BYTEIAAS_BUILD_ROUTER": {
       "default": "false"
+    },
+    "BYTEIAAS_BUILD_ARTIFACTS_SOURCE": {
+      "default": "byteiaas-wheel-artifacts"
+    },
+    "BYTEIAAS_MOONCAKE_WHEEL_SOURCE": {
+      "default": "mooncake-empty"
+    },
+    "MOONCAKE_GIT_REPOSITORY": {
+      "default": "https://github.com/wangyicong52/Mooncake.git"
+    },
+    "MOONCAKE_GIT_REF": {
+      "default": "vllm-dsv4.1"
+    },
+    "MOONCAKE_GIT_COMMIT": {
+      "default": "ffd73707e9dbfe0997053f3d82eab86d1568337e"
     },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"
@@ -64,6 +88,12 @@
     "MAX_JOBS": {
       "default": "2"
     },
+    "MOONCAKE_CMAKE_JOBS": {
+      "default": "8"
+    },
+    "MOONCAKE_EXTENSION_JOBS": {
+      "default": "2"
+    },
     "NVCC_THREADS": {
       "default": "8"
     },
@@ -71,10 +101,16 @@
       "default": "cuda"
     },
     "DEEPEP_COMMIT_HASH": {
-      "default": "d4f41e4e93"
+      "default": "d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb"
+    },
+    "NVSHMEM_VER": {
+      "default": "3.3.24"
     },
     "GIT_REPO_CHECK": {
       "default": "0"
+    },
+    "VLLM_BUILD_COMMIT": {
+      "default": "unknown"
     },
     "VLLM_MAX_SIZE_MB": {
       "default": "500"
@@ -96,6 +132,9 @@
     },
     "VLLM_IMAGE_SOURCE": {
       "default": "https://github.com/vllm-project/vllm"
+    },
+    "BYTEIAAS_REQUIRE_SOURCE_MOONCAKE": {
+      "default": "false"
     }
   }
 }

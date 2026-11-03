@@ -13,7 +13,7 @@ on:
         type: string
         default: "13.0.3"
       artifact_name:
-        description: "Uploaded wheel artifact name"
+        description: "Uploaded same-run component wheel artifact name"
         required: false
         type: string
         default: "vllm-cu130-wheel"
@@ -35,8 +35,14 @@ jobs:
       ALL_PROXY: http://100.68.162.211:3128
       NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,mirrors.volces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com,repo.almalinux.org,download.pytorch.org,astral.sh,releases.astral.sh,api.launchpad.net,launchpad.net,ppa.launchpad.net,ppa.launchpadcontent.net,keyserver.ubuntu.com
       BYTEIAAS_BUILDX_CACHE_ROOT: /data/buildkit/byteiaas-vllm-wheel-cache
+      BYTEIAAS_UBUNTU_MIRROR: http://mirrors.volces.com/ubuntu
+      BYTEIAAS_ALMALINUX_MIRROR: http://mirrors.volces.com/almalinux
+      BYTEIAAS_EPEL_MIRROR: http://mirrors.volces.com/epel
       BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
+      BYTEIAAS_MOONCAKE_GIT_REPOSITORY: https://github.com/wangyicong52/Mooncake.git
+      BYTEIAAS_MOONCAKE_GIT_REF: vllm-dsv4.1
+      BYTEIAAS_MOONCAKE_GIT_COMMIT: ffd73707e9dbfe0997053f3d82eab86d1568337e
       BYTEIAAS_CUDA_VERSION: ${{ inputs.cuda_version }}
     steps:
       - name: Validate immutable checkout ref
@@ -62,18 +68,44 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
+      - name: Set up uv for build input validation
+        timeout-minutes: 5
+        run: bash tools/byteiaas/setup_uv.sh
+
       - name: Validate build contract
+        timeout-minutes: 5
         env:
           CHECKOUT_REF: ${{ inputs.checkout_ref }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "2"
-          python3 tools/byteiaas/validate_build_contract.py
+          test "$(cat .github/byteiaas-build-contract)" = "3"
+          uv venv --python python3 --no-python-downloads .venv
+          .venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), sys.version'
+          .venv/bin/python tools/byteiaas/validate_build_contract.py
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
           fi
+
+      - name: Preflight supplemental Python index
+        timeout-minutes: 2
+        env:
+          UV_INDEX_URL: ${{ env.BYTEIAAS_PIP_INDEX_URL }}
+          UV_INDEX: ${{ env.BYTEIAAS_PIP_EXTRA_INDEX_URL }}
+        run: |
+          set -euo pipefail
+          requirements="${RUNNER_TEMP}/byteiaas-supplemental-index.txt"
+          printf '%s\n' 'xgrammar==0.2.8' > "${requirements}"
+          uv pip compile "${requirements}" \
+            --python .venv/bin/python \
+            --python-version 3.12 \
+            --python-platform x86_64-manylinux_2_28 \
+            --no-python-downloads \
+            --no-deps \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cu130 \
+            --output-file /dev/null
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         id: buildx
@@ -85,6 +117,38 @@ jobs:
             [registry."docker.io"]
               mirrors = ["127.0.0.1:5000"]
           cleanup: true
+
+      - name: Preflight Mooncake system dependencies
+        timeout-minutes: 10
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -euo pipefail
+          # This target has no dependency on uv, PyTorch or native compilation.
+          # The full build reuses its layers on this same BuildKit builder.
+          cache_dir="${BYTEIAAS_BUILDX_CACHE_ROOT}/build"
+          cache_args=()
+          if [ -d "${cache_dir}" ]; then
+            cache_args=(--cache-from "type=local,src=${cache_dir}")
+          fi
+          docker buildx build \
+            --builder "${BUILDX_BUILDER}" \
+            "${cache_args[@]}" \
+            --target mooncake-system-deps \
+            --platform linux/amd64 \
+            --network=host \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}" \
+            --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}" \
+            --build-arg HTTP_PROXY="${HTTP_PROXY}" \
+            --build-arg HTTPS_PROXY="${HTTPS_PROXY}" \
+            --build-arg ALL_PROXY="${ALL_PROXY}" \
+            --build-arg NO_PROXY="${NO_PROXY}" \
+            --build-arg http_proxy="${HTTP_PROXY}" \
+            --build-arg https_proxy="${HTTPS_PROXY}" \
+            --build-arg all_proxy="${ALL_PROXY}" \
+            --build-arg no_proxy="${NO_PROXY}" \
+            .
 
       - name: Build wheel stage image
         env:
@@ -127,11 +191,24 @@ jobs:
             --network=host \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION="${BYTEIAAS_CUDA_VERSION}" \
+            --build-arg UBUNTU_MIRROR="${BYTEIAAS_UBUNTU_MIRROR}" \
+            --build-arg ALMALINUX_MIRROR="${BYTEIAAS_ALMALINUX_MIRROR}" \
+            --build-arg EPEL_MIRROR="${BYTEIAAS_EPEL_MIRROR}" \
             --build-arg PIP_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}" \
             --build-arg PIP_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}" \
             --build-arg UV_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}" \
             --build-arg UV_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}" \
+            --build-arg UV_INDEX="${BYTEIAAS_PIP_EXTRA_INDEX_URL}" \
             --build-arg BYTEIAAS_BUILD_NATIVE=true \
+            --build-arg BYTEIAAS_BUILD_TOKENIZERS=true \
+            --build-arg BYTEIAAS_BUILD_ROUTER=true \
+            --build-arg BUILD_NIXL=false \
+            --build-arg INSTALL_NIXL=false \
+            --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-build \
+            --build-arg MOONCAKE_GIT_REPOSITORY="${BYTEIAAS_MOONCAKE_GIT_REPOSITORY}" \
+            --build-arg MOONCAKE_GIT_REF="${BYTEIAAS_MOONCAKE_GIT_REF}" \
+            --build-arg MOONCAKE_GIT_COMMIT="${BYTEIAAS_MOONCAKE_GIT_COMMIT}" \
+            --build-arg VLLM_BUILD_COMMIT="${{ inputs.checkout_ref }}" \
             --build-arg max_jobs="${build_max_jobs}" \
             --build-arg nvcc_threads="${build_nvcc_threads}" \
             --build-arg HTTP_PROXY="${HTTP_PROXY}" \
@@ -155,23 +232,38 @@ jobs:
             rm -rf "${cache_old}"
           fi
 
-      - name: Copy wheels from build stage
+      - name: Copy and seal same-run build artifacts
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
         run: |
           set -euo pipefail
-          rm -rf byteiaas-wheel-dist
-          mkdir -p byteiaas-wheel-dist
+          rm -rf byteiaas-build-artifacts
+          mkdir -p \
+            byteiaas-build-artifacts/workspace \
+            byteiaas-build-artifacts/tmp/ep_kernels_workspace \
+            byteiaas-build-artifacts/tmp/triton_from_source_workspace
           container="$(docker create "local/byteiaas-vllm-wheel:${GITHUB_RUN_ID}")"
           trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
-          docker cp "${container}:/workspace/dist/." byteiaas-wheel-dist/
-          docker cp "${container}:/workspace/byteiaas-native-dist" byteiaas-wheel-dist/
-          ls -lh byteiaas-wheel-dist
-          test -n "$(find byteiaas-wheel-dist -maxdepth 1 -name '*.whl' -print -quit)"
+          docker cp "${container}:/source-commit" byteiaas-build-artifacts/
+          for component in dist byteiaas-native-dist byteiaas-tokenizers-dist byteiaas-router-dist; do
+            docker cp "${container}:/workspace/${component}" \
+              byteiaas-build-artifacts/workspace/
+          done
+          for component in ep_kernels_workspace triton_from_source_workspace; do
+            docker cp "${container}:/tmp/${component}/dist" \
+              "byteiaas-build-artifacts/tmp/${component}/"
+          done
+          docker cp "${container}:/tmp/mooncake-dist" byteiaas-build-artifacts/tmp/
+          .venv/bin/python tools/byteiaas/build_artifacts.py seal \
+            --root byteiaas-build-artifacts \
+            --checkout-ref "${CHECKOUT_REF}" --run-id "${GITHUB_RUN_ID}"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact_name }}
-          path: byteiaas-wheel-dist/
+          path: byteiaas-build-artifacts/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
