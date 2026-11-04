@@ -21,6 +21,15 @@ _SHAPES = {
 }
 _TARGET_ROWS = (96, 104, 108, 112)
 _DRAFT_ROWS = (80, 88, 90, 96)
+_VALIDATED_TARGET_ROWS = (64, 256, 384)
+_VALIDATED_TARGET_PROJECTIONS = frozenset(
+    (
+        "attn.wq_b",
+        "attn.wo_b",
+        "ffn.shared_experts.gate_up_proj",
+        "ffn.shared_experts.down_proj",
+    )
+)
 _LEGACY_STREAM_K_PROJECTIONS = frozenset(
     (
         "attn.wq_b",
@@ -108,6 +117,55 @@ def _legacy_stream_k_tuning(projection, m):
     }
 
 
+def _validated_target_tuning(projection, m):
+    if (
+        projection not in _VALIDATED_TARGET_PROJECTIONS
+        or m not in _VALIDATED_TARGET_ROWS
+    ):
+        return None
+    if m == 64:
+        wq_b = projection == "attn.wq_b"
+        tuning = {
+            "block_shape": (64, 128, 128),
+            "warp_shape": (64, 32, 128 if wq_b else 64),
+            "use_stream_k": not wq_b,
+            "use_f16_accum": False,
+            "num_sms": 64 if wq_b else 78,
+            "num_stages": 3,
+            "num_ctas_per_sm": 2 if wq_b else 1,
+        }
+    elif projection == "attn.wo_b":
+        tuning = {
+            "block_shape": (64, 128, 128),
+            "warp_shape": (64, 32, 128),
+            "use_stream_k": True,
+            "use_f16_accum": False,
+            "num_sms": 78,
+            "num_stages": 3,
+            "num_ctas_per_sm": 2,
+        }
+    else:
+        tuning = {
+            "block_shape": (64, 128, 128),
+            "warp_shape": (64, 16, 128),
+            "use_stream_k": False,
+            "use_f16_accum": False,
+            "num_sms": 78,
+            "num_stages": 4,
+            "num_ctas_per_sm": 1,
+            "multi_cast_size_a": 1,
+            "multi_cast_size_b": 1,
+        }
+    tuning.update(
+        use_tma=True,
+        use_warp_spec=True,
+        raster_group_m=1,
+        use_tma_c=False,
+        stream_k_max_slices=3,
+    )
+    return tuning
+
+
 class Dsv41HummingDense(torch.nn.Module):
     @classmethod
     @torch.no_grad()
@@ -154,7 +212,13 @@ class Dsv41HummingDense(torch.nn.Module):
                 "DSV4.1 ordered Decode requires the unified Humming wheel "
                 "with native stream_k_max_slices support."
             )
-        self.rows = tuple(rows)
+        validated_rows = (
+            _VALIDATED_TARGET_ROWS
+            if tuple(rows) == _TARGET_ROWS
+            and projection in _VALIDATED_TARGET_PROJECTIONS
+            else ()
+        )
+        self.rows = (*rows, *validated_rows)
         self.m = self.rows[0]
         self.n, self.k = weight.shape
         with torch.device(weight.device):
@@ -187,12 +251,14 @@ class Dsv41HummingDense(torch.nn.Module):
             "attn.wq_b": 64,
         }
         for m in self.rows:
-            tuning = dict(get_heuristics_config(self.layer_config, shape_m=m))
-            tuning.update(use_tma_c=False, stream_k_max_slices=3)
-            if projection in _LEGACY_STREAM_K_PROJECTIONS:
-                tuning = _legacy_stream_k_tuning(projection, m)
-            if projection in grid_caps:
-                tuning["num_sms"] = grid_caps[projection]
+            tuning = _validated_target_tuning(projection, m)
+            if tuning is None:
+                tuning = dict(get_heuristics_config(self.layer_config, shape_m=m))
+                tuning.update(use_tma_c=False, stream_k_max_slices=3)
+                if projection in _LEGACY_STREAM_K_PROJECTIONS:
+                    tuning = _legacy_stream_k_tuning(projection, m)
+                if projection in grid_caps:
+                    tuning["num_sms"] = grid_caps[projection]
             if self.layer_config.use_block_scaled_mma:
                 raise RuntimeError("Ordered Decode requires ordinary FP32 scales.")
             self.tuning_configs[m] = tuning
