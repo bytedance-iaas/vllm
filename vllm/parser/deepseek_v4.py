@@ -49,6 +49,7 @@ DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
 DSML_PARAM_START = f"<{_DSML}parameter"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
+_BARE_PARAM_CLOSE = f"</{_DSML}>"
 
 # Spellings variants of ``DSML_TOOL_START`` observed in production.
 DSML_TOOL_START_VARIANTS: tuple[str, ...] = (
@@ -59,21 +60,30 @@ DSML_TOOL_START_VARIANTS: tuple[str, ...] = (
 
 def _param_patterns(
     param_start: str, param_close: str
-) -> tuple[re.Pattern, re.Pattern]:
-    """Complete and trailing-partial parameter regexes for one DSML dialect.
+) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
+    """Complete, trailing-partial, and value-end parameter regexes for one DSML dialect.
 
     The ``string`` attribute is optional: the model sometimes omits it, and
     dropping such a parameter hands the client a tool call with no arguments.
     """
     start, close = re.escape(param_start), re.escape(param_close)
     head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+    value_end = rf"{close}|{start}\s+name="
+    # A bare namespace closer is recoverable only at a parameter boundary.
+    bare_close = rf"{re.escape(_BARE_PARAM_CLOSE)}\s*(?={start}\s+name=|$)"
     return (
-        re.compile(rf"{head}(.*?)(?:{close}|(?={start}\s+name=))", re.DOTALL),
+        re.compile(
+            rf"{head}(.*?)(?:{close}|(?P<bare_close>{bare_close})|(?={start}\s+name=))",
+            re.DOTALL,
+        ),
         re.compile(rf"{head}(.*)$", re.DOTALL),
+        re.compile(value_end),
     )
 
 
-_PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
+_PARAM_RE, _PARTIAL_PARAM_RE, _PARAM_VALUE_END_RE = _param_patterns(
+    DSML_PARAM_START, DSML_PARAM_CLOSE
+)
 
 
 def _dsml_arg_converter(
@@ -82,6 +92,7 @@ def _dsml_arg_converter(
     *,
     param_re: re.Pattern = _PARAM_RE,
     partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
+    value_end_re: re.Pattern = _PARAM_VALUE_END_RE,
 ) -> str:
     params: dict[str, object] = {}
 
@@ -89,6 +100,9 @@ def _dsml_arg_converter(
     # A missing ``string`` attribute is treated like ``string="false"``: try
     # JSON, fall back to the literal text.
     for m in param_re.finditer(raw_args):
+        # A chunk can end inside a literal bare closer; final flush confirms it.
+        if partial and m.group("bare_close") and m.end() == len(raw_args):
+            break
         name, is_str, value = m.group(1), m.group(2), m.group(3)
         if is_str == "true":
             params[name] = value
@@ -99,15 +113,42 @@ def _dsml_arg_converter(
                 params[name] = value
         last_end = m.end()
 
-    if partial:
-        pm = partial_param_re.search(raw_args, last_end)
-        if pm:
-            name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
-            if is_str == "true":
-                params[name] = value
-            else:
+    pm = partial_param_re.search(raw_args, last_end)
+    # A repeated name must not replace the value already closed for it.
+    if pm and pm.group(1) in params:
+        pm = None
+    if pm:
+        name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
+        bare_start = value.rfind(_BARE_PARAM_CLOSE) if partial else -1
+        pending_bare = (
+            bare_start >= 0
+            and value_end_re.fullmatch(
+                value[bare_start + len(_BARE_PARAM_CLOSE) :].lstrip(), partial=True
+            )
+            is not None
+        )
+        if pending_bare:
+            value = value[:bare_start]
+        # The trailing parameter is unclosed, so a suffix that can only be the
+        # start of its close marker (or of the next parameter) is not part of
+        # the value, including at the end of a truncated output.
+        window_start = value.rfind("<")
+        if window_start != -1 and value_end_re.fullmatch(
+            value[window_start:], partial=True
+        ):
+            value = value[:window_start]
+        if is_str == "true":
+            params[name] = value
+        elif partial:
+            # A pending closer can still be literal text inside a JSON value.
+            if not pending_bare:
                 with contextlib.suppress(json.JSONDecodeError, ValueError):
                     params[name] = json.loads(value)
+        else:
+            try:
+                params[name] = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                params[name] = value
 
     return json.dumps(params, ensure_ascii=False)
 
@@ -116,6 +157,8 @@ def _unwrap_wrapper_args(
     args_json: str,
     tools: list[Tool] | None,
     func_name: str | None,
+    *,
+    partial: bool = False,
 ) -> str:
     if not tools or not func_name:
         return args_json
@@ -137,7 +180,7 @@ def _unwrap_wrapper_args(
             try:
                 inner = json.loads(inner)
             except json.JSONDecodeError:
-                return args_json
+                return "{}" if partial else args_json
         if isinstance(inner, dict) and set(inner.keys()).issubset(allowed):
             return json.dumps(inner, ensure_ascii=False)
     return args_json
@@ -274,4 +317,4 @@ class DeepSeekV4Parser(ParserEngine):
         if not self._tools:
             return result
         func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
-        return _unwrap_wrapper_args(result, self._tools, func_name)
+        return _unwrap_wrapper_args(result, self._tools, func_name, partial=partial)

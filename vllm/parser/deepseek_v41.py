@@ -14,13 +14,17 @@ from vllm.parser.deepseek_v4 import (
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig
 
 DSML_TOOL_START = "<｜DSML｜ calls>"
+# V4's ``tool_calls`` wrapper name with V4.1's spacing (#62051).
+DSML_TOOL_START_VARIANTS: tuple[str, ...] = ("<｜DSML｜ tool_calls>",)
 DSML_TOOL_END = "</｜DSML｜ calls>"
 DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
 DSML_INVOKE_END = "</｜DSML｜ invoke>"
 DSML_PARAM_START = "<｜DSML｜ parameter"
 DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
 
-_PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
+_PARAM_RE, _PARTIAL_PARAM_RE, _PARAM_VALUE_END_RE = _param_patterns(
+    DSML_PARAM_START, DSML_PARAM_CLOSE
+)
 
 
 @functools.cache
@@ -37,15 +41,29 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
     return replace(
         config,
         name="deepseek_v41",
-        terminals={**config.terminals, **terminal_overrides},
+        terminals={
+            **config.terminals,
+            **terminal_overrides,
+            # Keep the text alias independent of the canonical special token.
+            "TOOL_START_VARIANT": DSML_TOOL_START_VARIANTS,
+        },
         token_id_terminals={
             key: terminal_overrides.get(key, value)
             for key, value in config.token_id_terminals.items()
+        },
+        transitions={
+            **config.transitions,
+            **{
+                (state, "TOOL_START_VARIANT"): transition
+                for (state, terminal), transition in config.transitions.items()
+                if terminal == "TOOL_START"
+            },
         },
         arg_converter=functools.partial(
             _dsml_arg_converter,
             param_re=_PARAM_RE,
             partial_param_re=_PARTIAL_PARAM_RE,
+            value_end_re=_PARAM_VALUE_END_RE,
         ),
     )
 

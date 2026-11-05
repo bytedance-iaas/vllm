@@ -25,6 +25,9 @@ CALLS = (
     "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
 )
 
+# V4's ``tool_calls`` wrapper name with V4.1's spacing (#62051).
+V4_NAMED_CALLS = CALLS.replace("｜DSML｜ calls>", "｜DSML｜ tool_calls>")
+
 
 def tokenizer_for(text, special_calls):
     vocab = {"<think>": 50, "</think>": 51}
@@ -95,6 +98,58 @@ def test_registered_adapters_parse_complete_output(thinking):
     assert json.loads(calls[0].arguments) == {"city": "杭州", "count": 42}
 
 
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("special_calls", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+def test_v4_wrapper_name_opens_tool_block(thinking, special_calls, chunk_size):
+    text = ("Plan.</think>" if thinking else "") + "Checking." + V4_NAMED_CALLS
+    tokenizer, tokens = tokenizer_for(text, special_calls)
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": thinking}),
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+            prompt_token_ids=[50 if thinking else 51],
+        )
+    )
+    reasoning, content, calls = parser_for(tokenizer, {"thinking": thinking}).parse(
+        text,
+        _test_request(tools=DUMMY_TOOLS),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert output.reasoning == (reasoning or "") == ("Plan." if thinking else "")
+    assert output.content.strip() == (content or "").strip() == "Checking."
+    assert [call["name"] for call in output.tool_calls] == ["get_weather", "add"]
+    assert [call.name for call in calls] == ["get_weather", "add"]
+    assert (
+        [json.loads(call["arguments"]) for call in output.tool_calls]
+        == [json.loads(call.arguments) for call in calls]
+        == [{"city": "杭州", "count": 42}, {"x": 1.5, "y": 2.25}]
+    )
+
+
+@pytest.mark.parametrize("special_calls", [False, True])
+def test_v4_wrapper_name_ends_reasoning(special_calls):
+    text = "Plan." + V4_NAMED_CALLS
+    tokenizer, tokens = tokenizer_for(text, special_calls)
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": True}),
+            tokens,
+            chunk_size=1,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+            prompt_token_ids=[50],
+        )
+    )
+    assert output.reasoning == "Plan."
+    assert not output.content.strip()
+    assert [call["name"] for call in output.tool_calls] == ["get_weather", "add"]
+
+
 @pytest.mark.parametrize(
     ("controls", "text", "expected_reasoning", "reasoning_tokens"),
     [
@@ -146,3 +201,172 @@ def test_python_argument_conversion_and_partial_values():
         "bare": 7,
         "text": "  a<b",
     }
+    assert json.loads(converter(raw, False)) == {
+        "object": {"a": [True, None]},
+        "bad": "[broken",
+        "bare": 7,
+        "text": "  a<b",
+    }
+
+
+@pytest.mark.parametrize("partial", [True, False])
+@pytest.mark.parametrize(
+    "cut", ["<", "</", "</｜", "</｜DSML｜", "</｜DSML｜ parameter"]
+)
+def test_python_argument_conversion_drops_partial_close_marker(cut, partial):
+    converter = deepseek_v41_config().arg_converter
+    raw = '<｜DSML｜ parameter name="city" string="true">Paris' + cut
+    assert json.loads(converter(raw, partial)) == {"city": "Paris"}
+
+
+@pytest.mark.parametrize("partial", [True, False])
+def test_python_argument_conversion_ignores_unclosed_repeated_name(partial):
+    converter = deepseek_v41_config().arg_converter
+    raw = (
+        '<｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>'
+        '<｜DSML｜ parameter name="city" string="true">Lyon'
+    )
+    assert json.loads(converter(raw, partial)) == {"city": "Paris"}
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+@pytest.mark.parametrize(
+    ("text", "expected_name", "expected_args"),
+    [
+        (
+            (
+                '<｜DSML｜ calls>\n<｜DSML｜ invoke name="WebFetch">\n'
+                '<｜DSML｜ parameter name="url" string="true">https://example.com'
+            ),
+            "WebFetch",
+            {"url": "https://example.com"},
+        ),
+        (
+            (
+                '<｜DSML｜ calls>\n<｜DSML｜ invoke name="Read">\n'
+                '<｜DSML｜ parameter name="file_path" string="true">/tmp/a'
+                "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+            ),
+            "Read",
+            {"file_path": "/tmp/a"},
+        ),
+    ],
+)
+def test_truncated_and_unclosed_parameter_streaming_and_non_streaming(
+    chunk_size, text, expected_name, expected_args
+):
+    tokenizer, tokens = tokenizer_for(text, False)
+    parser = parser_for(tokenizer, {"thinking": False})
+    output = collect_output(
+        replay_streaming(
+            parser,
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+        )
+    )
+    assert len(output.tool_calls) == 1
+    assert output.tool_calls[0]["name"] == expected_name
+    assert json.loads(output.tool_calls[0]["arguments"]) == expected_args
+
+    parser_non_stream = parser_for(tokenizer, {"thinking": False})
+    _, content, calls = parser_non_stream.parse(
+        text,
+        _test_request(tools=DUMMY_TOOLS),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert not (content or "").strip()
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == expected_name
+    assert json.loads(calls[0].arguments) == expected_args
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+@pytest.mark.parametrize(
+    ("value", "closer"),
+    [
+        ("Paris", "</｜DSML｜>"),
+        ('print("</｜DSML｜>")', "</｜DSML｜ parameter>"),
+        ("text </｜DSML｜> literal", "</｜DSML｜ parameter>"),
+        ("</｜DSML｜>", "</｜DSML｜ parameter>"),
+    ],
+)
+@pytest.mark.parametrize("string_mode", ["true", "false", None])
+@pytest.mark.parametrize("has_schema", [False, True])
+def test_parameter_closer_recovery_preserves_argument_text(
+    chunk_size, value, closer, string_mode, has_schema
+):
+    attr = "" if string_mode is None else f' string="{string_mode}"'
+    raw_value = (
+        value if string_mode == "true" else json.dumps(value, ensure_ascii=False)
+    )
+    parameters: dict[str, object] = {"type": "object"}
+    if has_schema:
+        parameters["properties"] = {
+            "city": {"type": "string"},
+            "count": {"type": "integer"},
+        }
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": parameters},
+        }
+    ]
+    text = (
+        '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+        f'<｜DSML｜ parameter name="city"{attr}>{raw_value}{closer}\n'
+        '<｜DSML｜ parameter name="count" string="false">2</｜DSML｜ parameter>'
+        "</｜DSML｜ invoke></｜DSML｜ calls>"
+    )
+    tokenizer, tokens = tokenizer_for(text, False)
+    expected = {"city": value, "count": 2}
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": False}),
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=tools,
+        )
+    )
+    assert json.loads(output.tool_calls[0]["arguments"]) == expected
+    _, _, calls = parser_for(tokenizer, {"thinking": False}).parse(
+        text,
+        _test_request(tools=tools),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert calls is not None and len(calls) == 1
+    assert json.loads(calls[0].arguments) == expected
+
+
+@pytest.mark.parametrize("string_mode", ["true", "false", None])
+@pytest.mark.parametrize("after_closer", [0, 2, 8, 20])
+@pytest.mark.parametrize("next_parameter", [False, True])
+def test_bare_closer_waits_for_parameter_boundary(
+    string_mode, after_closer, next_parameter
+):
+    attr = "" if string_mode is None else f' string="{string_mode}"'
+    text = (
+        '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+        f'<｜DSML｜ parameter name="city"{attr}>Paris</｜DSML｜>\n'
+    )
+    expected: dict[str, object] = {"city": "Paris"}
+    if next_parameter:
+        text += '<｜DSML｜ parameter name="count" string="false">2</｜DSML｜ parameter>'
+        expected["count"] = 2
+    text += "</｜DSML｜ invoke></｜DSML｜ calls>"
+    tokenizer, tokens = tokenizer_for(text, False)
+    split = text.index("</｜DSML｜>") + len("</｜DSML｜>") + after_closer
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": False}),
+            tokens,
+            chunk_size=split,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+        )
+    )
+    assert json.loads(output.tool_calls[0]["arguments"]) == expected
