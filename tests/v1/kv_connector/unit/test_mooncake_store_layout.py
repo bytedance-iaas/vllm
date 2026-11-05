@@ -178,3 +178,30 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
 
         expected = torch.cat(producer_tensors[tp_rank * 2 : tp_rank * 2 + 2], dim=1)
         torch.testing.assert_close(tensor, expected)
+
+
+def test_canonical_component_and_relay_share_identity():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        component_id,
+    )
+
+    assert component_id("model.layers.8.attn") == component_id(
+        "model.layers.10.attn", relay=True
+    )
+    assert component_id("model.layers.8.attn.indexer.k_cache") != component_id(
+        "model.layers.8.attn"
+    )
+
+
+def test_canonical_regions_do_not_copy_the_packed_stride():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+    )
+
+    binding = Binding(
+        Component("layer_8/main_kv", 64, 128, 2, "uint8"), 3, 1000, 256, 8
+    )
+    assert binding.regions(0, 128, [2, 5]) == [(1512, 128), (2280, 128)]
+    with pytest.raises(ValueError, match="null/invalid"):
+        binding.regions(0, 64, [0])

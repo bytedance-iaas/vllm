@@ -125,11 +125,9 @@ class MultiKVConnectorPromMetrics(KVConnectorPromMetrics):
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         for connector_id, stats_data in transfer_stats_data.items():
-            assert connector_id in self._prom_metrics, (
-                f"{connector_id} is not contained in the list of registered connectors "
-                f"with Prometheus metrics support: {self._prom_metrics.keys()}"
-            )
-            self._prom_metrics[connector_id].observe(stats_data, engine_idx)
+            prom_metrics = self._prom_metrics.get(connector_id)
+            if prom_metrics is not None:
+                prom_metrics.observe(stats_data, engine_idx)
 
 
 class MultiConnector(KVConnectorBase_V1, SupportsHMA):
@@ -181,6 +179,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config=vllm_config, role=role, kv_cache_config=kv_cache_config
         )
 
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+        if "pd_store_profile" in extra:
+            from .mooncake.store.dsv41_profile import validate_composition
+
+            validate_composition(vllm_config)
         self._connectors: list[KVConnectorBase_V1] = []
         self._ktc_kv_transfer_config = []
         for connector_cls, temp_config in self._get_connector_classes_and_configs(

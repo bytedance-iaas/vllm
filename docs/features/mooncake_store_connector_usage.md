@@ -312,3 +312,10 @@ To use a custom shared seed, set the same `PYTHONHASHSEED` on every instance tha
 ```bash
 PYTHONHASHSEED=<shared-value> vllm serve ...
 ```
+
+## Experimental DSv4.1 encoder-only PD composition
+
+The opt-in [DSv4.1 PD DRAM profile](mooncake_store_dsv41_pd.md) uses a separate
+canonical backend for PP2/PCP4 P and accepted Decode KV persistence. Its execution
+and performance validation are pending; the general Store behavior above is
+unchanged without that explicit profile.

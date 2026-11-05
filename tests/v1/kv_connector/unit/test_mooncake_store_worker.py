@@ -5192,3 +5192,382 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_canonical_lookup_requires_every_component_of_each_chunk():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Component,
+        Manifest,
+        merge_components,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    components = [
+        Component(f"layer_{layer}/{kind}", 64, 128, 2, "uint8")
+        for layer in (2, 8, 14, 20)
+        for kind in ("main_kv", "indexer_k")
+    ]
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.manifest = Manifest(
+        "test", "revision", merge_components([components]), 64
+    )
+    canonical.store = Mock()
+    canonical._record = lambda *args, **kwargs: None
+    canonical.extra = {}
+    canonical.store.batch_is_exist.return_value = [1] * 8 + [1] * 7 + [0] + [1] * 8
+    assert canonical.lookup(193, [b"a", b"b", b"c"]).hit_length == 64
+    assert canonical.store.batch_is_exist.call_count == 1
+    canonical.store = None
+
+
+def test_canonical_relay_load_uses_owner_key_but_its_own_block_table():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+        Manifest,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    component = Component("layer_8/main_kv", 64, 128, 2, "uint8")
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.manifest = Manifest("test", "revision", (component,), 64)
+    canonical.bindings = [Binding(component, 1, 1000, 256, 10, writer=False)]
+    canonical.writer = True
+    job = Job("r", ([2], [5]), (b"a",), 0, 64)
+    assert canonical._batch(job, saving=True) == ([], [], [])
+    keys, addresses, sizes = canonical._batch(job, saving=False)
+    assert keys == [canonical.manifest.key(component, b"a")]
+    assert addresses == [[2280]] and sizes == [[128]]
+
+
+def _make_canonical_transfer_worker(monkeypatch, *, page_bytes=128):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+        Manifest,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    component = Component("layer_8/main_kv", 64, page_bytes, 2, "uint8")
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.capacity_only = False
+    canonical.lock = threading.Lock()
+    canonical.manifest = Manifest("test", "revision", (component,), 64)
+    canonical.bindings = [Binding(component, 0, 4096, page_bytes, 128)]
+    canonical.writer = True
+    canonical.pending = {}
+    # Legacy settings must no longer control transfer admission or prefix length.
+    canonical.max_jobs, canonical.max_bytes = 32, 256 * 1024**2
+    canonical.stall_seconds, canonical.cooldown = 30, 5
+    canonical.unhealthy_until = 0
+    canonical.device, canonical.extra = 0, {}
+    canonical.replication = object()
+    canonical.completed, canonical.received, canonical.failed = {}, set(), set()
+    canonical.stats = MooncakeStoreConnectorStats()
+    canonical.store = MagicMock()
+    canonical.put_executor = MagicMock()
+    canonical.get_executor = MagicMock()
+    canonical.store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    for name in ("batch_put_from_multi_buffers", "batch_get_into_multi_buffers"):
+        getattr(canonical.store, name).side_effect = lambda keys, *args: [0] * len(keys)
+    monkeypatch.setattr(
+        torch.accelerator, "device_index", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: object())
+    return canonical
+
+
+@pytest.mark.parametrize("pressure", ["jobs", "bytes", "stalled"])
+def test_canonical_get_submits_while_put_is_pending(monkeypatch, pressure):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+
+    canonical = _make_canonical_transfer_worker(monkeypatch, page_bytes=120 * 1024**2)
+    if pressure == "jobs":
+        canonical.max_jobs = 1
+    put_started, release_put, get_done = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def put(keys, *args):
+        put_started.set()
+        assert release_put.wait(5), "test must release the in-flight PUT"
+        return [0] * len(keys)
+
+    def get(keys, *args):
+        get_done.set()
+        return [0] * len(keys)
+
+    canonical.store.batch_put_from_multi_buffers.side_effect = put
+    canonical.store.batch_get_into_multi_buffers.side_effect = get
+    canonical.put_executor = ThreadPoolExecutor(max_workers=1)
+    canonical.get_executor = ThreadPoolExecutor(max_workers=1)
+    put_job = Job("put", ([1, 2],), (b"a", b"b"), 0, 128, save_id=1)
+    get_job = Job("get", ([3],), (b"a",), 0, 64)
+    try:
+        canonical._submit(put_job, saving=True)
+        assert put_started.wait(2)
+        if pressure == "stalled":
+            with canonical.lock:
+                size, _ = canonical.pending[(True, 1)]
+                canonical.pending[(True, 1)] = size, time.monotonic() - 60
+        canonical._submit(get_job, saving=False)
+        assert get_done.wait(2), "GET must run before the pending PUT finishes"
+        canonical.get_executor.shutdown(wait=True)
+        assert canonical.build_connector_worker_meta() is None
+        results = canonical.get_transfer_results(set(), Metadata())
+        assert results.finished_recving == {"get"}
+        assert not results.failed_recving
+        assert set(canonical.pending) == {(True, 1)}
+    finally:
+        release_put.set()
+        canonical.close()
+    assert canonical.build_connector_worker_meta().completed_saves == {1: 1}
+    assert not canonical.pending
+
+
+@pytest.mark.parametrize("stalled_put", [False, True])
+def test_canonical_large_prefix_lookup_and_load_are_not_byte_capped(
+    monkeypatch, stalled_put
+):
+    import time
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+
+    canonical = _make_canonical_transfer_worker(monkeypatch, page_bytes=8 * 1024**2)
+    hashes = tuple(i.to_bytes(4, "big") for i in range(64))
+    if stalled_put:
+        canonical.pending[(True, 7)] = 192 * 1024**2, time.monotonic() - 60
+    canonical.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    assert canonical.lookup(4097, hashes).hit_length == 4096
+    assert canonical.store.batch_is_exist.call_count == 2
+    canonical.get_executor.submit.side_effect = lambda fn, *args: fn(*args)
+    canonical._submit(
+        Job("large", (list(range(1, 65)),), hashes, 0, 4096), saving=False
+    )
+    calls = canonical.store.batch_get_into_multi_buffers.call_args_list
+    assert [len(call.args[0]) for call in calls] == [32, 32]
+    assert sum(sum(sum(row) for row in call.args[2]) for call in calls) == 512 * 1024**2
+    results = canonical.get_transfer_results(set(), Metadata())
+    assert results.finished_recving == {"large"}
+    assert not results.failed_recving
+    assert (False, "large") not in canonical.pending
+
+
+@pytest.mark.parametrize("saving", [False, True])
+@pytest.mark.parametrize("failure", ["exception", "short", "negative", "submission"])
+def test_canonical_transfer_failure_retires_only_after_native_return(
+    monkeypatch, saving, failure
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+
+    canonical = _make_canonical_transfer_worker(monkeypatch)
+    job = Job("r", ([1],), (b"a",), 0, 64, save_id=7)
+    key = (saving, 7 if saving else "r")
+
+    def transfer(keys, *args):
+        assert key in canonical.pending
+        assert canonical.build_connector_worker_meta() is None
+        assert not canonical.get_transfer_results(set(), Metadata()).finished_recving
+        if failure == "exception":
+            raise RuntimeError("native transfer failed")
+        return [] if failure == "short" else [-1]
+
+    method = (
+        canonical.store.batch_put_from_multi_buffers
+        if saving
+        else canonical.store.batch_get_into_multi_buffers
+    )
+    method.side_effect = transfer
+    executor = canonical.put_executor if saving else canonical.get_executor
+    if failure == "submission":
+        executor.submit.side_effect = RuntimeError("executor closed")
+    else:
+        executor.submit.side_effect = lambda fn, *args: fn(*args)
+    canonical._submit(job, saving=saving)
+    assert not canonical.pending
+    if saving:
+        assert canonical.build_connector_worker_meta().completed_saves == {7: 1}
+        assert not canonical.get_transfer_results(set(), Metadata()).finished_recving
+    else:
+        results = canonical.get_transfer_results(set(), Metadata())
+        assert results.finished_recving == results.failed_recving == {"r"}
+        assert canonical.get_block_ids_with_load_errors() == set()
+    if failure == "submission":
+        method.assert_not_called()
+    # A real failure is reported per job and must not globally disable later GETs.
+    canonical.store.batch_get_into_multi_buffers.side_effect = lambda keys, *args: (
+        [0] * len(keys)
+    )
+    canonical.get_executor.submit.side_effect = lambda fn, *args: fn(*args)
+    canonical._submit(Job("fresh", ([2],), (b"a",), 0, 64), saving=False)
+    results = canonical.get_transfer_results(set(), Metadata())
+    assert results.finished_recving == {"fresh"}
+    assert not results.failed_recving
+    assert not canonical.pending
+
+
+@pytest.mark.parametrize("devices", [("cuda:3",), ("cuda:3", "cuda:4"), ("cpu",)])
+def test_canonical_transfer_uses_kv_tensor_device_after_native_setup(
+    monkeypatch, devices
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+        dsv41_worker,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+
+    current = {"device": 0}
+
+    def set_device(device):
+        current["device"] = device
+
+    @contextlib.contextmanager
+    def device_context(device):
+        previous = current["device"]
+        set_device(device)
+        try:
+            yield
+        finally:
+            set_device(previous)
+
+    def setup(*args, **kwargs):
+        set_device(2)  # Model the native initializer changing the caller's device.
+        return 0
+
+    store = MagicMock()
+    store.setup.side_effect = setup
+    _install_fake_mooncake(monkeypatch, store)
+    monkeypatch.setattr(
+        torch.accelerator, "current_device_index", lambda: current["device"]
+    )
+    monkeypatch.setattr(torch.accelerator, "set_device_index", set_device)
+    monkeypatch.setattr(torch.accelerator, "device_index", device_context)
+    monkeypatch.setattr(
+        dsv41_worker.MooncakeStoreConfig, "load_from_config", _make_config
+    )
+    monkeypatch.setattr(dsv41_worker, "get_ip", lambda: "127.0.0.1")
+    group = SimpleNamespace(rank_in_group=0, world_size=1, cpu_group=None)
+    for name in ("get_pp_group", "get_pcp_group", "get_world_group"):
+        monkeypatch.setattr(dsv41_worker, name, lambda: group)
+    monkeypatch.setattr(
+        dsv41_worker, "resolve_kv_cache_block_sizes", lambda *args: (64, 64)
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(0, value),
+    )
+    config = _make_vllm_config(
+        extra_config={
+            "pd_role": "decode",
+            "save_decode_cache": True,
+            "cache_prefix": "test",
+            "model_revision": "revision",
+        }
+    )
+    canonical = dsv41_worker.Dsv41StoreWorker(config, _make_kv_cache_config())
+    assert current["device"] == 0
+    try:
+        storage = SimpleNamespace(data_ptr=lambda: 0x1000, nbytes=lambda: 16384)
+        components = [
+            Component(f"layer_{layer}/{kind}", 64, 128, 2, "uint8")
+            for layer in (2, 8, 14, 20)
+            for kind in ("main_kv", "indexer_k")
+        ]
+        bindings = [
+            Binding(
+                component,
+                0,
+                0x1000 + i * 512,
+                4096,
+                4,
+                tensor=SimpleNamespace(
+                    device=torch.device(devices[i % len(devices)]),
+                    untyped_storage=lambda: storage,
+                ),
+            )
+            for i, component in enumerate(components)
+        ]
+        monkeypatch.setattr(
+            dsv41_worker, "build_bindings", lambda *args, **kwargs: bindings
+        )
+        if len(devices) != 1 or devices[0] == "cpu":
+            with pytest.raises(ValueError, match="CUDA"):
+                canonical.register_kv_caches({})
+            store.register_buffer.assert_not_called()
+            return
+
+        def register(*args):
+            assert current["device"] == 3
+            return 0
+
+        store.register_buffer.side_effect = register
+        canonical.register_kv_caches({})
+        assert canonical.device == 3
+        assert current["device"] == 0
+        stream = object()
+        event = MagicMock()
+
+        def current_stream(device):
+            assert device == current["device"] == 3
+            return stream
+
+        def record(selected_stream):
+            assert selected_stream is stream and current["device"] == 3
+
+        def put(keys, *args):
+            assert current["device"] == 3
+            return [0] * len(keys)
+
+        event.record.side_effect = record
+        monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+        monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+        # Run the transfer on the caller for a deterministic CPU-only device probe.
+        monkeypatch.setattr(
+            canonical.put_executor, "submit", lambda fn, *args: fn(*args)
+        )
+        store.batch_is_exist.return_value = [0] * 8
+        store.batch_put_from_multi_buffers.side_effect = put
+        metadata = Metadata()
+        metadata.saves = [Job("r", ([1],), (b"a",), 0, 64, save_id=7)]
+        canonical.start_load_kv(metadata)
+        store.batch_put_from_multi_buffers.assert_called_once()
+        event.record.assert_called_once_with(stream)
+        event.synchronize.assert_called_once()
+        assert canonical.get_kv_connector_stats().data["save_put"][0]["status"] == "ok"
+        assert canonical.build_connector_worker_meta().completed_saves == {7: 1}
+        assert current["device"] == 0
+    finally:
+        canonical.close()
