@@ -5,6 +5,7 @@
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import torch
 
@@ -82,8 +83,6 @@ class Dsv41StoreWorker:
         )
         self.received = set()
         self.failed = set()
-        self.max_jobs = int(self.extra.get("max_pending_jobs", 32))
-        self.max_bytes = int(self.extra.get("max_inflight_bytes", 256 * 1024**2))
         self.stall_seconds = float(self.extra.get("store_stall_timeout_s", 30))
         self.cooldown = float(self.extra.get("failure_cooldown_s", 5))
         self.pending = {}
@@ -117,7 +116,7 @@ class Dsv41StoreWorker:
             error = str(exc)
         _, hash_tokens = resolve_kv_cache_block_sizes(self.cache_config, self.config)
         group = get_world_group()
-        descriptors = [None] * group.world_size
+        descriptors: list[Any] = [None] * group.world_size
         torch.distributed.all_gather_object(
             descriptors,
             (error, [b.component for b in self.bindings], hash_tokens),
@@ -169,17 +168,7 @@ class Dsv41StoreWorker:
     def lookup(self, num_tokens, hashes):
         manifest = self.manifest
         assert manifest is not None
-        if not self._healthy():
-            return MooncakeLookupResult(0)
-        bytes_per_chunk = sum(
-            c.page_bytes * (manifest.chunk_tokens // c.block_tokens)
-            for c in manifest.components
-        )
-        limit = min(
-            num_tokens - 1,
-            len(hashes) * manifest.hash_tokens,
-            self.max_bytes // bytes_per_chunk * manifest.chunk_tokens,
-        )
+        limit = min(num_tokens - 1, len(hashes) * manifest.hash_tokens)
         hit = 0
         deadline = (
             time.monotonic()
@@ -230,14 +219,8 @@ class Dsv41StoreWorker:
                 sizes.append([size for _, size in regions])
         return keys, addresses, sizes
 
-    def _healthy(self):
-        with self.lock:
-            return time.monotonic() >= self.unhealthy_until and all(
-                time.monotonic() - started < self.stall_seconds
-                for _, started in self.pending.values()
-            )
-
     def _trip(self):
+        # Diagnostic only: PUT pressure/failure must not disable independent GETs.
         with self.lock:
             self.unhealthy_until = time.monotonic() + self.cooldown
 
@@ -276,6 +259,7 @@ class Dsv41StoreWorker:
                 # Limit native RPC descriptor size without changing object identity.
                 from dataclasses import replace
 
+                assert self.manifest is not None
                 chunk = self.manifest.chunk_tokens
                 for offset in range(job.start, job.end, chunk * 32):
                     part = replace(
@@ -337,26 +321,8 @@ class Dsv41StoreWorker:
             if not saving or (self.writer and b.writer)
         )
         key = (saving, job.save_id if saving else job.request_id)
-        admitted = False
-        if self._healthy():
-            with self.lock:
-                if (
-                    len(self.pending) < self.max_jobs
-                    and sum(n for n, _ in self.pending.values()) + size
-                    <= self.max_bytes
-                ):
-                    self.pending[key] = size, time.monotonic()
-                    admitted = True
-        if not admitted:
-            self._record(
-                "save_admission" if saving else "load_admission",
-                time.monotonic(),
-                0,
-                size=size,
-                status="skipped",
-            )
-            self._finish(job, saving, not saving)
-            return
+        with self.lock:
+            self.pending[key] = size, time.monotonic()
         try:
             ready = None
             if saving:
@@ -364,6 +330,7 @@ class Dsv41StoreWorker:
                     ready = torch.cuda.Event()
                     ready.record(torch.cuda.current_stream(self.device))
             executor = self.put_executor if saving else self.get_executor
+            assert executor is not None
             executor.submit(self._transfer, job, ready, saving)
         except Exception:
             self._trip()

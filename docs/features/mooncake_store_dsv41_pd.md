@@ -92,11 +92,7 @@ granularity.
           "lookup_min_prompt_tokens": 2048,
           "load_async": true,
           "save_decode_cache": false,
-          "max_pending_jobs": 32,
           "max_pending_lookups": 32,
-          "max_pinned_blocks": 4096,
-          "max_pinned_bytes": 536870912,
-          "max_inflight_bytes": 268435456,
           "lookup_timeout_ms": 1000,
           "store_stall_timeout_s": 30,
           "failure_cooldown_s": 5
@@ -144,14 +140,18 @@ host memory and registered buffers. Shared keys may be served by remote owners;
 CPU DRAM L2 does not imply NUMA-local placement. Existing Store
 `preferred_segment` configuration is passed to Mooncake.
 
-`max_pending_jobs` and `max_inflight_bytes` bound local queued plus executing
-transfers. GET and PUT use separate single-thread executors. The scheduler also
-bounds save jobs, referenced blocks and a conservative byte estimate based on
-cache-group page sizes. These are block-reference budgets, separate from the
-Store's DRAM capacity. Save pins cover only complete pages in that job's range.
-Objects are sent in batches of at most 32 chunks. Scheduler save ranges can be
-shortened to fit the pin budget; worker admission can skip oversized saves.
-Lookup length is capped by the in-flight byte budget.
+GET and PUT use independent single-thread executors, matching the upstream Store
+queue policy. There is no shared job or byte admission budget, and PUT backlog
+does not disable GET or lookup. All eligible complete chunks may be saved or
+loaded; native operations still use batches of at most 32 chunks. Save pins cover
+only complete pages in each job's range and remain held until every worker
+acknowledges native completion. Store DRAM capacity and GPU block availability
+remain actual resource constraints.
+
+Legacy `max_pending_jobs`, `max_inflight_bytes`, `max_pinned_blocks` and
+`max_pinned_bytes` configuration keys are accepted but ignored by the canonical
+profile. The separate lookup channel retains `max_pending_lookups` and its
+socket timeout/recovery policy.
 
 Decode's publication boundary is capped by both computed tokens minus in-flight
 tokens and the accepted token history. Stale output cannot advance it. Finish-time
@@ -164,12 +164,13 @@ actually been computed; it is not published merely because sampling accepted it.
 Lookup timeout/unavailability becomes a miss. Failed GETs report request-level
 failure after all workers finish native I/O, then recompute; that request bypasses
 Store lookup on retry. No group-local block IDs are exposed as HMA-wide invalid
-IDs. Save failure/full queues become future misses. Existing immutable objects
+IDs. Save failures become future misses. Existing immutable objects
 are skipped on PUT, including a concurrent writer winning the same key.
 Publication is best effort: a failed or skipped chunk may leave a hole, so lookup
 always checks continuity and never assumes later chunks imply earlier ones exist.
 
-A stalled native call stops new admissions and retains its GPU references. An
+A stalled native call retains its GPU references and appears in telemetry; it
+does not disable submissions to the independent executor. An
 elapsed timeout does not establish DMA quiescence. Shutdown waits for native calls
 to return before closing the Store or releasing registered storage; a permanently
 hung native call may therefore require terminating and restarting the worker.
@@ -180,10 +181,10 @@ Prefix-cache reset returns false for this shared profile; it never invokes globa
 ABI changes. Reset is not a live namespace-rotation API.
 
 Existing operation metrics cover `lookup_exists`, `save_exists`, `save_put` and
-`load_get`; `save_admission`/`load_admission` with `status="skipped"` expose
-resource or health rejection. `vllm:mooncake_store_resources{resource=...}` exposes
+`load_get`. `vllm:mooncake_store_resources{resource=...}` exposes
 pending jobs/bytes, unhealthy workers and scheduler pinned jobs/blocks/estimated
-bytes, summed per engine. Pin snapshots are reported by one worker per engine.
+bytes, summed per engine. Unhealthy-worker diagnostics do not gate transfers.
+Pin snapshots are reported by one worker per engine.
 No request IDs or hashes become metric labels. Operation samples are bounded;
 under sustained overload the oldest unreported samples can be discarded.
 GPU/Store hit tokens remain visible through existing prefix-cache statistics.

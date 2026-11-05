@@ -3,7 +3,6 @@
 """Scheduler for the opt-in canonical Store; legacy Store scheduling is unchanged."""
 
 import math
-import time
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
@@ -47,15 +46,10 @@ class Dsv41StoreScheduler:
         self.cache_config = cache_config
         self.workers = config.parallel_config.world_size
         self.pool = None
-        self.max_jobs = int(extra.get("max_pending_jobs", 32))
-        self.max_blocks = int(extra.get("max_pinned_blocks", 4096))
-        self.max_bytes = int(extra.get("max_pinned_bytes", 512 * 1024**2))
-        self.stall_seconds = float(extra.get("store_stall_timeout_s", 30))
         self.bytes_per_block = sum(
             g.kv_cache_spec.page_size_bytes * max(1, len(g.layer_names))
             for g in cache_config.kv_cache_groups
         )
-        self.pin_times = {}
         self.resource_flush = False
         self.requests = {}
         self._pending_admissions = {}
@@ -148,22 +142,6 @@ class Dsv41StoreScheduler:
         start = self.saved.get(request.request_id, 0)
         if end <= start:
             return None
-        pinned_blocks = sum(len(value[0]) for value in self.pins.values())
-        if len(self.pins) >= self.max_jobs or any(
-            time.monotonic() - t > self.stall_seconds for t in self.pin_times.values()
-        ):
-            return None
-        available = (
-            min(self.max_blocks, self.max_bytes // self.bytes_per_block) - pinned_blocks
-        )
-        pages_per_chunk = sum(
-            self.chunk_tokens
-            // self.cache_config.kv_cache_groups[gid].kv_cache_spec.block_size
-            for gid in self.cache_config.prefix_cacheable_group_ids
-        )
-        end = min(end, start + available // pages_per_chunk * self.chunk_tokens)
-        if end <= start:
-            return None
         ids = []
         for gid in self.cache_config.prefix_cacheable_group_ids:
             span = self.cache_config.kv_cache_groups[gid].kv_cache_spec.block_size
@@ -179,7 +157,6 @@ class Dsv41StoreScheduler:
         self.next_id += 1
         self.pool.touch([self.pool.blocks[b] for b in ids])
         self.pins[job_id] = (ids, self.workers)
-        self.pin_times[job_id] = time.monotonic()
         self.saved[request.request_id] = end
         return Job(
             request.request_id,
@@ -287,7 +264,6 @@ class Dsv41StoreScheduler:
                 assert self.pool is not None
                 self.pool.free_blocks([self.pool.blocks[b] for b in reversed(ids)])
                 del self.pins[job_id]
-                del self.pin_times[job_id]
                 self.resource_flush = True
             else:
                 self.pins[job_id] = ids, remaining

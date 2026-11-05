@@ -1584,12 +1584,7 @@ def test_canonical_save_keeps_blocks_until_every_worker_acknowledges():
         prefix_cacheable_group_ids=(0,),
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
     )
-    scheduler.max_jobs, scheduler.max_blocks, scheduler.max_bytes = 32, 4096, 2**30
-    scheduler.stall_seconds, scheduler.bytes_per_block, scheduler.pin_times = (
-        30,
-        128,
-        {},
-    )
+    scheduler.bytes_per_block = 128
     scheduler.pool = Mock(blocks=list(range(10)))
     request = SimpleNamespace(
         request_id="r",
@@ -1669,12 +1664,7 @@ def test_canonical_finish_snapshot_survives_request_block_table_cleanup():
         prefix_cacheable_group_ids=(0,),
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
     )
-    scheduler.max_jobs, scheduler.max_blocks, scheduler.max_bytes = 32, 4096, 2**30
-    scheduler.stall_seconds, scheduler.bytes_per_block, scheduler.pin_times = (
-        30,
-        128,
-        {},
-    )
+    scheduler.bytes_per_block = 128
     scheduler.pool = Mock(blocks=list(range(10)))
     request = SimpleNamespace(
         request_id="r",
@@ -1728,6 +1718,7 @@ def test_canonical_lookup_skips_when_no_external_increment_is_possible():
     request = SimpleNamespace(
         request_id="r",
         num_tokens=512,
+        num_prompt_tokens=512,
         block_hashes=[b"a", b"b", b"c"],
         mm_features=[],
         lora_request=None,
@@ -1750,6 +1741,7 @@ def test_canonical_lookup_runs_when_external_increment_is_possible():
     request = SimpleNamespace(
         request_id="r",
         num_tokens=512,
+        num_prompt_tokens=512,
         block_hashes=[b"a", b"b", b"c", b"d"],
         mm_features=[],
         lora_request=None,
@@ -1762,39 +1754,49 @@ def test_canonical_lookup_runs_when_external_increment_is_possible():
     assert scheduler.load_specs == {"r": (128, 192)}
 
 
-def test_canonical_pin_budget_only_advances_through_the_admitted_chunks():
-    from unittest.mock import Mock
-
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
-        Dsv41StoreScheduler,
+def test_canonical_save_keeps_full_prefix_pinned_despite_legacy_limits():
+    scheduler = _make_canonical_scheduler(
+        "prefill",
+        extra_config={
+            "max_pending_jobs": 1,
+            "max_pinned_blocks": 1,
+            "max_pinned_bytes": 128,
+        },
     )
-
-    scheduler = Dsv41StoreScheduler.__new__(Dsv41StoreScheduler)
-    scheduler.hash_tokens = scheduler.chunk_tokens = 64
-    scheduler.prefill, scheduler.workers, scheduler.next_id = True, 8, 0
-    scheduler.saved, scheduler.pins, scheduler.pin_times = {}, {}, {}
-    scheduler.max_jobs, scheduler.max_blocks, scheduler.max_bytes = 1, 1, 128
-    scheduler.bytes_per_block, scheduler.stall_seconds = 128, 30
-    scheduler.cache_config = SimpleNamespace(
-        prefix_cacheable_group_ids=(0,),
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=64))],
-    )
-    scheduler.pool = Mock(blocks=list(range(10)))
+    scheduler.workers = 8
+    pool = scheduler.pool
+    blocks = KVCacheBlocks((pool.get_new_blocks(4),))
     request = SimpleNamespace(
         request_id="r",
-        block_hashes=[b"a", b"b"],
+        block_hashes=[b"a", b"b", b"c", b"d"],
         mm_features=[],
         lora_request=None,
         prompt_embeds=None,
     )
-    job = scheduler._save(request, ([2, 3],), 128)
-    assert job.end == scheduler.saved["r"] == 64
-    scheduler.pool.touch.assert_called_once_with([2])
-    assert scheduler._save(request, ([2, 3],), 128) is None
-    assert scheduler.saved["r"] == 64
+    first = scheduler._save(request, blocks.get_block_ids(), 256)
+    assert first is not None and first.end == scheduler.saved["r"] == 256
+    request.request_id = "next"
+    second = scheduler._save(request, blocks.get_block_ids(), 256)
+    assert second is not None and second.end == 256
+    # Retire the request's ownership while two native saves still hold references.
+    pool.free_blocks(blocks.blocks[0])
+    assert all(block.ref_cnt == 2 for block in blocks.blocks[0])
+    for job_id, count, expected_refs in (
+        (first.save_id, 7, 2),
+        (first.save_id, 1, 1),
+        (second.save_id, 8, 0),
+    ):
+        scheduler.update_connector_output(
+            SimpleNamespace(
+                failed_recving=set(),
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata({job_id: count}),
+            )
+        )
+        assert all(block.ref_cnt == expected_refs for block in blocks.blocks[0])
+    assert not scheduler.pins
 
 
-def _make_canonical_scheduler(pd_role):
+def _make_canonical_scheduler(pd_role, *, extra_config=None):
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
         Dsv41StoreScheduler,
     )
@@ -1812,6 +1814,7 @@ def _make_canonical_scheduler(pd_role):
             kv_connector_extra_config={
                 "pd_role": pd_role,
                 "save_decode_cache": True,
+                **(extra_config or {}),
             }
         ),
         parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),

@@ -36,11 +36,7 @@ def validate_store(config: Any) -> None:
             "Canonical Store lookup_min_prompt_tokens must be a nonnegative integer"
         )
     for key, default in {
-        "max_pending_jobs": 32,
         "max_pending_lookups": 32,
-        "max_pinned_blocks": 4096,
-        "max_pinned_bytes": 512 * 1024**2,
-        "max_inflight_bytes": 256 * 1024**2,
         "lookup_timeout_ms": 1000,
         "store_stall_timeout_s": 30,
         "failure_cooldown_s": 5,

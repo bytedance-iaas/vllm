@@ -4797,9 +4797,8 @@ def test_canonical_lookup_requires_every_component_of_each_chunk():
         "test", "revision", merge_components([components]), 64
     )
     canonical.store = Mock()
-    canonical._healthy = lambda: True
     canonical._record = lambda *args, **kwargs: None
-    canonical.extra, canonical.max_bytes = {}, 2**30
+    canonical.extra = {}
     canonical.store.batch_is_exist.return_value = [1] * 8 + [1] * 7 + [0] + [1] * 8
     assert canonical.lookup(193, [b"a", b"b", b"c"]).hit_length == 64
     assert canonical.store.batch_is_exist.call_count == 1
@@ -4831,35 +4830,187 @@ def test_canonical_relay_load_uses_owner_key_but_its_own_block_table():
     assert addresses == [[2280]] and sizes == [[128]]
 
 
-def test_canonical_queue_rejection_acknowledges_saves_and_fails_loads_without_dma():
-    import threading
+def _make_canonical_transfer_worker(monkeypatch, *, page_bytes=128):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_layout import (  # noqa: E501
+        Binding,
+        Component,
+        Manifest,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
+        Dsv41StoreWorker,
+    )
+
+    component = Component("layer_8/main_kv", 64, page_bytes, 2, "uint8")
+    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
+    canonical.capacity_only = False
+    canonical.lock = threading.Lock()
+    canonical.manifest = Manifest("test", "revision", (component,), 64)
+    canonical.bindings = [Binding(component, 0, 4096, page_bytes, 128)]
+    canonical.writer = True
+    canonical.pending = {}
+    # Legacy settings must no longer control transfer admission or prefix length.
+    canonical.max_jobs, canonical.max_bytes = 32, 256 * 1024**2
+    canonical.stall_seconds, canonical.cooldown = 30, 5
+    canonical.unhealthy_until = 0
+    canonical.device, canonical.extra = 0, {}
+    canonical.replication = object()
+    canonical.completed, canonical.received, canonical.failed = {}, set(), set()
+    canonical.stats = MooncakeStoreConnectorStats()
+    canonical.store = MagicMock()
+    canonical.put_executor = MagicMock()
+    canonical.get_executor = MagicMock()
+    canonical.store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    for name in ("batch_put_from_multi_buffers", "batch_get_into_multi_buffers"):
+        getattr(canonical.store, name).side_effect = lambda keys, *args: [0] * len(keys)
+    monkeypatch.setattr(
+        torch.accelerator, "device_index", lambda *args: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "Event", MagicMock)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: object())
+    return canonical
+
+
+@pytest.mark.parametrize("pressure", ["jobs", "bytes", "stalled"])
+def test_canonical_get_submits_while_put_is_pending(monkeypatch, pressure):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
+    )
+
+    canonical = _make_canonical_transfer_worker(monkeypatch, page_bytes=120 * 1024**2)
+    if pressure == "jobs":
+        canonical.max_jobs = 1
+    put_started, release_put, get_done = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def put(keys, *args):
+        put_started.set()
+        assert release_put.wait(5), "test must release the in-flight PUT"
+        return [0] * len(keys)
+
+    def get(keys, *args):
+        get_done.set()
+        return [0] * len(keys)
+
+    canonical.store.batch_put_from_multi_buffers.side_effect = put
+    canonical.store.batch_get_into_multi_buffers.side_effect = get
+    canonical.put_executor = ThreadPoolExecutor(max_workers=1)
+    canonical.get_executor = ThreadPoolExecutor(max_workers=1)
+    put_job = Job("put", ([1, 2],), (b"a", b"b"), 0, 128, save_id=1)
+    get_job = Job("get", ([3],), (b"a",), 0, 64)
+    try:
+        canonical._submit(put_job, saving=True)
+        assert put_started.wait(2)
+        if pressure == "stalled":
+            with canonical.lock:
+                size, _ = canonical.pending[(True, 1)]
+                canonical.pending[(True, 1)] = size, time.monotonic() - 60
+        canonical._submit(get_job, saving=False)
+        assert get_done.wait(2), "GET must run before the pending PUT finishes"
+        canonical.get_executor.shutdown(wait=True)
+        assert canonical.build_connector_worker_meta() is None
+        results = canonical.get_transfer_results(set(), Metadata())
+        assert results.finished_recving == {"get"}
+        assert not results.failed_recving
+        assert set(canonical.pending) == {(True, 1)}
+    finally:
+        release_put.set()
+        canonical.close()
+    assert canonical.build_connector_worker_meta().completed_saves == {1: 1}
+    assert not canonical.pending
+
+
+@pytest.mark.parametrize("stalled_put", [False, True])
+def test_canonical_large_prefix_lookup_and_load_are_not_byte_capped(
+    monkeypatch, stalled_put
+):
     import time
 
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
         Job,
         Metadata,
     )
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_worker import (  # noqa: E501
-        Dsv41StoreWorker,
+
+    canonical = _make_canonical_transfer_worker(monkeypatch, page_bytes=8 * 1024**2)
+    hashes = tuple(i.to_bytes(4, "big") for i in range(64))
+    if stalled_put:
+        canonical.pending[(True, 7)] = 192 * 1024**2, time.monotonic() - 60
+    canonical.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    assert canonical.lookup(4097, hashes).hit_length == 4096
+    assert canonical.store.batch_is_exist.call_count == 2
+    canonical.get_executor.submit.side_effect = lambda fn, *args: fn(*args)
+    canonical._submit(
+        Job("large", (list(range(1, 65)),), hashes, 0, 4096), saving=False
+    )
+    calls = canonical.store.batch_get_into_multi_buffers.call_args_list
+    assert [len(call.args[0]) for call in calls] == [32, 32]
+    assert sum(sum(sum(row) for row in call.args[2]) for call in calls) == 512 * 1024**2
+    results = canonical.get_transfer_results(set(), Metadata())
+    assert results.finished_recving == {"large"}
+    assert not results.failed_recving
+    assert (False, "large") not in canonical.pending
+
+
+@pytest.mark.parametrize("saving", [False, True])
+@pytest.mark.parametrize("failure", ["exception", "short", "negative", "submission"])
+def test_canonical_transfer_failure_retires_only_after_native_return(
+    monkeypatch, saving, failure
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.dsv41_scheduler import (  # noqa: E501
+        Job,
+        Metadata,
     )
 
-    canonical = Dsv41StoreWorker.__new__(Dsv41StoreWorker)
-    canonical.capacity_only = False
-    canonical.lock = threading.Lock()
-    canonical.pending = {(True, 0): (1, time.monotonic())}
-    canonical.bindings, canonical.writer = [], True
-    canonical.max_jobs, canonical.max_bytes = 1, 1024
-    canonical.stall_seconds, canonical.unhealthy_until = 30, 0
-    canonical.completed, canonical.received, canonical.failed = {}, set(), set()
-    canonical.stats = MooncakeStoreConnectorStats()
-    job = Job("r", ([2],), (b"a",), 0, 64, 1)
-    canonical._submit(job, saving=True)
-    canonical._submit(job, saving=False)
-    assert canonical.build_connector_worker_meta().completed_saves == {1: 1}
+    canonical = _make_canonical_transfer_worker(monkeypatch)
+    job = Job("r", ([1],), (b"a",), 0, 64, save_id=7)
+    key = (saving, 7 if saving else "r")
+
+    def transfer(keys, *args):
+        assert key in canonical.pending
+        assert canonical.build_connector_worker_meta() is None
+        assert not canonical.get_transfer_results(set(), Metadata()).finished_recving
+        if failure == "exception":
+            raise RuntimeError("native transfer failed")
+        return [] if failure == "short" else [-1]
+
+    method = (
+        canonical.store.batch_put_from_multi_buffers
+        if saving
+        else canonical.store.batch_get_into_multi_buffers
+    )
+    method.side_effect = transfer
+    executor = canonical.put_executor if saving else canonical.get_executor
+    if failure == "submission":
+        executor.submit.side_effect = RuntimeError("executor closed")
+    else:
+        executor.submit.side_effect = lambda fn, *args: fn(*args)
+    canonical._submit(job, saving=saving)
+    assert not canonical.pending
+    if saving:
+        assert canonical.build_connector_worker_meta().completed_saves == {7: 1}
+        assert not canonical.get_transfer_results(set(), Metadata()).finished_recving
+    else:
+        results = canonical.get_transfer_results(set(), Metadata())
+        assert results.finished_recving == results.failed_recving == {"r"}
+        assert canonical.get_block_ids_with_load_errors() == set()
+    if failure == "submission":
+        method.assert_not_called()
+    # A real failure is reported per job and must not globally disable later GETs.
+    canonical.store.batch_get_into_multi_buffers.side_effect = lambda keys, *args: (
+        [0] * len(keys)
+    )
+    canonical.get_executor.submit.side_effect = lambda fn, *args: fn(*args)
+    canonical._submit(Job("fresh", ([2],), (b"a",), 0, 64), saving=False)
     results = canonical.get_transfer_results(set(), Metadata())
-    assert results.finished_recving == results.failed_recving == {"r"}
-    assert canonical.get_block_ids_with_load_errors() == set()
-    assert set(canonical.pending) == {(True, 0)}
+    assert results.finished_recving == {"fresh"}
+    assert not results.failed_recving
+    assert not canonical.pending
 
 
 @pytest.mark.parametrize("devices", [("cuda:3",), ("cuda:3", "cuda:4"), ("cpu",)])
