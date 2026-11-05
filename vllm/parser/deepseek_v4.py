@@ -289,6 +289,10 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
 class DeepSeekV4Parser(ParserEngine):
     parser_config = staticmethod(deepseek_v4_config)
 
+    @property
+    def tool_call_stop(self) -> str | None:
+        return self.parser_engine_config.terminal_literal("TOOL_END")
+
     def __init__(
         self,
         tokenizer: TokenizerLike,

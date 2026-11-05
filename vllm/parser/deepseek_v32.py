@@ -121,6 +121,10 @@ def deepseek_v32_config() -> ParserEngineConfig:
 
 
 class DeepSeekV32Parser(ParserEngine):
+    @property
+    def tool_call_stop(self) -> str | None:
+        return self.parser_engine_config.terminal_literal("TOOL_END")
+
     def __init__(
         self,
         tokenizer: TokenizerLike,

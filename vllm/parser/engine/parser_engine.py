@@ -224,10 +224,44 @@ class ParserEngine(Parser):
         self._content_has_nonws = False
         self._prompt_streaming_prepared = False
 
+    @property
+    def tool_call_stop(self) -> str | None:
+        """An opt-in marker that ends the whole tool-call turn."""
+        return None
+
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
+        return self._add_tool_call_stop(request)
+
+    def _add_tool_call_stop(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        """Stop generation once a tool-call block is closed."""
+        closer = self.tool_call_stop
+        if (
+            not closer
+            or not getattr(request, "tools", None)
+            or request.tool_choice == "none"
+            or self.skip_tool_parsing
+        ):
+            return request
+        stop = getattr(request, "stop", None)
+        stops = [stop] if isinstance(stop, str) else stop or []
+        # The sampler has one inclusion flag for all stops. Preserve a caller's
+        # hidden stops instead of exposing them to retain our internal closer.
+        if not request.include_stop_str_in_output and any(s != closer for s in stops):
+            return request
+        if stop is None:
+            request.stop = [closer]
+        elif isinstance(stop, str):
+            request.stop = [closer] if stop == closer else [stop, closer]
+        elif closer not in stop:
+            stop.append(closer)
+        # The parser must still see the closer to finish the tool call.
+        if hasattr(request, "include_stop_str_in_output"):
+            request.include_stop_str_in_output = True
         return request
 
     def _preprocess_feed(

@@ -12,6 +12,7 @@ from tests.parser.engine.replay_harness import (
     collect_output,
     replay_streaming,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.parser.deepseek_v41 import deepseek_v41_config
 from vllm.parser.parser_manager import ParserManager
 
@@ -96,6 +97,44 @@ def test_registered_adapters_parse_complete_output(thinking):
     assert not (content or "").strip()
     assert [call.name for call in calls] == ["get_weather", "add"]
     assert json.loads(calls[0].arguments) == {"city": "杭州", "count": 42}
+
+
+@pytest.mark.parametrize("tools", [None, []], ids=["omitted", "empty"])
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("special_calls", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+def test_no_tools_preserves_dsml_and_following_text(
+    tools, thinking, special_calls, chunk_size
+):
+    if tools == []:
+        with pytest.raises(VLLMValidationError, match="must not be an empty array"):
+            _test_request(tools=tools)
+        return
+    body = CALLS.replace(
+        "</｜DSML｜ calls>", "Between calls.</｜DSML｜ calls>After calls."
+    )
+    text = ("Plan.</think>" if thinking else "") + "Checking." + body
+    tokenizer, tokens = tokenizer_for(text, special_calls)
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": thinking}),
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=tools,
+            prompt_token_ids=[50 if thinking else 51],
+        )
+    )
+    reasoning, content, calls = parser_for(tokenizer, {"thinking": thinking}).parse(
+        text,
+        _test_request(tools=tools),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert output.reasoning == (reasoning or "") == ("Plan." if thinking else "")
+    assert output.content == content == "Checking." + body
+    assert output.tool_calls == []
+    assert not calls
 
 
 @pytest.mark.parametrize("thinking", [False, True])

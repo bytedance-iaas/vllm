@@ -399,6 +399,9 @@ so that JSON-encoded string values keep the same contents across chunks.
 When generation ends before the last DSML parameter closes, the parser preserves
 its generated value and completes the argument JSON. This recovery does not
 reconstruct missing argument text or establish that the tool call is complete.
+Chat responses cut by the token limit retain `finish_reason="length"`, even
+when tool arguments form valid JSON. Clients should check this before executing
+a recovered tool call.
 
 ### OpenAI OSS Models (`openai`)
 
