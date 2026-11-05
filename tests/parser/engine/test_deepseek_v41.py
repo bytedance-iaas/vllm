@@ -99,6 +99,40 @@ def test_registered_adapters_parse_complete_output(thinking):
 
 
 @pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("special_calls", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+@pytest.mark.parametrize(
+    "content", ["Example:" + CALLS, "Quoted: `" + V4_NAMED_CALLS + "`"]
+)
+def test_no_tools_preserves_dsml_as_content(
+    thinking, special_calls, chunk_size, content
+):
+    text = ("Plan.</think>" if thinking else "") + content
+    tokenizer, tokens = tokenizer_for(text, special_calls)
+    output = collect_output(
+        replay_streaming(
+            parser_for(tokenizer, {"thinking": thinking}),
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            prompt_token_ids=[50 if thinking else 51],
+        )
+    )
+    reasoning, parsed_content, calls = parser_for(
+        tokenizer, {"thinking": thinking}
+    ).parse(
+        text,
+        _test_request(),
+        enable_auto_tools=True,
+        model_output_token_ids=[tid for tid, _ in tokens],
+    )
+    assert output.reasoning == (reasoning or "") == ("Plan." if thinking else "")
+    assert output.content == parsed_content == content
+    assert output.tool_calls == []
+    assert not calls
+
+
+@pytest.mark.parametrize("thinking", [False, True])
 @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
 def test_v4_wrapper_name_opens_tool_block(thinking, chunk_size):
     text = ("Plan.</think>" if thinking else "") + "Checking." + V4_NAMED_CALLS

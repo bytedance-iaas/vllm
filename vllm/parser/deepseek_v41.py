@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1 reasoning and spaced DSML tool calls."""
 
+from __future__ import annotations
+
 import functools
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
@@ -12,6 +15,10 @@ from vllm.parser.deepseek_v4 import (
     deepseek_v4_config,
 )
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 DSML_TOOL_START = "<｜DSML｜ calls>"
 # V4's ``tool_calls`` wrapper name with V4.1's spacing (#62051).
@@ -61,3 +68,11 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
 
 class DeepSeekV41Parser(DeepSeekV4Parser):
     parser_config = staticmethod(deepseek_v41_config)
+
+    def _check_skip_tool_parsing(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> None:
+        super()._check_skip_tool_parsing(request)
+        # Without tools, DSML is model output, not a tool-call turn.
+        if not request.tools:
+            self.skip_tool_parsing = True
