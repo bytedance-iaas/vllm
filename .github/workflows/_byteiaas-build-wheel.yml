@@ -40,15 +40,10 @@ jobs:
       BYTEIAAS_EPEL_MIRROR: http://mirrors.volces.com/epel
       BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
-      BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
-      BYTEIAAS_DEEPGEMM_GIT_COMMIT: 09f5008a04e4184b6e8e5da7d70c57c38aa91fac
       BYTEIAAS_DEEPEP_GIT_REPOSITORY: https://github.com/deepseek-ai/DeepEP
       BYTEIAAS_DEEPEP_GIT_COMMIT: d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
       BYTEIAAS_NVSHMEM_VERSION: 3.3.24
       BYTEIAAS_NCCL_VERSION: 2.30.7
-      BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY: https://github.com/wangyicong52/router.git
-      BYTEIAAS_VLLM_ROUTER_GIT_REF: dev/dsv4.1-flash
-      BYTEIAAS_VLLM_ROUTER_GIT_COMMIT: ef339bc73a04872dc7999aebf761c5f86263af64
       BYTEIAAS_MOONCAKE_GIT_REPOSITORY: https://github.com/wangyicong52/Mooncake.git
       BYTEIAAS_MOONCAKE_GIT_REF: vllm-dsv4.1
       BYTEIAAS_MOONCAKE_GIT_COMMIT: ffd73707e9dbfe0997053f3d82eab86d1568337e
@@ -85,11 +80,29 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "2"
+          test "$(cat .github/byteiaas-build-contract)" = "4"
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
           fi
+
+      - name: Resolve dependency branches
+        run: |
+          set -euo pipefail
+          source docker/byteiaas/dependencies.env
+          for component in DEEPGEMM VLLM_ROUTER PREFILL_HUMMING DECODE_HUMMING; do
+            prefix="BYTEIAAS_${component}_GIT"
+            repo_var="${prefix}_REPOSITORY"
+            ref_var="${prefix}_REF"
+            ref="refs/heads/${!ref_var}"
+            git check-ref-format "${ref}"
+            result="$(git ls-remote --exit-code "${!repo_var}" "${ref}")"
+            read -r commit actual_ref <<< "${result}"
+            [[ "${commit}" =~ ^[0-9a-f]{40}$ && "${actual_ref}" = "${ref}" ]]
+            echo "${component}: ${!repo_var} ${!ref_var}@${commit}"
+            printf '%s\n' "${repo_var}=${!repo_var}" "${ref_var}=${!ref_var}" \
+              "${prefix}_COMMIT=${commit}" >> "${GITHUB_ENV}"
+          done
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         id: buildx
@@ -152,6 +165,7 @@ jobs:
             --build-arg UV_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}" \
             --build-arg UV_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}" \
             --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}" \
+            --build-arg DEEPGEMM_GIT_REF="${BYTEIAAS_DEEPGEMM_GIT_REF}" \
             --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}" \
             --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON \
             --build-arg DEEPEP_COMMIT_HASH="${BYTEIAAS_DEEPEP_GIT_COMMIT}" \
@@ -218,6 +232,15 @@ jobs:
             byteiaas-build-artifacts/tmp/
           docker cp "${container}:/tmp/vllm-router-dist" \
             byteiaas-build-artifacts/tmp/
+
+          for component in PREFILL_HUMMING DECODE_HUMMING; do
+            prefix="BYTEIAAS_${component}_GIT"
+            repo_var="${prefix}_REPOSITORY"
+            ref_var="${prefix}_REF"
+            commit_var="${prefix}_COMMIT"
+            printf '%s\n' "repository=${!repo_var}" "ref=${!ref_var}" \
+              "commit=${!commit_var}" > "byteiaas-build-artifacts/${component,,}.env"
+          done
 
           test "$(cat byteiaas-build-artifacts/source-commit)" = \
             "${{ inputs.checkout_ref }}"

@@ -570,6 +570,7 @@ FROM ${BYTEIAAS_VLLM_ROUTER_SOURCE} AS vllm-router-source
 #################### DEEPGEMM WHEEL BUILD IMAGE ####################
 FROM base AS byteiaas-deepgemm-checkout
 ARG DEEPGEMM_GIT_REPOSITORY
+ARG DEEPGEMM_GIT_REF=
 ARG DEEPGEMM_GIT_COMMIT
 ARG DEEPGEMM_REQUIRE_SM90_MEGA_MOE
 
@@ -603,6 +604,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         sha256sum ./*.whl > wheels.sha256); \
     printf '%s\n' \
         "repository=${DEEPGEMM_GIT_REPOSITORY}" \
+        "ref=${DEEPGEMM_GIT_REF}" \
         "commit=${DEEPGEMM_GIT_COMMIT}" \
         > /workspace/byteiaas-deepgemm-dist/source.env
 
@@ -619,6 +621,33 @@ RUN set -eux; \
 FROM ${BYTEIAAS_DEEPGEMM_SOURCE} AS byteiaas-deepgemm-source
 FROM ${BYTEIAAS_DEEPGEMM_WHEEL_SOURCE} AS byteiaas-deepgemm-wheel-source
 #################### DEEPGEMM WHEEL BUILD IMAGE ####################
+
+#################### BYTEIAAS HUMMING SOURCES ####################
+FROM base AS byteiaas-humming-source
+ARG DSV41_PREFILL_HUMMING_GIT_REPOSITORY=
+ARG DSV41_PREFILL_HUMMING_GIT_COMMIT=
+ARG DSV41_DECODE_HUMMING_GIT_REPOSITORY=
+ARG DSV41_DECODE_HUMMING_GIT_COMMIT=
+WORKDIR /workspace/byteiaas-humming-source
+RUN set -eu; \
+    snapshot() { \
+        repo="$1"; commit="$2"; target="$3"; \
+        mkdir "${target}"; \
+        if [ -n "${commit}" ]; then \
+            test "${#commit}" -eq 40; \
+            case "${commit}" in *[!0-9a-f]*) exit 1;; esac; \
+            git init /tmp/humming-checkout; \
+            git -C /tmp/humming-checkout fetch --no-tags --depth 1 "${repo}" "${commit}"; \
+            test "$(git -C /tmp/humming-checkout rev-parse FETCH_HEAD)" = "${commit}"; \
+            git -C /tmp/humming-checkout checkout --detach FETCH_HEAD; \
+            rm -rf /tmp/humming-checkout/.git; \
+            cp -a /tmp/humming-checkout/. "${target}/"; \
+            rm -rf /tmp/humming-checkout; \
+            printf '%s\n' "${commit}" > "${target}/SOURCE_COMMIT"; \
+        fi; \
+    }; \
+    snapshot "${DSV41_PREFILL_HUMMING_GIT_REPOSITORY}" "${DSV41_PREFILL_HUMMING_GIT_COMMIT}" prefill; \
+    snapshot "${DSV41_DECODE_HUMMING_GIT_REPOSITORY}" "${DSV41_DECODE_HUMMING_GIT_COMMIT}" decode
 
 #################### MOONCAKE BUILD IMAGE ####################
 FROM base AS mooncake-build
@@ -1158,6 +1187,8 @@ ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
 ARG UV_VERSION
 ARG DSV41_HUMMING_VERSION=0.1.12
+ARG DSV41_PREFILL_HUMMING_GIT_COMMIT=
+ARG DSV41_DECODE_HUMMING_GIT_COMMIT=
 ARG DSV41_PREFILL_HUMMING_COMMIT=3632a5052b6e42011415ee1390cba6b614567059
 ARG DSV41_PREFILL_HUMMING_PATH=/opt/humming-dsv41-prefill-3632a505
 
@@ -1396,32 +1427,46 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Keep the validated DSv4.1 Decode kernels isolated from the global Humming
-# dependency used by Prefill. Decode opts into this path through PYTHONPATH.
+# Keep the role-specific Humming overlays at the existing PYTHONPATH locations.
 RUN --mount=type=cache,target=/opt/uv/cache \
-    humming_extra=cu13 \
-    && if [ "$(echo $CUDA_VERSION | cut -d. -f1)" = "12" ]; then \
-        humming_extra=cu12; \
-    fi \
-    && uv_extra_index_args="" \
-    && if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
-        uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
-    fi \
-    && uv pip install \
-        --target "/opt/humming-${DSV41_HUMMING_VERSION}" \
-        --no-deps \
-        "humming-kernels[${humming_extra}]==${DSV41_HUMMING_VERSION}" \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-        ${uv_extra_index_args}
+    --mount=type=bind,from=byteiaas-humming-source,source=/workspace/byteiaas-humming-source/decode,target=/tmp/humming-decode,ro \
+    set -eu; \
+    decode_path="/opt/humming-${DSV41_HUMMING_VERSION}"; \
+    if [ -n "${DSV41_DECODE_HUMMING_GIT_COMMIT}" ]; then \
+        test "$(cat /tmp/humming-decode/SOURCE_COMMIT)" = "${DSV41_DECODE_HUMMING_GIT_COMMIT}"; \
+        cp -a /tmp/humming-decode /tmp/humming-decode-build; \
+        short_commit="$(cut -c1-7 /tmp/humming-decode/SOURCE_COMMIT)"; \
+        SETUPTOOLS_SCM_PRETEND_VERSION_FOR_HUMMING_KERNELS="${DSV41_HUMMING_VERSION}+g${short_commit}" \
+            uv pip install --target "${decode_path}" --no-deps /tmp/humming-decode-build; \
+        PYTHONPATH="${decode_path}" python3 -c \
+            "from humming.build import build_native; print(build_native())"; \
+        cp /tmp/humming-decode/SOURCE_COMMIT "${decode_path}/"; \
+        rm -rf /tmp/humming-decode-build; \
+    else \
+        humming_extra=cu13; \
+        if [ "${CUDA_VERSION%%.*}" = "12" ]; then humming_extra=cu12; fi; \
+        uv_extra_index_args=""; \
+        if [ -n "${UV_EXTRA_INDEX_URL:-}" ]; then \
+            uv_extra_index_args="--extra-index-url ${UV_EXTRA_INDEX_URL}"; \
+        fi; \
+        uv pip install --target "${decode_path}" --no-deps \
+            "humming-kernels[${humming_extra}]==${DSV41_HUMMING_VERSION}" \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            ${uv_extra_index_args}; \
+    fi
 
-# Package the exact, separately qualified H20 Prefill runtime. Decode keeps
-# using /opt/humming-${DSV41_HUMMING_VERSION}.
 COPY third_party/humming-dsv41-prefill ${DSV41_PREFILL_HUMMING_PATH}
-RUN test "$(cat ${DSV41_PREFILL_HUMMING_PATH}/SOURCE_COMMIT)" = \
-        "${DSV41_PREFILL_HUMMING_COMMIT}" \
-    && PYTHONPATH="${DSV41_PREFILL_HUMMING_PATH}" python3 -c \
-        "from humming.build import build_native; print(build_native())" \
-    && find "${DSV41_PREFILL_HUMMING_PATH}/humming/_native" \
+RUN --mount=type=bind,from=byteiaas-humming-source,source=/workspace/byteiaas-humming-source/prefill,target=/tmp/humming-prefill,ro \
+    set -eu; \
+    if [ -n "${DSV41_PREFILL_HUMMING_GIT_COMMIT}" ]; then \
+        rm -rf "${DSV41_PREFILL_HUMMING_PATH}"; \
+        cp -a /tmp/humming-prefill "${DSV41_PREFILL_HUMMING_PATH}"; \
+    fi; \
+    test "$(cat "${DSV41_PREFILL_HUMMING_PATH}/SOURCE_COMMIT")" = \
+        "${DSV41_PREFILL_HUMMING_GIT_COMMIT:-${DSV41_PREFILL_HUMMING_COMMIT}}"; \
+    PYTHONPATH="${DSV41_PREFILL_HUMMING_PATH}" python3 -c \
+        "from humming.build import build_native; print(build_native())"; \
+    find "${DSV41_PREFILL_HUMMING_PATH}/humming/_native" \
         -maxdepth 2 -type f -print -exec sha256sum {} \;
 
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
@@ -1712,6 +1757,7 @@ ARG VLLM_IMAGE_TAG
 ARG VLLM_IMAGE_SOURCE=https://github.com/vllm-project/vllm
 ARG BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=false
 ARG BYTEIAAS_REQUIRE_SOURCE_DEEPGEMM=false
+ARG DEEPGEMM_GIT_REF=
 ARG DEEPGEMM_GIT_REPOSITORY
 ARG DEEPGEMM_GIT_COMMIT
 ARG MOONCAKE_GIT_REPOSITORY
@@ -1896,6 +1942,7 @@ LABEL org.opencontainers.image.source="${VLLM_IMAGE_SOURCE}" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}" \
       ai.vllm.deepgemm.repository="${DEEPGEMM_GIT_REPOSITORY}" \
+      ai.vllm.deepgemm.ref="${DEEPGEMM_GIT_REF}" \
       ai.vllm.deepgemm.commit="${DEEPGEMM_GIT_COMMIT}" \
       ai.vllm.tokenizers.commit="${TOKENIZERS_GIT_COMMIT}" \
       ai.vllm.router.repository="${VLLM_ROUTER_GIT_REPOSITORY}" \

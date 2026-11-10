@@ -68,8 +68,6 @@ jobs:
       BYTEIAAS_GET_PIP_URL: https://bootstrap.pypa.io/get-pip.py
       BYTEIAAS_PIP_INDEX_URL: https://mirrors.volces.com/pypi/simple
       BYTEIAAS_PIP_EXTRA_INDEX_URL: https://pypi.org/simple
-      BYTEIAAS_DEEPGEMM_GIT_REPOSITORY: https://github.com/wangyicong52/DeepGEMM.git
-      BYTEIAAS_DEEPGEMM_GIT_COMMIT: 09f5008a04e4184b6e8e5da7d70c57c38aa91fac
       BYTEIAAS_DEEPEP_GIT_REPOSITORY: https://github.com/deepseek-ai/DeepEP
       BYTEIAAS_DEEPEP_GIT_COMMIT: d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb
       BYTEIAAS_NVSHMEM_VERSION: 3.3.24
@@ -77,9 +75,6 @@ jobs:
       BYTEIAAS_TOKENIZERS_GIT_REPOSITORY: https://github.com/wangyicong52/tokenizers.git
       BYTEIAAS_TOKENIZERS_GIT_REF: vllm
       BYTEIAAS_TOKENIZERS_GIT_COMMIT: 441393c720fbd27a4faea02b7af18ebe08a65a01
-      BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY: https://github.com/wangyicong52/router.git
-      BYTEIAAS_VLLM_ROUTER_GIT_REF: dev/dsv4.1-flash
-      BYTEIAAS_VLLM_ROUTER_GIT_COMMIT: ef339bc73a04872dc7999aebf761c5f86263af64
       BYTEIAAS_MOONCAKE_GIT_REPOSITORY: https://github.com/wangyicong52/Mooncake.git
       BYTEIAAS_MOONCAKE_GIT_REF: vllm-dsv4.1
       BYTEIAAS_MOONCAKE_GIT_COMMIT: ffd73707e9dbfe0997053f3d82eab86d1568337e
@@ -125,7 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "2"
+          test "$(cat .github/byteiaas-build-contract)" = "4"
           if [ "${BYTEIAAS_CUDA_VERSION}" != "13.0.3" ]; then
             echo "::error::ByteIAAS builds require CUDA 13.0.3"
             exit 1
@@ -197,12 +192,24 @@ jobs:
             cd byteiaas-build-artifacts/tmp/vllm-router-dist
             sha256sum --check --strict wheels.sha256
           )
-          test "$(sed -n 's/^repository=//p' \
-            byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist/source.env)" = \
-            "${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
-          test "$(sed -n 's/^commit=//p' \
-            byteiaas-build-artifacts/workspace/byteiaas-deepgemm-dist/source.env)" = \
-            "${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
+          source docker/byteiaas/dependencies.env
+          for component in DEEPGEMM VLLM_ROUTER PREFILL_HUMMING DECODE_HUMMING; do
+            case "${component}" in
+              DEEPGEMM) manifest=workspace/byteiaas-deepgemm-dist/source.env ;;
+              VLLM_ROUTER) manifest=tmp/vllm-router-dist/source.env ;;
+              *) manifest="${component,,}.env" ;;
+            esac
+            manifest="byteiaas-build-artifacts/${manifest}"
+            prefix="BYTEIAAS_${component}_GIT"
+            repo_var="${prefix}_REPOSITORY"
+            ref_var="${prefix}_REF"
+            test "$(sed -n 's/^repository=//p' "${manifest}")" = "${!repo_var}"
+            test "$(sed -n 's/^ref=//p' "${manifest}")" = "${!ref_var}"
+            commit="$(sed -n 's/^commit=//p' "${manifest}")"
+            [[ "${commit}" =~ ^[0-9a-f]{40}$ ]]
+            printf '%s\n' "${repo_var}=${!repo_var}" "${ref_var}=${!ref_var}" \
+              "${prefix}_COMMIT=${commit}" >> "${GITHUB_ENV}"
+          done
           test "$(sed -n 's/^repository=//p' \
             byteiaas-build-artifacts/tmp/ep_kernels_workspace/dist/source.env)" = \
             "${BYTEIAAS_DEEPEP_GIT_REPOSITORY}"
@@ -227,15 +234,6 @@ jobs:
           test "$(sed -n 's/^commit=//p' \
             byteiaas-build-artifacts/tmp/mooncake-dist/source.env)" = \
             "${BYTEIAAS_MOONCAKE_GIT_COMMIT}"
-          test "$(sed -n 's/^repository=//p' \
-            byteiaas-build-artifacts/tmp/vllm-router-dist/source.env)" = \
-            "${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY}"
-          test "$(sed -n 's/^ref=//p' \
-            byteiaas-build-artifacts/tmp/vllm-router-dist/source.env)" = \
-            "${BYTEIAAS_VLLM_ROUTER_GIT_REF}"
-          test "$(sed -n 's/^commit=//p' \
-            byteiaas-build-artifacts/tmp/vllm-router-dist/source.env)" = \
-            "${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
 
       - name: Resolve Volcengine publish target
         run: |
@@ -376,10 +374,6 @@ jobs:
             echo "::error::Invalid tokenizers commit: ${BYTEIAAS_TOKENIZERS_GIT_COMMIT}"
             exit 1
           fi
-          if ! [[ "${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Invalid vLLM Router commit: ${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
-            exit 1
-          fi
           echo "Building tokenizers ${BYTEIAAS_TOKENIZERS_GIT_REF}@${BYTEIAAS_TOKENIZERS_GIT_COMMIT}"
           echo "Building vLLM Router ${BYTEIAAS_VLLM_ROUTER_GIT_REF}@${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
           echo "Building Mooncake ${BYTEIAAS_MOONCAKE_GIT_REF}@${BYTEIAAS_MOONCAKE_GIT_COMMIT}"
@@ -452,6 +446,7 @@ jobs:
               --build-arg UV_INDEX_URL="${BYTEIAAS_PIP_INDEX_URL}"
               --build-arg UV_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}"
               --build-arg DEEPGEMM_GIT_REPOSITORY="${BYTEIAAS_DEEPGEMM_GIT_REPOSITORY}"
+              --build-arg DEEPGEMM_GIT_REF="${BYTEIAAS_DEEPGEMM_GIT_REF}"
               --build-arg DEEPGEMM_GIT_COMMIT="${BYTEIAAS_DEEPGEMM_GIT_COMMIT}"
               --build-arg DEEPGEMM_REQUIRE_SM90_MEGA_MOE=ON
               --build-arg BYTEIAAS_REQUIRE_SOURCE_DEEPGEMM=true
@@ -463,6 +458,10 @@ jobs:
               --build-arg VLLM_ROUTER_GIT_REPOSITORY="${BYTEIAAS_VLLM_ROUTER_GIT_REPOSITORY}"
               --build-arg VLLM_ROUTER_GIT_REF="${BYTEIAAS_VLLM_ROUTER_GIT_REF}"
               --build-arg VLLM_ROUTER_GIT_COMMIT="${BYTEIAAS_VLLM_ROUTER_GIT_COMMIT}"
+              --build-arg DSV41_PREFILL_HUMMING_GIT_REPOSITORY="${BYTEIAAS_PREFILL_HUMMING_GIT_REPOSITORY}"
+              --build-arg DSV41_PREFILL_HUMMING_GIT_COMMIT="${BYTEIAAS_PREFILL_HUMMING_GIT_COMMIT}"
+              --build-arg DSV41_DECODE_HUMMING_GIT_REPOSITORY="${BYTEIAAS_DECODE_HUMMING_GIT_REPOSITORY}"
+              --build-arg DSV41_DECODE_HUMMING_GIT_COMMIT="${BYTEIAAS_DECODE_HUMMING_GIT_COMMIT}"
               --build-arg BYTEIAAS_BUILD_ARTIFACTS_SOURCE=byteiaas-prebuilt
               --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=byteiaas-prebuilt
               --build-arg BYTEIAAS_VLLM_ROUTER_SOURCE=byteiaas-prebuilt

@@ -72,8 +72,8 @@ jobs:
             exit 1
           fi
           contract="$(git show "${checkout_sha}:.github/byteiaas-build-contract")"
-          if [ "${contract}" != "2" ]; then
-            echo "::error::Release tag lacks ByteIAAS build contract 2"
+          if [ "${contract}" != "4" ]; then
+            echo "::error::Release tag lacks ByteIAAS build contract 4"
             exit 1
           fi
           python3 scripts/ci/get_byteiaas_image_tag.py \
