@@ -11,6 +11,7 @@ from pathlib import Path
 
 import router_wheel
 import tokenizers_wheel
+from prepare_native_source import package_version
 
 COMPONENTS = {
     "vllm": ("workspace/dist", "vllm-*.whl", "wheel.sha256"),
@@ -68,8 +69,19 @@ def inventory(root: Path) -> dict:
 
 def check_provenance(repo: Path, kind: str, directory: Path, wheel: Path) -> None:
     if kind in ("deepgemm", "humming"):
-        lock_path = repo / "docker/byteiaas/native" / kind / "source-lock.json"
+        config_path = repo / "docker/byteiaas/native" / kind / "source.json"
+        config = json.loads(config_path.read_text())
+        lock_path = directory / "source-lock.json"
         lock = json.loads(lock_path.read_text())
+        if (
+            lock["format_version"] != 1
+            or lock["repository"] != config["repository"]
+            or lock["ref"] != config["ref"]
+            or not is_hex(lock["source_commit"], 40)
+            or not is_hex(lock["source_tree"], 40)
+            or lock["package_version"] != package_version(config, lock["source_commit"])
+        ):
+            raise ValueError(f"Invalid resolved native source: {kind}")
         manifest = json.loads((directory / "native-manifest.json").read_text())
         expected = {
             "format_version": 1,
@@ -78,7 +90,7 @@ def check_provenance(repo: Path, kind: str, directory: Path, wheel: Path) -> Non
             "version": lock["package_version"],
             **{
                 key: lock[key]
-                for key in ("repository", "base_commit", "source_commit", "source_tree")
+                for key in ("repository", "ref", "source_commit", "source_tree")
             },
         }
         contract = manifest["torch_contract"]
@@ -113,9 +125,16 @@ def check_provenance(repo: Path, kind: str, directory: Path, wheel: Path) -> Non
                 if not expected_files.issubset(archive.namelist()):
                     raise ValueError("Humming artifact lacks compiled native files")
     elif kind in ("router", "tokenizers"):
-        builder = router_wheel if kind == "router" else tokenizers_wheel
         manifest = json.loads((directory / f"{kind}-manifest.json").read_text())
-        expected = {"repository": builder.REPOSITORY, "commit": builder.COMMIT}
+        if kind == "router":
+            if not is_hex(manifest["commit"], 40):
+                raise ValueError("Invalid router source commit")
+            expected = {"repository": router_wheel.REPOSITORY, "ref": router_wheel.REF}
+        else:
+            expected = {
+                "repository": tokenizers_wheel.REPOSITORY,
+                "commit": tokenizers_wheel.COMMIT,
+            }
     elif kind in ("mooncake", "ep"):
         versions = json.loads((repo / "docker/versions.json").read_text())["variable"]
         manifest = source_env(directory / "source.env")
@@ -200,10 +219,10 @@ def main() -> None:
         raise ValueError("Expected an immutable source commit")
     if (root / "source-commit").read_text().strip() != args.checkout_ref:
         raise ValueError("Artifact source commit differs from image checkout")
-    if (repo / ".github/byteiaas-build-contract").read_text().strip() != "3":
-        raise ValueError("Expected ByteIAAS artifact build contract 3")
+    if (repo / ".github/byteiaas-build-contract").read_text().strip() != "5":
+        raise ValueError("Expected ByteIAAS artifact build contract 5")
     identity = {
-        "format_version": 3,
+        "format_version": 5,
         "source_commit": args.checkout_ref,
         "run_id": args.run_id,
         "cuda_version": "13.0.3",

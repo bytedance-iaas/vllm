@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "3"
+          test "$(cat .github/byteiaas-build-contract)" = "5"
           uv venv --python python3 --no-python-downloads .venv
           .venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), sys.version'
           .venv/bin/python tools/byteiaas/validate_build_contract.py
@@ -106,6 +106,19 @@ jobs:
             --index-strategy unsafe-best-match \
             --extra-index-url https://download.pytorch.org/whl/cu130 \
             --output-file /dev/null
+
+      - name: Resolve dependency branches
+        run: |
+          set -euo pipefail
+          for kind in deepgemm humming; do
+            commit="$(.venv/bin/python tools/byteiaas/prepare_native_source.py \
+              --config "docker/byteiaas/native/${kind}/source.json" resolve)"
+            echo "${kind}: ${commit}"
+            echo "${kind^^}_GIT_COMMIT=${commit}" >> "${GITHUB_ENV}"
+          done
+          router_commit="$(.venv/bin/python tools/byteiaas/router_wheel.py resolve)"
+          echo "router: ${router_commit}"
+          echo "VLLM_ROUTER_GIT_COMMIT=${router_commit}" >> "${GITHUB_ENV}"
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         id: buildx
@@ -200,6 +213,9 @@ jobs:
             --build-arg UV_EXTRA_INDEX_URL="${BYTEIAAS_PIP_EXTRA_INDEX_URL}" \
             --build-arg UV_INDEX="${BYTEIAAS_PIP_EXTRA_INDEX_URL}" \
             --build-arg BYTEIAAS_BUILD_NATIVE=true \
+            --build-arg DEEPGEMM_GIT_COMMIT="${DEEPGEMM_GIT_COMMIT}" \
+            --build-arg HUMMING_GIT_COMMIT="${HUMMING_GIT_COMMIT}" \
+            --build-arg VLLM_ROUTER_GIT_COMMIT="${VLLM_ROUTER_GIT_COMMIT}" \
             --build-arg BYTEIAAS_BUILD_TOKENIZERS=true \
             --build-arg BYTEIAAS_BUILD_ROUTER=true \
             --build-arg BUILD_NIXL=false \

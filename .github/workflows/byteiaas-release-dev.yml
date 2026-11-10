@@ -109,8 +109,8 @@ jobs:
             exit 1
           fi
           contract="$(git show "${checkout_sha}:.github/byteiaas-build-contract")"
-          if [ "${contract}" != "3" ]; then
-            echo "::error::Requested source lacks ByteIAAS build contract 3"
+          if [ "${contract}" != "5" ]; then
+            echo "::error::Requested source lacks ByteIAAS build contract 5"
             exit 1
           fi
           echo "checkout_sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"

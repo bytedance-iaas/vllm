@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Reject stale release build inputs before running expensive CI builds."""
 
-import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
-    if (root / ".github/byteiaas-build-contract").read_text().strip() != "3":
-        raise ValueError("Expected ByteIAAS build contract 3")
+    if (root / ".github/byteiaas-build-contract").read_text().strip() != "5":
+        raise ValueError("Expected ByteIAAS build contract 5")
     dockerfile = (root / "docker/Dockerfile").read_text()
     for name, value in {
         "CUDA_VERSION": "13.0.3",
@@ -85,24 +85,18 @@ def main() -> None:
         raise ValueError("Mooncake build must reuse the system dependency preflight")
     sources = {}
     for kind in ("deepgemm", "humming"):
-        path = root / "docker/byteiaas/native" / kind / "source-lock.json"
-        lock = json.loads(path.read_text())
-        if lock["format_version"] != 1:
-            raise ValueError(f"Unsupported source lock: {kind}")
-        for key in ("base_commit", "source_commit", "source_tree"):
-            if len(lock[key]) != 40 or any(
-                char not in "0123456789abcdef" for char in lock[key]
-            ):
-                raise ValueError(f"Invalid source identity: {kind}/{key}")
-        for patch in lock["patches"]:
-            data = (path.parent / patch["file"]).read_bytes()
-            if hashlib.sha256(data).hexdigest() != patch["sha256"]:
-                raise ValueError(f"Native patch checksum mismatch: {patch['file']}")
-        sources[kind] = {
-            key: lock[key]
-            for key in ("repository", "base_commit", "source_tree", "package_version")
-        }
-    print(json.dumps({"contract": 3, "native_sources": sources}, indent=2))
+        path = root / "docker/byteiaas/native" / kind / "source.json"
+        config = json.loads(path.read_text())
+        if (
+            not config["repository"].startswith("https://")
+            or not config["package_version"]
+        ):
+            raise ValueError(f"Invalid native source config: {kind}")
+        subprocess.run(
+            ["git", "check-ref-format", f"refs/heads/{config['ref']}"], check=True
+        )
+        sources[kind] = config
+    print(json.dumps({"contract": 5, "native_sources": sources}, indent=2))
 
 
 if __name__ == "__main__":

@@ -43,8 +43,11 @@ def build(args: argparse.Namespace) -> None:
     tree = subprocess.check_output(
         ["git", "-C", str(source), "write-tree"], text=True
     ).strip()
-    if tree != lock["source_tree"]:
-        raise ValueError(f"Native source differs from lock: {tree}")
+    commit = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if commit != lock["source_commit"] or tree != lock["source_tree"]:
+        raise ValueError(f"Native source differs from lock: {commit} {tree}")
     subprocess.run(["git", "-C", str(source), "diff", "--exit-code"], check=True)
     extras = subprocess.check_output(
         ["git", "-C", str(source), "ls-files", "--others", "--exclude-standard"],
@@ -134,7 +137,7 @@ def build(args: argparse.Namespace) -> None:
         "format_version": 1,
         "kind": args.kind,
         "repository": lock["repository"],
-        "base_commit": lock["base_commit"],
+        "ref": lock["ref"],
         "source_commit": lock["source_commit"],
         "source_tree": tree,
         "package": metadata["Name"],
@@ -158,7 +161,7 @@ def verify(args: argparse.Namespace) -> None:
         raise ValueError("Native wheel source lock checksum mismatch")
     if manifest["version"] != lock["package_version"]:
         raise ValueError("Native wheel version differs from source lock")
-    for key in ("repository", "base_commit", "source_commit", "source_tree"):
+    for key in ("repository", "ref", "source_commit", "source_tree"):
         if manifest[key] != lock[key]:
             raise ValueError(f"Native wheel provenance mismatch: {key}")
     if manifest["torch_contract"] != torch_contract():

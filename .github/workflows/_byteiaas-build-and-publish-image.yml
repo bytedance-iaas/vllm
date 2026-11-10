@@ -118,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${CHECKOUT_REF}"
-          test "$(cat .github/byteiaas-build-contract)" = "3"
+          test "$(cat .github/byteiaas-build-contract)" = "5"
           uv venv --python python3 --no-python-downloads .venv
           .venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), sys.version'
           .venv/bin/python tools/byteiaas/validate_build_contract.py
@@ -285,7 +285,7 @@ jobs:
           build_commit="$(git rev-parse HEAD)"
           build_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           image_source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
-          echo "Building checked-in native locks and fixed tokenizers/router sources"
+          echo "Building images from verified same-run wheels"
 
           mkdir -p "${cache_root}"
 

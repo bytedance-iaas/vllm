@@ -107,8 +107,7 @@ ARG BUILD_NIXL=false
 ARG INSTALL_NIXL=true
 ARG BYTEIAAS_NIXL_WHEEL_SOURCE=extensions-build
 
-# Build the release-pinned ByteIAAS native source overlays. The public build
-# remains opt-in; internal workflows enable this immutable source contract.
+# Build ByteIAAS sources from the commits resolved for this CI run.
 ARG BYTEIAAS_BUILD_NATIVE=false
 ARG BYTEIAAS_BUILD_TOKENIZERS=false
 ARG BYTEIAAS_BUILD_ROUTER=false
@@ -407,7 +406,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### BYTEIAAS ROUTER BUILD IMAGE ####################
 FROM rust-toolchain AS byteiaas-router-build
 ARG BYTEIAAS_BUILD_ROUTER
-COPY tools/byteiaas/router_wheel.py /workspace/byteiaas-router-wheel.py
+ARG VLLM_ROUTER_GIT_COMMIT
+COPY tools/byteiaas/router_wheel.py tools/byteiaas/prepare_native_source.py /workspace/byteiaas-router-tools/
 # Router protocol generation uses Rust protox/prost, not C++ protobuf headers.
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
@@ -419,12 +419,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         dnf clean all; \
         uv pip install --python /opt/venv/bin/python3 \
             "auditwheel==6.5.0" "build==1.3.0" "patchelf==0.17.2.4"; \
-        python3 /workspace/byteiaas-router-wheel.py build \
+        python3 /workspace/byteiaas-router-tools/router_wheel.py build \
+            --commit "${VLLM_ROUTER_GIT_COMMIT}" \
             --source /workspace/byteiaas-router-source \
             --output /workspace/byteiaas-router-dist; \
     else \
         mkdir -p /workspace/byteiaas-router-dist; \
         printf '%s\n' disabled > /workspace/byteiaas-router-dist/build-state; \
+        printf '{}\n' > /workspace/byteiaas-router-dist/router-manifest.json; \
         (cd /workspace/byteiaas-router-dist && sha256sum build-state > wheels.sha256); \
     fi
 #################### BYTEIAAS ROUTER BUILD IMAGE ####################
@@ -432,11 +434,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### BYTEIAAS NATIVE BUILD IMAGE ####################
 FROM base AS byteiaas-native-build
 ARG BYTEIAAS_BUILD_NATIVE
+ARG DEEPGEMM_GIT_COMMIT
+ARG HUMMING_GIT_COMMIT
 ARG max_jobs=2
 ENV MAX_JOBS=${max_jobs}
 WORKDIR /workspace/byteiaas-native
-COPY docker/byteiaas/native/deepgemm /workspace/byteiaas-native/locks/deepgemm
-COPY docker/byteiaas/native/humming /workspace/byteiaas-native/locks/humming
+COPY docker/byteiaas/native /workspace/byteiaas-native/config
 COPY requirements/build/cuda.txt /workspace/requirements/build/cuda.txt
 COPY tools/byteiaas/prepare_native_source.py tools/byteiaas/native_wheel.py /workspace/byteiaas-native/tools/
 RUN mkdir -p deepgemm-source deepgemm-dist humming-source humming-dist && \
@@ -445,19 +448,25 @@ RUN mkdir -p deepgemm-source deepgemm-dist humming-source humming-dist && \
         uv pip install --python /opt/venv/bin/python3 \
             -r /workspace/requirements/build/cuda.txt && \
         python3 tools/prepare_native_source.py \
-            --lock locks/deepgemm/source-lock.json --source deepgemm-source && \
+            --config config/deepgemm/source.json checkout \
+            --commit "${DEEPGEMM_GIT_COMMIT}" --source deepgemm-source \
+            --lock deepgemm-dist/source-lock.json && \
         python3 tools/native_wheel.py build \
-            --lock locks/deepgemm/source-lock.json --source deepgemm-source \
+            --lock deepgemm-dist/source-lock.json --source deepgemm-source \
             --output deepgemm-dist && \
         python3 tools/prepare_native_source.py \
-            --lock locks/humming/source-lock.json --source humming-source && \
+            --config config/humming/source.json checkout \
+            --commit "${HUMMING_GIT_COMMIT}" --source humming-source \
+            --lock humming-dist/source-lock.json && \
         python3 tools/native_wheel.py build --kind humming \
-            --lock locks/humming/source-lock.json --source humming-source \
+            --lock humming-dist/source-lock.json --source humming-source \
             --output humming-dist; \
     else \
         printf '%s\n' disabled > deepgemm-dist/build-state && \
+        printf '{}\n' > deepgemm-dist/source-lock.json && \
         (cd deepgemm-dist && sha256sum build-state > wheels.sha256) && \
         printf '%s\n' disabled > humming-dist/build-state && \
+        printf '{}\n' > humming-dist/source-lock.json && \
         (cd humming-dist && sha256sum build-state > wheels.sha256); \
     fi
 #################### BYTEIAAS NATIVE BUILD IMAGE ####################
@@ -915,12 +924,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 tools/use_existing_torch.py --prefix; \
     fi
 
+COPY --from=byteiaas-native-build /workspace/byteiaas-native/humming-dist/source-lock.json /tmp/byteiaas-humming-source-lock.json
+
 # Build the vLLM wheel
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=.git,target=.git \
     if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
         humming_version=$(python3 -c \
-            "import json; print(json.load(open('docker/byteiaas/native/humming/source-lock.json'))['package_version'])"); \
+            "import json; print(json.load(open('/tmp/byteiaas-humming-source-lock.json'))['package_version'])"); \
         sed -i "s/^humming-kernels\\[cu13\\]==.*/humming-kernels[cu13]==${humming_version}/" requirements/cuda.txt; \
     fi && \
     if [ "${vllm_target_device}" = "cuda" ]; then \
@@ -1665,7 +1676,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 
 ARG BYTEIAAS_BUILD_ROUTER
 COPY --from=vllm-build-artifacts /workspace/byteiaas-router-dist/wheels.sha256 /tmp/byteiaas-router-wheels.sha256
-COPY tools/byteiaas/router_wheel.py /opt/byteiaas/tools/router_wheel.py
+COPY --from=vllm-build-artifacts /workspace/byteiaas-router-dist/router-manifest.json /tmp/byteiaas-router-manifest.json
+COPY tools/byteiaas/router_wheel.py tools/byteiaas/prepare_native_source.py /opt/byteiaas/tools/
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-router-dist,target=/tmp/byteiaas-router-dist,ro \
     set -eu; \
@@ -1687,15 +1699,18 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG BYTEIAAS_BUILD_NATIVE
 COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/deepgemm/wheels.sha256 /tmp/byteiaas-deepgemm-wheels.sha256
 COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/humming/wheels.sha256 /tmp/byteiaas-humming-wheels.sha256
-COPY docker/byteiaas/native/deepgemm/source-lock.json /opt/byteiaas/provenance/deepgemm-source-lock.json
-COPY docker/byteiaas/native/humming/source-lock.json /opt/byteiaas/provenance/humming-source-lock.json
+COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/deepgemm/source-lock.json /tmp/byteiaas-deepgemm-source-lock.json
+COPY --from=vllm-build-artifacts /workspace/byteiaas-native-dist/humming/source-lock.json /tmp/byteiaas-humming-source-lock.json
 COPY tools/byteiaas/native_wheel.py /opt/byteiaas/tools/native_wheel.py
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-native-dist/deepgemm,target=/tmp/byteiaas-deepgemm-dist,ro \
     --mount=type=bind,from=vllm-build-artifacts,source=/workspace/byteiaas-native-dist/humming,target=/tmp/byteiaas-humming-dist,ro \
     set -eu; \
     if [ "${BYTEIAAS_BUILD_NATIVE}" = "true" ]; then \
+        mkdir -p /opt/byteiaas/provenance; \
         for kind in deepgemm humming; do \
+            cp "/tmp/byteiaas-${kind}-source-lock.json" \
+                "/opt/byteiaas/provenance/${kind}-source-lock.json"; \
             (cd "/tmp/byteiaas-${kind}-dist" && sha256sum --check --strict "/tmp/byteiaas-${kind}-wheels.sha256"); \
             uv pip install --system --no-deps --reinstall "/tmp/byteiaas-${kind}-dist/"*.whl; \
             python3 /opt/byteiaas/tools/native_wheel.py verify \

@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build and verify the fixed encoder-only Prefill router."""
+"""Build and verify the encoder-only Prefill router."""
 
 import argparse
 import hashlib
 import importlib.metadata
 import json
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
+from prepare_native_source import checkout, resolve
+
 REPOSITORY = "https://github.com/wangyicong52/router.git"
-COMMIT = "ef339bc73a04872dc7999aebf761c5f86263af64"
+REF = "dev/dsv4.1-flash"
 
 
 def digest(data: bytes) -> str:
@@ -26,21 +29,8 @@ def build(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     if source.exists() or output.exists():
         raise ValueError("Use new router source and wheel directories")
-    source.mkdir(parents=True)
+    checkout(REPOSITORY, args.commit, source)
     output.mkdir(parents=True)
-    subprocess.run(["git", "init", str(source)], check=True)
-    subprocess.run(
-        ["git", "-C", str(source), "fetch", "--depth", "1", REPOSITORY, COMMIT],
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(source), "checkout", "--detach", "FETCH_HEAD"], check=True
-    )
-    actual = subprocess.check_output(
-        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
-    ).strip()
-    if actual != COMMIT:
-        raise ValueError("Unexpected router source commit")
     lock_hash = digest((source / "Cargo.lock").read_bytes())
     unrepaired = output / "unrepaired"
     subprocess.run(
@@ -79,7 +69,8 @@ def build(args: argparse.Namespace) -> None:
     wheel = wheels[0]
     manifest = {
         "repository": REPOSITORY,
-        "commit": COMMIT,
+        "ref": REF,
+        "commit": args.commit,
         "cargo_lock_sha256": lock_hash,
         "wheel": wheel.name,
         "sha256": digest(wheel.read_bytes()),
@@ -92,7 +83,11 @@ def build(args: argparse.Namespace) -> None:
 
 def verify(args: argparse.Namespace) -> None:
     manifest = json.loads(args.manifest.read_text())
-    if manifest["repository"] != REPOSITORY or manifest["commit"] != COMMIT:
+    if (
+        manifest["repository"] != REPOSITORY
+        or manifest["ref"] != REF
+        or not re.fullmatch(r"[0-9a-f]{40}", manifest["commit"])
+    ):
         raise ValueError("Unexpected router source provenance")
     wheel = args.manifest.parent / manifest["wheel"]
     if digest(wheel.read_bytes()) != manifest["sha256"]:
@@ -131,7 +126,11 @@ def verify(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("resolve").set_defaults(
+        func=lambda _: print(resolve(REPOSITORY, REF))
+    )
     builder = commands.add_parser("build")
+    builder.add_argument("--commit", required=True)
     builder.add_argument("--source", type=Path, required=True)
     builder.add_argument("--output", type=Path, required=True)
     builder.set_defaults(func=build)

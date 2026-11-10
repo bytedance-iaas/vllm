@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Recreate a native dependency from an immutable base and checked-in patches."""
+"""Resolve a native dependency branch and record the source used by a build."""
 
 import argparse
-import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -13,68 +13,72 @@ def git(source: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
 
 
-def prepare(
-    lock_path: Path, source: Path, local: Path | None, submodules: bool
-) -> None:
-    lock = json.loads(lock_path.read_text())
-    if lock["format_version"] != 1:
-        raise ValueError("Unsupported native source lock")
-    for patch in lock["patches"]:
-        path = lock_path.parent / patch["file"]
-        if hashlib.sha256(path.read_bytes()).hexdigest() != patch["sha256"]:
-            raise ValueError(f"Native patch checksum mismatch: {path}")
-    if source.exists():
-        raise ValueError(f"Use a new source directory: {source}")
+def resolve(repository: str, ref: str) -> str:
+    branch = f"refs/heads/{ref}"
+    git(Path.cwd(), "check-ref-format", branch)
+    commit, actual_ref = git(
+        Path.cwd(), "ls-remote", "--exit-code", repository, branch
+    ).split()
+    if actual_ref != branch or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError(f"Invalid branch resolution: {repository} {branch}")
+    return commit
+
+
+def checkout(repository: str, commit: str, source: Path) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Expected a full source commit")
     source.mkdir(parents=True)
-    subprocess.run(["git", "init", str(source)], check=True)
-    repository = str(local.resolve()) if local else lock["repository"]
-    git(source, "fetch", "--depth", "1", repository, lock["base_commit"])
+    git(source, "init")
+    git(source, "remote", "add", "origin", repository)
+    git(source, "fetch", "--no-tags", "--depth", "1", "origin", commit)
     git(source, "checkout", "--detach", "FETCH_HEAD")
-    if git(source, "rev-parse", "HEAD") != lock["base_commit"]:
-        raise ValueError("Unexpected native base commit")
-    for patch in lock["patches"]:
-        git(
-            source,
-            "apply",
-            "--index",
-            str((lock_path.parent / patch["file"]).resolve()),
-        )
-    tree = git(source, "write-tree")
-    if tree != lock["source_tree"]:
-        raise ValueError(f"Unexpected native source tree: {tree}")
-    if submodules and (source / ".gitmodules").exists():
-        git(source, "submodule", "sync", "--recursive")
+    if git(source, "rev-parse", "HEAD") != commit:
+        raise ValueError("Unexpected native source commit")
+
+
+def package_version(config: dict, commit: str) -> str:
+    version = config["package_version"]
+    return f"{version}.g{commit[:7]}" if version.endswith("+unified") else version
+
+
+def prepare(config: dict, commit: str, source: Path, lock: Path) -> None:
+    checkout(config["repository"], commit, source)
+    if (source / ".gitmodules").exists():
         git(source, "submodule", "update", "--init", "--recursive")
         status = git(source, "submodule", "status", "--recursive")
         if any(line.startswith(("-", "+", "U")) for line in status.splitlines()):
-            raise ValueError("Native submodules differ from the locked gitlinks")
-    print(
+            raise ValueError("Native submodules differ from the checked-out gitlinks")
+    lock.write_text(
         json.dumps(
             {
-                "repository": lock["repository"],
-                "base_commit": lock["base_commit"],
-                "ported_commit": lock["source_commit"],
-                "source_tree": tree,
-                "source": str(source),
-                "submodules_initialized": submodules,
-            }
+                "format_version": 1,
+                "repository": config["repository"],
+                "ref": config["ref"],
+                "source_commit": commit,
+                "source_tree": git(source, "rev-parse", "HEAD^{tree}"),
+                "package_version": package_version(config, commit),
+            },
+            indent=2,
         )
+        + "\n"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lock", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
-    parser.add_argument("--local-repository", type=Path)
-    parser.add_argument("--skip-submodules", action="store_true")
+    parser.add_argument("--config", type=Path, required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("resolve")
+    builder = commands.add_parser("checkout")
+    builder.add_argument("--commit", required=True)
+    builder.add_argument("--source", type=Path, required=True)
+    builder.add_argument("--lock", type=Path, required=True)
     args = parser.parse_args()
-    prepare(
-        args.lock.resolve(),
-        args.source.resolve(),
-        args.local_repository,
-        not args.skip_submodules,
-    )
+    config = json.loads(args.config.read_text())
+    if args.command == "resolve":
+        print(resolve(config["repository"], config["ref"]))
+    else:
+        prepare(config, args.commit, args.source.resolve(), args.lock)
 
 
 if __name__ == "__main__":

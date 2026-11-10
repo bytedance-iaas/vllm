@@ -15,6 +15,11 @@ docker build --target vllm-openai -f docker/Dockerfile \
   --build-arg BYTEIAAS_BUILD_NATIVE=true \
   --build-arg BYTEIAAS_BUILD_TOKENIZERS=true \
   --build-arg BYTEIAAS_BUILD_ROUTER=true \
+  --build-arg DEEPGEMM_GIT_COMMIT="$(.venv/bin/python tools/byteiaas/prepare_native_source.py \
+    --config docker/byteiaas/native/deepgemm/source.json resolve)" \
+  --build-arg HUMMING_GIT_COMMIT="$(.venv/bin/python tools/byteiaas/prepare_native_source.py \
+    --config docker/byteiaas/native/humming/source.json resolve)" \
+  --build-arg VLLM_ROUTER_GIT_COMMIT="$(.venv/bin/python tools/byteiaas/router_wheel.py resolve)" \
   --build-arg BYTEIAAS_MOONCAKE_WHEEL_SOURCE=mooncake-build \
   --build-arg BYTEIAAS_REQUIRE_SOURCE_MOONCAKE=true \
   --build-arg INSTALL_NIXL=false \
@@ -24,17 +29,15 @@ docker build --target vllm-openai -f docker/Dockerfile \
   -t "$BUILT_IMAGE" .
 ```
 
-The DeepGEMM lock reconstructs SM90 MegaMoE on release base `1e1842a8`.
-The Humming lock reconstructs the unified Prefill/Decode implementation on
-upstream main `f970d0b3`. Both locks include patch SHA256 and the exact
-resulting Git tree. Local source commit IDs are attribution; remote fetches
-use upstream base commits and apply the checked-in patches.
+The DeepGEMM, Humming, and router builds follow their ByteIAAS branches.
+The wheel workflow resolves each branch once and builds the selected commit.
+The native manifests record the repository, branch, commit, Git tree, and
+wheel checksum. The router manifest records the commit and Cargo.lock digest.
 
-These sources produce DeepGEMM `2.8.0+local` and Humming
-`0.1.18+unified.g596bb89`. The Humming build includes its launcher,
+DeepGEMM retains its SM90 MegaMoE operators on the 2.8 baseline. Humming
+provides the unified Prefill and Decode kernels and includes the launcher,
 device-info extension, cubin patcher, NVRTC binary, and native manifest.
-Tokenizers is fixed to `441393c7`; the encoder-only router is fixed to
-`ef339bc7`. Mooncake is fixed to `ffd73707`, including the PR #4208 backport,
+Tokenizers is fixed to `441393c7`. Mooncake is fixed to `ffd73707`, including the PR #4208 backport,
 and built with `STORE_USE_JEMALLOC=ON`. The image enables jemalloc's background
 purge thread with `MALLOC_CONF=background_thread:true`.
 
@@ -50,9 +53,7 @@ Supplemental indexes use `UV_INDEX` so PyTorch's command-line
 `--extra-index-url` cannot hide the public PyPI fallback when the regional
 mirror has not yet synchronized a release. CI checks the known supplemental
 index requirement for Python 3.12/manylinux_2_28 before building images.
-Native source locks replace the obsolete DeepGEMM fork build arguments.
-
-Build contract 3 extends these source locks with same-run artifact reuse.
+Build contract 5 reuses the branch snapshots through same-run artifacts.
 The wheel workflow uploads vLLM, DeepGEMM, unified Humming, DeepEP, patched
 tokenizers, router, and Mooncake wheels with source/provenance manifests and
 checksums. The image workflows download that same run's artifact and install
