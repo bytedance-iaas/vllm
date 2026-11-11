@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_norm,
@@ -75,10 +75,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
         self.use_mha = False
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        self.use_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         self.self_attn = DeepseekV32Attention(
             vllm_config=vllm_config,
@@ -181,10 +178,7 @@ class DeepseekV32Model(torch.nn.Module):
 
         self.vocab_size = config.vocab_size
         parallel_config = vllm_config.parallel_config
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        self.use_sequence_parallel = parallel_config.use_sequence_parallel_moe
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
         self.is_v32 = True
@@ -229,7 +223,7 @@ class DeepseekV32Model(torch.nn.Module):
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states"], config.hidden_size
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
@@ -263,11 +257,10 @@ class DeepseekV32Model(torch.nn.Module):
             else:
                 assert input_ids is not None
                 hidden_states = self.embed_input_ids(input_ids)
-            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        residual = None
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -294,12 +287,13 @@ class DeepseekV32Model(torch.nn.Module):
             attn_in = None
 
         if not get_pp_group().is_last_rank:
-            assert not self.use_sequence_parallel, (
-                "Currently, SP is not supported with PP"
-            )
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            if self.use_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states + residual)[:full_num_tokens]
+            else:
+                hidden_states = residual + tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.use_sequence_parallel:
             hidden_states, _ = self.norm(hidden_states, residual)
