@@ -40,9 +40,11 @@ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
     get_fused_mqa_topk_workspaces,
     use_fused_mqa_topk,
 )
+from vllm.model_executor.layers.canonical_topk import canonicalize_topk_
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
     deep_select_topk,
+    deterministic_sparse_topk,
     get_indexer_topk,
     is_deep_select_supported,
 )
@@ -654,7 +656,18 @@ def sparse_attn_indexer(
         )
         assert candidate_block_size > 0
 
-    fused_mqa_topk = topk_backend != "flashinfer_sm120" and use_fused_mqa_topk(
+    deterministic = deterministic_sparse_topk()
+    if deterministic:
+        if topk_backend in ("deep_select", "flashinfer_sm120"):
+            # Canonical selection requires the raw FP32 scores.
+            topk_backend = "auto"
+        if dcp_world_size != 1:
+            logger.warning_once(
+                "VLLM_DETERMINISTIC_SPARSE_TOPK does not cover the decode context "
+                "parallel top-k merge; its result keeps the merge's order."
+            )
+    # The fused prefill kernel never materializes the scores to canonicalize.
+    fused_mqa_topk = not deterministic and topk_backend != "flashinfer_sm120" and use_fused_mqa_topk(
         query_shape=q_quant.shape[1:],
         topk=topk_tokens,
         fp4_cache=use_fp4_cache,
@@ -1130,6 +1143,10 @@ def sparse_attn_indexer(
                                 topk_indices[rows],
                                 topk_tokens,
                             )
+
+                        # XPU's absolute-column logits are outside this path.
+                        if deterministic and row_starts is None:
+                            canonicalize_topk_(logits, topk_indices[rows], row_ends)
 
             if deinterleave_idx is None and not fused_sm120:
                 # Under the PCP path the top-k already ran over the whole
