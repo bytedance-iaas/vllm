@@ -263,7 +263,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
-            dp_sync_state=dp_sync_state,
+            # PCP may reshape the drafter batch after the target DP agreement.
+            dp_sync_state=dp_sync_state if self.pcp_manager is None else None,
         )
         num_tokens_across_dp = (
             prefill_batch_sync.num_tokens_across_dp
