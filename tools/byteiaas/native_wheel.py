@@ -58,7 +58,8 @@ def build(args: argparse.Namespace) -> None:
     contract = torch_contract()
     env = dict(os.environ)
     if args.kind == "deepgemm":
-        env.update(DG_FORCE_BUILD="1", DG_USE_LOCAL_VERSION="1")
+        # The source lock records the full commit independently of the wheel version.
+        env.update(DG_FORCE_BUILD="1", DG_USE_LOCAL_VERSION="0")
         command = [sys.executable, "setup.py", "bdist_wheel", "--dist-dir", str(output)]
     else:
         env["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_HUMMING_KERNELS"] = lock[

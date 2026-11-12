@@ -1,5 +1,5 @@
 {
   "repository": "https://github.com/wangyicong52/DeepGEMM.git",
   "ref": "port/sm90-v032-20261030",
-  "package_version": "2.8.0+local"
+  "package_version": "2.8.0"
 }
