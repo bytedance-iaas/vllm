@@ -1470,6 +1470,14 @@ class Worker(WorkerBase):
             uniform_decode=True,
             randomize_inputs=self.randomize_dummy_inputs,
         )
+        if (
+            self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.pipeline_parallel_size == 1
+        ):
+            # Idle DP ranks must participate in EP, but must not enqueue an
+            # unbounded number of dummy forwards ahead of KV-ready requests.
+            # PP ranks need their existing pipeline progress ordering.
+            torch.cuda.current_stream(self.device).synchronize()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
