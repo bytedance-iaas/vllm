@@ -1888,6 +1888,7 @@ def build_prefill_chunk_metadata(
     cp_kv_cache_interleave_size: int = 1,
     pcp_plan: PCPGlobalChunkPlan | None = None,
     certify_visible_keys: bool = False,
+    build_query_segments: bool = False,
 ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
     if pcp_plan is not None:
         total_seq_lens = pcp_plan.total
@@ -1950,11 +1951,14 @@ def build_prefill_chunk_metadata(
         f"{total_query_len} tokens; the metadata tail would stay uninitialized"
     )
 
-    query_cu_cpu = (
-        query_start_loc_cpu[start_idx : end_idx + 1] - query_start_loc_cpu[start_idx]
-    )
-    query_cu_cpu = query_cu_cpu.clamp(min=qs_start, max=qs_stop) - qs_start
-    cu_query_lens = async_tensor_h2d(query_cu_cpu, device=device, dtype=torch.int32)
+    cu_query_lens = None
+    if certify_visible_keys or build_query_segments:
+        query_cu_cpu = (
+            query_start_loc_cpu[start_idx : end_idx + 1]
+            - query_start_loc_cpu[start_idx]
+        )
+        query_cu_cpu = query_cu_cpu.clamp(min=qs_start, max=qs_stop) - qs_start
+        cu_query_lens = async_tensor_h2d(query_cu_cpu, device=device, dtype=torch.int32)
     min_visible_keys = 0
     if certify_visible_keys:
         assert compress_ratio == 1 and dcp_world_size == 1 and pcp_plan is None

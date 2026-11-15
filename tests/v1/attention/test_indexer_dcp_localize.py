@@ -619,6 +619,7 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
             dcp_rank=dcp_rank,
             dcp_world_size=dcp_world_size,
             cp_kv_cache_interleave_size=interleave,
+            build_query_segments=True,
         )
         assert chunk is not None
         torch.accelerator.synchronize()
@@ -694,6 +695,7 @@ def test_sparse_prefill_query_segments_follow_sliced_chunk():
         block_table=block_table,
         compress_ratio=1,
         query_slice=slice(2, 8),
+        build_query_segments=True,
     )
     assert chunk is not None and chunk.cu_query_lens is not None
     torch.accelerator.synchronize()
