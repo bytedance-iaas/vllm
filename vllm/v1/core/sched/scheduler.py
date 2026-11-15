@@ -3202,6 +3202,7 @@ class Scheduler(SchedulerInterface):
         if envs.VLLM_ENABLE_PREFILL_PROGRESS:
             terminal = self._prefill_request_snapshot(request)
             terminal["release_fence"] = self.sched_step_seq
+            terminal["completion_fence"] = self.prefill_scheduled_step_seq
             self.prefill_terminal[request.external_req_id] = terminal
             self.prefill_terminal.move_to_end(request.external_req_id)
             internal_ids = self.prefill_external_ids[request.external_req_id]
@@ -3348,9 +3349,13 @@ class Scheduler(SchedulerInterface):
             elif request_id in self.prefill_terminal:
                 snapshot = dict(self.prefill_terminal[request_id])
                 fence = snapshot.pop("release_fence")
+                completion_fence = snapshot.pop("completion_fence")
                 snapshot["drained"] = (
-                    not self.defer_block_free or fence <= self.processed_step_seq
+                    completion_fence <= self.prefill_processed_step_seq
+                    and (not self.defer_block_free or fence <= self.processed_step_seq)
                 )
+                if snapshot["drained"]:
+                    snapshot["in_flight_tokens"] = 0
                 snapshots.append(snapshot)
             else:
                 snapshots.append({"request_id": request_id, "status": "UNKNOWN"})

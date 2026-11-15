@@ -106,6 +106,11 @@ Already-held transfer leases are unavailable in the real free pool. No Router
 snapshot can grant KV, and new requests cannot repeatedly pass a first-chunk
 check against an overcommitted full-input pool.
 
+A cancelled request's terminal progress is retained until its submitted GPU
+outputs settle. `drained=true` requires both that completion fence and any
+existing deferred KV release fence; it then reports zero in-flight tokens.
+The completion observation does not change the allocator's release ordering.
+
 Visible profile/epoch/wave mismatch, stale steps, out-of-range history, excessive
 declared calibration error, unsupported multimodal/streaming/decode traffic or
 a budget smaller than one quantum cause a **collective** fallback to the original
@@ -133,8 +138,10 @@ through the existing development `collective_rpc` endpoint. This endpoint must
 be used only on an explicitly task-owned development service; do not enable it
 on production or expose it as a public API. The recorder is inactive by default,
 holds at most64 local records, and rejects restarting over unfinished CUDA events.
-It does not synchronize the GPU in the serving path. After real requests drain,
-read every relevant worker and reject incomplete samples or missing ranks.
+It does not synchronize the GPU in the serving path. Before worker control RPCs,
+wait for both real requests and the DP engine wave to become idle: zero request
+counts alone can leave dummy EP steps running. Read every relevant worker and
+reject incomplete samples or missing ranks.
 
 The target interval begins after input/DP/PP preparation and surrounds the actual
 model forward and its ordinary joins on the current stream. The separate worker

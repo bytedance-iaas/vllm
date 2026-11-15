@@ -390,6 +390,40 @@ def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(
     assert restarted["epoch"] != completed["epoch"]
 
 
+def test_prefill_progress_cancel_waits_for_submitted_outputs(monkeypatch, tmp_path):
+    """Retiring a request cannot report GPU drain before its outputs settle."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+    )
+    request = create_requests(1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+    retired = scheduler.get_prefill_progress([request.request_id])["requests"][0]
+    assert retired["terminal"]
+    assert retired["in_flight_tokens"] == 16
+    assert not retired["drained"]
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        ),
+    )
+    settled = scheduler.get_prefill_progress([request.request_id])["requests"][0]
+    assert settled["terminal"] and settled["drained"]
+    assert settled["in_flight_tokens"] == 0
+    assert settled["confirmed_tokens"] == 0
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [
