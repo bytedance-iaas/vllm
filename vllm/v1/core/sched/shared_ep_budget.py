@@ -181,7 +181,8 @@ class SharedEPBudget:
             return fallback("wave_step_mismatch")
         identity = tuple(s.epoch for s in snapshots), snapshots[0].wave
         step = snapshots[0].step
-        if identity != self.identity:
+        fresh_identity = identity != self.identity
+        if fresh_identity:
             self.identity = identity
             self.last_step = -1
             self.deficits = [0.0] * 4
@@ -211,9 +212,6 @@ class SharedEPBudget:
                 return fallback("invalid_charge_history")
 
         active = [i for i in range(4) if any(s.demands[i].tokens for s in snapshots)]
-        urgent = any(self.ages[i] >= cfg.aging_steps for i in active)
-        mode = "protect" if 0 in active and not urgent else "throughput"
-        budget = cfg.protect_ms if mode == "protect" else cfg.throughput_ms
         for i in range(4):
             if i not in active:
                 self.deficits[i] = 0
@@ -224,13 +222,26 @@ class SharedEPBudget:
                 for s in snapshots
             ]
             histories = [list(s.charged_histories) for s in snapshots]
-            service = cfg.cost_ms(charged, histories, include_fixed=False)
+            service = (
+                0.0
+                if fresh_identity
+                else cfg.cost_ms(charged, histories, include_fixed=False)
+            )
+            self.deficits[i] = max(-cfg.throughput_ms, self.deficits[i] - service)
+            self.ages[i] = (
+                0
+                if service or fresh_identity
+                else min(self.ages[i] + 1, cfg.aging_steps * 2)
+            )
+
+        urgent = any(self.ages[i] >= cfg.aging_steps for i in active)
+        mode = "protect" if 0 in active and not urgent else "throughput"
+        budget = cfg.protect_ms if mode == "protect" else cfg.throughput_ms
+        for i in active:
             self.deficits[i] = min(
                 cfg.throughput_ms * cfg.aging_steps,
-                max(-cfg.throughput_ms, self.deficits[i] - service)
-                + budget / len(active),
+                self.deficits[i] + budget / len(active),
             )
-            self.ages[i] = 0 if service else min(self.ages[i] + 1, cfg.aging_steps * 2)
 
         order = tuple(
             sorted(

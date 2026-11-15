@@ -128,7 +128,7 @@ def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
         BucketDemand(64, 500),
     )
     modes, served = [], [0] * 4
-    charges = (0, 0, 0, 0)
+    charges = [(0, 0, 0, 0)] * 2
     for step in range(12):
         snapshots = [
             BudgetSnapshot(
@@ -138,7 +138,7 @@ def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
                 cfg.fingerprint,
                 64,
                 demands,
-                charges,
+                charges[rank],
                 (0, 0, 0, 500),
             )
             for rank in range(2)
@@ -147,7 +147,11 @@ def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
         assert decision.fallback is None
         assert decision.predicted_ms <= decision.budget_ms
         modes.append(decision.mode)
-        charges = tuple(decision.grants[0])
+        # Force three allocation-denied steps, then report each rank's actual
+        # service; an unconsumed grant cannot clear the long bucket's age.
+        charges = (
+            [(0, 0, 0, 0)] * 2 if step < 3 else [tuple(row) for row in decision.grants]
+        )
         for bucket in range(4):
             served[bucket] += sum(row[bucket] for row in decision.grants)
     assert served[0] > 0 and served[3] > 0
@@ -191,6 +195,32 @@ def test_shared_ep_budget_collective_fallback(failure):
             snapshots[1], demands=(BucketDemand(8, 2000000),) + (BucketDemand(),) * 3
         )
     assert planner.decide(snapshots).fallback is not None
+
+
+def test_shared_ep_restart_does_not_settle_an_old_wave_charge():
+    cfg = shared_ep_test_config()
+    planner = SharedEPBudget(cfg)
+    snapshots = [
+        BudgetSnapshot(
+            str(rank),
+            0,
+            0,
+            cfg.fingerprint,
+            64,
+            (BucketDemand(64),) + (BucketDemand(),) * 3,
+        )
+        for rank in range(2)
+    ]
+    planner.decide(snapshots)
+    restarted = [
+        dataclasses.replace(
+            s, epoch=s.epoch + "new", wave=1, charged_tokens=(64, 0, 0, 0)
+        )
+        for s in snapshots
+    ]
+    planner.decide(restarted)
+    assert planner.deficits[0] == cfg.protect_ms
+    assert planner.ages[0] == 0
 
 
 def test_full_kv_admission_keeps_other_inflight_reservations(tmp_path):
