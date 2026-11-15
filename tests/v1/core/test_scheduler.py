@@ -161,6 +161,34 @@ def test_single_dp_key_model_tracks_real_demand_and_charged_request_counts(tmp_p
     assert SharedEPBudget(cfg).decide([invalid]).fallback == "invalid_charge_count"
 
 
+def test_single_dp_budget_rejects_a_small_request_hidden_by_its_bucket(tmp_path):
+    """Bucket totals must not qualify a per-request query below the floor."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    cfg = dataclasses.replace(
+        shared_ep_test_config(), dp_size=1, query_minimum=4, quantum=4
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    small = create_requests(1, num_tokens=1, req_ids=["small"])[0]
+    larger = create_requests(1, num_tokens=16, req_ids=["larger"])[0]
+    scheduler.add_request(small)
+    scheduler.add_request(larger)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[small.request_id] == 1
+    assert output.num_scheduled_tokens[larger.request_id] > 0
+    assert scheduler.shared_ep_observation["fallback"] == "unsupported_shape"
+    snapshot = scheduler.get_shared_ep_snapshot(0, 1)
+    assert sum(snapshot.charged_tokens) >= cfg.query_minimum
+    assert not snapshot.supported
+
+
 def test_shared_ep_budget_counts_declared_dummy_rows_and_rejects_mismatch(tmp_path):
     """Idle speculative queries are replicated across PCP, not one real row."""
     from transformers import OPTConfig

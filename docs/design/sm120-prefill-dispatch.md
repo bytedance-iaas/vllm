@@ -40,6 +40,14 @@ not pay key preparation. Missing/invalid actual counts fail closed for a nonzero
 key coefficient. All coefficients, query limits and held-out error must match
 the measured topology and dispatcher. Legacy profiles retain their zero-key cost.
 
+The query floor is checked per request as well as per bucket. A small known tail
+cannot become qualified by another request's larger bucket total. Actual charge
+qualification also retains per-request floor violations for the next common
+decision. On single-DP, a newly confirmed prefix may reveal an unqualified tiny
+query after planning; that call abandons the research quota without rewinding
+visited requests or KV. The next decision restores ordinary fallback ordering.
+Multi-DP does not make a rank-local transport decision or skip a collective.
+
 `VLLM_ENABLE_PREFILL_PROGRESS=1` enables `POST /internal/prefill/progress` with
 `{"request_ids":["external-request-id"]}`. It is disabled by default and intended
 for a trusted internal router. Each response contains bounded snapshots from

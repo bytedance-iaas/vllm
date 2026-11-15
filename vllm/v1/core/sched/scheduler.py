@@ -259,6 +259,7 @@ class Scheduler(SchedulerInterface):
         self.shared_ep_charged_tokens = [0] * 4
         self.shared_ep_charged_histories = [0] * 4
         self.shared_ep_charged_requests = [0] * 4
+        self.shared_ep_actual_supported = True
         self.shared_ep_observation: dict[str, Any] | None = None
         self.local_ep_actual_tokens = [0] * 4
         self.local_ep_actual_histories = [0] * 4
@@ -920,7 +921,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
-            num_new_tokens = self._shared_ep_cap(request, num_new_tokens)
+            num_new_tokens = self._shared_ep_cap(
+                request, num_new_tokens, check_query=True
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1445,7 +1448,9 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
-                    num_new_tokens = self._shared_ep_cap(request, num_new_tokens)
+                    num_new_tokens = self._shared_ep_cap(
+                        request, num_new_tokens, check_query=True
+                    )
                     if num_new_tokens == 0:
                         skip_request(request_queue)
                         continue
@@ -1924,11 +1929,14 @@ class Scheduler(SchedulerInterface):
                 self.shared_ep_charged_tokens = [0] * 4
                 self.shared_ep_charged_histories = [0] * 4
                 self.shared_ep_charged_requests = [0] * 4
+                self.shared_ep_actual_supported = True
                 for request_id, q in num_scheduled_tokens.items():
                     request = self.requests[request_id]
                     bucket = BUCKETS.index(request.prefill_bucket)
                     self.shared_ep_charged_tokens[bucket] += q
                     self.shared_ep_charged_requests[bucket] += 1
+                    if 0 < q < self.shared_ep_config.query_minimum:
+                        self.shared_ep_actual_supported = False
                     self.shared_ep_charged_histories[bucket] = max(
                         self.shared_ep_charged_histories[bucket],
                         request.num_computed_tokens,
@@ -3252,10 +3260,14 @@ class Scheduler(SchedulerInterface):
         cfg = self.shared_ep_config
         assert cfg is not None
         tokens, histories, counts = [0] * 4, [0] * 4, [0] * 4
-        supported = self._pause_state == PauseState.UNPAUSED and (
-            cfg.dp_size == 1
-            or cfg.dummy_tokens_per_pcp
-            == self.num_spec_tokens + self.num_sampled_tokens_per_step
+        supported = (
+            self.shared_ep_actual_supported
+            and self._pause_state == PauseState.UNPAUSED
+            and (
+                cfg.dp_size == 1
+                or cfg.dummy_tokens_per_pcp
+                == self.num_spec_tokens + self.num_sampled_tokens_per_step
+            )
         )
         for request in self.requests.values():
             if request.is_finished():
@@ -3287,6 +3299,8 @@ class Scheduler(SchedulerInterface):
             remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
             if not remaining:
                 continue
+            if remaining < cfg.query_minimum:
+                supported = False
             counts[bucket] += 1
             tokens[bucket] = min(
                 self.max_num_scheduled_tokens, tokens[bucket] + remaining
@@ -3314,6 +3328,7 @@ class Scheduler(SchedulerInterface):
         self.shared_ep_charged_tokens = [0] * 4
         self.shared_ep_charged_histories = [0] * 4
         self.shared_ep_charged_requests = [0] * 4
+        self.shared_ep_actual_supported = True
         return snapshot
 
     def apply_shared_ep_decision(self, decision, rank: int) -> None:
@@ -3338,12 +3353,35 @@ class Scheduler(SchedulerInterface):
             for request in waiting:
                 self.waiting.add_request(request)
 
-    def _shared_ep_cap(self, request: Request, tokens: int) -> int:
+    def _shared_ep_cap(
+        self, request: Request, tokens: int, check_query: bool = False
+    ) -> int:
         if self.shared_ep_grants is None:
             return tokens
         from vllm.v1.core.sched.shared_ep_budget import BUCKETS
 
-        return min(tokens, self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)])
+        cap = min(tokens, self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)])
+        cfg = self.shared_ep_config
+        assert cfg is not None
+        if (
+            self.local_ep_budget is not None
+            and check_query
+            and 0 < cap < cfg.query_minimum
+        ):
+            # A newly confirmed prefix can expose a smaller query than the
+            # pre-admission estimate. Single-DP has no peer decision to undo;
+            # abandon this quota without rewinding visited requests or KV.
+            self.shared_ep_grants = None
+            assert self.shared_ep_observation is not None
+            self.shared_ep_observation.update(
+                mode="fallback",
+                fallback="actual_query_below_calibration_range",
+                budget_ms=0,
+                predicted_ms=0,
+                grants=[0] * 4,
+            )
+            return tokens
+        return cap
 
     def _shared_ep_consume(
         self, request: Request, tokens: int, history: int | None = None
