@@ -1142,6 +1142,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if (
+                    request_queue is self.waiting
+                    and request.status
+                    in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    and self._shared_ep_cap(request, 1) == 0
+                ):
+                    # Avoid probing a long prefix for an ungranted bucket.
+                    # Blocked statuses must still reach their promotion hook.
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:

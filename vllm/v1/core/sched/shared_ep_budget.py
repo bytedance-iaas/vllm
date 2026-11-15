@@ -208,6 +208,8 @@ class SharedEPBudget:
                 return fallback("invalid_charge")
             if sum(s.charged_tokens) > s.token_limit:
                 return fallback("invalid_charge")
+            if sum(s.charged_tokens) > cfg.query_limit:
+                return fallback("query_out_of_range")
             if any(not 0 <= h <= cfg.history_limit for h in s.charged_histories):
                 return fallback("invalid_charge_history")
 

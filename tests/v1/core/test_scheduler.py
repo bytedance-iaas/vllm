@@ -167,11 +167,15 @@ def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
     assert denied.deficits[3] > debt
 
 
-@pytest.mark.parametrize("failure", ["stale", "profile", "shape", "error", "history"])
+@pytest.mark.parametrize(
+    "failure", ["stale", "profile", "shape", "error", "history", "query"]
+)
 def test_shared_ep_budget_collective_fallback(failure):
     cfg = shared_ep_test_config()
     if failure == "error":
         cfg = dataclasses.replace(cfg, observed_relative_error=1.0)
+    elif failure == "query":
+        cfg = dataclasses.replace(cfg, query_limit=4)
     planner = SharedEPBudget(cfg)
     snapshots = [
         BudgetSnapshot(
@@ -194,6 +198,8 @@ def test_shared_ep_budget_collective_fallback(failure):
         snapshots[1] = dataclasses.replace(
             snapshots[1], demands=(BucketDemand(8, 2000000),) + (BucketDemand(),) * 3
         )
+    elif failure == "query":
+        snapshots[1] = dataclasses.replace(snapshots[1], charged_tokens=(8, 0, 0, 0))
     assert planner.decide(snapshots).fallback is not None
 
 
