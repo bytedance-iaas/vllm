@@ -378,6 +378,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.tp_rank = 0
         w.pcp_rank = 0
         w.pcp_dcp_sharded = False
+        w._replicated_pcp_done_sending = set()
         w.world_size = 1
         w.pp_size = 1
         w.engine_id = "test-decode-engine"

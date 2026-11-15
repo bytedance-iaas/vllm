@@ -654,6 +654,77 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
 
 
 class TestNixlHandshake:
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("mode", ["pull", "push"])
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_replicated_pcp_synthetic_send_reaches_world_aggregation(
+        self, default_vllm_config, dist_init, tmp_path, mode
+    ):
+        """A non-transferring PCP rank still completes the producer's send fence."""
+        from types import SimpleNamespace
+
+        from transformers import OPTConfig
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
+            NixlPushConnector,
+        )
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+
+        block_size = maybe_update_block_size(16)
+        OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+        config = create_vllm_config(
+            model=str(tmp_path), kv_role="kv_producer", block_size=block_size
+        )
+        config.parallel_config.prefill_context_parallel_size = 2
+        spec = FullAttentionSpec(
+            block_size=block_size, num_kv_heads=4, head_size=16, dtype=torch.float16
+        )
+        cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+        )
+        raw = torch.zeros(spec.page_size_bytes * 2, dtype=torch.int8)
+        (cache,) = dense_kv_cache_views(
+            raw, spec, 2, num_layers=1, layout=KVCacheLayout.BLHNC
+        )
+        worker_path = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
+        cls = NixlConnector if mode == "pull" else NixlPushConnector
+        with (
+            patch(
+                f"{worker_path}.get_current_attn_backends",
+                return_value=[FlashAttentionBackend],
+            ),
+            patch(
+                f"{worker_path}.get_pcp_group",
+                return_value=SimpleNamespace(rank_in_group=1),
+            ),
+            patch("threading.Thread"),
+            set_current_vllm_config(config),
+        ):
+            connector = cls(config, KVConnectorRole.WORKER, cache_config)
+            connector.register_kv_caches({"layer0": cache})
+        metadata = NixlConnectorMetadata()
+        metadata.reqs_in_batch.add("req")
+        metadata.reqs_to_send["req"] = time.perf_counter() + 30
+        connector.connector_worker.start_load_kv(metadata)
+        results = connector.get_transfer_results(set())
+        assert results.finished_sending == {"req"}
+        assert not connector.get_transfer_results(set()).finished_sending
+        aggregator = KVOutputAggregator.from_connector(connector, world_size=2)
+        aggregated = aggregator.aggregate(
+            [
+                create_model_runner_output([], finished_sending={"req"}),
+                create_model_runner_output(
+                    [], finished_sending=results.finished_sending
+                ),
+            ]
+        )
+        assert aggregated.kv_connector_output.finished_sending == {"req"}
+
     @pytest.mark.parametrize(
         ("pcp_rank", "pcp_size", "dcp_size", "expected_tracked"),
         [
@@ -739,7 +810,7 @@ class TestNixlHandshake:
             return_value=KVConnectorTransferResults(finished_sending={"sent"})
         )
         results = connector.get_transfer_results(set())
-        assert results.finished_sending == ({"sent"} if expected_tracked else set())
+        assert results.finished_sending == {"sent"}
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
