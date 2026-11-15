@@ -7,9 +7,15 @@ import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    _flashinfer_sm120_causal_offsets,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
-from vllm.v1.attention.backends.mla.indexer import build_prefill_chunk_metadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadataBuilder,
+    build_prefill_chunk_metadata,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
 )
@@ -622,6 +628,11 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
     # cu_seqlen_ks/ke carry the global causal bounds.
     chunk = build(dcp_world_size=1, dcp_rank=0)
     assert chunk.local_cu_seq_lens is chunk.cu_seq_lens
+    assert chunk.cu_query_lens is not None
+    torch.testing.assert_close(
+        chunk.cu_query_lens.cpu(),
+        torch.tensor([0, seq_len], dtype=torch.int32),
+    )
     torch.testing.assert_close(
         chunk.cu_seqlen_ks.cpu(),
         torch.zeros(seq_len, dtype=torch.int32),
@@ -660,6 +671,91 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
     torch.testing.assert_close(
         chunk.cu_seqlen_ke.cpu(),
         torch.tensor([1, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_sparse_prefill_query_segments_follow_sliced_chunk():
+    device = torch.device("cuda")
+    query_start_loc_cpu = torch.tensor([0, 2, 5, 9, 11], dtype=torch.int32)
+    query_start_loc = query_start_loc_cpu.to(device)
+    seq_lens_cpu = torch.tensor([2, 5, 9, 11], dtype=torch.int32)
+    seq_lens = seq_lens_cpu.to(device)
+    block_table = torch.zeros((4, 1), dtype=torch.int32, device=device)
+
+    chunk = build_prefill_chunk_metadata(
+        start_idx=1,
+        end_idx=4,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        uncompressed_seq_lens=seq_lens,
+        compressed_seq_lens=seq_lens,
+        compressed_seq_lens_cpu=seq_lens_cpu,
+        block_table=block_table,
+        compress_ratio=1,
+        query_slice=slice(2, 8),
+    )
+    assert chunk is not None and chunk.cu_query_lens is not None
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        chunk.cu_query_lens.cpu(),
+        torch.tensor([0, 1, 5, 6], dtype=torch.int32),
+    )
+
+
+def test_flashinfer_sm120_causal_offsets_ignore_empty_segments():
+    cu_query_lens = torch.tensor([0, 1, 1, 5, 6, 6], dtype=torch.int32)
+    row_starts = torch.tensor([0, 2, 2, 2, 2, 7], dtype=torch.int32)
+    row_ends = torch.tensor([8, 5, 6, 7, 8, 17], dtype=torch.int32)
+    offsets = _flashinfer_sm120_causal_offsets(cu_query_lens, row_starts, row_ends)
+    torch.testing.assert_close(
+        offsets,
+        torch.tensor([7, 2, 2, 9, 0], dtype=torch.int64),
+    )
+
+
+def test_sm120_long_query_chunk_keeps_dense_fallback_budget():
+    """Long rows bypass dense scratch; a short neighbor retains its cap."""
+    split = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks
+    lengths = torch.tensor([1048576, 16384], dtype=torch.int32)
+    queries = torch.tensor([1024, 32], dtype=torch.int32)
+    budget = 512 * 1024 * 1024
+    dense = split(lengths, queries, 2 * 1048576, budget)
+    fused = split(
+        lengths,
+        queries,
+        2 * 1048576,
+        budget,
+        min_visible_keys_cpu=lengths - queries + 1,
+    )
+    assert len(dense) == 9
+    assert fused == [(slice(0, 1), slice(0, 1024)), (slice(1, 2), slice(0, 32))]
+    for requests, rows in dense:
+        assert (rows.stop - rows.start) * int(lengths[requests].sum()) * 4 <= budget
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+def test_sm120_visible_bound_uses_sliced_nonempty_segments():
+    """Empty segments do not weaken the certified bound or shift causal rows."""
+    starts_cpu = torch.tensor([0, 4, 12], dtype=torch.int32)
+    lengths_cpu = torch.tensor([100000, 200000], dtype=torch.int32)
+    chunk = build_prefill_chunk_metadata(
+        0,
+        2,
+        starts_cpu.cuda(),
+        starts_cpu,
+        lengths_cpu.cuda(),
+        lengths_cpu.cuda(),
+        lengths_cpu,
+        torch.zeros((2, 1), dtype=torch.int32, device="cuda"),
+        1,
+        query_slice=slice(5, 9),
+        certify_visible_keys=True,
+    )
+    assert chunk is not None
+    assert chunk.min_visible_keys == 199994
+    torch.testing.assert_close(
+        chunk.cu_query_lens.cpu(), torch.tensor([0, 0, 4], dtype=torch.int32)
     )
 
 

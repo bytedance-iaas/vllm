@@ -66,6 +66,32 @@ logger = init_logger(__name__)
 MXFP4_BLOCK_SIZE = 32
 
 
+def _flashinfer_sm120_api():
+    try:
+        from flashinfer.dsa_indexer import dsa_indexer_topk
+        from flashinfer.experimental.sm120_dsa_indexer import ragged_scratch_bytes
+    except ImportError as exc:
+        raise RuntimeError(
+            "sparse_indexer_topk_backend='flashinfer_sm120' requires "
+            "FlashInfer's experimental SM120 DSA indexer API"
+        ) from exc
+    return dsa_indexer_topk, ragged_scratch_bytes
+
+
+def _flashinfer_sm120_causal_offsets(
+    cu_query_lens: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+) -> torch.Tensor:
+    """Per-segment offset matching the first row's visible key count."""
+    assert row_starts.shape == row_ends.shape and row_starts.numel() > 0
+    starts = cu_query_lens[:-1].to(torch.long)
+    valid = starts < row_starts.shape[0]
+    safe_starts = starts.clamp(max=row_starts.shape[0] - 1)
+    offsets = (row_ends[safe_starts] - row_starts[safe_starts] - 1).to(torch.int64)
+    return offsets.masked_fill(~valid, 0)
+
+
 def _assert_cutedsl_dcp_merge_supported(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -466,6 +492,8 @@ def sparse_attn_indexer(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
+    forward_context.sparse_indexer_generation += 1
+    forward_context.sparse_indexer_remaps.clear()
     attn_metadata = forward_context.attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
@@ -498,12 +526,34 @@ def sparse_attn_indexer(
             profile_specs.extend(gather_spec * 2)
         current_workspace_manager().get_simultaneous(*profile_specs)
 
-        # Dummy allocation to simulate for peak logits tensor memory during inference.
-        # FP8 elements so elements == bytes
-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-        _ = torch.empty(
-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
-        )
+        if topk_backend == "flashinfer_sm120":
+            _, ragged_scratch_bytes = _flashinfer_sm120_api()
+
+            scheduler_config = get_current_vllm_config().scheduler_config
+            max_rows = max(
+                hidden_states.shape[0], scheduler_config.max_num_batched_tokens
+            )
+            scratch_bytes = ragged_scratch_bytes(
+                max_rows,
+                top_k=topk_tokens,
+                num_heads=q_quant.shape[1],
+                device=hidden_states.device,
+            )
+            _ = torch.empty(
+                max(
+                    scratch_bytes,
+                    envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
+                ),
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
+        else:
+            # Dummy allocation to simulate for peak logits tensor memory during
+            # inference. FP8 elements so elements == bytes.
+            max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            _ = torch.empty(
+                max_logits_elems, dtype=torch.uint8, device=hidden_states.device
+            )
 
         # The dummy run returns before exchange_topk executes, so reserve its
         # worst-case transient for the memory profile.
@@ -686,6 +736,14 @@ def sparse_attn_indexer(
             q_slice = q_quant[row_start:row_end]
             q_scale_slice = q_scale[row_start:row_end] if q_scale is not None else None
             topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]
+            fused_sm120 = (
+                topk_backend == "flashinfer_sm120"
+                and chunk.min_visible_keys > 49152
+                and not use_fp4_cache
+                and candidate_blocks is None
+                and dcp_world_size == 1
+                and row_shard is None
+            )
 
             # DeepGEMM returns compressed logits: row i starts at K position
             # cu_seqlen_ks[i]. None means every row starts at column zero.
@@ -706,7 +764,61 @@ def sparse_attn_indexer(
                     k_scale_cast = k_scale.view(
                         torch.int32 if mqa_logits_use_mx_scales() else torch.float32
                     ).squeeze(-1)
-                if current_platform.is_xpu():
+                if fused_sm120:
+                    if use_fp4_cache:
+                        raise RuntimeError(
+                            "flashinfer_sm120 Prefill currently supports FP8 K only"
+                        )
+                    if candidate_blocks is not None:
+                        raise RuntimeError(
+                            "flashinfer_sm120 Prefill does not support candidate blocks"
+                        )
+                    if dcp_world_size != 1 or row_shard is not None:
+                        raise RuntimeError(
+                            "flashinfer_sm120 Prefill first requires DCP=1 and "
+                            "no TP row sharding"
+                        )
+                    if chunk.cu_query_lens is None:
+                        raise RuntimeError(
+                            "flashinfer_sm120 Prefill requires query segment metadata"
+                        )
+                    q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
+                        q_slice_cast,
+                        q_scale_slice,
+                        weights[row_start:row_end],
+                    )
+                    assert q_scale_slice is None
+                    q_causal_offsets = _flashinfer_sm120_causal_offsets(
+                        chunk.cu_query_lens, cu_seqlen_ks, cu_seqlen_ke
+                    )
+                    dsa_indexer_topk, _ = _flashinfer_sm120_api()
+
+                    fused_indices, fused_scores = dsa_indexer_topk(
+                        q_slice_cast,
+                        k_quant_cast,
+                        chunk_weights,
+                        chunk.cu_query_lens,
+                        chunk.cu_seq_lens,
+                        top_k=topk_tokens,
+                        backend="sm120",
+                        k_scale=k_scale_cast,
+                        q_causal_offsets=q_causal_offsets,
+                        ratio=1,
+                        max_seqlen_k=chunk.max_seqlen_k,
+                        min_seqlen_k=chunk.min_visible_keys,
+                        indices=topk_indices,
+                        return_scores=False,
+                        # TK300/CUDA 13.0 reports PDL support, but the SM120
+                        # resident launch fails with CUDA error 716 when it is
+                        # enabled. Keep launch ordering explicit on this path.
+                        enable_pdl=False,
+                    )
+                    assert fused_indices.data_ptr() == topk_indices.data_ptr()
+                    assert fused_scores is None
+                    logits = None
+                    row_starts = cu_seqlen_ks
+                    row_ends = cu_seqlen_ke
+                elif current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -735,8 +847,9 @@ def sparse_attn_indexer(
                         ),
                         row_ends,
                     )
-                num_rows = logits.shape[0]
-                if candidate_blocks is not None:
+                num_rows = q_slice.shape[0]
+                if not fused_sm120 and candidate_blocks is not None:
+                    assert logits is not None
                     # Two-level selection (v4.1): the candidate source
                     # publishes its top blocks; later indexers mask their
                     # scores to them. Both before the row top-k.
@@ -760,18 +873,22 @@ def sparse_attn_indexer(
                             chunk_candidates,
                             candidate_block_size,
                         )
-                ops.top_k_per_row_prefill(
-                    logits,
-                    torch.zeros_like(row_ends) if row_starts is None else row_starts,
-                    row_ends,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if not fused_sm120:
+                    assert logits is not None
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        torch.zeros_like(row_ends)
+                        if row_starts is None
+                        else row_starts,
+                        row_ends,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
-            if deinterleave_idx is None:
+            if deinterleave_idx is None and not fused_sm120:
                 # Under the PCP path the top-k already ran over the whole
                 # context.
                 _merge_dcp_topk_global(
@@ -924,7 +1041,10 @@ def sparse_attn_indexer(
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
-        get_indexer_topk(topk_backend)(
+        decode_topk_backend = (
+            "auto" if topk_backend == "flashinfer_sm120" else topk_backend
+        )
+        get_indexer_topk(decode_topk_backend)(
             logits,
             seq_lens,
             next_n,
@@ -1057,6 +1177,51 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+        if self.topk_backend == "flashinfer_sm120":
+            if not (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability_family(120)
+            ):
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' requires "
+                    "an SM12x CUDA device"
+                )
+            _flashinfer_sm120_api()
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' first "
+                    "supports the FP8 indexer cache only"
+                )
+            if self.dcp_world_size != 1:
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' first "
+                    "requires DCP=1"
+                )
+            if candidate_blocks is not None:
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' does not "
+                    "support candidate blocks"
+                )
+            if compress_ratio != 1:
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' first "
+                    "requires index compression ratio 1"
+                )
+            if head_dim != 128 or not 1 <= topk_tokens <= 4096:
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' requires "
+                    "head_dim=128 and index_topk in [1, 4096]"
+                )
+            if tp_prefill_row_sharding_supported(
+                vllm_config,
+                self.dcp_world_size,
+                self.use_pcp,
+                parallel_config.tensor_parallel_size,
+            ):
+                raise RuntimeError(
+                    "sparse_indexer_topk_backend='flashinfer_sm120' does not "
+                    "support TP prefill row sharding"
+                )
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "

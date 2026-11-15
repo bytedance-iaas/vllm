@@ -13,10 +13,28 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
+    make_empty_intermediate_tensors_factory,
 )
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.cpu_test
+def test_pp_receive_buffers_keep_topk_dtype_and_own_storage():
+    """Integer TopK cannot share the hidden-state dtype or another receive slot."""
+    producer = torch.full((8, 2048), -1, dtype=torch.int32)
+    factory = make_empty_intermediate_tensors_factory(
+        ["hidden_states", "residual"], 64, {"topk_indices": producer}
+    )
+    first = factory(4, torch.bfloat16, torch.device("cpu"))
+    second = factory(4, torch.bfloat16, torch.device("cpu"))
+    assert first["topk_indices"].dtype == torch.int32
+    assert first["topk_indices"].shape == (4, 2048)
+    assert first["hidden_states"].dtype == first["residual"].dtype == torch.bfloat16
+    first["topk_indices"].fill_(7)
+    assert bool((second["topk_indices"] == 0).all())
+    assert bool((producer == -1).all())
 
 
 class ModuleWithBatchNorm(torch.nn.Module):

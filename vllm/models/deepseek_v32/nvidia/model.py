@@ -188,6 +188,10 @@ class DeepseekV32Model(torch.nn.Module):
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
         self.is_v32 = True
+        self.pp_indexer_handoff = (
+            vllm_config.kernel_config.enable_pp_indexer_handoff
+            and parallel_config.pipeline_parallel_size > 1
+        )
         # On the model, not a local: the MTP proposer shares it with the draft.
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -229,7 +233,11 @@ class DeepseekV32Model(torch.nn.Module):
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states", "residual"],
+            config.hidden_size,
+            {"topk_indices": self.topk_indices_buffer}
+            if self.pp_indexer_handoff
+            else None,
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
@@ -268,6 +276,13 @@ class DeepseekV32Model(torch.nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if self.pp_indexer_handoff:
+                received_topk = intermediate_tensors["topk_indices"]
+                self.topk_indices_buffer[: received_topk.shape[0]].copy_(received_topk)
+                if is_forward_context_available():
+                    context = get_forward_context()
+                    context.sparse_indexer_generation += 1
+                    context.sparse_indexer_remaps.clear()
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -297,9 +312,14 @@ class DeepseekV32Model(torch.nn.Module):
             assert not self.use_sequence_parallel, (
                 "Currently, SP is not supported with PP"
             )
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self.pp_indexer_handoff:
+                # The next forward reuses the producer buffer while this
+                # microbatch's asynchronous PP send can still be in flight.
+                tensors["topk_indices"] = self.topk_indices_buffer[
+                    :full_num_tokens
+                ].clone()
+            return IntermediateTensors(tensors)
 
         if self.use_sequence_parallel:
             hidden_states, _ = self.norm(hidden_states, residual)

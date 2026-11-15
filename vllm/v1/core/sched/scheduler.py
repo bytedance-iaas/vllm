@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
-from collections import defaultdict, deque
+import uuid
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -221,6 +223,10 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        self.prefill_progress_epoch = uuid.uuid4().hex
+        self.prefill_progress_seq = 0
+        self.prefill_terminal: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self.prefill_external_ids: dict[str, set[str]] = defaultdict(set)
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -1256,6 +1262,9 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+                    request.prefill_cached_tokens = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
                     self._set_kv_fetch_stage(
                         request, KV_FETCH_WAITING_TO_START if load_kv_async else None
                     )
@@ -2947,6 +2956,10 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+                self.prefill_external_ids[request.external_req_id].add(
+                    request.request_id
+                )
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3064,7 +3077,84 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+            terminal = self._prefill_request_snapshot(request)
+            terminal["release_fence"] = self.sched_step_seq
+            self.prefill_terminal[request.external_req_id] = terminal
+            self.prefill_terminal.move_to_end(request.external_req_id)
+            internal_ids = self.prefill_external_ids[request.external_req_id]
+            internal_ids.discard(request.request_id)
+            if not internal_ids:
+                del self.prefill_external_ids[request.external_req_id]
+            while len(self.prefill_terminal) > 4096:
+                self.prefill_terminal.popitem(last=False)
         del self.requests[request.request_id]
+
+    def _prefill_request_snapshot(self, request: Request) -> dict[str, Any]:
+        confirmed = min(
+            request.num_prompt_tokens,
+            max(
+                0,
+                request.num_computed_tokens
+                - max(request.num_in_flight_tokens, request.num_output_placeholders),
+            ),
+        )
+        return {
+            "request_id": request.external_req_id,
+            "internal_request_id": request.request_id,
+            "bucket": request.prefill_bucket,
+            "input_tokens": request.num_prompt_tokens,
+            "cached_tokens": request.prefill_cached_tokens,
+            "confirmed_tokens": confirmed,
+            "in_flight_tokens": request.num_in_flight_tokens,
+            "remaining_tokens": max(0, request.num_prompt_tokens - confirmed),
+            "status": request.status.name,
+            "terminal": request.is_finished(),
+            "drained": False,
+        }
+
+    def get_prefill_progress(self, request_ids: list[str]) -> dict[str, Any]:
+        """A bounded CPU snapshot; unknown requests never imply an idle engine."""
+        if not envs.VLLM_ENABLE_PREFILL_PROGRESS:
+            raise RuntimeError("Prefill progress is disabled")
+        if len(request_ids) > 128:
+            raise ValueError("At most 128 request IDs may be queried")
+        self.prefill_progress_seq += 1
+        snapshots = []
+        for request_id in request_ids:
+            internal_ids = self.prefill_external_ids.get(request_id)
+            if internal_ids:
+                snapshots.extend(
+                    self._prefill_request_snapshot(self.requests[internal_id])
+                    for internal_id in sorted(internal_ids)
+                )
+            elif request_id in self.prefill_terminal:
+                snapshot = dict(self.prefill_terminal[request_id])
+                fence = snapshot.pop("release_fence")
+                snapshot["drained"] = (
+                    not self.defer_block_free or fence <= self.processed_step_seq
+                )
+                snapshots.append(snapshot)
+            else:
+                snapshots.append({"request_id": request_id, "status": "UNKNOWN"})
+        queues = {
+            bucket: {"waiting": 0, "running": 0}
+            for bucket in ("short", "medium", "long", "very_long")
+        }
+        for request in self.requests.values():
+            if request.is_finished() or request.num_output_tokens:
+                continue
+            state = "running" if request.status == RequestStatus.RUNNING else "waiting"
+            queues[request.prefill_bucket][state] += 1
+        return {
+            "schema_version": 1,
+            "epoch": self.prefill_progress_epoch,
+            "dp_rank": self.parallel_config.data_parallel_rank,
+            "seq": self.prefill_progress_seq,
+            "requests": snapshots,
+            "queues": queues,
+            "free_kv_blocks": self.kv_cache_manager.block_pool.get_num_free_blocks(),
+        }
 
     @property
     def pause_state(self) -> PauseState:

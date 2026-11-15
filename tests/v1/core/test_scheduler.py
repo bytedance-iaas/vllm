@@ -85,6 +85,55 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize(
+    "tokens,bucket",
+    [
+        (16383, "short"),
+        (16384, "medium"),
+        (65535, "medium"),
+        (65536, "long"),
+        (262143, "long"),
+        (262144, "very_long"),
+    ],
+)
+def test_prefill_bucket_uses_total_input(tokens, bucket):
+    request = create_requests(1, num_tokens=tokens)[0]
+    assert request.prefill_bucket == bucket
+
+
+def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(monkeypatch):
+    """Scheduling ahead cannot decrease remaining work before execution finishes."""
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
+    scheduler = create_scheduler(max_num_batched_tokens=16, max_model_len=128)
+    request = create_requests(1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    before = scheduler.get_prefill_progress([request.request_id, "unknown"])
+    output = scheduler.schedule()
+    scheduled = scheduler.get_prefill_progress([request.request_id])
+    assert scheduled["seq"] > before["seq"]
+    assert scheduled["requests"][0]["confirmed_tokens"] == 0
+    assert scheduled["requests"][0]["remaining_tokens"] == 64
+    assert scheduled["requests"][0]["in_flight_tokens"] == 16
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        ),
+    )
+    completed = scheduler.get_prefill_progress([request.request_id])
+    assert completed["requests"][0]["confirmed_tokens"] == 16
+    assert completed["requests"][0]["remaining_tokens"] == 48
+    assert before["requests"][1] == {"request_id": "unknown", "status": "UNKNOWN"}
+    scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+    retired = scheduler.get_prefill_progress([request.request_id])["requests"][0]
+    assert retired["terminal"] and retired["drained"]
+    assert retired["status"] == "FINISHED_ABORTED"
+    restarted = create_scheduler(max_model_len=128).get_prefill_progress([])
+    assert restarted["epoch"] != completed["epoch"]
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

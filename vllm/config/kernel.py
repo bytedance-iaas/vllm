@@ -176,6 +176,7 @@ SparseIndexerTopkBackend = Literal[
     "persistent",
     "per_row",
     "flashinfer",
+    "flashinfer_sm120",
     "torch",
     "aiter",
 ]
@@ -266,6 +267,12 @@ LinearBackend = Literal[
     "xpu_woq",
 ]
 
+MlaBmmBackend = Literal[
+    "auto",
+    "torch",
+    "flashinfer_cudnn",
+]
+
 
 @config
 class KernelConfig:
@@ -283,6 +290,28 @@ class KernelConfig:
     enable_flashinfer_autotune: bool = None  # type: ignore[assignment]
     """Benchmark FlashInfer kernel implementations during warmup and use the
     fastest. Enabled by default except at `-O0`; disable for faster startup."""
+
+    mla_bmm_backend: MlaBmmBackend = "auto"
+    """Backend for the BF16 query-absorb and value-up BMMs in MLA.
+
+    - "auto" / "torch": use ``torch.bmm``.
+    - "flashinfer_cudnn": use FlashInfer's cuDNN BF16 BMM for 1024-token
+      full chunks. The two exact MLA shapes are tuned once during weight
+      post-processing without enabling full-model FlashInfer autotuning;
+      other token counts retain ``torch.bmm``.
+    """
+
+    enable_sparse_indexer_remap_reuse: bool = False
+    """Reuse SM120 logical-to-physical mappings within an eager forward and
+    indexer generation, with identical page-table identity/layout and stream.
+    HiSparse and captured execution retain the original mapping path.
+    """
+
+    enable_pp_indexer_handoff: bool = False
+    """Send logical TopK indices with hidden/residual tensors for DSA pipeline
+    boundaries. Each outgoing microbatch owns its TopK copy; physical remapping
+    remains local to the receiving stage. Requires runtime PP/PCP validation.
+    """
 
     enable_rocm_segmented_attn_autotune: bool = False
     """If True, autotune ROCm segmented attention during kernel warmup on RDNA GPUs."""
@@ -353,6 +382,9 @@ class KernelConfig:
     - "persistent": Use vLLM's persistent_topk kernel
     - "per_row": Use vLLM's top_k_per_row_decode kernel
     - "flashinfer": Use FlashInfer's top_k_ragged_transform kernel
+    - "flashinfer_sm120": Fuse FP8 index scoring and exact top-k with
+      FlashInfer's experimental SM120 DSA indexer for Prefill. Decode keeps
+      the automatic vLLM top-k path.
     - "torch": Use a plain torch.topk implementation (debug reference)
     - "aiter": Use AITER's top_k_per_row_decode kernel (ROCm gfx950 only,
       requires VLLM_ROCM_USE_AITER)
@@ -406,6 +438,13 @@ class KernelConfig:
     @field_validator("linear_backend", mode="before")
     @classmethod
     def _normalize_linear_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower().replace("-", "_")
+        return value
+
+    @field_validator("mla_bmm_backend", mode="before")
+    @classmethod
+    def _normalize_mla_bmm_backend(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
         return value

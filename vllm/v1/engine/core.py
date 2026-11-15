@@ -435,6 +435,9 @@ class EngineCore:
         self._log_pooler_config(supported_tasks)
         return supported_tasks
 
+    def get_prefill_progress(self, request_ids: list[str]) -> dict[str, Any]:
+        return self.scheduler.get_prefill_progress(request_ids)
+
     def _log_pooler_config(self, supported_tasks: tuple[SupportedTask, ...]) -> None:
         if self._pooler_config_logged:
             return

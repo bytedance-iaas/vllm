@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
 )
@@ -86,6 +88,7 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
+        self.remap_reuse = vllm_config.kernel_config.enable_sparse_indexer_remap_reuse
         model_type = None
         if vllm_config.model_config is not None:
             model_type = getattr(
@@ -189,17 +192,50 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )
-        topk_indices_physical = cast(
-            torch.Tensor,
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            ),
+        context = get_forward_context()
+        cache_key = None
+        if (
+            self.remap_reuse
+            and context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            cache_key = (
+                context.sparse_indexer_generation,
+                id(attn_metadata.block_table),
+                attn_metadata.block_table.data_ptr(),
+                attn_metadata.block_table.shape,
+                attn_metadata.block_table.stride(),
+                attn_metadata.req_id_per_token.data_ptr(),
+                attn_metadata.req_id_per_token.shape,
+                attn_metadata.req_id_per_token.stride(),
+                topk_indices.data_ptr(),
+                topk_indices.shape,
+                topk_indices.stride(),
+                attn_metadata.block_size,
+                block_stride_rows,
+                kv_rows.dtype,
+                kv_rows.shape[-1],
+                torch.cuda.current_stream(q.device).cuda_stream,
+            )
+        topk_indices_physical = (
+            context.sparse_indexer_remaps.get(cache_key)
+            if cache_key is not None
+            else None
         )
+        if topk_indices_physical is None:
+            topk_indices_physical = cast(
+                torch.Tensor,
+                triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_actual_toks],
+                    attn_metadata.block_table,
+                    topk_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    BLOCK_STRIDE_ROWS=block_stride_rows,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                ),
+            )
+            if cache_key is not None:
+                context.sparse_indexer_remaps[cache_key] = topk_indices_physical
         return (
             self._run_mqa_kernel(
                 q,

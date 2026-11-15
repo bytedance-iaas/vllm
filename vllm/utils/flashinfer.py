@@ -47,6 +47,23 @@ def flashinfer_bf16_mm(
     )
 
 
+def flashinfer_bf16_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    backend: str,
+) -> torch.Tensor:
+    from flashinfer import bmm_bf16
+
+    return bmm_bf16(
+        a,
+        b,
+        out=out,
+        out_dtype=out.dtype,
+        backend=backend,
+    )
+
+
 # This is the storage path for the cubins, it can be replaced
 # with a local path for testing.
 # Referenced from https://github.com/flashinfer-ai/flashinfer/blob/0c9a92c3d9a7e043ab6f3f7b2273269caf6ab044/flashinfer/jit/cubin_loader.py#L35  # noqa: E501
@@ -164,6 +181,15 @@ def has_flashinfer_bf16_gemm() -> bool:
 
 
 @functools.cache
+def has_flashinfer_bf16_bmm() -> bool:
+    """Return whether FlashInfer exposes the BF16 batched GEMM API."""
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer")
+    return mod is not None and callable(getattr(mod, "bmm_bf16", None))
+
+
+@functools.cache
 def is_flashinfer_bf16_gemm_supported(
     backend: str,
     compute_capability: int | None = None,
@@ -175,6 +201,33 @@ def is_flashinfer_bf16_gemm_supported(
     mod = _get_submodule("flashinfer")
     mm_bf16 = getattr(mod, "mm_bf16", None) if mod is not None else None
     backend_supported = getattr(mm_bf16, "is_backend_supported", None)
+    if not callable(backend_supported):
+        return False
+
+    if compute_capability is None:
+        device_capability = current_platform.get_device_capability()
+        if device_capability is None:
+            return False
+        compute_capability = device_capability.to_int()
+
+    try:
+        return bool(backend_supported(backend, compute_capability))
+    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def is_flashinfer_bf16_bmm_supported(
+    backend: str,
+    compute_capability: int | None = None,
+) -> bool:
+    """Return whether an exact FlashInfer BF16 BMM backend is available."""
+    if not current_platform.is_cuda() or not has_flashinfer_bf16_bmm():
+        return False
+
+    mod = _get_submodule("flashinfer")
+    bmm_bf16 = getattr(mod, "bmm_bf16", None) if mod is not None else None
+    backend_supported = getattr(bmm_bf16, "is_backend_supported", None)
     if not callable(backend_supported):
         return False
 
@@ -1273,8 +1326,11 @@ def is_flashinfer_cudnn_fp8_prefill_attn_supported() -> bool:
 __all__ = [
     "has_flashinfer",
     "flashinfer_bf16_mm",
+    "flashinfer_bf16_bmm",
     "has_flashinfer_bf16_gemm",
+    "has_flashinfer_bf16_bmm",
     "is_flashinfer_bf16_gemm_supported",
+    "is_flashinfer_bf16_bmm_supported",
     "is_flashinfer_cutedsl_bf16_gemm_supported",
     "flashinfer_trtllm_fp8_block_scale_moe",
     "flashinfer_cutlass_fused_moe",

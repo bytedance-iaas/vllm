@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.logger import init_logger
@@ -54,6 +55,21 @@ async def get_server_load_metrics(request: Request):
 async def show_version():
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
+
+
+@router.post("/internal/prefill/progress")
+async def get_prefill_progress(request: Request):
+    if not envs.VLLM_ENABLE_PREFILL_PROGRESS:
+        raise HTTPException(status_code=404, detail="Prefill progress is disabled")
+    body = await request.json()
+    ids = body.get("request_ids") if isinstance(body, dict) else None
+    if (
+        not isinstance(ids, list)
+        or len(ids) > 128
+        or any(not isinstance(value, str) or len(value) > 256 for value in ids)
+    ):
+        raise HTTPException(status_code=400, detail="Expected up to 128 request IDs")
+    return {"engines": await engine_client(request).get_prefill_progress(ids)}
 
 
 @router.get("/kv_event_sources")
