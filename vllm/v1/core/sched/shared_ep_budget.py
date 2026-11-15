@@ -17,6 +17,7 @@ class StageCost:
     ep_ms_per_token: float
     draft_ms_per_row: float
     fixed_ms: float
+    key_ms_per_token: float = 0.0
 
     def __post_init__(self):
         if any(not math.isfinite(x) or x < 0 for x in vars(self).values()):
@@ -100,20 +101,32 @@ class SharedEPBudgetConfig:
         tokens: list[list[int]],
         histories: list[list[int]],
         include_fixed: bool = True,
+        request_counts: list[list[int]] | None = None,
     ) -> float:
         if not any(any(row) for row in tokens):
             return 0.0
         costs = []
         for stage in self.stages:
             private = []
-            for rank_tokens, rank_histories in zip(tokens, histories):
+            for rank, (rank_tokens, rank_histories) in enumerate(
+                zip(tokens, histories)
+            ):
                 total = 0.0
-                for q, h in zip(rank_tokens, rank_histories):
+                for bucket, (q, h) in enumerate(zip(rank_tokens, rank_histories)):
+                    if not q:
+                        continue
                     rows = math.ceil(q / self.pcp_size)
                     total += (stage.private_ms_per_row + stage.draft_ms_per_row) * rows
                     # Max history plus triangular query scan is a conservative
                     # envelope when several requests share a bucket grant.
                     total += stage.scan_ms_per_pair * rows * (h + (q + 1) / 2)
+                    count = (
+                        1 if request_counts is None else request_counts[rank][bucket]
+                    )
+                    # Key preparation is per request, independent of query rows.
+                    # Max history bounds each request; at most q requests can
+                    # receive positive tokens. Idle buckets prepare no keys.
+                    total += stage.key_ms_per_token * (min(count, q) * h + q)
                 private.append(total)
             ep_rows = sum(
                 sum(row) or self.pcp_size * self.dummy_tokens_per_pcp for row in tokens
@@ -130,6 +143,7 @@ class SharedEPBudgetConfig:
 class BucketDemand:
     tokens: int = 0
     history: int = 0
+    request_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,7 @@ class BudgetSnapshot:
     charged_tokens: tuple[int, ...] = (0, 0, 0, 0)
     charged_histories: tuple[int, ...] = (0, 0, 0, 0)
     supported: bool = True
+    charged_requests: tuple[int, ...] = (0, 0, 0, 0)
 
 
 @dataclass
@@ -203,9 +218,26 @@ class SharedEPBudget:
             if not s.supported or s.token_limit <= 0:
                 return fallback("unsupported_shape")
             if not (
-                len(s.demands) == len(s.charged_tokens) == len(s.charged_histories) == 4
+                len(s.demands)
+                == len(s.charged_tokens)
+                == len(s.charged_histories)
+                == len(s.charged_requests)
+                == 4
             ):
                 return fallback("invalid_payload")
+            if any(
+                type(d.request_count) is not int
+                or d.request_count < (1 if d.tokens else 0)
+                for d in s.demands
+            ):
+                return fallback("invalid_request_count")
+            if any(type(n) is not int or n < 0 for n in s.charged_requests):
+                return fallback("invalid_charge_count")
+            if any(stage.key_ms_per_token for stage in cfg.stages) and any(
+                (q > 0 and not 1 <= n <= q) or (q == 0 and n != 0)
+                for q, n in zip(s.charged_tokens, s.charged_requests)
+            ):
+                return fallback("invalid_charge_count")
             if any(
                 d.tokens < 0 or not 0 <= d.history <= cfg.history_limit
                 for d in s.demands
@@ -238,7 +270,12 @@ class SharedEPBudget:
             service = (
                 0.0
                 if fresh_identity
-                else cfg.cost_ms(charged, histories, include_fixed=False)
+                else cfg.cost_ms(
+                    charged,
+                    histories,
+                    include_fixed=False,
+                    request_counts=[list(s.charged_requests) for s in snapshots],
+                )
             )
             self.deficits[i] = max(-cfg.throughput_ms, self.deficits[i] - service)
             self.ages[i] = (
@@ -269,6 +306,7 @@ class SharedEPBudget:
         )
         grants = [[0] * 4 for _ in snapshots]
         histories = [[d.history for d in s.demands] for s in snapshots]
+        counts = [[d.request_count for d in s.demands] for s in snapshots]
         for rank, s in enumerate(snapshots):
             for i in active:
                 minimum = min(
@@ -276,7 +314,7 @@ class SharedEPBudget:
                 )
                 probe = [[0] * 4 for _ in snapshots]
                 probe[rank][i] = minimum
-                if cfg.cost_ms(probe, histories) > budget:
+                if cfg.cost_ms(probe, histories, request_counts=counts) > budget:
                     return fallback("budget_below_quantum")
         virtual = list(self.deficits)
         while active:
@@ -285,7 +323,7 @@ class SharedEPBudget:
                 active,
                 key=lambda i: (-(self.ages[i] >= cfg.aging_steps), -virtual[i], i),
             ):
-                before = cfg.cost_ms(grants, histories)
+                before = cfg.cost_ms(grants, histories, request_counts=counts)
                 for offset in range(cfg.dp_size):
                     rank = (step + offset) % cfg.dp_size
                     s = snapshots[rank]
@@ -298,16 +336,22 @@ class SharedEPBudget:
                     if delta <= 0:
                         continue
                     grants[rank][i] += delta
-                    if cfg.cost_ms(grants, histories) > budget:
+                    if cfg.cost_ms(grants, histories, request_counts=counts) > budget:
                         grants[rank][i] -= delta
                     else:
                         progressed = True
-                virtual[i] -= max(0, cfg.cost_ms(grants, histories) - before)
+                virtual[i] -= max(
+                    0, cfg.cost_ms(grants, histories, request_counts=counts) - before
+                )
             if not progressed:
                 break
         if active and not any(any(row) for row in grants):
             # A budget smaller than a legal chunk must not deadlock a request.
             return fallback("budget_below_quantum")
         return BudgetDecision(
-            grants, order, mode, budget, cfg.cost_ms(grants, histories)
+            grants,
+            order,
+            mode,
+            budget,
+            cfg.cost_ms(grants, histories, request_counts=counts),
         )

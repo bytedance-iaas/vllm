@@ -31,6 +31,15 @@ existing path. No map or KV tensor persists between forwards.
 
 ## Internal progress snapshots
 
+The optional shared-EP stage profile also accepts `key_ms_per_token` (default0).
+It models an independent visible-key preparation envelope in addition to the
+query/history scan product, not a causal kernel timing. A bucket grant uses its
+maximum history and real candidate count to bound per-request key preparation;
+actual charges retain the number of requests really scheduled. Idle buckets do
+not pay key preparation. Missing/invalid actual counts fail closed for a nonzero
+key coefficient. All coefficients, query limits and held-out error must match
+the measured topology and dispatcher. Legacy profiles retain their zero-key cost.
+
 `VLLM_ENABLE_PREFILL_PROGRESS=1` enables `POST /internal/prefill/progress` with
 `{"request_ids":["external-request-id"]}`. It is disabled by default and intended
 for a trusted internal router. Each response contains bounded snapshots from

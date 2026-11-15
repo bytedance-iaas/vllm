@@ -258,9 +258,11 @@ class Scheduler(SchedulerInterface):
         self.shared_ep_order = (0, 1, 2, 3)
         self.shared_ep_charged_tokens = [0] * 4
         self.shared_ep_charged_histories = [0] * 4
+        self.shared_ep_charged_requests = [0] * 4
         self.shared_ep_observation: dict[str, Any] | None = None
         self.local_ep_actual_tokens = [0] * 4
         self.local_ep_actual_histories = [0] * 4
+        self.local_ep_actual_requests = [0] * 4
         self.local_ep_budget = None
         if self.shared_ep_config is not None and self.shared_ep_config.dp_size == 1:
             from vllm.v1.core.sched.shared_ep_budget import SharedEPBudget
@@ -1921,10 +1923,12 @@ class Scheduler(SchedulerInterface):
 
                 self.shared_ep_charged_tokens = [0] * 4
                 self.shared_ep_charged_histories = [0] * 4
+                self.shared_ep_charged_requests = [0] * 4
                 for request_id, q in num_scheduled_tokens.items():
                     request = self.requests[request_id]
                     bucket = BUCKETS.index(request.prefill_bucket)
                     self.shared_ep_charged_tokens[bucket] += q
+                    self.shared_ep_charged_requests[bucket] += 1
                     self.shared_ep_charged_histories[bucket] = max(
                         self.shared_ep_charged_histories[bucket],
                         request.num_computed_tokens,
@@ -3247,7 +3251,7 @@ class Scheduler(SchedulerInterface):
 
         cfg = self.shared_ep_config
         assert cfg is not None
-        tokens, histories = [0] * 4, [0] * 4
+        tokens, histories, counts = [0] * 4, [0] * 4, [0] * 4
         supported = self._pause_state == PauseState.UNPAUSED and (
             cfg.dp_size == 1
             or cfg.dummy_tokens_per_pcp
@@ -3281,6 +3285,9 @@ class Scheduler(SchedulerInterface):
                 continue
             bucket = BUCKETS.index(request.prefill_bucket)
             remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            if not remaining:
+                continue
+            counts[bucket] += 1
             tokens[bucket] = min(
                 self.max_num_scheduled_tokens, tokens[bucket] + remaining
             )
@@ -3298,18 +3305,21 @@ class Scheduler(SchedulerInterface):
             step,
             cfg.fingerprint,
             self.max_num_scheduled_tokens,
-            tuple(BucketDemand(q, h) for q, h in zip(tokens, histories)),
+            tuple(BucketDemand(q, h, n) for q, h, n in zip(tokens, histories, counts)),
             tuple(self.shared_ep_charged_tokens),
             tuple(self.shared_ep_charged_histories),
             supported,
+            tuple(self.shared_ep_charged_requests),
         )
         self.shared_ep_charged_tokens = [0] * 4
         self.shared_ep_charged_histories = [0] * 4
+        self.shared_ep_charged_requests = [0] * 4
         return snapshot
 
     def apply_shared_ep_decision(self, decision, rank: int) -> None:
         self.local_ep_actual_tokens = [0] * 4
         self.local_ep_actual_histories = [0] * 4
+        self.local_ep_actual_requests = [0] * 4
         self.shared_ep_grants = (
             list(decision.grants[rank]) if decision.fallback is None else None
         )
@@ -3344,6 +3354,7 @@ class Scheduler(SchedulerInterface):
             bucket = BUCKETS.index(request.prefill_bucket)
             self.shared_ep_grants[bucket] -= tokens
             if self.local_ep_budget is not None:
+                self.local_ep_actual_requests[bucket] += 1
                 self.local_ep_actual_tokens[bucket] += tokens
                 self.local_ep_actual_histories[bucket] = max(
                     self.local_ep_actual_histories[bucket],
@@ -3383,7 +3394,16 @@ class Scheduler(SchedulerInterface):
                     continue
                 grants[bucket] += delta
                 combined = [a + g for a, g in zip(actual, grants)]
-                if cfg.cost_ms([combined], [histories]) > budget:
+                counts = [
+                    n + (d.request_count if g else 0)
+                    for n, d, g in zip(
+                        self.local_ep_actual_requests, snapshot.demands, grants
+                    )
+                ]
+                if (
+                    cfg.cost_ms([combined], [histories], request_counts=[counts])
+                    > budget
+                ):
                     grants[bucket] -= delta
                 else:
                     progressed = True
@@ -3391,9 +3411,13 @@ class Scheduler(SchedulerInterface):
                 break
         self.shared_ep_grants = grants
         combined = [a + g for a, g in zip(actual, grants)]
+        counts = [
+            n + (d.request_count if g else 0)
+            for n, d, g in zip(self.local_ep_actual_requests, snapshot.demands, grants)
+        ]
         self.shared_ep_observation.update(
             grants=combined,
-            predicted_ms=cfg.cost_ms([combined], [histories]),
+            predicted_ms=cfg.cost_ms([combined], [histories], request_counts=[counts]),
             borrowed=True,
         )
 

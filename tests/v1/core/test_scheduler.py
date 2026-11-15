@@ -118,6 +118,49 @@ def test_shared_ep_budget_counts_both_dp_rows_and_idle_peer():
     assert both - idle == pytest.approx(0.3)
 
 
+def test_shared_ep_key_preparation_is_per_request_not_per_query_row():
+    """Two requests with equal q/H still gather two visible key ranges."""
+    cfg = dataclasses.replace(
+        shared_ep_test_config(), stages=(StageCost(1, 0, 0.1, 0, 0, 0.01),)
+    )
+    q, h = [[8, 0, 0, 0], [0] * 4], [[100, 0, 0, 0], [0] * 4]
+    single = cfg.cost_ms(q, h, request_counts=[[1, 0, 0, 0], [0] * 4])
+    two = cfg.cost_ms(q, h, request_counts=[[2, 0, 0, 0], [0] * 4])
+    assert two - single == pytest.approx(1)
+    # Idle peers pay dummy EP rows, not the previous request's key history.
+    assert cfg.cost_ms([[0] * 4, [0] * 4], h, request_counts=[[2] * 4] * 2) == 0
+
+
+def test_single_dp_key_model_tracks_real_demand_and_charged_request_counts(tmp_path):
+    """Observe actual two-request scheduling, then reject a missing count."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    cfg = dataclasses.replace(
+        shared_ep_test_config(),
+        dp_size=1,
+        stages=(StageCost(1, 0, 0.1, 0, 0, 0.001),),
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    for request in create_requests(2, num_tokens=8):
+        scheduler.add_request(request)
+    snapshot = scheduler.get_shared_ep_snapshot(0, 0)
+    assert snapshot.demands[0].request_count == 2
+    output = scheduler.schedule()
+    assert len(output.num_scheduled_tokens) == 2
+    charged = scheduler.get_shared_ep_snapshot(0, 1)
+    assert charged.charged_requests[0] == 2
+    assert sum(charged.charged_tokens) == sum(output.num_scheduled_tokens.values())
+    invalid = dataclasses.replace(charged, charged_requests=(0, 0, 0, 0))
+    assert SharedEPBudget(cfg).decide([invalid]).fallback == "invalid_charge_count"
+
+
 def test_shared_ep_budget_counts_declared_dummy_rows_and_rejects_mismatch(tmp_path):
     """Idle speculative queries are replicated across PCP, not one real row."""
     from transformers import OPTConfig
