@@ -288,6 +288,7 @@ def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tm
     scheduler.apply_shared_ep_decision(decision, 0)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {second.request_id: 8}
+    assert output.shared_ep_step is None
     assert first.num_computed_tokens == 0
     after = scheduler.get_shared_ep_snapshot(0, 1)
     assert after.charged_tokens == (8, 0, 0, 0)

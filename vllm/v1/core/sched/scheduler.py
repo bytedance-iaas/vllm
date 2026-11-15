@@ -1878,6 +1878,11 @@ class Scheduler(SchedulerInterface):
 
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
+        if self.shared_ep_observation is not None:
+            wave = self.shared_ep_observation.get("wave")
+            step = self.shared_ep_observation.get("step")
+            if wave is not None and step is not None:
+                scheduler_output.shared_ep_step = (wave, step)
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).

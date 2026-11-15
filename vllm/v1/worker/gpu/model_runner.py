@@ -2069,6 +2069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             timing_step = self.prefill_timing.begin_target(
                 {
                     "requests": pairs,
+                    "shared_ep_step": scheduler_output.shared_ep_step,
                     "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
                     "local_tokens": input_batch.num_tokens,
                     "local_tokens_padded": input_batch.num_tokens_after_padding,
