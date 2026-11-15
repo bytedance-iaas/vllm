@@ -1936,7 +1936,10 @@ class Scheduler(SchedulerInterface):
                     bucket = BUCKETS.index(request.prefill_bucket)
                     self.shared_ep_charged_tokens[bucket] += q
                     self.shared_ep_charged_requests[bucket] += 1
-                    if 0 < q < self.shared_ep_config.query_minimum:
+                    if (
+                        0 < q < self.shared_ep_config.query_minimum
+                        or q % self.shared_ep_config.query_alignment
+                    ):
                         self.shared_ep_actual_supported = False
                     self.shared_ep_charged_histories[bucket] = max(
                         self.shared_ep_charged_histories[bucket],
@@ -3304,7 +3307,8 @@ class Scheduler(SchedulerInterface):
                 supported = False
             counts[bucket] += 1
             tokens[bucket] = min(
-                self.max_num_scheduled_tokens, tokens[bucket] + remaining
+                self.max_num_scheduled_tokens,
+                tokens[bucket] + cfg.align_query(remaining),
             )
             # Unadmitted prefix hits are unknown: bound by full history instead
             # of treating a missing snapshot as cached or idle.
@@ -3391,7 +3395,7 @@ class Scheduler(SchedulerInterface):
                 grants=[0] * 4,
             )
             return tokens
-        return cap
+        return cfg.align_query(cap) if check_query else cap
 
     def _shared_ep_consume(
         self, request: Request, tokens: int, history: int | None = None
@@ -3439,6 +3443,7 @@ class Scheduler(SchedulerInterface):
                     snapshot.demands[bucket].tokens - grants[bucket],
                     limit - sum(grants),
                 )
+                delta = cfg.align_query(delta)
                 if delta < cfg.query_minimum:
                     continue
                 grants[bucket] += delta

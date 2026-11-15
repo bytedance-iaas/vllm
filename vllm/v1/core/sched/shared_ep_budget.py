@@ -49,6 +49,7 @@ class SharedEPBudgetConfig:
     observed_relative_error: float = 0.0
     query_minimum: int = 1
     dummy_tokens_per_pcp: int = 1
+    query_alignment: int = 1
 
     def __post_init__(self):
         if not self.stages or not self.calibration_id:
@@ -62,6 +63,7 @@ class SharedEPBudgetConfig:
             "aging_steps",
             "query_minimum",
             "dummy_tokens_per_pcp",
+            "query_alignment",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -82,6 +84,17 @@ class SharedEPBudgetConfig:
             raise ValueError("The query quantum must align with PCP")
         if self.query_minimum > min(self.quantum, self.query_limit):
             raise ValueError("The calibrated query floor exceeds the quantum/limit")
+        if any(
+            value % self.query_alignment
+            for value in (self.query_minimum, self.quantum, self.query_limit)
+        ):
+            raise ValueError(
+                "Query floor, quantum and limit must align with calibration"
+            )
+
+    def align_query(self, tokens: int) -> int:
+        """Cap modeled work at its calibrated granularity; native tails are separate."""
+        return tokens // self.query_alignment * self.query_alignment
 
     @classmethod
     def from_dict(cls, values: dict) -> "SharedEPBudgetConfig":
@@ -333,6 +346,7 @@ class SharedEPBudget:
                         cfg.query_limit - sum(grants[rank]),
                     )
                     delta = min(cfg.quantum, remaining)
+                    delta = cfg.align_query(delta)
                     if delta <= 0:
                         continue
                     grants[rank][i] += delta
