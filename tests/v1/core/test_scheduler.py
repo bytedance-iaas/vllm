@@ -101,10 +101,20 @@ def test_prefill_bucket_uses_total_input(tokens, bucket):
     assert request.prefill_bucket == bucket
 
 
-def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(monkeypatch):
+def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(
+    monkeypatch, tmp_path
+):
     """Scheduling ahead cannot decrease remaining work before execution finishes."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
     monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
-    scheduler = create_scheduler(max_num_batched_tokens=16, max_model_len=128)
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+    )
     request = create_requests(1, num_tokens=64)[0]
     scheduler.add_request(request)
     before = scheduler.get_prefill_progress([request.request_id, "unknown"])
@@ -130,7 +140,9 @@ def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(monkeypatc
     retired = scheduler.get_prefill_progress([request.request_id])["requests"][0]
     assert retired["terminal"] and retired["drained"]
     assert retired["status"] == "FINISHED_ABORTED"
-    restarted = create_scheduler(max_model_len=128).get_prefill_progress([])
+    restarted = create_scheduler(
+        model=str(tmp_path), max_model_len=128, skip_tokenizer_init=True
+    ).get_prefill_progress([])
     assert restarted["epoch"] != completed["epoch"]
 
 
