@@ -56,6 +56,13 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.shared_ep_budget import (
+    BucketDemand,
+    BudgetSnapshot,
+    SharedEPBudget,
+    SharedEPBudgetConfig,
+    StageCost,
+)
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.core import EngineCore
@@ -83,6 +90,172 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def shared_ep_test_config():
+    """Synthetic coefficients for state tests, never a serving calibration."""
+    return SharedEPBudgetConfig(
+        stages=(StageCost(1, 0.001, 0.1, 0.1, 0.1),),
+        calibration_id="state-test-only",
+        dp_size=2,
+        pcp_size=1,
+        history_limit=1048576,
+        query_limit=64,
+        protect_ms=18,
+        throughput_ms=36,
+        quantum=4,
+        aging_steps=3,
+        error_margin=1,
+    )
+
+
+def test_shared_ep_budget_counts_both_dp_rows_and_idle_peer():
+    cfg = shared_ep_test_config()
+    # Two real ranks have twice the common work, not max-padding.
+    h = [[0] * 4, [0] * 4]
+    both = cfg.cost_ms([[4, 0, 0, 0], [4, 0, 0, 0]], h)
+    idle = cfg.cost_ms([[4, 0, 0, 0], [0, 0, 0, 0]], h)
+    assert both - idle == pytest.approx(0.3)
+
+
+def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
+    cfg = shared_ep_test_config()
+    planner = SharedEPBudget(cfg)
+    demands = (
+        BucketDemand(64, 0),
+        BucketDemand(),
+        BucketDemand(),
+        BucketDemand(64, 500),
+    )
+    modes, served = [], [0] * 4
+    charges = (0, 0, 0, 0)
+    for step in range(12):
+        snapshots = [
+            BudgetSnapshot(
+                str(rank),
+                0,
+                step,
+                cfg.fingerprint,
+                64,
+                demands,
+                charges,
+                (0, 0, 0, 500),
+            )
+            for rank in range(2)
+        ]
+        decision = planner.decide(snapshots)
+        assert decision.fallback is None
+        assert decision.predicted_ms <= decision.budget_ms
+        modes.append(decision.mode)
+        charges = tuple(decision.grants[0])
+        for bucket in range(4):
+            served[bucket] += sum(row[bucket] for row in decision.grants)
+    assert served[0] > 0 and served[3] > 0
+    assert "protect" in modes and "throughput" in modes
+    # A wave where all allocations were denied leaves service credit unpaid.
+    denied = SharedEPBudget(cfg)
+    first = [
+        dataclasses.replace(s, step=0, charged_tokens=(0, 0, 0, 0)) for s in snapshots
+    ]
+    denied.decide(first)
+    debt = denied.deficits[3]
+    denied.decide([dataclasses.replace(s, step=1) for s in first])
+    assert denied.deficits[3] > debt
+
+
+@pytest.mark.parametrize("failure", ["stale", "profile", "shape", "error", "history"])
+def test_shared_ep_budget_collective_fallback(failure):
+    cfg = shared_ep_test_config()
+    if failure == "error":
+        cfg = dataclasses.replace(cfg, observed_relative_error=1.0)
+    planner = SharedEPBudget(cfg)
+    snapshots = [
+        BudgetSnapshot(
+            str(rank),
+            0,
+            0,
+            cfg.fingerprint,
+            64,
+            (BucketDemand(8, 0),) + (BucketDemand(),) * 3,
+        )
+        for rank in range(2)
+    ]
+    if failure == "stale":
+        planner.decide(snapshots)
+    elif failure == "profile":
+        snapshots[1] = dataclasses.replace(snapshots[1], profile="other")
+    elif failure == "shape":
+        snapshots[1] = dataclasses.replace(snapshots[1], supported=False)
+    elif failure == "history":
+        snapshots[1] = dataclasses.replace(
+            snapshots[1], demands=(BucketDemand(8, 2000000),) + (BucketDemand(),) * 3
+        )
+    assert planner.decide(snapshots).fallback is not None
+
+
+def test_full_kv_admission_keeps_other_inflight_reservations(tmp_path):
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        num_blocks=7,
+        max_num_batched_tokens=16,
+        max_model_len=256,
+        skip_tokenizer_init=True,
+    )
+    first, second = create_requests(2, num_tokens=64)
+    scheduler.add_request(first)
+    scheduler.schedule()
+    manager = scheduler.kv_cache_manager
+    free = manager.block_pool.get_num_free_blocks()
+    reserved = scheduler._request_remaining_blocks(first)
+    assert free >= 4 and free - reserved < 4
+    assert (
+        manager.allocate_slots(
+            second, 16, full_sequence_must_fit=True, reserved_blocks=reserved
+        )
+        is None
+    )
+    assert manager.block_pool.get_num_free_blocks() == free
+
+
+def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tmp_path):
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    cfg = shared_ep_test_config()
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        data_parallel_size=2,
+        max_num_batched_tokens=64,
+        max_model_len=1048576,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    first = create_requests(1, num_tokens=262144, req_ids=["large"])[0]
+    second = create_requests(1, num_tokens=32, req_ids=["small"])[0]
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    snapshots = [scheduler.get_shared_ep_snapshot(0, 0)]
+    snapshots.append(
+        dataclasses.replace(snapshots[0], epoch="peer", demands=(BucketDemand(),) * 4)
+    )
+    decision = SharedEPBudget(cfg).decide(snapshots)
+    # The synthetic history cost would not fit a quantum; collective fallback
+    # remains valid. Use an explicit tested grant to isolate the scheduler gate.
+    decision.fallback = None
+    decision.grants = [[8, 0, 0, 0], [0] * 4]
+    decision.order = (0, 1, 2, 3)
+    scheduler.apply_shared_ep_decision(decision, 0)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {second.request_id: 8}
+    assert first.num_computed_tokens == 0
+    after = scheduler.get_shared_ep_snapshot(0, 1)
+    assert after.charged_tokens == (8, 0, 0, 0)
+    assert scheduler.shared_ep_grants is None
+    scheduler.finish_requests([second.request_id], RequestStatus.FINISHED_ABORTED)
+    assert scheduler.get_shared_ep_snapshot(0, 2).demands[0].tokens == 0
 
 
 @pytest.mark.parametrize(

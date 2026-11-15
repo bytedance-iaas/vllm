@@ -93,6 +93,7 @@ def create_scheduler(
     scheduler_cls: type[Scheduler] | None = None,
     lora_config: LoRAConfig | None = None,
     speculative_config: SpeculativeConfig | None = None,
+    additional_config: dict | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -209,6 +210,7 @@ def create_scheduler(
         diffusion_config = DiffusionConfig(canvas_length=diffusion_canvas_length)
 
     vllm_config = VllmConfig(
+        additional_config=additional_config or {},
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,

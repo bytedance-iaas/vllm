@@ -62,7 +62,60 @@ not settle an old execution from a new epoch or an unknown request.
 
 `free_kv_blocks` is an observation of the real pool, not a reservation or a
 guarantee of request capacity. Actual KV admission remains in the engine.
-The queue counts are views; they do not yet implement shared-EP time quotas.
+The queue counts alone are views, not shared-EP grants.
+
+## Experimental shared-EP budgets
+
+An explicit `additional_config.shared_ep_budget` cost profile enables a
+synchronous engine-coordinator budget before each DP step. This is disabled
+by default; there are no baked-in TK300 latency coefficients. All DP engine
+processes must use the same source, profile and flag. The current opt-in requires
+EP, at least two DPs, matching PCP/PP geometry, FCFS and chunked prefill. Changing
+the DP topology requires a new calibration; elastic resizing is not supported.
+
+The profile has `calibration_id`, `dp_size`, `pcp_size`, `history_limit`,
+`query_limit`, `protect_ms`, `throughput_ms`, and one entry per PP stage in
+`stages`. Stage entries contain `private_ms_per_row`, `scan_ms_per_pair`,
+`ep_ms_per_token`, `draft_ms_per_row` (sampling/draft combined), and `fixed_ms`.
+Optional controls are `quantum` (128 tokens, PCP-aligned), `aging_steps` (8),
+`error_margin` (1.25), `max_relative_error` (0.25), and
+`observed_relative_error` (0). These defaults are research controls, not
+production weights or calibrated performance promises. Record calibration
+coverage and measured held-out error before enabling the profile. Cumulative
+kernel time alone is not a wall-time calibration.
+
+Each rank sends four bounded demand envelopes and the preceding step's actual
+scheduled charge through the existing CPU DP process group. The model uses
+the maximum private stage cost plus shared EP cost from the **sum** of real
+per-DP rows, with dummy peer rows included. Full prompt length determines the
+bucket; unadmitted cache hits remain unknown and use a conservative history
+envelope. Scheduling caps actual tokens only after the ordinary engine prefix
+lookup. Equal active-bucket service credit, bounded deficits, aging and rank
+rotation allow unused shares to be borrowed without strict short-first policy.
+Short demand chooses the protection budget unless an aged bucket calls for
+a throughput step. These are estimated service shares, not hard isolation.
+
+Grants are consumed once by the real scheduler; block holders keep their
+separate drain-first queue, and existing PP/MTP alignment and release fences
+still govern execution. Actual scheduled work is charged on the next DP
+step, not requests that failed KV allocation. Confirmed/settled progress is
+reported separately: submitted work is not GPU completion. Atomic KV admission
+checks the full input against the real deduplicated allocator after subtracting
+future blocks owed to other resident requests plus speculative step headroom.
+Already-held transfer leases are unavailable in the real free pool. No Router
+snapshot can grant KV, and new requests cannot repeatedly pass a first-chunk
+check against an overcommitted full-input pool.
+
+Visible profile/epoch/wave mismatch, stale steps, out-of-range history, excessive
+declared calibration error, unsupported multimodal/streaming/decode traffic or
+a budget smaller than one quantum cause a **collective** fallback to the original
+FCFS/token strategy. The opt-in full-input KV qualification remains active.
+Communication failure follows the existing fatal DP error path, never a
+rank-local skip or reuse of stale grants. Progress responses include
+`shared_ep_budget` with wave/step, mode, grants, estimated cost, deficits, ages
+and fallback reason. Real multi-DP/PP service, cancellation, restart and mixed
+load calibration are required before adoption; CPU state tests are not that
+validation.
 
 For diagnostic Torch captures, `profiler_config.detailed_trace_annotation=true`
 adds scheduled query/history geometry using the existing worker annotations.

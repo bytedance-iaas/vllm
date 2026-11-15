@@ -229,6 +229,36 @@ class Scheduler(SchedulerInterface):
         self.prefill_processed_step_seq = 0
         self.prefill_terminal: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.prefill_external_ids: dict[str, set[str]] = defaultdict(set)
+        from vllm.v1.core.sched.shared_ep_budget import SharedEPBudgetConfig
+
+        extra = vllm_config.additional_config
+        budget_config = (
+            extra.get("shared_ep_budget") if isinstance(extra, dict) else None
+        )
+        self.shared_ep_config = (
+            SharedEPBudgetConfig.from_dict(budget_config)
+            if budget_config is not None
+            else None
+        )
+        if self.shared_ep_config is not None:
+            cfg = self.shared_ep_config
+            if (
+                cfg.dp_size < 2
+                or cfg.dp_size != self.parallel_config.data_parallel_size
+                or self.parallel_config.enable_elastic_ep
+                or cfg.pcp_size != self.pcp_world_size
+                or len(cfg.stages) != self.parallel_config.pipeline_parallel_size
+                or self.scheduler_config.policy != "fcfs"
+                or not self.scheduler_config.enable_chunked_prefill
+            ):
+                raise ValueError(
+                    "Shared EP budget requires matching topology and FCFS chunks"
+                )
+        self.shared_ep_grants: list[int] | None = None
+        self.shared_ep_order = (0, 1, 2, 3)
+        self.shared_ep_charged_tokens = [0] * 4
+        self.shared_ep_charged_histories = [0] * 4
+        self.shared_ep_observation: dict[str, Any] | None = None
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -706,6 +736,22 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.shared_ep_grants is not None:
+            order = {bucket: i for i, bucket in enumerate(self.shared_ep_order)}
+            from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+            self.running.sort(
+                key=lambda r: (order[BUCKETS.index(r.prefill_bucket)], r.arrival_time)
+            )
+            # Rebuild only the policy queue; block holders retain their separate
+            # drain-first queue and all existing blocked-request handling.
+            waiting = sorted(
+                self.waiting,
+                key=lambda r: (order[BUCKETS.index(r.prefill_bucket)], r.arrival_time),
+            )
+            self.waiting = create_request_queue(self.policy)
+            for request in waiting:
+                self.waiting.add_request(request)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -854,6 +900,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            num_new_tokens = self._shared_ep_cap(request, num_new_tokens)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -937,7 +984,10 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or self.shared_ep_grants is not None
+                    ):
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
@@ -949,7 +999,10 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or self.shared_ep_grants is not None
+                    ):
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -990,8 +1043,8 @@ class Scheduler(SchedulerInterface):
             if new_blocks is None:
                 if (
                     self.policy == SchedulingPolicy.PRIORITY
-                    and request.status == RequestStatus.PREEMPTED
-                ):
+                    or self.shared_ep_grants is not None
+                ) and request.status == RequestStatus.PREEMPTED:
                     # The request was the lowest-priority running request and
                     # preempted itself. The requests after it have higher
                     # priority and may still fit (it just freed its blocks);
@@ -1009,6 +1062,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            self._shared_ep_consume(request, num_new_tokens)
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1356,6 +1410,10 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._shared_ep_cap(request, num_new_tokens)
+                    if num_new_tokens == 0:
+                        skip_request(request_queue)
+                        continue
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1429,15 +1487,29 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
+                if self.shared_ep_config is not None:
+                    reserved_blocks = (
+                        sum(
+                            self._request_remaining_blocks(other)
+                            for other in self.requests.values()
+                            if other is not request
+                            and not other.is_finished()
+                            and self._holds_kv_blocks(other)
+                        )
+                        + self._spec_decode_step_blocks
+                    )
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
+                    reserved_blocks = max(
+                        reserved_blocks,
+                        (
+                            self._inflight_prefill_reserved_blocks()
+                            + self._spec_decode_step_blocks
+                        ),
                     )
 
                 # Replayed tokens are already counted in the adopted hit; a
@@ -1457,7 +1529,10 @@ class Scheduler(SchedulerInterface):
                         else ()
                     ),
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl
+                        or self.shared_ep_config is not None
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
@@ -1469,6 +1544,9 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self.shared_ep_config is not None:
+                        skip_request(request_queue)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1580,6 +1658,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                self._shared_ep_consume(request, num_new_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1794,6 +1873,21 @@ class Scheduler(SchedulerInterface):
                 self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
+            if self.shared_ep_config is not None:
+                from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+                self.shared_ep_charged_tokens = [0] * 4
+                self.shared_ep_charged_histories = [0] * 4
+                for request_id, q in num_scheduled_tokens.items():
+                    request = self.requests[request_id]
+                    bucket = BUCKETS.index(request.prefill_bucket)
+                    self.shared_ep_charged_tokens[bucket] += q
+                    self.shared_ep_charged_histories[bucket] = max(
+                        self.shared_ep_charged_histories[bucket],
+                        request.num_computed_tokens,
+                    )
+                # A grant is for one schedule only, never a reusable lease.
+                self.shared_ep_grants = None
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -3098,6 +3192,93 @@ class Scheduler(SchedulerInterface):
                 self.prefill_terminal.popitem(last=False)
         del self.requests[request.request_id]
 
+    def get_shared_ep_snapshot(self, wave: int, step: int):
+        from vllm.v1.core.sched.shared_ep_budget import (
+            BUCKETS,
+            BucketDemand,
+            BudgetSnapshot,
+        )
+
+        cfg = self.shared_ep_config
+        assert cfg is not None
+        tokens, histories = [0] * 4, [0] * 4
+        supported = self._pause_state == PauseState.UNPAUSED
+        for request in self.requests.values():
+            if request.is_finished():
+                continue
+            if (
+                request.has_encoder_inputs
+                or request.resumable
+                or request.num_output_tokens
+                or request.lora_request
+            ):
+                supported = False
+            if request.status not in (
+                RequestStatus.RUNNING,
+                RequestStatus.WAITING,
+                RequestStatus.PREEMPTED,
+            ):
+                continue
+            bucket = BUCKETS.index(request.prefill_bucket)
+            remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            tokens[bucket] = min(
+                self.max_num_scheduled_tokens, tokens[bucket] + remaining
+            )
+            # Unadmitted prefix hits are unknown: bound by full history instead
+            # of treating a missing snapshot as cached or idle.
+            history = (
+                request.num_computed_tokens
+                if request.status == RequestStatus.RUNNING
+                else request.num_prompt_tokens
+            )
+            histories[bucket] = max(histories[bucket], history)
+        snapshot = BudgetSnapshot(
+            self.prefill_progress_epoch,
+            wave,
+            step,
+            cfg.fingerprint,
+            self.max_num_scheduled_tokens,
+            tuple(BucketDemand(q, h) for q, h in zip(tokens, histories)),
+            tuple(self.shared_ep_charged_tokens),
+            tuple(self.shared_ep_charged_histories),
+            supported,
+        )
+        self.shared_ep_charged_tokens = [0] * 4
+        self.shared_ep_charged_histories = [0] * 4
+        return snapshot
+
+    def apply_shared_ep_decision(self, decision, rank: int) -> None:
+        self.shared_ep_grants = (
+            list(decision.grants[rank]) if decision.fallback is None else None
+        )
+        self.shared_ep_order = decision.order
+        self.shared_ep_observation = {
+            "mode": decision.mode,
+            "fallback": decision.fallback,
+            "budget_ms": decision.budget_ms,
+            "predicted_ms": decision.predicted_ms,
+            "grants": decision.grants[rank],
+        }
+        if decision.fallback is not None:
+            self.running.sort(key=lambda r: r.arrival_time)
+            waiting = sorted(self.waiting, key=lambda r: r.arrival_time)
+            self.waiting = create_request_queue(self.policy)
+            for request in waiting:
+                self.waiting.add_request(request)
+
+    def _shared_ep_cap(self, request: Request, tokens: int) -> int:
+        if self.shared_ep_grants is None:
+            return tokens
+        from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+        return min(tokens, self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)])
+
+    def _shared_ep_consume(self, request: Request, tokens: int) -> None:
+        if self.shared_ep_grants is not None:
+            from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+            self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)] -= tokens
+
     def _prefill_request_snapshot(self, request: Request) -> dict[str, Any]:
         confirmed = min(
             request.num_prompt_tokens,
@@ -3165,6 +3346,7 @@ class Scheduler(SchedulerInterface):
             "requests": snapshots,
             "queues": queues,
             "free_kv_blocks": self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            "shared_ep_budget": self.shared_ep_observation,
         }
 
     @property
