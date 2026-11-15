@@ -122,6 +122,10 @@ and fallback reason. Real multi-DP/PP service, cancellation, restart and mixed
 load calibration are required before adoption; CPU state tests are not that
 validation.
 
+Budget collectives follow a running DP wave or real unfinished request work.
+An idle rank flushing finished notifications or connector cleanup does not join
+them: those local scheduler steps can run after its peers have stopped.
+
 For diagnostic Torch captures, `profiler_config.detailed_trace_annotation=true`
 adds scheduled query/history geometry using the existing worker annotations.
 `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` additionally marks `gpu_worker: dp_dummy`

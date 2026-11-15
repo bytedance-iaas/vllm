@@ -2486,7 +2486,9 @@ class DPEngineCoreProc(EngineCoreProc):
             return
         # Match the same running/idle edge as GPU/dummy participation. Never
         # condition a collective on this rank having a nonempty local queue.
-        if not self.engines_running and not self.scheduler.has_requests():
+        # Finished notifications/connector cleanup can step only one idle rank.
+        # They must not enter a collective after the shared wave has ended.
+        if not self.engines_running and not self.scheduler.has_unfinished_requests():
             return
         import torch.distributed as dist
 
