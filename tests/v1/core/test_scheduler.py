@@ -285,6 +285,49 @@ def test_full_kv_admission_keeps_other_inflight_reservations(tmp_path):
     assert manager.block_pool.get_num_free_blocks() == free
 
 
+def test_single_dp_budget_runs_through_real_scheduler_and_keeps_fallback(tmp_path):
+    """One DP needs no transport, but still consumes the same grants and charges."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    cfg = dataclasses.replace(shared_ep_test_config(), dp_size=1)
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    request = create_requests(1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert 0 < first.total_num_scheduled_tokens < 64
+    assert first.shared_ep_step == (0, 0)
+    assert scheduler.shared_ep_observation["fallback"] is None
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        ),
+    )
+    second = scheduler.schedule()
+    assert second.shared_ep_step == (0, 1)
+    assert second.total_num_scheduled_tokens > 0
+    bad = dataclasses.replace(cfg, observed_relative_error=1)
+    rejected = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=64,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(bad)},
+    )
+    rejected.add_request(create_requests(1, num_tokens=64)[0])
+    assert rejected.schedule().total_num_scheduled_tokens == 64
+    assert rejected.shared_ep_observation["fallback"] == "model_error"
+
+
 def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tmp_path):
     from transformers import OPTConfig
 

@@ -243,7 +243,7 @@ class Scheduler(SchedulerInterface):
         if self.shared_ep_config is not None:
             cfg = self.shared_ep_config
             if (
-                cfg.dp_size < 2
+                cfg.dp_size < 1
                 or cfg.dp_size != self.parallel_config.data_parallel_size
                 or self.parallel_config.enable_elastic_ep
                 or cfg.pcp_size != self.pcp_world_size
@@ -259,6 +259,11 @@ class Scheduler(SchedulerInterface):
         self.shared_ep_charged_tokens = [0] * 4
         self.shared_ep_charged_histories = [0] * 4
         self.shared_ep_observation: dict[str, Any] | None = None
+        self.local_ep_budget = None
+        if self.shared_ep_config is not None and self.shared_ep_config.dp_size == 1:
+            from vllm.v1.core.sched.shared_ep_budget import SharedEPBudget
+
+            self.local_ep_budget = SharedEPBudget(self.shared_ep_config)
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -735,6 +740,17 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.local_ep_budget is not None:
+            snapshot = self.get_shared_ep_snapshot(0, self.current_step)
+            decision = self.local_ep_budget.decide([snapshot])
+            self.apply_shared_ep_decision(decision, 0)
+            assert self.shared_ep_observation is not None
+            self.shared_ep_observation.update(
+                wave=0,
+                step=self.current_step,
+                deficits_ms=list(self.local_ep_budget.deficits),
+                ages_steps=list(self.local_ep_budget.ages),
+            )
         self.current_step += 1
         if self.shared_ep_grants is not None:
             order = {bucket: i for i, bucket in enumerate(self.shared_ep_order)}
@@ -3223,9 +3239,9 @@ class Scheduler(SchedulerInterface):
         cfg = self.shared_ep_config
         assert cfg is not None
         tokens, histories = [0] * 4, [0] * 4
-        supported = (
-            self._pause_state == PauseState.UNPAUSED
-            and cfg.dummy_tokens_per_pcp
+        supported = self._pause_state == PauseState.UNPAUSED and (
+            cfg.dp_size == 1
+            or cfg.dummy_tokens_per_pcp
             == self.num_spec_tokens + self.num_sampled_tokens_per_step
         )
         for request in self.requests.values():

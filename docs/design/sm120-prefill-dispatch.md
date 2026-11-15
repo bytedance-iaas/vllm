@@ -136,6 +136,12 @@ Budget collectives follow a running DP wave or real unfinished request work.
 An idle rank flushing finished notifications or connector cleanup does not join
 them: those local scheduler steps can run after its peers have stopped.
 
+With a single DP replica, the same planner runs at the scheduler boundary without
+a transport collective. It retains bucket grants, aging, actual charges,
+calibration fallback and atomic KV admission; the step identity is the local
+scheduler sequence. Profiles must match the actual PCP/PP topology and query
+budget. A profile calibrated for DP2/PCP4 is not valid for DP1/PCP8.
+
 For diagnostic Torch captures, `profiler_config.detailed_trace_annotation=true`
 adds scheduled query/history geometry using the existing worker annotations.
 `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` additionally marks `gpu_worker: dp_dummy`
