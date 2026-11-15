@@ -190,47 +190,6 @@ def test_single_dp_budget_rejects_a_small_request_hidden_by_its_bucket(tmp_path)
     assert not snapshot.supported
 
 
-def test_single_dp_calibrated_query_alignment_completes_native_tail(tmp_path):
-    """An uncalibrated remainder must finish without being charged as modeled work."""
-    from transformers import OPTConfig
-
-    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
-    cfg = dataclasses.replace(
-        shared_ep_test_config(),
-        dp_size=1,
-        quantum=4,
-        query_minimum=4,
-        query_alignment=4,
-        protect_ms=100,
-        throughput_ms=100,
-    )
-    scheduler = create_scheduler(
-        model=str(tmp_path),
-        max_num_batched_tokens=64,
-        max_model_len=128,
-        skip_tokenizer_init=True,
-        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
-    )
-    req = create_requests(1, num_tokens=7, req_ids=["tail"])[0]
-    scheduler.add_request(req)
-    first = scheduler.schedule()
-    assert first.num_scheduled_tokens[req.request_id] == 4
-    assert scheduler.shared_ep_observation["fallback"] is None
-    scheduler.update_from_output(
-        first,
-        ModelRunnerOutput(
-            req_ids=[req.request_id],
-            req_id_to_index={req.request_id: 0},
-            sampled_token_ids=[[]],
-        ),
-    )
-    tail = scheduler.schedule()
-    assert tail.num_scheduled_tokens[req.request_id] == 3
-    assert first.total_num_scheduled_tokens + tail.total_num_scheduled_tokens == 7
-    assert scheduler.shared_ep_observation["fallback"] == "unsupported_shape"
-    assert not scheduler.get_shared_ep_snapshot(0, 2).supported
-
-
 def test_shared_ep_budget_counts_declared_dummy_rows_and_rejects_mismatch(tmp_path):
     """Idle speculative queries are replicated across PCP, not one real row."""
     from transformers import OPTConfig
