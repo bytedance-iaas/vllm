@@ -225,6 +225,8 @@ class Scheduler(SchedulerInterface):
         self.requests: dict[str, Request] = {}
         self.prefill_progress_epoch = uuid.uuid4().hex
         self.prefill_progress_seq = 0
+        self.prefill_scheduled_step_seq = 0
+        self.prefill_processed_step_seq = 0
         self.prefill_terminal: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.prefill_external_ids: dict[str, set[str]] = defaultdict(set)
         # Scheduling policy
@@ -1785,8 +1787,11 @@ class Scheduler(SchedulerInterface):
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
-            self.sched_step_seq += 1
+        if total_num_scheduled_tokens > 0:
+            if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+                self.prefill_scheduled_step_seq += 1
+            if self.defer_block_free:
+                self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2285,10 +2290,13 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
-            self.processed_step_seq += 1
-            self._drain_deferred_frees()
-            self._drain_deferred_loads()
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+                self.prefill_processed_step_seq += 1
+            if self.defer_block_free:
+                self.processed_step_seq += 1
+                self._drain_deferred_frees()
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -3152,8 +3160,8 @@ class Scheduler(SchedulerInterface):
             "dp_rank": self.parallel_config.data_parallel_rank,
             "seq": self.prefill_progress_seq,
             "scheduler_step": self.current_step,
-            "scheduled_step_seq": self.sched_step_seq,
-            "processed_step_seq": self.processed_step_seq,
+            "scheduled_step_seq": self.prefill_scheduled_step_seq,
+            "processed_step_seq": self.prefill_processed_step_seq,
             "requests": snapshots,
             "queues": queues,
             "free_kv_blocks": self.kv_cache_manager.block_pool.get_num_free_blocks(),

@@ -41,8 +41,11 @@ Query at most 128 IDs at a time.
 
 `seq` orders queries, while `scheduler_step`, `scheduled_step_seq`, and
 `processed_step_seq` identify scheduler calls, nonempty submitted steps, and
-settled outputs respectively. PP can have several submitted steps in flight;
-poll counts and CPU enqueue spans must not be used as completed-wave counts.
+settled outputs respectively. PP can have several submitted steps in flight.
+The progress counters advance for every nonempty step while progress is enabled;
+they are distinct from connector-specific deferred-free fences, which may remain
+zero on a producer. They do not change KV lifetime or release ordering.
+Poll counts and CPU enqueue spans must not be used as completed-wave counts.
 The engine adds `dp_wave` and `dp_step` when it participates in DP coordination,
 or null when there is no shared counter. A DP wave spans a collective
 running-to-idle epoch; it is not one GPU forward. These observations are not
