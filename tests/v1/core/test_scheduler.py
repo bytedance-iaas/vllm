@@ -223,7 +223,9 @@ def test_full_kv_admission_keeps_other_inflight_reservations(tmp_path):
 def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tmp_path):
     from transformers import OPTConfig
 
-    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    OPTConfig(
+        architectures=["OPTForCausalLM"], max_position_embeddings=1048576
+    ).save_pretrained(tmp_path)
     cfg = shared_ep_test_config()
     scheduler = create_scheduler(
         model=str(tmp_path),
@@ -256,6 +258,33 @@ def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tm
     assert scheduler.shared_ep_grants is None
     scheduler.finish_requests([second.request_id], RequestStatus.FINISHED_ABORTED)
     assert scheduler.get_shared_ep_snapshot(0, 2).demands[0].tokens == 0
+
+
+def test_shared_ep_does_not_reserve_time_for_a_full_runner(tmp_path):
+    """A waiter must not consume share while the real active-slot gate is closed."""
+    from transformers import OPTConfig
+
+    OPTConfig(
+        architectures=["OPTForCausalLM"], max_position_embeddings=1048576
+    ).save_pretrained(tmp_path)
+    cfg = shared_ep_test_config()
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        data_parallel_size=2,
+        max_num_active_seqs=1,
+        max_num_batched_tokens=64,
+        max_model_len=1048576,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    first = create_requests(1, num_tokens=65536, req_ids=["running"])[0]
+    scheduler.add_request(first)
+    scheduler.schedule()
+    second = create_requests(1, num_tokens=32, req_ids=["waiting"])[0]
+    scheduler.add_request(second)
+    snapshot = scheduler.get_shared_ep_snapshot(0, 1)
+    assert snapshot.demands[0].tokens == 0
+    assert snapshot.demands[2].tokens > 0
 
 
 @pytest.mark.parametrize(

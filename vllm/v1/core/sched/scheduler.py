@@ -3219,6 +3219,14 @@ class Scheduler(SchedulerInterface):
                 RequestStatus.PREEMPTED,
             ):
                 continue
+            if (
+                request.status != RequestStatus.RUNNING
+                and len(self.running) + self.num_waiting_for_streaming_input
+                >= self.max_num_active_reqs
+            ):
+                # Match the native admission gate; a full runner cannot borrow
+                # a running request's share for an unadmittable waiter.
+                continue
             bucket = BUCKETS.index(request.prefill_bucket)
             remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
             tokens[bucket] = min(
