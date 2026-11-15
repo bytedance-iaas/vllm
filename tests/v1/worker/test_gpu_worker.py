@@ -12,11 +12,40 @@ from tests.utils import create_new_process_for_each_test
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
+from vllm.v1.worker.gpu.prefill_timing import PrefillTimingRecorder
 from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+
+
+def test_prefill_event_capture_pairs_real_gpu_work_and_bounds_samples():
+    recorder = PrefillTimingRecorder()
+    with pytest.raises(ValueError, match="between 1 and 64"):
+        recorder.start(0)
+    recorder.start(1)
+    with pytest.raises(RuntimeError, match="already active"):
+        recorder.start(1)
+    step = recorder.begin_target({"query": 1024, "history": 65536})
+    tensor = torch.ones(1024, 1024, device="cuda")
+    tensor.add_(1)
+    recorder.end_target(step)
+    sampled = recorder.begin_sample()
+    assert sampled is step
+    tensor.mul_(2)
+    recorder.end_sample(sampled)
+    assert recorder.begin_target({"query": 1}) is None
+    torch.cuda.synchronize()
+    result = recorder.read()
+    assert not result["active"] and result["pending"] == 0
+    assert result["recorded"] == 1
+    assert result["samples"][0]["query"] == 1024
+    assert result["samples"][0]["target_elapsed_ms"] > 0
+    assert result["samples"][0]["sample_and_draft_elapsed_ms"] > 0
+    assert torch.all(tensor == 4)
+    recorder.start(1)
+    assert recorder.read()["samples"] == []
 
 
 def test_v2_worker_requires_triton(monkeypatch):

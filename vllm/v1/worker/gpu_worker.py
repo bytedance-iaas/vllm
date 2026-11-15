@@ -1332,7 +1332,30 @@ class Worker(WorkerBase):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         with record_function_or_nullcontext("gpu_worker: sample_and_draft"):
-            return self.model_runner.sample_tokens(grammar_output)
+            recorder = (
+                self.model_runner.prefill_timing if self.use_v2_model_runner else None
+            )
+            step = recorder.begin_sample() if recorder is not None else None
+            result = self.model_runner.sample_tokens(grammar_output)
+            if recorder is not None:
+                recorder.end_sample(step)
+            return result
+
+    def start_prefill_timing(self, max_steps: str = "32") -> None:
+        if not self.use_v2_model_runner:
+            raise ValueError("Prefill event timings currently require Model Runner V2")
+        self.model_runner.prefill_timing.start(int(max_steps))
+
+    def read_prefill_timing(self, stop: str = "true") -> dict:
+        if not self.use_v2_model_runner or stop not in ("true", "false"):
+            raise ValueError("Expected Model Runner V2 and a true/false stop argument")
+        result = self.model_runner.prefill_timing.read(stop=stop == "true")
+        result.update(
+            dp=self.parallel_config.data_parallel_rank,
+            pp=get_pp_group().rank_in_group,
+            pcp=get_pcp_group().rank_in_group,
+        )
+        return result
 
     @torch.inference_mode()
     @with_gpu_sync_check

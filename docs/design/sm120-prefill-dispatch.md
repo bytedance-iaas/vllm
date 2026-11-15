@@ -127,6 +127,27 @@ for each capture session on the TK300 Torch/Kineto package after the observed
 repeated-capture destructor crash. Diagnostic request latency is excluded from
 performance acceptance.
 
+For a lightweight completion-timing window, Model Runner V2 workers provide
+`start_prefill_timing(max_steps="32")` and `read_prefill_timing(stop="true")`
+through the existing development `collective_rpc` endpoint. This endpoint must
+be used only on an explicitly task-owned development service; do not enable it
+on production or expose it as a public API. The recorder is inactive by default,
+holds at most64 local records, and rejects restarting over unfinished CUDA events.
+It does not synchronize the GPU in the serving path. After real requests drain,
+read every relevant worker and reject incomplete samples or missing ranks.
+
+The target interval begins after input/DP/PP preparation and surrounds the actual
+model forward and its ordinary joins on the current stream. The separate worker
+sampling interval includes sampling, draft, and PP sampled-token dependencies;
+non-last PP intervals can therefore contain broadcast waits. The metadata records
+scheduled q/history, actual local/padded rows, and the agreed per-DP local row
+counts. Dummy model forwards are not represented as real request throughput.
+CUDA event elapsed time includes stream dependencies and host launch gaps; it
+is not private kernel-only time, removable latency, or full-request TTFT.
+Use source/shape-matched stage measurements and existing trace attribution to
+test a cost model; do not identify cross-host timestamps or sum stage waits as
+an additive speedup. Repeated event windows do not start a Kineto profiler.
+
 ## Cross-stage TopK
 
 `enable_pp_indexer_handoff=true` adds logical `int32` TopK to the existing
