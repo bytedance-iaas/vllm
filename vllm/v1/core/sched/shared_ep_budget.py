@@ -46,6 +46,7 @@ class SharedEPBudgetConfig:
     error_margin: float = 1.25
     max_relative_error: float = 0.25
     observed_relative_error: float = 0.0
+    query_minimum: int = 1
 
     def __post_init__(self):
         if not self.stages or not self.calibration_id:
@@ -57,6 +58,7 @@ class SharedEPBudgetConfig:
             "query_limit",
             "quantum",
             "aging_steps",
+            "query_minimum",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -75,6 +77,8 @@ class SharedEPBudgetConfig:
             raise ValueError("Invalid time budget or error margin")
         if self.quantum % self.pcp_size:
             raise ValueError("The query quantum must align with PCP")
+        if self.query_minimum > min(self.quantum, self.query_limit):
+            raise ValueError("The calibrated query floor exceeds the quantum/limit")
 
     @classmethod
     def from_dict(cls, values: dict) -> "SharedEPBudgetConfig":
@@ -204,12 +208,16 @@ class SharedEPBudget:
                 for d in s.demands
             ):
                 return fallback("history_out_of_range")
+            if any(0 < d.tokens < cfg.query_minimum for d in s.demands):
+                return fallback("query_below_calibration_range")
             if any(q < 0 or q > s.token_limit for q in s.charged_tokens):
                 return fallback("invalid_charge")
             if sum(s.charged_tokens) > s.token_limit:
                 return fallback("invalid_charge")
             if sum(s.charged_tokens) > cfg.query_limit:
                 return fallback("query_out_of_range")
+            if any(0 < q < cfg.query_minimum for q in s.charged_tokens):
+                return fallback("charge_below_calibration_range")
             if any(not 0 <= h <= cfg.history_limit for h in s.charged_histories):
                 return fallback("invalid_charge_history")
 

@@ -111,6 +111,10 @@ outputs settle. `drained=true` requires both that completion fence and any
 existing deferred KV release fence; it then reports zero in-flight tokens.
 The completion observation does not change the allocator's release ordering.
 
+`query_minimum` and the query/history limits bound the calibrated shape range.
+The quantum must be at least that query floor. Smaller demands or actual charges
+fall back collectively; a short tail is not extrapolated from large-query data.
+
 Visible profile/epoch/wave mismatch, stale steps, out-of-range history, excessive
 declared calibration error, unsupported multimodal/streaming/decode traffic or
 a budget smaller than one quantum cause a **collective** fallback to the original

@@ -168,7 +168,7 @@ def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
 
 
 @pytest.mark.parametrize(
-    "failure", ["stale", "profile", "shape", "error", "history", "query"]
+    "failure", ["stale", "profile", "shape", "error", "history", "query", "small_query"]
 )
 def test_shared_ep_budget_collective_fallback(failure):
     cfg = shared_ep_test_config()
@@ -176,6 +176,8 @@ def test_shared_ep_budget_collective_fallback(failure):
         cfg = dataclasses.replace(cfg, observed_relative_error=1.0)
     elif failure == "query":
         cfg = dataclasses.replace(cfg, query_limit=4)
+    elif failure == "small_query":
+        cfg = dataclasses.replace(cfg, query_minimum=16, quantum=16)
     planner = SharedEPBudget(cfg)
     snapshots = [
         BudgetSnapshot(
@@ -200,7 +202,10 @@ def test_shared_ep_budget_collective_fallback(failure):
         )
     elif failure == "query":
         snapshots[1] = dataclasses.replace(snapshots[1], charged_tokens=(8, 0, 0, 0))
-    assert planner.decide(snapshots).fallback is not None
+    decision = planner.decide(snapshots)
+    assert decision.fallback is not None
+    if failure == "small_query":
+        assert decision.fallback == "query_below_calibration_range"
 
 
 def test_shared_ep_restart_does_not_settle_an_old_wave_charge():
