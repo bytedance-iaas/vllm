@@ -47,6 +47,9 @@ decision. On single-DP, a newly confirmed prefix may reveal an unqualified tiny
 query after planning; that call abandons the research quota without rewinding
 visited requests or KV. The next decision restores ordinary fallback ordering.
 Multi-DP does not make a rank-local transport decision or skip a collective.
+For a KV-denied local refit, the progress observation retains the unconsumed
+grants and actual charges immediately before refitting. Compare these with the
+resulting grants instead of assuming any query above the quantum was borrowed.
 
 `VLLM_ENABLE_PREFILL_PROGRESS=1` enables `POST /internal/prefill/progress` with
 `{"request_ids":["external-request-id"]}`. It is disabled by default and intended

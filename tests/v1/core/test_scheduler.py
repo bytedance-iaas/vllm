@@ -431,6 +431,12 @@ def test_single_dp_reuses_a_kv_denied_bucket_share_without_extra_credit(tmp_path
     assert scheduler.shared_ep_charged_tokens[3] == 0
     assert scheduler.local_ep_budget.deficits[3] == unpaid + cfg.protect_ms / 2
     assert scheduler.local_ep_budget.last_step == 1
+    observation = scheduler.shared_ep_observation
+    assert observation["borrowed"]
+    assert output.num_scheduled_tokens[small.request_id] > (
+        observation["unconsumed_before_refit"][0]
+        + observation["actual_before_refit"][0]
+    )
 
 
 def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tmp_path):

@@ -3406,6 +3406,7 @@ class Scheduler(SchedulerInterface):
         cfg = self.shared_ep_config
         assert cfg is not None and self.shared_ep_observation is not None
         actual = self.local_ep_actual_tokens
+        unconsumed_before_refit = list(self.shared_ep_grants)
         if any(0 < q < cfg.query_minimum for q in actual):
             return
         snapshot = self.get_shared_ep_snapshot(0, self.current_step, remaining)
@@ -3457,6 +3458,8 @@ class Scheduler(SchedulerInterface):
             grants=combined,
             predicted_ms=cfg.cost_ms([combined], [histories], request_counts=[counts]),
             borrowed=True,
+            unconsumed_before_refit=unconsumed_before_refit,
+            actual_before_refit=list(actual),
         )
 
     def _prefill_request_snapshot(self, request: Request) -> dict[str, Any]:
