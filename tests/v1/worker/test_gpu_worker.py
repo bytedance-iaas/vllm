@@ -36,7 +36,7 @@ def test_prefill_event_capture_pairs_real_gpu_work_and_bounds_samples():
     tensor.mul_(2)
     recorder.end_sample(sampled)
     assert recorder.begin_target({"query": 1}) is None
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     result = recorder.read()
     assert not result["active"] and result["pending"] == 0
     assert result["recorded"] == 1
@@ -518,6 +518,26 @@ def test_execute_model_waits_previous_pp_send_before_forward(
 
     assert log == ["wait:prev-tensor", "forward", "isend"]
     assert worker._pp_send_work == [tensor_handle]
+
+
+def test_idle_dp_draft_skip_rejects_unqualified_worker(tmp_path):
+    """The opt-in cannot run on a worker without its MTP/DP prerequisites."""
+    from transformers import OPTConfig
+
+    from vllm.config import KernelConfig, ModelConfig, VllmConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), skip_tokenizer_init=True),
+        kernel_config=KernelConfig(enable_idle_dp_draft_skip=True),
+    )
+    with pytest.raises(ValueError, match="Idle DP draft skip requires"):
+        gpu_worker.Worker(
+            vllm_config=config,
+            local_rank=0,
+            rank=0,
+            distributed_init_method="env://",
+        )
 
 
 def test_jit_monitor_activation_follows_enable_jit_warmup(

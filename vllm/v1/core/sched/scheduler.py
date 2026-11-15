@@ -3223,7 +3223,11 @@ class Scheduler(SchedulerInterface):
         cfg = self.shared_ep_config
         assert cfg is not None
         tokens, histories = [0] * 4, [0] * 4
-        supported = self._pause_state == PauseState.UNPAUSED
+        supported = (
+            self._pause_state == PauseState.UNPAUSED
+            and cfg.dummy_tokens_per_pcp
+            == self.num_spec_tokens + self.num_sampled_tokens_per_step
+        )
         for request in self.requests.values():
             if request.is_finished():
                 continue

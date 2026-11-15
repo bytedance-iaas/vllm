@@ -313,6 +313,12 @@ class KernelConfig:
     remains local to the receiving stage. Requires runtime PP/PCP validation.
     """
 
+    enable_idle_dp_draft_skip: bool = False
+    """Let idle DP workers agree to skip unused MTP drafts on Model Runner V2.
+    Experimental: single-module MTP, EP and eager execution only. Real ranks
+    retain the all-rank agreement; the zero-count draft prefill still runs.
+    """
+
     enable_rocm_segmented_attn_autotune: bool = False
     """If True, autotune ROCm segmented attention during kernel warmup on RDNA GPUs."""
 

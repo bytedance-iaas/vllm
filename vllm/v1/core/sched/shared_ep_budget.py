@@ -47,6 +47,7 @@ class SharedEPBudgetConfig:
     max_relative_error: float = 0.25
     observed_relative_error: float = 0.0
     query_minimum: int = 1
+    dummy_tokens_per_pcp: int = 1
 
     def __post_init__(self):
         if not self.stages or not self.calibration_id:
@@ -59,6 +60,7 @@ class SharedEPBudgetConfig:
             "quantum",
             "aging_steps",
             "query_minimum",
+            "dummy_tokens_per_pcp",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -113,8 +115,9 @@ class SharedEPBudgetConfig:
                     # envelope when several requests share a bucket grant.
                     total += stage.scan_ms_per_pair * rows * (h + (q + 1) / 2)
                 private.append(total)
-            # Idle peers still execute one dummy row per PCP worker.
-            ep_rows = sum(sum(row) or self.pcp_size for row in tokens)
+            ep_rows = sum(
+                sum(row) or self.pcp_size * self.dummy_tokens_per_pcp for row in tokens
+            )
             costs.append(
                 max(private)
                 + stage.ep_ms_per_token * ep_rows

@@ -111,6 +111,12 @@ outputs settle. `drained=true` requires both that completion fence and any
 existing deferred KV release fence; it then reports zero in-flight tokens.
 The completion observation does not change the allocator's release ordering.
 
+`dummy_tokens_per_pcp` records the actual idle target rows per PCP worker.
+For MTP5 in this eager recipe it is six, so an idle PCP4 peer contributes 24
+EP rows. The scheduler rejects a profile whose dummy query differs from the
+model's speculative plus sampled-token width; private prefill rows remain
+partitioned by PCP. Do not infer idle geometry from the prefill quantum.
+
 `query_minimum` and the query/history limits bound the calibrated shape range.
 The quantum must be at least that query floor. Smaller demands or actual charges
 fall back collectively; a short tail is not extrapolated from large-query data.
@@ -162,6 +168,18 @@ is not private kernel-only time, removable latency, or full-request TTFT.
 Use source/shape-matched stage measurements and existing trace attribution to
 test a cost model; do not identify cross-host timestamps or sum stage waits as
 an additive speedup. Repeated event windows do not start a Kineto profiler.
+
+## Idle DP drafting
+
+`enable_idle_dp_draft_skip=true` is an experimental CUDA/V2, single-module MTP,
+static EP/DP, eager-only option. A runtime idle DP worker votes to allow the
+existing AND-reduced unused-draft skip. Every real rank must still allow it;
+if a real request needs drafts, all peers keep the original proposal count.
+The idle proposal uses the agreed zero count too, preventing divergent draft
+collectives. The ordinary zero-count draft prefill pass remains and maintains
+draft KV; only unused draft sampling/decode work is skipped. Profiling and graph
+warmup calls keep their original dummy behavior. The option defaults off and
+requires real single-/mixed-DP, prefix and PD regression before adoption.
 
 ## Cross-stage TopK
 

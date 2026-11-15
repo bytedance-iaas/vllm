@@ -850,6 +850,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        allow_skip_drafts: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -901,6 +902,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output = SchedulerOutput.make_empty()
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+        dummy_scheduler_output.skip_drafts = allow_skip_drafts and not is_profile
 
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
@@ -964,6 +966,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             with use_workspace_lane(self._draft_workspace_lane):
+                draft_kwargs = (
+                    {"num_speculative_tokens": 0}
+                    if allow_skip_drafts
+                    and not is_profile
+                    and dp_sync_state is not None
+                    and dp_sync_state.skip_drafts
+                    else {}
+                )
                 self.speculator.propose(
                     input_batch=input_batch,
                     attn_metadata=attn_metadata,
@@ -985,6 +995,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     skip_attn_for_dummy_run=skip_attn,
                     mm_inputs=mm_inputs,
                     is_profile=is_profile,
+                    **draft_kwargs,
                 )
             self.step_timing.drafter_end()
 

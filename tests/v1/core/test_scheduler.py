@@ -118,6 +118,30 @@ def test_shared_ep_budget_counts_both_dp_rows_and_idle_peer():
     assert both - idle == pytest.approx(0.3)
 
 
+def test_shared_ep_budget_counts_declared_dummy_rows_and_rejects_mismatch(tmp_path):
+    """Idle speculative queries are replicated across PCP, not one real row."""
+    from transformers import OPTConfig
+
+    cfg = dataclasses.replace(shared_ep_test_config(), dummy_tokens_per_pcp=6)
+    h = [[0] * 4, [0] * 4]
+    assert cfg.cost_ms([[8, 0, 0, 0], [0, 0, 0, 0]], h) == pytest.approx(
+        8 * 1.1 + (8 + 6) * 0.1 + 0.1 + 8 * 4.5 * 0.001
+    )
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        data_parallel_size=2,
+        max_num_batched_tokens=64,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    # This real constructor has no speculator, so its idle query is one token.
+    snapshot = scheduler.get_shared_ep_snapshot(0, 0)
+    assert not snapshot.supported
+    peer = dataclasses.replace(snapshot, epoch="peer")
+    assert SharedEPBudget(cfg).decide([snapshot, peer]).fallback == "unsupported_shape"
+
+
 def test_shared_ep_budget_ages_long_bucket_and_never_charges_denied_kv():
     cfg = shared_ep_test_config()
     planner = SharedEPBudget(cfg)

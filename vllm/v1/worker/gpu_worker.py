@@ -219,6 +219,28 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        self.idle_dp_draft_skip = vllm_config.kernel_config.enable_idle_dp_draft_skip
+        if self.idle_dp_draft_skip:
+            spec = vllm_config.speculative_config
+            if not (
+                self.use_v2_model_runner
+                and current_platform.is_cuda()
+                and spec is not None
+                and spec.method == "mtp"
+                and getattr(
+                    self.model_config.hf_text_config, "num_nextn_predict_layers", 0
+                )
+                == 1
+                and self.parallel_config.data_parallel_size > 1
+                and self.parallel_config.enable_expert_parallel
+                and not self.parallel_config.enable_elastic_ep
+                and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            ):
+                raise ValueError(
+                    "Idle DP draft skip requires CUDA V2, single-module MTP, "
+                    "static EP/DP and eager execution"
+                )
+
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
@@ -1493,11 +1515,13 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+        skip_kwargs = {"allow_skip_drafts": True} if self.idle_dp_draft_skip else {}
         with record_function_or_nullcontext("gpu_worker: dp_dummy"):
             self.model_runner._dummy_run(
                 num_tokens,
                 uniform_decode=True,
                 randomize_inputs=self.randomize_dummy_inputs,
+                **skip_kwargs,
             )
         if (
             self.parallel_config.data_parallel_size > 1
