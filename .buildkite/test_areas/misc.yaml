@@ -333,6 +333,19 @@ steps:
     - pytest -v -s -m 'cpu_test' v1/metrics
     - pytest -v -s watermarking
 
+- label: ":python: NIXL Replicated PCP Completion"
+  key: nixl-replicated-pcp-completion
+  timeout_in_minutes: 10
+  device: cpu-small
+  source_file_dependencies:
+    - vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py
+    - vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py
+    - tests/v1/kv_connector/unit/test_nixl_connector.py
+    - tests/v1/kv_connector/unit/test_nixl_push_connector.py
+  commands:
+    - pytest -v -s v1/kv_connector/unit/test_nixl_connector.py -k synthetic_send_reaches
+    - pytest -v -s v1/kv_connector/unit/test_nixl_push_connector.py -k noncanonical_pcp_rank_only_pushes_distinct_shards
+
 - label: ":nvidia: (H200 MIG 18GB) Extract Hidden States Integration"
   key: extract-hidden-states-integration
   timeout_in_minutes: 20
