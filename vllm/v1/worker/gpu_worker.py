@@ -102,7 +102,11 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import (
+    compute_iteration_details,
+    record_function_or_nullcontext,
+    report_usage_stats,
+)
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -1327,7 +1331,8 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        with record_function_or_nullcontext("gpu_worker: sample_and_draft"):
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1465,11 +1470,12 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(
-            num_tokens,
-            uniform_decode=True,
-            randomize_inputs=self.randomize_dummy_inputs,
-        )
+        with record_function_or_nullcontext("gpu_worker: dp_dummy"):
+            self.model_runner._dummy_run(
+                num_tokens,
+                uniform_decode=True,
+                randomize_inputs=self.randomize_dummy_inputs,
+            )
         if (
             self.parallel_config.data_parallel_size > 1
             and self.parallel_config.pipeline_parallel_size == 1

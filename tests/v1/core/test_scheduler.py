@@ -121,6 +121,9 @@ def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(
     output = scheduler.schedule()
     scheduled = scheduler.get_prefill_progress([request.request_id])
     assert scheduled["seq"] > before["seq"]
+    assert scheduled["scheduler_step"] == before["scheduler_step"] + 1
+    assert scheduled["scheduled_step_seq"] == before["scheduled_step_seq"] + 1
+    assert scheduled["processed_step_seq"] == before["processed_step_seq"]
     assert scheduled["requests"][0]["confirmed_tokens"] == 0
     assert scheduled["requests"][0]["remaining_tokens"] == 64
     assert scheduled["requests"][0]["in_flight_tokens"] == 16
@@ -133,6 +136,8 @@ def test_prefill_progress_confirms_completed_chunks_and_keeps_unknown(
         ),
     )
     completed = scheduler.get_prefill_progress([request.request_id])
+    assert completed["scheduled_step_seq"] == scheduled["scheduled_step_seq"]
+    assert completed["processed_step_seq"] == completed["scheduled_step_seq"]
     assert completed["requests"][0]["confirmed_tokens"] == 16
     assert completed["requests"][0]["remaining_tokens"] == 48
     assert before["requests"][1] == {"request_id": "unknown", "status": "UNKNOWN"}

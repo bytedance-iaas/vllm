@@ -39,6 +39,15 @@ are the engine's external IDs (for OpenAI requests, the response ID with the
 completion prompt suffix), and each snapshot also identifies the internal ID.
 Query at most 128 IDs at a time.
 
+`seq` orders queries, while `scheduler_step`, `scheduled_step_seq`, and
+`processed_step_seq` identify scheduler calls, nonempty submitted steps, and
+settled outputs respectively. PP can have several submitted steps in flight;
+poll counts and CPU enqueue spans must not be used as completed-wave counts.
+The engine adds `dp_wave` and `dp_step` when it participates in DP coordination,
+or null when there is no shared counter. A DP wave spans a collective
+running-to-idle epoch; it is not one GPU forward. These observations are not
+quota grants and cannot authorize skipping a peer or changing an in-flight step.
+
 Confirmed tokens exclude in-flight execution and speculative placeholders.
 The full input length determines the context bucket: below 16K, 16–64K,
 64–256K, or at least 256K. A cached prefix does not change that bucket.
@@ -51,6 +60,16 @@ not settle an old execution from a new epoch or an unknown request.
 `free_kv_blocks` is an observation of the real pool, not a reservation or a
 guarantee of request capacity. Actual KV admission remains in the engine.
 The queue counts are views; they do not yet implement shared-EP time quotas.
+
+For diagnostic Torch captures, `profiler_config.detailed_trace_annotation=true`
+adds scheduled query/history geometry using the existing worker annotations.
+`VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` additionally marks `gpu_worker: dp_dummy`
+and `gpu_worker: sample_and_draft`, including V2 runner calls. Sampling and draft
+remain one combined scope, and GPU work is attributed through launch correlation;
+scope CPU duration is not a GPU completion measurement. Use a fresh worker process
+for each capture session on the TK300 Torch/Kineto package after the observed
+repeated-capture destructor crash. Diagnostic request latency is excluded from
+performance acceptance.
 
 ## Cross-stage TopK
 
