@@ -50,6 +50,11 @@ Multi-DP does not make a rank-local transport decision or skip a collective.
 For a KV-denied local refit, the progress observation retains the unconsumed
 grants and actual charges immediately before refitting. Compare these with the
 resulting grants instead of assuming any query above the quantum was borrowed.
+Progress also includes bounded reason-keyed `shared_ep_fallbacks` counters for
+the current engine epoch. A fast fallback can disappear from the last-step
+observation before a poll arrives; compare counter deltas rather than changing
+the query workload or assuming an unseen event did not happen. Counters do not
+change allocation, transport or fallback decisions.
 
 `VLLM_ENABLE_PREFILL_PROGRESS=1` enables `POST /internal/prefill/progress` with
 `{"request_ids":["external-request-id"]}`. It is disabled by default and intended

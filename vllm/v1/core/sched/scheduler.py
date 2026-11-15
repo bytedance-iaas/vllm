@@ -261,6 +261,7 @@ class Scheduler(SchedulerInterface):
         self.shared_ep_charged_requests = [0] * 4
         self.shared_ep_actual_supported = True
         self.shared_ep_observation: dict[str, Any] | None = None
+        self.shared_ep_fallbacks: dict[str, int] = {}
         self.local_ep_actual_tokens = [0] * 4
         self.local_ep_actual_histories = [0] * 4
         self.local_ep_actual_requests = [0] * 4
@@ -3332,6 +3333,11 @@ class Scheduler(SchedulerInterface):
         return snapshot
 
     def apply_shared_ep_decision(self, decision, rank: int) -> None:
+        if decision.fallback is not None:
+            reason = decision.fallback
+            self.shared_ep_fallbacks[reason] = (
+                self.shared_ep_fallbacks.get(reason, 0) + 1
+            )
         self.local_ep_actual_tokens = [0] * 4
         self.local_ep_actual_histories = [0] * 4
         self.local_ep_actual_requests = [0] * 4
@@ -3372,6 +3378,10 @@ class Scheduler(SchedulerInterface):
             # pre-admission estimate. Single-DP has no peer decision to undo;
             # abandon this quota without rewinding visited requests or KV.
             self.shared_ep_grants = None
+            reason = "actual_query_below_calibration_range"
+            self.shared_ep_fallbacks[reason] = (
+                self.shared_ep_fallbacks.get(reason, 0) + 1
+            )
             assert self.shared_ep_observation is not None
             self.shared_ep_observation.update(
                 mode="fallback",
@@ -3534,6 +3544,7 @@ class Scheduler(SchedulerInterface):
             "queues": queues,
             "free_kv_blocks": self.kv_cache_manager.block_pool.get_num_free_blocks(),
             "shared_ep_budget": self.shared_ep_observation,
+            "shared_ep_fallbacks": dict(self.shared_ep_fallbacks),
         }
 
     @property

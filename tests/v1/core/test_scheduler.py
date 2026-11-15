@@ -184,6 +184,7 @@ def test_single_dp_budget_rejects_a_small_request_hidden_by_its_bucket(tmp_path)
     assert output.num_scheduled_tokens[small.request_id] == 1
     assert output.num_scheduled_tokens[larger.request_id] > 0
     assert scheduler.shared_ep_observation["fallback"] == "unsupported_shape"
+    assert scheduler.shared_ep_fallbacks["unsupported_shape"] == 1
     snapshot = scheduler.get_shared_ep_snapshot(0, 1)
     assert sum(snapshot.charged_tokens) >= cfg.query_minimum
     assert not snapshot.supported
