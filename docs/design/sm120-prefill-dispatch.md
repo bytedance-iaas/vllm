@@ -142,6 +142,14 @@ calibration fallback and atomic KV admission; the step identity is the local
 scheduler sequence. Profiles must match the actual PCP/PP topology and query
 budget. A profile calibrated for DP2/PCP4 is not valid for DP1/PCP8.
 
+After a real KV allocation denial, the single-DP path refits the unconsumed
+grant among the remaining, unvisited waiting candidates. It counts actual
+already-scheduled q/history against the same step budget and token limit; no
+second credit or age update is issued. Denied and already-visited requests do
+not receive that loan. Prefix lookup and final KV eligibility remain owned by
+the ordinary allocator. An actual query below the calibration floor prevents
+this local refit. Multi-DP grants still require their existing joint decision.
+
 For diagnostic Torch captures, `profiler_config.detailed_trace_annotation=true`
 adds scheduled query/history geometry using the existing worker annotations.
 `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` additionally marks `gpu_worker: dp_dummy`

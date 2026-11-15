@@ -259,6 +259,8 @@ class Scheduler(SchedulerInterface):
         self.shared_ep_charged_tokens = [0] * 4
         self.shared_ep_charged_histories = [0] * 4
         self.shared_ep_observation: dict[str, Any] | None = None
+        self.local_ep_actual_tokens = [0] * 4
+        self.local_ep_actual_histories = [0] * 4
         self.local_ep_budget = None
         if self.shared_ep_config is not None and self.shared_ep_config.dp_size == 1:
             from vllm.v1.core.sched.shared_ep_budget import SharedEPBudget
@@ -1577,6 +1579,11 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     if self.shared_ep_config is not None:
                         skip_request(request_queue)
+                        if self.local_ep_budget is not None:
+                            remaining = {r.request_id for r in self.waiting} | {
+                                r.request_id for r in self.kv_holding_waiting
+                            }
+                            self._borrow_local_ep_grants(remaining)
                         continue
                     break
 
@@ -1689,7 +1696,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
-                self._shared_ep_consume(request, num_new_tokens)
+                self._shared_ep_consume(request, num_new_tokens, num_computed_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -3229,7 +3236,9 @@ class Scheduler(SchedulerInterface):
                 self.prefill_terminal.popitem(last=False)
         del self.requests[request.request_id]
 
-    def get_shared_ep_snapshot(self, wave: int, step: int):
+    def get_shared_ep_snapshot(
+        self, wave: int, step: int, only_requests: set[str] | None = None
+    ):
         from vllm.v1.core.sched.shared_ep_budget import (
             BUCKETS,
             BucketDemand,
@@ -3246,6 +3255,8 @@ class Scheduler(SchedulerInterface):
         )
         for request in self.requests.values():
             if request.is_finished():
+                continue
+            if only_requests is not None and request.request_id not in only_requests:
                 continue
             if (
                 request.has_encoder_inputs
@@ -3297,6 +3308,8 @@ class Scheduler(SchedulerInterface):
         return snapshot
 
     def apply_shared_ep_decision(self, decision, rank: int) -> None:
+        self.local_ep_actual_tokens = [0] * 4
+        self.local_ep_actual_histories = [0] * 4
         self.shared_ep_grants = (
             list(decision.grants[rank]) if decision.fallback is None else None
         )
@@ -3322,11 +3335,67 @@ class Scheduler(SchedulerInterface):
 
         return min(tokens, self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)])
 
-    def _shared_ep_consume(self, request: Request, tokens: int) -> None:
+    def _shared_ep_consume(
+        self, request: Request, tokens: int, history: int | None = None
+    ) -> None:
         if self.shared_ep_grants is not None:
             from vllm.v1.core.sched.shared_ep_budget import BUCKETS
 
-            self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)] -= tokens
+            bucket = BUCKETS.index(request.prefill_bucket)
+            self.shared_ep_grants[bucket] -= tokens
+            if self.local_ep_budget is not None:
+                self.local_ep_actual_tokens[bucket] += tokens
+                self.local_ep_actual_histories[bucket] = max(
+                    self.local_ep_actual_histories[bucket],
+                    request.num_computed_tokens if history is None else history,
+                )
+
+    def _borrow_local_ep_grants(self, remaining: set[str]) -> None:
+        """Refit unconsumed grants after real KV denial, without issuing credit."""
+        if self.local_ep_budget is None or self.shared_ep_grants is None:
+            return
+        cfg = self.shared_ep_config
+        assert cfg is not None and self.shared_ep_observation is not None
+        actual = self.local_ep_actual_tokens
+        if any(0 < q < cfg.query_minimum for q in actual):
+            return
+        snapshot = self.get_shared_ep_snapshot(0, self.current_step, remaining)
+        if not snapshot.supported:
+            return
+        histories = [
+            max(d.history, h)
+            for d, h in zip(snapshot.demands, self.local_ep_actual_histories)
+        ]
+        if any(h > cfg.history_limit for h in histories):
+            return
+        grants = [0] * 4
+        budget = self.shared_ep_observation["budget_ms"]
+        limit = min(snapshot.token_limit, cfg.query_limit) - sum(actual)
+        while True:
+            progressed = False
+            for bucket in self.shared_ep_order:
+                delta = min(
+                    cfg.quantum,
+                    snapshot.demands[bucket].tokens - grants[bucket],
+                    limit - sum(grants),
+                )
+                if delta < cfg.query_minimum:
+                    continue
+                grants[bucket] += delta
+                combined = [a + g for a, g in zip(actual, grants)]
+                if cfg.cost_ms([combined], [histories]) > budget:
+                    grants[bucket] -= delta
+                else:
+                    progressed = True
+            if not progressed:
+                break
+        self.shared_ep_grants = grants
+        combined = [a + g for a, g in zip(actual, grants)]
+        self.shared_ep_observation.update(
+            grants=combined,
+            predicted_ms=cfg.cost_ms([combined], [histories]),
+            borrowed=True,
+        )
 
     def _prefill_request_snapshot(self, request: Request) -> dict[str, Any]:
         confirmed = min(

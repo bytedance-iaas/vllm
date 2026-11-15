@@ -328,6 +328,40 @@ def test_single_dp_budget_runs_through_real_scheduler_and_keeps_fallback(tmp_pat
     assert rejected.shared_ep_observation["fallback"] == "model_error"
 
 
+def test_single_dp_reuses_a_kv_denied_bucket_share_without_extra_credit(tmp_path):
+    """KV-denied shares can add real work beyond the smaller bucket's first quantum."""
+    from transformers import OPTConfig
+
+    OPTConfig(
+        architectures=["OPTForCausalLM"], max_position_embeddings=1048576
+    ).save_pretrained(tmp_path)
+    cfg = dataclasses.replace(
+        shared_ep_test_config(),
+        dp_size=1,
+        stages=(StageCost(1, 0, 0.1, 0.1, 0.1),),
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        num_blocks=128,
+        max_num_batched_tokens=64,
+        max_model_len=1048576,
+        skip_tokenizer_init=True,
+        additional_config={"shared_ep_budget": dataclasses.asdict(cfg)},
+    )
+    large = create_requests(1, num_tokens=262144, req_ids=["large"])[0]
+    scheduler.add_request(large)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    unpaid = scheduler.local_ep_budget.deficits[3]
+    small = create_requests(1, num_tokens=32, req_ids=["small"])[0]
+    scheduler.add_request(small)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens.get(small.request_id, 0) > cfg.quantum
+    assert large.request_id not in output.num_scheduled_tokens
+    assert scheduler.shared_ep_charged_tokens[3] == 0
+    assert scheduler.local_ep_budget.deficits[3] == unpaid + cfg.protect_ms / 2
+    assert scheduler.local_ep_budget.last_step == 1
+
+
 def test_shared_ep_scheduler_enforces_bucket_grant_and_settles_only_real_work(tmp_path):
     from transformers import OPTConfig
 
