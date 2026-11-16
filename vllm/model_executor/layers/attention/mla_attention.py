@@ -326,6 +326,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FLASHINFER_MLA_BMM_TUNED: set[tuple[Any, ...]] = set()
+_FLASHINFER_MLA_BMM_ROWS = (1024, 432, 224, 16)
 
 
 def _mla_bmm_signature(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> tuple:
@@ -341,6 +342,19 @@ def _mla_bmm_signature(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> t
         b.stride(),
         out.stride(),
     )
+
+
+def run_mla_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    backend: str,
+    tuned_shapes: set[tuple],
+) -> torch.Tensor:
+    if backend == "flashinfer_cudnn" and _mla_bmm_signature(a, b, out) in tuned_shapes:
+        return flashinfer_bf16_bmm(a, b, out, backend="cudnn")
+    return torch.bmm(a, b, out=out)
 
 
 _FP8_DTYPE = current_platform.fp8_dtype()
@@ -1474,12 +1488,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     def _mla_bmm(
         self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
     ) -> torch.Tensor:
-        if (
-            self.mla_bmm_backend == "flashinfer_cudnn"
-            and _mla_bmm_signature(a, b, out) in self.mla_bmm_tuned_shapes
-        ):
-            return flashinfer_bf16_bmm(a, b, out, backend="cudnn")
-        return torch.bmm(a, b, out=out)
+        return run_mla_bmm(
+            a,
+            b,
+            out,
+            backend=self.mla_bmm_backend,
+            tuned_shapes=self.mla_bmm_tuned_shapes,
+        )
 
     def _tune_flashinfer_mla_bmm(self, act_dtype: torch.dtype) -> None:
         if self.mla_bmm_backend != "flashinfer_cudnn":
@@ -1500,45 +1515,60 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             act_dtype,
             version("flashinfer-python"),
             torch.backends.cudnn.version(),
+            _FLASHINFER_MLA_BMM_ROWS,
         )
 
         # Match the runtime token-major activation and output views exactly.
         # The context is limited to these two calls, so the full-model warmup
         # does not profile unrelated FlashInfer MoE kernels or their workspace.
-        m = 1024
-        q_token = self.W_UK_T.new_empty((m, self.num_heads, self.qk_nope_head_dim))
-        q_out_token = self.W_UK_T.new_empty((m, self.num_heads, self.kv_lora_rank))
-        v_token = self.W_UV.new_empty((m, self.num_heads, self.kv_lora_rank))
-        v_out_token = self.W_UV.new_empty((m, self.num_heads, self.v_head_dim))
-        self.mla_bmm_tuned_shapes.update(
-            (
-                _mla_bmm_signature(
-                    q_token.transpose(0, 1), self.W_UK_T, q_out_token.transpose(0, 1)
-                ),
-                _mla_bmm_signature(
-                    v_token.transpose(0, 1), self.W_UV, v_out_token.transpose(0, 1)
-                ),
+        for m in _FLASHINFER_MLA_BMM_ROWS:
+            q_token = self.W_UK_T.new_empty((m, self.num_heads, self.qk_nope_head_dim))
+            q_out_token = self.W_UK_T.new_empty((m, self.num_heads, self.kv_lora_rank))
+            v_token = self.W_UV.new_empty((m, self.num_heads, self.kv_lora_rank))
+            v_out_token = self.W_UV.new_empty((m, self.num_heads, self.v_head_dim))
+            self.mla_bmm_tuned_shapes.update(
+                (
+                    _mla_bmm_signature(
+                        q_token.transpose(0, 1),
+                        self.W_UK_T,
+                        q_out_token.transpose(0, 1),
+                    ),
+                    _mla_bmm_signature(
+                        v_token.transpose(0, 1),
+                        self.W_UV,
+                        v_out_token.transpose(0, 1),
+                    ),
+                )
             )
-        )
         if key in _FLASHINFER_MLA_BMM_TUNED:
             return
         with flashinfer_autotune(tune_mode=True):
-            flashinfer_bf16_bmm(
-                q_token.transpose(0, 1),
-                self.W_UK_T,
-                q_out_token.transpose(0, 1),
-                backend="cudnn",
-            )
-            flashinfer_bf16_bmm(
-                v_token.transpose(0, 1),
-                self.W_UV,
-                v_out_token.transpose(0, 1),
-                backend="cudnn",
-            )
+            for m in _FLASHINFER_MLA_BMM_ROWS:
+                q_token = self.W_UK_T.new_empty(
+                    (m, self.num_heads, self.qk_nope_head_dim)
+                )
+                q_out_token = self.W_UK_T.new_empty(
+                    (m, self.num_heads, self.kv_lora_rank)
+                )
+                v_token = self.W_UV.new_empty((m, self.num_heads, self.kv_lora_rank))
+                v_out_token = self.W_UV.new_empty((m, self.num_heads, self.v_head_dim))
+                flashinfer_bf16_bmm(
+                    q_token.transpose(0, 1),
+                    self.W_UK_T,
+                    q_out_token.transpose(0, 1),
+                    backend="cudnn",
+                )
+                flashinfer_bf16_bmm(
+                    v_token.transpose(0, 1),
+                    self.W_UV,
+                    v_out_token.transpose(0, 1),
+                    backend="cudnn",
+                )
         torch.cuda.synchronize(self.W_UK_T.device)
         _FLASHINFER_MLA_BMM_TUNED.add(key)
         logger.info_once(
-            "Tuned FlashInfer cuDNN MLA BMMs for M=1024, Q=(%d,%d), V=(%d,%d).",
+            "Tuned FlashInfer cuDNN MLA BMMs for M=%s, Q=(%d,%d), V=(%d,%d).",
+            _FLASHINFER_MLA_BMM_ROWS,
             self.qk_nope_head_dim,
             self.kv_lora_rank,
             self.kv_lora_rank,

@@ -6,7 +6,14 @@ from unittest.mock import Mock
 
 import torch
 from torch import nn
+from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+    DeepseekV3Config,
+)
 
+from vllm.models.deepseek_v32.attention import (
+    get_pp_indexer_handoff_directions,
+    is_index_producing_layer,
+)
 from vllm.models.deepseek_v32.nvidia import model as deepseek_v32_model
 from vllm.models.deepseek_v32.nvidia import mtp as deepseek_v32_mtp
 
@@ -146,3 +153,34 @@ def test_mtp_projects_sequence_shard_and_restores_full_output(monkeypatch):
     torch.testing.assert_close(hidden_states, expected)
     torch.testing.assert_close(recycled_hidden_states, expected)
     norm.assert_called_once()
+
+
+def test_pp_full_indexer_boundaries_do_not_require_topk_handoff():
+    pattern = ["S"] * 78
+    for layer_id in (0, 18, 38, 58):
+        pattern[layer_id] = "F"
+    config = DeepseekV3Config(
+        num_hidden_layers=78,
+        index_topk_pattern=pattern,
+    )
+
+    stages = ((0, 18), (18, 38), (38, 58), (58, 78))
+    assert all(
+        get_pp_indexer_handoff_directions(config, start, end) == (False, False)
+        for start, end in stages
+    )
+
+
+def test_pp_shared_indexer_boundary_requires_topk_handoff():
+    pattern = ["F", "S", "F", "S"]
+    config = DeepseekV3Config(
+        num_hidden_layers=len(pattern),
+        index_topk_pattern=pattern,
+    )
+
+    assert is_index_producing_layer(config, 0)
+    assert not is_index_producing_layer(config, 1)
+    assert is_index_producing_layer(config, 2)
+    assert not is_index_producing_layer(config, 3)
+    assert get_pp_indexer_handoff_directions(config, 0, 1) == (False, True)
+    assert get_pp_indexer_handoff_directions(config, 1, 2) == (True, False)

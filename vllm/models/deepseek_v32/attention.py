@@ -47,6 +47,37 @@ if TYPE_CHECKING:
     )
 
 
+def is_index_producing_layer(
+    config: DeepseekV2Config | DeepseekV3Config, layer_id: int
+) -> bool:
+    index_topk_freq = getattr(config, "index_topk_freq", 1)
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+    if index_topk_pattern is None:
+        skip_topk = max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+    elif 0 <= layer_id < len(index_topk_pattern):
+        skip_topk = index_topk_pattern[layer_id] == "S"
+    else:
+        skip_topk = False
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
+    return not skip_topk or is_mtp_layer
+
+
+def get_pp_indexer_handoff_directions(
+    config: DeepseekV2Config | DeepseekV3Config,
+    start_layer: int,
+    end_layer: int,
+) -> tuple[bool, bool]:
+    num_hidden_layers = config.num_hidden_layers
+    receives = start_layer > 0 and not is_index_producing_layer(config, start_layer)
+    sends = end_layer < num_hidden_layers and not is_index_producing_layer(
+        config, end_layer
+    )
+    return receives, sends
+
+
 class DeepseekV32Indexer(nn.Module):
     indexer_cache_cls = DeepseekV32IndexerCache
 
@@ -164,20 +195,9 @@ class DeepseekV32Attention(MLAAttention):
             scaling = scaling * mscale * mscale
 
         layer_id = extract_layer_index(prefix)
-        index_topk_freq = getattr(config, "index_topk_freq", 1)
-        index_topk_pattern = getattr(config, "index_topk_pattern", None)
-        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
-        if index_topk_pattern is None:
-            skip_topk = (
-                max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
-            )
-        elif 0 <= layer_id < len(index_topk_pattern):
-            skip_topk = index_topk_pattern[layer_id] == "S"
-        else:
-            skip_topk = False
-
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
+        skip_topk = not is_index_producing_layer(config, layer_id)
 
         kv_b_proj = ColumnParallelLinear(
             kv_lora_rank,
@@ -421,7 +441,14 @@ class DeepseekV32Attention(MLAAttention):
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         if prepare_mqa_query:
-            ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+            ql_nope = q_nope.new_empty(
+                (q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank)
+            )
+            self._mla_bmm(
+                q_nope.transpose(0, 1),
+                self.W_UK_T,
+                out=ql_nope.transpose(0, 1),
+            )
         else:
             ql_nope = q_nope
 
@@ -651,6 +678,6 @@ class DeepseekV32Attention(MLAAttention):
             .view(num_actual, self.num_local_heads, self.v_head_dim)
             .transpose(0, 1)
         )
-        torch.bmm(x, self.W_UV, out=out)
+        self._mla_bmm(x, self.W_UV, out=out)
         if self.use_pcp and num_actual < output.shape[0]:
             output[num_actual:].zero_()

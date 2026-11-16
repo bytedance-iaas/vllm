@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.layers import utils as layer_utils
+from vllm.model_executor.layers.attention.mla_attention import (
+    _FLASHINFER_MLA_BMM_ROWS,
+    run_mla_bmm,
+)
 from vllm.utils.flashinfer import (
     autotune,
     flashinfer_bf16_bmm,
@@ -57,13 +61,16 @@ def test_flashinfer_bf16_cutedsl_correctness(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-1)
 
 
-@pytest.mark.parametrize("k,n", [(192, 512), (512, 256)])
-def test_flashinfer_cudnn_bmm_keeps_mla_strided_output(k: int, n: int) -> None:
+@pytest.mark.parametrize("k,n", [(192, 512), (512, 256), (128, 512), (512, 128)])
+@pytest.mark.parametrize("rows", _FLASHINFER_MLA_BMM_ROWS)
+def test_flashinfer_cudnn_bmm_keeps_mla_strided_output(
+    k: int, n: int, rows: int
+) -> None:
     """The exact MLA activation/weight/output views must preserve the BF16 result."""
     if not is_flashinfer_bf16_bmm_supported("cudnn"):
         pytest.skip("FlashInfer cuDNN BF16 BMM is unavailable")
     torch.manual_seed(0)
-    rows, heads = 1024, 64
+    heads = 64
     a = (
         torch.randn(rows, heads, k, device="cuda", dtype=torch.bfloat16) * 0.1
     ).transpose(0, 1)
@@ -82,3 +89,22 @@ def test_flashinfer_cudnn_bmm_keeps_mla_strided_output(k: int, n: int) -> None:
     assert actual.data_ptr() == out_view.data_ptr()
     assert actual.stride() == out_view.stride()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_mla_bmm_unknown_shape_uses_torch_fallback() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(4, 17, 8)
+    b = torch.randn(4, 8, 6)
+    out = torch.empty(4, 17, 6)
+
+    actual = run_mla_bmm(
+        a,
+        b,
+        out,
+        backend="flashinfer_cudnn",
+        tuned_shapes=set(),
+    )
+    expected = torch.bmm(a, b)
+
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

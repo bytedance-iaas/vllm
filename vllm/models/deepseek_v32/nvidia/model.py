@@ -44,7 +44,10 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
-from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+from vllm.models.deepseek_v32.attention import (
+    DeepseekV32Attention,
+    get_pp_indexer_handoff_directions,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.mla.index_group import (
     SparseMLAIndexGroupBuilder,
@@ -188,7 +191,7 @@ class DeepseekV32Model(torch.nn.Module):
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
         self.is_v32 = True
-        self.pp_indexer_handoff = (
+        pp_indexer_handoff_enabled = (
             vllm_config.kernel_config.enable_pp_indexer_handoff
             and parallel_config.pipeline_parallel_size > 1
         )
@@ -227,6 +230,11 @@ class DeepseekV32Model(torch.nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        receives_topk, sends_topk = get_pp_indexer_handoff_directions(
+            config, self.start_layer, self.end_layer
+        )
+        self.pp_receives_indexer_handoff = pp_indexer_handoff_enabled and receives_topk
+        self.pp_sends_indexer_handoff = pp_indexer_handoff_enabled and sends_topk
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -236,7 +244,7 @@ class DeepseekV32Model(torch.nn.Module):
             ["hidden_states", "residual"],
             config.hidden_size,
             {"topk_indices": self.topk_indices_buffer}
-            if self.pp_indexer_handoff
+            if self.pp_receives_indexer_handoff
             else None,
         )
 
@@ -276,7 +284,7 @@ class DeepseekV32Model(torch.nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-            if self.pp_indexer_handoff:
+            if self.pp_receives_indexer_handoff:
                 received_topk = intermediate_tensors["topk_indices"]
                 self.topk_indices_buffer[: received_topk.shape[0]].copy_(received_topk)
                 if is_forward_context_available():
@@ -313,7 +321,7 @@ class DeepseekV32Model(torch.nn.Module):
                 "Currently, SP is not supported with PP"
             )
             tensors = {"hidden_states": hidden_states, "residual": residual}
-            if self.pp_indexer_handoff:
+            if self.pp_sends_indexer_handoff:
                 # The next forward reuses the producer buffer while this
                 # microbatch's asynchronous PP send can still be in flight.
                 tensors["topk_indices"] = self.topk_indices_buffer[
