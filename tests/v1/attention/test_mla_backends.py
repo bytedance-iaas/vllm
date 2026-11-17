@@ -76,7 +76,8 @@ DEVICE_TYPE = current_platform.device_type
 
 
 @pytest.mark.parametrize("budget", [2048, 4096, 8192])
-def test_flashinfer_mla_bmm_budget_and_strided_outputs(budget):
+@pytest.mark.parametrize("nope_dim,value_dim", [(128, 128), (192, 256)])
+def test_flashinfer_mla_bmm_budget_and_strided_outputs(budget, nope_dim, value_dim):
     """Full and tail projections preserve MRV2 views and the caller's output."""
     from flashinfer import autotune
 
@@ -91,19 +92,24 @@ def test_flashinfer_mla_bmm_budget_and_strided_outputs(budget):
     set_random_seed(0)
     # Integer products accumulate exactly, isolating layout errors from rounding.
     for m in (rows[0], rows[0] - 16, 16):
-        for k, n, padding in ((128, 512, 64), (128, 512, 0), (512, 128, 0)):
+        for k, n, padding in (
+            (nope_dim, 512, 64),
+            (nope_dim, 512, 0),
+            (512, value_dim, 0),
+        ):
             a_storage = torch.randint(-1, 2, (m, 64, k + padding), device=device).to(
                 torch.bfloat16
             )
             a = a_storage[..., :k].transpose(0, 1)
-            # Match post-load W_UK_T/W_UV views of the token-major KV weight.
-            b_storage = torch.randint(-1, 2, (512, 64, 256), device=device).to(
-                torch.bfloat16
-            )
+            # Match split_kv_b_proj's transpose/view of linear [out, in] weight.
+            b_weight = torch.randint(
+                -1, 2, (64 * (nope_dim + value_dim), 512), device=device
+            ).to(torch.bfloat16)
+            b_storage = b_weight.T.view(512, 64, nope_dim + value_dim)
             b = (
-                b_storage[..., :128].permute(1, 2, 0)
-                if k == 128
-                else b_storage[..., 128:].transpose(0, 1)
+                b_storage[..., :nope_dim].permute(1, 2, 0)
+                if k == nope_dim
+                else b_storage[..., nope_dim:].transpose(0, 1)
             )
             out_storage = torch.full(
                 (m + 2, 64, n), 123, device=device, dtype=torch.bfloat16

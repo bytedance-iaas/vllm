@@ -28,6 +28,11 @@ Tuning is cached with geometry, device capability and FlashInfer/cuDNN version
 identity and does not enable full-model FlashInfer autotuning. Account for
 tuning time, transient tensors and cuDNN workspace in the actual memory profile.
 
+The kernel regression covers both Q/V dimensions 128/128 and GLM-5.3's
+192/256, with 64 heads, KV rank 512, RoPE width 64, and the linear weight's
+transpose/view layout. These numerical/layout checks do not establish serving
+throughput, startup cost or KV capacity.
+
 `enable_sparse_indexer_remap_reuse=true` reuses physical row indices inside
 one eager forward and one indexer generation. Every producer invalidates the
 map. The page-table identity/layout, request-row mapping, query/TopK shape,
