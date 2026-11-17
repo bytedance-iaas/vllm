@@ -398,6 +398,16 @@ class FlashInferMoeEp:
         )
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
+        parallel = get_current_vllm_config().parallel_config
+        # This topology has one shared scheduled batch across its PCP ranks.
+        # Its MoE input row count is already rank-uniform, so Cake can size the
+        # cooperative grid without gathering routing stats back to the host.
+        self._uniform_cake_rows = (
+            spec.kernel == "cake_nvfp4"
+            and parallel.data_parallel_size == 1
+            and parallel.tensor_parallel_size == 1
+            and parallel.prefill_context_parallel_size == ep_group.world_size
+        )
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -445,6 +455,12 @@ class FlashInferMoeEp:
                 f"the workspace supports at most {self._max_num_tokens}"
             )
         tensors = self._tensors(hidden_states, topk_ids, topk_weights)
+        if self._uniform_cake_rows:
+            return self._mega_layer.forward(
+                tensors,
+                compile_tokens_per_rank=hidden_states.shape[0],
+                return_workspace_view=self._return_workspace_view,
+            )
         if self._return_workspace_view and getattr(
             self._mega_layer, "supports_output_view", False
         ):
