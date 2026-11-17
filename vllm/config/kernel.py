@@ -295,10 +295,11 @@ class KernelConfig:
     """Backend for the BF16 query-absorb and value-up BMMs in MLA.
 
     - "auto" / "torch": use ``torch.bmm``.
-    - "flashinfer_cudnn": use FlashInfer's cuDNN BF16 BMM for 1024-token
-      full chunks. The two exact MLA shapes are tuned once during weight
-      post-processing without enabling full-model FlashInfer autotuning;
-      other token counts retain ``torch.bmm``.
+    - "flashinfer_cudnn": use FlashInfer's cuDNN BF16 BMM for the local
+      full chunk and cache-block-aligned tails derived from the scheduler
+      budget and PCP size. Query and value shapes, including the sliced
+      query layout, are tuned during weight post-processing without enabling
+      full-model FlashInfer autotuning. Other layouts retain ``torch.bmm``.
     """
 
     enable_sparse_indexer_remap_reuse: bool = False

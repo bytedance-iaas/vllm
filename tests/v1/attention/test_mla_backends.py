@@ -75,6 +75,71 @@ if current_platform.is_rocm():
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize("budget", [2048, 4096, 8192])
+def test_flashinfer_mla_bmm_budget_and_strided_outputs(budget):
+    """Full and tail projections preserve MRV2 views and the caller's output."""
+    from flashinfer import autotune
+
+    from vllm.utils.flashinfer import flashinfer_bf16_bmm
+
+    if not mla_attention_module.is_flashinfer_bf16_bmm_supported("cudnn"):
+        pytest.skip("FlashInfer cuDNN BF16 BMM requires a supported CUDA GPU")
+    rows = mla_attention_module._mla_bmm_rows(budget, 4, 64)
+    assert rows[0] == budget // 4
+    assert set(range(16, budget // 4 + 1, 16)).issubset(rows)
+    device = torch.device(DEVICE_TYPE)
+    set_random_seed(0)
+    # Integer products accumulate exactly, isolating layout errors from rounding.
+    for m in (rows[0], rows[0] - 16, 16):
+        for k, n, padding in ((128, 512, 64), (128, 512, 0), (512, 128, 0)):
+            a_storage = torch.randint(-1, 2, (m, 64, k + padding), device=device).to(
+                torch.bfloat16
+            )
+            a = a_storage[..., :k].transpose(0, 1)
+            # Match post-load W_UK_T/W_UV views of the token-major KV weight.
+            b_storage = torch.randint(-1, 2, (512, 64, 256), device=device).to(
+                torch.bfloat16
+            )
+            b = (
+                b_storage[..., :128].permute(1, 2, 0)
+                if k == 128
+                else b_storage[..., 128:].transpose(0, 1)
+            )
+            out_storage = torch.full(
+                (m + 2, 64, n), 123, device=device, dtype=torch.bfloat16
+            )
+            out = out_storage[1:-1].transpose(0, 1)
+            expected = torch.bmm(a, b)
+            with autotune(tune_mode=True):
+                flashinfer_bf16_bmm(a, b, out, backend="cudnn")
+            result = mla_attention_module.run_mla_bmm(
+                a,
+                b,
+                out,
+                backend="flashinfer_cudnn",
+                tuned_shapes={mla_attention_module._mla_bmm_signature(a, b, out)},
+            )
+            assert result.data_ptr() == out.data_ptr()
+            torch.testing.assert_close(out, expected, atol=0, rtol=0)
+            assert torch.all(out_storage[0] == 123)
+            assert torch.all(out_storage[-1] == 123)
+            # Unknown output strides must remain usable through the torch path.
+            fallback_storage = torch.full(
+                (m, 64, 2 * n), 123, device=device, dtype=torch.bfloat16
+            )
+            fallback = fallback_storage[..., ::2].transpose(0, 1)
+            result = mla_attention_module.run_mla_bmm(
+                a,
+                b,
+                fallback,
+                backend="flashinfer_cudnn",
+                tuned_shapes={mla_attention_module._mla_bmm_signature(a, b, out)},
+            )
+            assert result.data_ptr() == fallback.data_ptr()
+            torch.testing.assert_close(fallback, expected, atol=0, rtol=0)
+            assert torch.all(fallback_storage[..., 1::2] == 123)
+
+
 @pytest.mark.parametrize(
     ("tensor_parallel_size", "query_len", "expected"),
     [

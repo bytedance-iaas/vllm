@@ -15,12 +15,18 @@ indexer KV, head dimension 128, and no TP row sharding or candidate blocks.
 PDL is disabled. Startup reserves the greater of the fused scratch bound and
 the dense fallback budget; fewer tensor elements are not a promised KV saving.
 
-`mla_bmm_backend="flashinfer_cudnn"` tunes the two BF16 MLA BMM shapes with
-1024 rows during weight post-processing. Runtime dispatch requires matching
-device, dtypes, shapes and strides, including the output view. Other shapes
-use `torch.bmm`. Tuning is cached with FlashInfer/cuDNN version identity and
-does not enable full-model FlashInfer autotuning. Account for cuDNN workspace
-in the actual memory profile.
+`mla_bmm_backend="flashinfer_cudnn"` tunes BF16 query-absorb and value-up BMMs
+during weight post-processing. The finite row set contains the scheduler token
+budget divided by PCP size, cache-block-aligned tails up to that local limit,
+and the existing small tail shapes within the limit. For block size 64 and
+PCP4, budgets 2048/4096/8192 give local full rows 512/1024/2048 and a tail
+quantum of 16. The policy is shared across requests and workload points.
+Query tuning covers both compact input and the MRV2 slice whose head stride
+includes RoPE columns. Runtime dispatch requires matching device, dtypes,
+shapes and strides, including the output view. Other layouts use `torch.bmm`.
+Tuning is cached with geometry, device capability and FlashInfer/cuDNN version
+identity and does not enable full-model FlashInfer autotuning. Account for
+tuning time, transient tensors and cuDNN workspace in the actual memory profile.
 
 `enable_sparse_indexer_remap_reuse=true` reuses physical row indices inside
 one eager forward and one indexer generation. Every producer invalidates the
