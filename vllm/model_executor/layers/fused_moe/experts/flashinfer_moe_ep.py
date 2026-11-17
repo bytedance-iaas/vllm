@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config.kernel import FLASHINFER_MOE_EP_CAKE_NVFP4, MoEBackend
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -148,13 +149,19 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
                 w13_scale=getattr(layer, "w13_weight_scale", None),
                 w2_scale=getattr(layer, "w2_weight_scale", None),
             ),
-            epilogue_from_quant_config(self.quant_config),
+            epilogue_from_quant_config(
+                self.quant_config, moe_backend=self.moe_config.moe_backend
+            ),
             apply_topk_in_fc1=apply_topk_in_fc1(
                 self.moe_config,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
             ),
         )
         adapter.warmup()
+        if self.moe_config.moe_backend == "flashinfer_moe_ep_cake_nvfp4":
+            # Rebinding releases canonical tensors only after weight conversion
+            # and warmup finish. Native rollback reloads the checkpoint.
+            torch.accelerator.synchronize()
         for name, tensor in zip(KERNEL_WEIGHT_NAMES, adapter.kernel_weights()):
             # Rebind, never copy: the params must alias the megakernel buffers (EPLB).
             getattr(layer, name).data = tensor
@@ -180,21 +187,22 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         if self._adapter is None:
             raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
-        output.copy_(
-            self._adapter(hidden_states, topk_ids.to(torch.int32), topk_weights)
-        )
+        output.copy_(self._adapter(hidden_states, topk_ids, topk_weights))
 
 
+@torch.no_grad()
 def epilogue_from_quant_config(
     quant_config: FusedMoEQuantConfig,
+    *,
+    moe_backend: MoEBackend | None = None,
 ) -> FlashInferMoeEpEpilogue:
     """Per-expert epilogue constants from the canonical quant config.
 
     The weight global scales (``g1_alphas``/``g2_alphas``) become the fc1/fc2
-    alphas. Activations are quantized dynamically inside the megakernel, so the
-    checkpoint's input scales drop out. MXFP4 checkpoints carry no global scales
-    and keep the default epilogue. The alphas alias the layer's parameters, so
-    EPLB permutations reach the kernel.
+    alphas. Cake preserves checkpoint activation normalization and folds its
+    inverse into those alphas once during weight loading. CuTeDSL quantizes
+    dynamically with unit normalization. MXFP4 keeps the default epilogue.
+    The alphas alias the layer's parameters so EPLB permutations reach the kernel.
     """
     fc1_alpha, fc2_alpha = quant_config.g1_alphas, quant_config.g2_alphas
     if fc1_alpha is None and fc2_alpha is None:
@@ -204,6 +212,30 @@ def epilogue_from_quant_config(
     require_finite_positive_scales("g2_alphas", fc2_alpha)
     if fc1_alpha.dim() != 1 or fc2_alpha.dim() != 1:
         raise ValueError("the megakernel needs one weight global scale per expert")
+    if moe_backend == FLASHINFER_MOE_EP_CAKE_NVFP4:
+        input_norm, intermediate_norm = quant_config.a1_gscale, quant_config.a2_gscale
+        if input_norm is None or intermediate_norm is None:
+            raise ValueError("NVFP4 Cake requires checkpoint activation normalization")
+        for name, value in (
+            ("a1_gscale", input_norm),
+            ("a2_gscale", intermediate_norm),
+        ):
+            require_finite_positive_scales(name, value)
+            if value.shape != fc1_alpha.shape:
+                raise ValueError(f"{name} must have one scale per local expert")
+        if not torch.equal(input_norm, input_norm[0].expand_as(input_norm)):
+            raise ValueError("NVFP4 Cake input normalization must be shared by experts")
+        input_norm_const = float(input_norm[0].item())
+        # Fold into canonical parameters, as the native backend does, so
+        # expert-weight views keep reading the same alpha storage.
+        fc1_alpha.div_(input_norm_const)
+        fc2_alpha.div_(intermediate_norm)
+        return FlashInferMoeEpEpilogue(
+            input_norm_const=input_norm_const,
+            fc1_alpha=fc1_alpha.float().contiguous(),
+            fc2_alpha=fc2_alpha.float().contiguous(),
+            fc1_norm_const=intermediate_norm.float().contiguous(),
+        )
     return FlashInferMoeEpEpilogue(
         fc1_alpha=fc1_alpha.float().contiguous(),
         fc2_alpha=fc2_alpha.float().contiguous(),

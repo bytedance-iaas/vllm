@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.utils.b12x_moe import (
     prepare_nvfp4_moe_layer_for_b12x,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    amax_for_moe_activation_quant,
     nvfp4_swizzled_scale_to_cutedsl_mma_view,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
@@ -51,6 +52,7 @@ class NvFp4MoeBackend(Enum):
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
     EMULATION = "EMULATION"
+    FLASHINFER_MOE_EP_CAKE_NVFP4 = "FLASHINFER_MOE_EP_CAKE_NVFP4"
     FLASHINFER_MOE_EP_CUTEDSL = "FLASHINFER_MOE_EP_CUTEDSL"
 
 
@@ -68,7 +70,10 @@ def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
     # of all experts in Expert Parallel Mode when all experts are not
     # on the same rank.
 
-    return backend in FLASHINFER_NVFP4_MOE_BACKENDS
+    return (
+        backend in FLASHINFER_NVFP4_MOE_BACKENDS
+        or backend == NvFp4MoeBackend.FLASHINFER_MOE_EP_CAKE_NVFP4
+    )
 
 
 def backend_to_kernel_cls(
@@ -150,7 +155,10 @@ def backend_to_kernel_cls(
         )
 
         return [Nvfp4QuantizationEmulationTritonExperts]
-    elif backend == NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL:
+    elif backend in (
+        NvFp4MoeBackend.FLASHINFER_MOE_EP_CAKE_NVFP4,
+        NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
+    ):
         from vllm.model_executor.layers.fused_moe.experts.flashinfer_moe_ep import (  # noqa: E501
             FlashInferMoeEpExperts,
         )
@@ -168,6 +176,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        "flashinfer_moe_ep_cake_nvfp4": NvFp4MoeBackend.FLASHINFER_MOE_EP_CAKE_NVFP4,
         "flashinfer_moe_ep_cutedsl": NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
@@ -218,6 +227,7 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
+        NvFp4MoeBackend.FLASHINFER_MOE_EP_CAKE_NVFP4,
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.MARLIN,
         NvFp4MoeBackend.EMULATION,
@@ -505,6 +515,19 @@ def convert_to_nvfp4_moe_kernel_format(
         # for other experts - other selection strategies may be used.
         a13_scale = 1.0 / a13_scale.max().to(torch.float32)
         a2_scale = 1.0 / a2_scale.max().to(torch.float32)
+    elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_MOE_EP_CAKE_NVFP4:
+        if a13_scale is None or a2_scale is None:
+            raise ValueError("NVFP4 Cake requires checkpoint activation scales")
+        # Match the native shared activation scale without changing the
+        # canonical gate/up weight layout the Cake transformer consumes.
+        enable_eplb = layer.moe_config.moe_parallel_config.enable_eplb
+        num_experts = w13.shape[0]
+        a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
+            num_experts
+        )
+        a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(
+            num_experts
+        )
     elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL:
         # The megakernel transforms the checkpoint tensors itself at init.
         pass

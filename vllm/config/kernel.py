@@ -130,6 +130,7 @@ MoEBackend = Literal[
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
     "flashinfer_moe_ep_cutedsl",
+    "flashinfer_moe_ep_cake_nvfp4",
     "flashinfer_b12x",
     "b12x",
     "flashinfer_moe_ep_mega_deep_gemm",
@@ -147,12 +148,14 @@ MoEBackend = Literal[
 ]
 
 FLASHINFER_MOE_EP_CUTEDSL = "flashinfer_moe_ep_cutedsl"
+FLASHINFER_MOE_EP_CAKE_NVFP4 = "flashinfer_moe_ep_cake_nvfp4"
 FLASHINFER_MOE_EP_DEEP_GEMM = "flashinfer_moe_ep_mega_deep_gemm"
 
 # Backends implemented by the shared FlashInfer MoE-EP adapter.
 FLASHINFER_MOE_EP_BACKENDS = frozenset(
     {
         FLASHINFER_MOE_EP_CUTEDSL,
+        FLASHINFER_MOE_EP_CAKE_NVFP4,
         FLASHINFER_MOE_EP_DEEP_GEMM,
     }
 )
@@ -188,6 +191,7 @@ FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
         "DeepseekV41ForCausalLM",
+        "GlmMoeDsaForCausalLM",
     }
 )
 
@@ -354,6 +358,9 @@ class KernelConfig:
     - "flashinfer_moe_ep_cutedsl": Use FlashInfer's CuTeDSL MoE-EP
       mega-kernel with NVFP4 weights (MXFP4 checkpoints are requantized at
       load); requires Blackwell, expert parallelism, and NVSHMEM
+    - "flashinfer_moe_ep_cake_nvfp4": Use the SM120 Cake NVFP4 MoE-EP
+      megakernel with BF16 return and an external BF16 shared expert.
+      Routing weights apply before intermediate requantization.
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "b12x": Use b12x FP4 MoE kernels on SM12x

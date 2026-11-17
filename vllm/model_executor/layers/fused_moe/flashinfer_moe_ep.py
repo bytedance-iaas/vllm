@@ -13,6 +13,7 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import (
     FLASHINFER_MOE_EP_BACKENDS,
+    FLASHINFER_MOE_EP_CAKE_NVFP4,
     FLASHINFER_MOE_EP_CUTEDSL,
     FLASHINFER_MOE_EP_DEEP_GEMM,
 )
@@ -30,14 +31,14 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
+FlashInferMoeEpKernel = Literal["cake_nvfp4", "cutedsl", "deep_gemm"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4"]
 _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
     kNvfp4Static: "nvfp4",
     kMxfp4Static: "mxfp4",
 }
 
-_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0)})
 
 
 def supports_current_device() -> bool:
@@ -71,6 +72,7 @@ _E2M1_LUT = (
 class FlashInferMoeEpBackendSpec:
     kernel: FlashInferMoeEpKernel
     weight_formats: frozenset[FlashInferMoeEpWeightFormat]
+    capabilities: frozenset[tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -93,10 +95,17 @@ _BACKEND_SPECS = {
     FLASHINFER_MOE_EP_CUTEDSL: FlashInferMoeEpBackendSpec(
         kernel="cutedsl",
         weight_formats=frozenset({"nvfp4", "mxfp4"}),
+        capabilities=frozenset({(10, 0), (10, 3)}),
+    ),
+    FLASHINFER_MOE_EP_CAKE_NVFP4: FlashInferMoeEpBackendSpec(
+        kernel="cake_nvfp4",
+        weight_formats=frozenset({"nvfp4"}),
+        capabilities=frozenset({(12, 0)}),
     ),
     FLASHINFER_MOE_EP_DEEP_GEMM: FlashInferMoeEpBackendSpec(
         kernel="deep_gemm",
         weight_formats=frozenset({"mxfp4"}),
+        capabilities=frozenset({(10, 0), (10, 3)}),
     ),
 }
 
@@ -131,6 +140,12 @@ def flashinfer_moe_ep_unsupported_reasons(
     """
     spec = flashinfer_moe_ep_backend_spec(moe.moe_backend)
     unsupported: list[str] = []
+    capability = current_platform.get_device_capability()
+    capability_tuple = (
+        None if capability is None else (capability.major, capability.minor)
+    )
+    if capability_tuple not in spec.capabilities:
+        unsupported.append(f"device capability {capability_tuple}")
     weight_format = _WEIGHT_FORMATS.get(weight_key)
     if weight_format is None:
         unsupported.append(f"weight scheme {weight_key}")
@@ -266,6 +281,11 @@ class _FlashInferMoeEpApi:
         self.MoEEpTensors = MoEEpTensors
         self.MoEWeightPack = MoEWeightPack
         self.Nvfp4CutedslMegaMoeConfig = Nvfp4CutedslMegaMoeConfig
+        from flashinfer import moe_ep
+
+        self.Sm120Nvfp4CakeMegaMoeConfig = getattr(
+            moe_ep, "Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig", None
+        )
 
 
 def _load_flashinfer_moe_ep_api() -> _FlashInferMoeEpApi:
@@ -303,9 +323,10 @@ class FlashInferMoeEp:
             process_group=ep_group.device_group,
             device=torch.accelerator.current_device_index(),
         )
+        max_tokens_per_rank = moe.max_num_tokens
         fleet_params = api.FleetParams(
             num_experts=moe.num_experts,
-            max_tokens_per_rank=moe.max_num_tokens,
+            max_tokens_per_rank=max_tokens_per_rank,
             token_hidden_size=moe.hidden_dim,
         )
         weight_pack = api.MoEWeightPack(
@@ -314,7 +335,23 @@ class FlashInferMoeEp:
             w13_scale=weights.w13_scale,
             w2_scale=weights.w2_scale,
         )
-        if spec.kernel == "cutedsl":
+        if spec.kernel == "cake_nvfp4":
+            if api.Sm120Nvfp4CakeMegaMoeConfig is None:
+                raise RuntimeError(
+                    "The installed FlashInfer lacks the NVFP4 Cake backend"
+                )
+            megakernel = api.Sm120Nvfp4CakeMegaMoeConfig(
+                intermediate_size=moe.intermediate_size,
+                top_k=moe.experts_per_token,
+                gate_up_clamp=moe.swiglu_limit,
+                apply_routing_weights_before_fc2=True,
+                combine_dtype="bf16",
+                input_norm_const=epilogue.input_norm_const,
+                fc1_alpha=epilogue.fc1_alpha,
+                fc2_alpha=epilogue.fc2_alpha,
+                fc1_norm_const=epilogue.fc1_norm_const,
+            )
+        elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
             # renamed in_kernel_fc2_reduce to enable_in_kernel_fc2_reduce.
             megakernel = api.Nvfp4CutedslMegaMoeConfig(
@@ -352,9 +389,13 @@ class FlashInferMoeEp:
         )
         self._device = weights.w13.device
         self._hidden_size = moe.hidden_dim
-        self._max_num_tokens = moe.max_num_tokens
+        self._max_num_tokens = max_tokens_per_rank
         self._num_experts = moe.num_experts
         self._top_k = moe.experts_per_token
+        self._kernel_kind = spec.kernel
+        self._topk_indices_dtype = (
+            torch.int64 if spec.kernel == "cake_nvfp4" else torch.int32
+        )
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
 
@@ -368,7 +409,7 @@ class FlashInferMoeEp:
 
     @property
     def topk_indices_dtype(self) -> torch.dtype:
-        return torch.int32
+        return self._topk_indices_dtype
 
     @property
     def is_monolithic(self) -> bool:
@@ -383,7 +424,7 @@ class FlashInferMoeEp:
         epilogue = cast(FlashInferMoeEpEpilogue, self._epilogue)
         return self._moe_ep_tensors_cls(
             hidden_states=hidden_states,
-            topk_ids=topk_ids,
+            topk_ids=topk_ids.to(self._topk_indices_dtype),
             topk_weights=topk_weights,
             fc1_alpha=epilogue.fc1_alpha,
             fc2_alpha=epilogue.fc2_alpha,
@@ -443,7 +484,17 @@ class FlashInferMoeEp:
         """
         if self._mega_layer is None:
             raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
-        (fc1_weight, fc1_sf), (fc2_weight, fc2_sf) = self._mega_layer._transformed
+        transformed = self._mega_layer._transformed
+        if self._kernel_kind == "cake_nvfp4":
+            local_experts = transformed.local_experts
+            # SFB is flattened over experts. Exclude the guard expert after
+            # exposing one complete expert per row, not by slicing flat rows.
+            fc1_weight = transformed.w1_fp4
+            fc1_sf = transformed.w1_sfb.view(local_experts + 1, -1)[:local_experts]
+            fc2_weight = transformed.w2_fp4
+            fc2_sf = transformed.w2_sfb.view(local_experts + 1, -1)[:local_experts]
+        else:
+            (fc1_weight, fc1_sf), (fc2_weight, fc2_sf) = transformed
         return (
             _expert_major_bytes(fc1_weight),
             _expert_major_bytes(fc1_sf),

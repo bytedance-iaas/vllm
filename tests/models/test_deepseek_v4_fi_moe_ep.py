@@ -10,6 +10,7 @@ import torch
 from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm.config.kernel import (
     FLASHINFER_MOE_EP_BACKENDS,
+    FLASHINFER_MOE_EP_CAKE_NVFP4,
     FLASHINFER_MOE_EP_CUTEDSL,
     FLASHINFER_MOE_EP_DEEP_GEMM,
     MEGA_MOE_BACKENDS,
@@ -308,6 +309,51 @@ def test_epilogue_rejects_unloaded_weight_global_scales():
     )
     with pytest.raises(ValueError, match="g1_alphas"):
         epilogue_from_quant_config(quant_config)
+
+
+def test_cake_epilogue_preserves_checkpoint_normalization_and_alpha_aliases():
+    g1 = torch.tensor([2.0, 4.0])
+    g2 = torch.tensor([6.0, 8.0])
+    original_g1, original_g2 = g1.clone(), g2.clone()
+    quant = nvfp4_moe_quant_config(
+        g1_alphas=g1,
+        g2_alphas=g2,
+        a1_gscale=torch.full((2,), 100.0),
+        a2_gscale=torch.full((2,), 50.0),
+        w1_scale=torch.ones(2, 4, 1),
+        w2_scale=torch.ones(2, 2, 1),
+    )
+    epilogue = epilogue_from_quant_config(
+        quant, moe_backend=FLASHINFER_MOE_EP_CAKE_NVFP4
+    )
+    assert epilogue.input_norm_const == 100.0
+    assert epilogue.fc1_alpha.data_ptr() == g1.data_ptr()
+    assert epilogue.fc2_alpha.data_ptr() == g2.data_ptr()
+    torch.testing.assert_close(
+        epilogue.fc1_alpha * epilogue.input_norm_const, original_g1
+    )
+    torch.testing.assert_close(
+        epilogue.fc2_alpha * epilogue.fc1_norm_const, original_g2
+    )
+
+
+def test_cake_kernel_format_uses_global_activation_scales_without_reordering():
+    tensors = tuple(torch.arange(4.0).reshape(2, 2) + i for i in range(8))
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(enable_eplb=False)
+        )
+    )
+    converted = convert_to_nvfp4_moe_kernel_format(
+        NvFp4MoeBackend.FLASHINFER_MOE_EP_CAKE_NVFP4,
+        layer,
+        *tensors,
+        is_act_and_mul=True,
+    )
+    for index in (0, 1, 2, 4, 5, 6):
+        assert converted[index] is tensors[index]
+    torch.testing.assert_close(converted[3], torch.full((2,), tensors[3].max()))
+    torch.testing.assert_close(converted[7], torch.full((2,), tensors[7].max()))
 
 
 def test_mxfp4_checkpoints_keep_the_default_epilogue():
