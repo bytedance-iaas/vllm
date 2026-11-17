@@ -666,8 +666,8 @@ def sparse_attn_indexer(
                 "VLLM_DETERMINISTIC_SPARSE_TOPK does not cover the decode context "
                 "parallel top-k merge; its result keeps the merge's order."
             )
-    # The fused prefill kernel never materializes the scores to canonicalize.
-    fused_mqa_topk = not deterministic and topk_backend != "flashinfer_sm120" and use_fused_mqa_topk(
+    # The shared eligibility wrapper also disables this under determinism.
+    fused_mqa_topk = topk_backend != "flashinfer_sm120" and use_fused_mqa_topk(
         query_shape=q_quant.shape[1:],
         topk=topk_tokens,
         fp4_cache=use_fp4_cache,
@@ -683,7 +683,6 @@ def sparse_attn_indexer(
     chunk_decode = (
         decode_budget > 0
         and current_platform.is_device_capability_family(100)
-        and topk_backend != "flashinfer_sm120"
         and not use_pcp
         and dcp_world_size == 1
         and topk_backend in ("auto", "persistent")
