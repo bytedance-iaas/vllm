@@ -543,6 +543,8 @@ class DeepseekV32Attention(MLAAttention):
                 ),
                 skip_topk_buffer_clear=True,
                 topk_backend=self.indexer.indexer_op.topk_backend,
+                sampling_policy=self.indexer.indexer_op.sampling_policy,
+                sampling_full_rows=self.indexer.indexer_op.sampling_full_rows,
             )
         self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
