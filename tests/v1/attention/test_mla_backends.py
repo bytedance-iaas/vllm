@@ -10,7 +10,7 @@ Known Issues:
 
 import sys
 from types import MethodType, SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 import torch
@@ -93,6 +93,7 @@ def test_sm120_sampling_preserves_tail_and_uncertified_history(
     from vllm.config import KernelConfig, ParallelConfig, SchedulerConfig
     from vllm.model_executor.layers.sparse_attn_indexer import (
         _flashinfer_sm120_sample_target,
+        _flashinfer_sm120_sampling_full_rows,
     )
 
     kernel = KernelConfig(sparse_indexer_sampling_policy=policy)
@@ -108,18 +109,128 @@ def test_sm120_sampling_preserves_tail_and_uncertified_history(
         max_num_seqs=32,
         is_encoder_decoder=False,
     )
+    full_rows = _flashinfer_sm120_sampling_full_rows(parallel, scheduler)
+    assert full_rows == 1024
     assert (
         _flashinfer_sm120_sample_target(
-            kernel, parallel, scheduler, rows, 2048, history
+            kernel.sparse_indexer_sampling_policy, full_rows, rows, 2048, history
         )
         == expected
     )
     assert (
         _flashinfer_sm120_sample_target(
-            kernel, parallel, scheduler, rows, 1024, history
+            kernel.sparse_indexer_sampling_policy, full_rows, rows, 1024, history
         )
         is None
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 kernel"
+)
+def test_sm120_indexer_forward_without_current_config(workspace_init):
+    """Worker forward retains exact top-k after the construction context ends."""
+    from flashinfer.dsa_indexer import dsa_indexer_topk
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.model_executor.layers import sparse_attn_indexer  # noqa: F401
+    from vllm.v1.attention.backend import AttentionMetadata
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepseekV32IndexerMetadata,
+        DeepseekV32IndexerPrefillChunkMetadata,
+        DeepseekV32IndexerPrefillMetadata,
+    )
+
+    set_random_seed(0)
+    length, head_dim, top_k = 65536, 128, 2048
+    q = torch.randn(1, 64, head_dim, device="cuda").to(current_platform.fp8_dtype())
+    weights = torch.rand(1, 64, device="cuda")
+    k = torch.randn(length, head_dim, dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty(
+        length // 64, 64, head_dim + 4, dtype=torch.uint8, device="cuda"
+    )
+    ops.indexer_k_quant_and_cache(
+        k, cache, torch.arange(length, device="cuda"), head_dim, "ue8m0"
+    )
+    blocks = torch.arange(length // 64, dtype=torch.int32, device="cuda")[None]
+    cu_k = torch.tensor([0, length], dtype=torch.int32, device="cuda")
+    cu_q = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    chunk = DeepseekV32IndexerPrefillChunkMetadata(
+        block_table=blocks,
+        cu_seqlen_ks=cu_q[:1],
+        cu_seqlen_ke=cu_k[1:],
+        cu_seq_lens=cu_k,
+        token_to_seq=cu_q[:1],
+        total_seq_lens=length,
+        max_seqlen_k=length,
+        token_start=0,
+        token_end=1,
+        num_reqs=1,
+        local_cu_seq_lens=cu_k,
+        local_total_seq_lens=length,
+        max_local_total_seq_lens=length,
+        cu_query_lens=cu_q,
+        min_visible_keys=length,
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=cu_k[1:],
+        max_seq_len=length,
+        slot_mapping=cu_q[:1],
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        num_prefill_tokens=1,
+        prefill=DeepseekV32IndexerPrefillMetadata(chunks=[chunk]),
+    )
+    indices = torch.empty(1, top_k, dtype=torch.int32, device="cuda")
+    assert get_current_vllm_config_or_none() is None
+    with override_forward_context(
+        ForwardContext({}, {"indexer": cast(AttentionMetadata, metadata)}, {})
+    ):
+        result = torch.ops.vllm.sparse_attn_indexer(
+            k[:1],
+            "indexer",
+            cache,
+            q,
+            None,
+            None,
+            weights,
+            head_dim,
+            "ue8m0",
+            top_k,
+            head_dim,
+            length,
+            length,
+            indices,
+            True,
+            False,
+            False,
+            "",
+            topk_backend="flashinfer_sm120",
+        )
+    gathered = torch.empty(
+        length, head_dim, dtype=current_platform.fp8_dtype(), device="cuda"
+    )
+    scales = torch.empty(length, 4, dtype=torch.uint8, device="cuda")
+    ops.cp_gather_indexer_k_quant_cache(cache, gathered, scales, blocks, cu_k)
+    expected, _ = dsa_indexer_topk(
+        q,
+        gathered,
+        weights,
+        cu_q,
+        cu_k,
+        top_k=top_k,
+        backend="sm120",
+        k_scale=scales.view(torch.float32).squeeze(-1),
+        q_causal_offsets=torch.tensor([length - 1], device="cuda"),
+        max_seqlen_k=length,
+        min_seqlen_k=length,
+        return_scores=False,
+        enable_pdl=False,
+    )
+    assert result.data_ptr() == indices.data_ptr()
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("budget", [2048, 4096, 8192])
