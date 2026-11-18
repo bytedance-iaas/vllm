@@ -75,6 +75,53 @@ if current_platform.is_rocm():
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    "policy,rows,history,expected",
+    [
+        ("legacy", 1024, 899969, None),
+        ("long_full", 1024, 899969, 5120),
+        ("long_full", 432, 998273, None),
+        ("long_full", 1023, 899969, None),
+        ("long_full", 1024, 524288, None),
+        ("long_full", 1024, None, None),
+    ],
+)
+def test_sm120_sampling_preserves_tail_and_uncertified_history(
+    policy, rows, history, expected
+):
+    """Only the full long-history path opts into a larger exact candidate target."""
+    from vllm.config import KernelConfig, ParallelConfig, SchedulerConfig
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        _flashinfer_sm120_sample_target,
+    )
+
+    kernel = KernelConfig(sparse_indexer_sampling_policy=policy)
+    parallel = ParallelConfig(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=4,
+        prefill_context_parallel_size=4,
+        distributed_executor_backend="external_launcher",
+    )
+    scheduler = SchedulerConfig(
+        max_model_len=1048576,
+        max_num_batched_tokens=4096,
+        max_num_seqs=32,
+        is_encoder_decoder=False,
+    )
+    assert (
+        _flashinfer_sm120_sample_target(
+            kernel, parallel, scheduler, rows, 2048, history
+        )
+        == expected
+    )
+    assert (
+        _flashinfer_sm120_sample_target(
+            kernel, parallel, scheduler, rows, 1024, history
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("budget", [2048, 4096, 8192])
 @pytest.mark.parametrize("nope_dim,value_dim", [(128, 128), (192, 256)])
 def test_flashinfer_mla_bmm_budget_and_strided_outputs(budget, nope_dim, value_dim):

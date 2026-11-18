@@ -15,6 +15,17 @@ indexer KV, head dimension 128, and no TP row sharding or candidate blocks.
 PDL is disabled. Startup reserves the greater of the fused scratch bound and
 the dense fallback budget; fewer tensor elements are not a promised KV saving.
 
+`sparse_indexer_sampling_policy="long_full"` selects a threshold target of5120
+for TP1/DP1 full PCP batches with at least1024 local query rows and a certified
+minimum visible history above512Ki tokens. Full rows come from the configured
+batch token budget divided by PCP size. A partial batch, a tail, an unsupported
+parallel configuration or missing history certification retains the original
+threshold target. The default `"legacy"` policy preserves existing dispatch.
+The option requires FlashInfer's ragged `sample_target` API; candidate capacity,
+native score arithmetic, deterministic TopK and complete recovery are unchanged.
+It is a sampling/finalization cost tradeoff, and its intended deployment still
+requires full/tail, real service and quality validation.
+
 `mla_bmm_backend="flashinfer_cudnn"` tunes BF16 query-absorb and value-up BMMs
 during weight post-processing. The finite row set contains the scheduler token
 budget divided by PCP size, cache-block-aligned tails up to that local limit,

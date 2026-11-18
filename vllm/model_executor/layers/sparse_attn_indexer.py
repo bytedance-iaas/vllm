@@ -78,6 +78,34 @@ def _flashinfer_sm120_api():
     return dsa_indexer_topk, ragged_scratch_bytes
 
 
+def _flashinfer_sm120_sample_target(
+    kernel_config,
+    parallel_config,
+    scheduler_config,
+    rows: int,
+    top_k: int,
+    min_visible_keys: int | None,
+) -> int | None:
+    if kernel_config.sparse_indexer_sampling_policy == "legacy":
+        return None
+    parallel = parallel_config
+    pcp = parallel.prefill_context_parallel_size
+    budget = scheduler_config.max_num_batched_tokens
+    if (
+        top_k != 2048
+        or min_visible_keys is None
+        or min_visible_keys <= 524288
+        or parallel.tensor_parallel_size != 1
+        or parallel.data_parallel_size != 1
+        or pcp <= 0
+        or budget % pcp
+        or rows != budget // pcp
+        or rows < 1024
+    ):
+        return None
+    return 5120
+
+
 def _flashinfer_sm120_causal_offsets(
     cu_query_lens: torch.Tensor,
     row_starts: torch.Tensor,
@@ -792,6 +820,20 @@ def sparse_attn_indexer(
                         chunk.cu_query_lens, cu_seqlen_ks, cu_seqlen_ke
                     )
                     dsa_indexer_topk, _ = _flashinfer_sm120_api()
+                    sampling_config = get_current_vllm_config()
+                    sample_target = _flashinfer_sm120_sample_target(
+                        sampling_config.kernel_config,
+                        sampling_config.parallel_config,
+                        sampling_config.scheduler_config,
+                        q_slice_cast.shape[0],
+                        topk_tokens,
+                        chunk.min_visible_keys,
+                    )
+                    sampling_args = (
+                        {}
+                        if sample_target is None
+                        else {"sample_target": sample_target}
+                    )
 
                     fused_indices, fused_scores = dsa_indexer_topk(
                         q_slice_cast,
@@ -812,6 +854,7 @@ def sparse_attn_indexer(
                         # resident launch fails with CUDA error 716 when it is
                         # enabled. Keep launch ordering explicit on this path.
                         enable_pdl=False,
+                        **sampling_args,
                     )
                     assert fused_indices.data_ptr() == topk_indices.data_ptr()
                     assert fused_scores is None

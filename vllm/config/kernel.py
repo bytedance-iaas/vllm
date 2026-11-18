@@ -406,6 +406,14 @@ class KernelConfig:
     Explicit values raise RuntimeError when their constraints are not met.
     """
 
+    sparse_indexer_sampling_policy: Literal["legacy", "long_full"] = "legacy"
+    """SM120 Prefill sampling policy. `long_full` requests target5120 only
+    for TP1/DP1 full PCP batches with at least1024 local queries and a certified
+    visible-history lower bound above512Ki tokens. Tails and unsupported
+    metadata retain the legacy target; scores and exact recovery are unchanged.
+    Requires FlashInfer's optional ragged `sample_target` argument.
+    """
+
     linear_backend: LinearBackend = "auto"
     """Backend for linear layer GEMM kernels. Available options:
 

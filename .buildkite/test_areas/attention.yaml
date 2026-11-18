@@ -9,6 +9,8 @@ steps:
   device: h100
   source_file_dependencies:
     - vllm/config/attention.py
+    - vllm/config/kernel.py
+    - vllm/model_executor/layers/sparse_attn_indexer.py
     - vllm/model_executor/layers/attention
     - vllm/v1/attention
     - tests/v1/attention
@@ -25,6 +27,8 @@ steps:
       - image-build-amd
       source_file_dependencies:
       - vllm/config/attention.py
+      - vllm/config/kernel.py
+      - vllm/model_executor/layers/sparse_attn_indexer.py
       - vllm/model_executor/layers/attention
       - vllm/v1/attention
       - tests/v1/attention
@@ -43,6 +47,8 @@ steps:
   device: b200-k8s
   source_file_dependencies:
     - vllm/config/attention.py
+    - vllm/config/kernel.py
+    - vllm/model_executor/layers/sparse_attn_indexer.py
     - vllm/model_executor/layers/attention
     - vllm/v1/attention
     - tests/v1/attention
@@ -59,6 +65,8 @@ steps:
       - image-build-amd
       source_file_dependencies:
       - vllm/config/attention.py
+      - vllm/config/kernel.py
+      - vllm/model_executor/layers/sparse_attn_indexer.py
       - vllm/model_executor/layers/attention
       - vllm/v1/attention
       - tests/v1/attention
