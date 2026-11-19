@@ -93,7 +93,7 @@ class Dsv41StoreScheduler:
             self.lookup_skip_short_prompt += 1
             return 0, False
         # A complete-page load must not overwrite a partly shared local page.
-        if num_computed_tokens % self.chunk_tokens:
+        if num_computed_tokens < 0 or num_computed_tokens % self.chunk_tokens:
             return 0, False
         max_usable_hit = (
             min(request.num_tokens - 1, len(request.block_hashes) * self.hash_tokens)
@@ -104,14 +104,17 @@ class Dsv41StoreScheduler:
             self.lookup_skip_no_possible_increment += 1
             return 0, False
         result = self.client.lookup(
-            request.request_id, request.num_tokens, request.block_hashes
+            request.request_id,
+            request.num_tokens,
+            request.block_hashes,
+            start_tokens=num_computed_tokens,
         )
         if result is None:
             return None, False
         hit = result.hit_length
         if hit <= max(num_computed_tokens, 128):
             return 0, False
-        if hit % self.chunk_tokens or hit >= request.num_tokens:
+        if hit % self.chunk_tokens or hit > max_usable_hit:
             return 0, False
         self.load_specs[request.request_id] = (num_computed_tokens, hit)
         return hit - num_computed_tokens, True

@@ -165,17 +165,26 @@ class Dsv41StoreWorker:
         ):
             self.server = LookupServer(self, self.config)
 
-    def lookup(self, num_tokens, hashes):
+    def lookup(self, num_tokens, hashes, start_tokens=0):
         manifest = self.manifest
         assert manifest is not None
         limit = min(num_tokens - 1, len(hashes) * manifest.hash_tokens)
-        hit = 0
+        span = manifest.chunk_tokens
+        # Only the scheduler's confirmed complete local pages may be skipped.
+        # Return an absolute end; no Store key before start_tokens is required.
+        if (
+            type(start_tokens) is not int
+            or start_tokens < 0
+            or start_tokens % span
+            or start_tokens > limit
+        ):
+            return MooncakeLookupResult(0)
+        hit = start_tokens
         deadline = (
             time.monotonic()
             + int(self.extra.get("lookup_timeout_ms", 1000)) / 1000 * 0.8
         )
-        span = manifest.chunk_tokens
-        for begin in range(span, limit + 1, span * 32):
+        for begin in range(start_tokens + span, limit + 1, span * 32):
             ends = list(range(begin, min(limit, begin + span * 31) + 1, span))
             keys = [
                 manifest.key(component, hashes[end // manifest.hash_tokens - 1])
