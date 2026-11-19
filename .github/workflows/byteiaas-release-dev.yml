@@ -164,7 +164,7 @@ jobs:
           mkdir -p byteiaas-flashinfer-dist
           docker run --rm --network host --entrypoint bash \
             -e HTTP_PROXY -e HTTPS_PROXY -e ALL_PROXY -e NO_PROXY \
-            -e CUDA_VISIBLE_DEVICES= -e BUILD_NVEP=0 \
+            -e CUDA_VISIBLE_DEVICES= -e BUILD_NVEP=0 -e FLASHINFER_BUILD_NO_PIP=1 \
             -v "${PWD}/byteiaas-flashinfer-source:/source:ro" \
             -v "${PWD}/byteiaas-flashinfer-dist:/out" \
             "${BASE_IMAGE}" -c 'set -e; cp -a /source /tmp/flashinfer-source; cd /tmp/flashinfer-source; uv pip install --system --no-deps "setuptools>=77" wheel; uv build --wheel --no-build-isolation --out-dir /out'
