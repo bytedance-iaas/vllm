@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
-from collections import defaultdict, deque
+import uuid
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import (
@@ -222,6 +224,53 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        self.prefill_progress_epoch = uuid.uuid4().hex
+        self.prefill_progress_seq = 0
+        self.prefill_scheduled_step_seq = 0
+        self.prefill_processed_step_seq = 0
+        self.prefill_terminal: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self.prefill_external_ids: dict[str, set[str]] = defaultdict(set)
+        from vllm.v1.core.sched.shared_ep_budget import SharedEPBudgetConfig
+
+        extra = vllm_config.additional_config
+        budget_config = (
+            extra.get("shared_ep_budget") if isinstance(extra, dict) else None
+        )
+        self.shared_ep_config = (
+            SharedEPBudgetConfig.from_dict(budget_config)
+            if budget_config is not None
+            else None
+        )
+        if self.shared_ep_config is not None:
+            cfg = self.shared_ep_config
+            if (
+                cfg.dp_size < 1
+                or cfg.dp_size != self.parallel_config.data_parallel_size
+                or self.parallel_config.enable_elastic_ep
+                or cfg.pcp_size != self.pcp_world_size
+                or len(cfg.stages) != self.parallel_config.pipeline_parallel_size
+                or self.scheduler_config.policy != "fcfs"
+                or not self.scheduler_config.enable_chunked_prefill
+            ):
+                raise ValueError(
+                    "Shared EP budget requires matching topology and FCFS chunks"
+                )
+        self.shared_ep_grants: list[int] | None = None
+        self.shared_ep_order = (0, 1, 2, 3)
+        self.shared_ep_charged_tokens = [0] * 4
+        self.shared_ep_charged_histories = [0] * 4
+        self.shared_ep_charged_requests = [0] * 4
+        self.shared_ep_actual_supported = True
+        self.shared_ep_observation: dict[str, Any] | None = None
+        self.shared_ep_fallbacks: dict[str, int] = {}
+        self.local_ep_actual_tokens = [0] * 4
+        self.local_ep_actual_histories = [0] * 4
+        self.local_ep_actual_requests = [0] * 4
+        self.local_ep_budget = None
+        if self.shared_ep_config is not None and self.shared_ep_config.dp_size == 1:
+            from vllm.v1.core.sched.shared_ep_budget import SharedEPBudget
+
+            self.local_ep_budget = SharedEPBudget(self.shared_ep_config)
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -689,7 +738,34 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        if self.local_ep_budget is not None:
+            snapshot = self.get_shared_ep_snapshot(0, self.current_step)
+            decision = self.local_ep_budget.decide([snapshot])
+            self.apply_shared_ep_decision(decision, 0)
+            assert self.shared_ep_observation is not None
+            self.shared_ep_observation.update(
+                wave=0,
+                step=self.current_step,
+                deficits_ms=list(self.local_ep_budget.deficits),
+                ages_steps=list(self.local_ep_budget.ages),
+            )
         self.current_step += 1
+        if self.shared_ep_grants is not None:
+            order = {bucket: i for i, bucket in enumerate(self.shared_ep_order)}
+            from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+            self.running.sort(
+                key=lambda r: (order[BUCKETS.index(r.prefill_bucket)], r.arrival_time)
+            )
+            # Rebuild only the policy queue; block holders retain their separate
+            # drain-first queue and all existing blocked-request handling.
+            waiting = sorted(
+                self.waiting,
+                key=lambda r: (order[BUCKETS.index(r.prefill_bucket)], r.arrival_time),
+            )
+            self.waiting = create_request_queue(self.policy)
+            for request in waiting:
+                self.waiting.add_request(request)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -820,6 +896,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            num_new_tokens = self._shared_ep_cap(
+                request, num_new_tokens, check_query=True
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -903,10 +982,18 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or self.shared_ep_grants is not None
+                    ):
                         preempted_req = max(
                             self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                            key=lambda r: (
+                                r.priority
+                                if self.policy == SchedulingPolicy.PRIORITY
+                                else 0,
+                                r.arrival_time,
+                            ),
                         )
                     else:
                         preempted_req = self.running[-1]
@@ -915,7 +1002,10 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or self.shared_ep_grants is not None
+                    ):
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -960,8 +1050,8 @@ class Scheduler(SchedulerInterface):
             if new_blocks is None:
                 if (
                     self.policy == SchedulingPolicy.PRIORITY
-                    and request.status == RequestStatus.PREEMPTED
-                ):
+                    or self.shared_ep_grants is not None
+                ) and request.status == RequestStatus.PREEMPTED:
                     # The request was the lowest-priority running request and
                     # preempted itself. The requests after it have higher
                     # priority and may still fit (it just freed its blocks);
@@ -979,6 +1069,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            self._shared_ep_consume(request, num_new_tokens)
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1086,6 +1177,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if (
+                    request_queue is self.waiting
+                    and request.status
+                    in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    and self._shared_ep_cap(request, 1) == 0
+                ):
+                    # Avoid probing a long prefix for an ungranted bucket.
+                    # Blocked statuses must still reach their promotion hook.
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1269,6 +1370,9 @@ class Scheduler(SchedulerInterface):
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                         )
+                    request.prefill_cached_tokens = (
+                        num_new_local_computed_tokens + num_external_computed_tokens
+                    )
                     self._set_kv_fetch_stage(
                         request, KV_FETCH_WAITING_TO_START if load_kv_async else None
                     )
@@ -1376,6 +1480,12 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._shared_ep_cap(
+                        request, num_new_tokens, check_query=True
+                    )
+                    if num_new_tokens == 0:
+                        skip_request(request_queue)
+                        continue
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1461,15 +1571,29 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
+                if self.shared_ep_config is not None:
+                    reserved_blocks = (
+                        sum(
+                            self._request_remaining_blocks(other)
+                            for other in self.requests.values()
+                            if other is not request
+                            and not other.is_finished()
+                            and self._holds_kv_blocks(other)
+                        )
+                        + self._spec_decode_step_blocks
+                    )
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
+                    reserved_blocks = max(
+                        reserved_blocks,
+                        (
+                            self._inflight_prefill_reserved_blocks()
+                            + self._spec_decode_step_blocks
+                        ),
                     )
 
                 # Replayed tokens are already counted in the adopted hit; a
@@ -1489,7 +1613,10 @@ class Scheduler(SchedulerInterface):
                         else ()
                     ),
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=(
+                        self.scheduler_reserve_full_isl
+                        or self.shared_ep_config is not None
+                    ),
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
@@ -1501,6 +1628,14 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self.shared_ep_config is not None:
+                        skip_request(request_queue)
+                        if self.local_ep_budget is not None:
+                            remaining = {r.request_id for r in self.waiting} | {
+                                r.request_id for r in self.kv_holding_waiting
+                            }
+                            self._borrow_local_ep_grants(remaining)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1609,6 +1744,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                self._shared_ep_consume(request, num_new_tokens, num_computed_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1794,13 +1930,41 @@ class Scheduler(SchedulerInterface):
 
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
+        if self.shared_ep_observation is not None:
+            wave = self.shared_ep_observation.get("wave")
+            step = self.shared_ep_observation.get("step")
+            if wave is not None and step is not None:
+                scheduler_output.shared_ep_step = (wave, step)
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
-            self.sched_step_seq += 1
+        if total_num_scheduled_tokens > 0:
+            if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+                self.prefill_scheduled_step_seq += 1
+            if self.defer_block_free:
+                self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
+            if self.shared_ep_config is not None:
+                from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+                self.shared_ep_charged_tokens = [0] * 4
+                self.shared_ep_charged_histories = [0] * 4
+                self.shared_ep_charged_requests = [0] * 4
+                self.shared_ep_actual_supported = True
+                for request_id, q in num_scheduled_tokens.items():
+                    request = self.requests[request_id]
+                    bucket = BUCKETS.index(request.prefill_bucket)
+                    self.shared_ep_charged_tokens[bucket] += q
+                    self.shared_ep_charged_requests[bucket] += 1
+                    if 0 < q < self.shared_ep_config.query_minimum:
+                        self.shared_ep_actual_supported = False
+                    self.shared_ep_charged_histories[bucket] = max(
+                        self.shared_ep_charged_histories[bucket],
+                        request.num_computed_tokens,
+                    )
+                # A grant is for one schedule only, never a reusable lease.
+                self.shared_ep_grants = None
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -2276,10 +2440,13 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
-            self.processed_step_seq += 1
-            self._drain_deferred_frees()
-            self._drain_deferred_loads()
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+                self.prefill_processed_step_seq += 1
+            if self.defer_block_free:
+                self.processed_step_seq += 1
+                self._drain_deferred_frees()
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -3037,6 +3204,10 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+                self.prefill_external_ids[request.external_req_id].add(
+                    request.request_id
+                )
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3157,7 +3328,317 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        if envs.VLLM_ENABLE_PREFILL_PROGRESS:
+            terminal = self._prefill_request_snapshot(request)
+            terminal["release_fence"] = self.sched_step_seq
+            terminal["completion_fence"] = self.prefill_scheduled_step_seq
+            self.prefill_terminal[request.external_req_id] = terminal
+            self.prefill_terminal.move_to_end(request.external_req_id)
+            internal_ids = self.prefill_external_ids[request.external_req_id]
+            internal_ids.discard(request.request_id)
+            if not internal_ids:
+                del self.prefill_external_ids[request.external_req_id]
+            while len(self.prefill_terminal) > 4096:
+                self.prefill_terminal.popitem(last=False)
         del self.requests[request.request_id]
+
+    def get_shared_ep_snapshot(
+        self, wave: int, step: int, only_requests: set[str] | None = None
+    ):
+        from vllm.v1.core.sched.shared_ep_budget import (
+            BUCKETS,
+            BucketDemand,
+            BudgetSnapshot,
+        )
+
+        cfg = self.shared_ep_config
+        assert cfg is not None
+        tokens, histories, counts = [0] * 4, [0] * 4, [0] * 4
+        supported = (
+            self.shared_ep_actual_supported
+            and self._pause_state == PauseState.UNPAUSED
+            and (
+                cfg.dp_size == 1
+                or cfg.dummy_tokens_per_pcp
+                == self.num_spec_tokens + self.num_sampled_tokens_per_step
+            )
+        )
+        for request in self.requests.values():
+            if request.is_finished():
+                continue
+            if only_requests is not None and request.request_id not in only_requests:
+                continue
+            if (
+                request.has_encoder_inputs
+                or request.resumable
+                or request.num_output_tokens
+                or request.lora_request
+            ):
+                supported = False
+            if request.status not in (
+                RequestStatus.RUNNING,
+                RequestStatus.WAITING,
+                RequestStatus.PREEMPTED,
+            ):
+                continue
+            if (
+                request.status != RequestStatus.RUNNING
+                and len(self.running) + self.num_waiting_for_streaming_input
+                >= self.max_num_active_reqs
+            ):
+                # Match the native admission gate; a full runner cannot borrow
+                # a running request's share for an unadmittable waiter.
+                continue
+            bucket = BUCKETS.index(request.prefill_bucket)
+            remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            if not remaining:
+                continue
+            if remaining < cfg.query_minimum:
+                supported = False
+            counts[bucket] += 1
+            tokens[bucket] = min(
+                self.max_num_scheduled_tokens, tokens[bucket] + remaining
+            )
+            # Unadmitted prefix hits are unknown: bound by full history instead
+            # of treating a missing snapshot as cached or idle.
+            history = (
+                request.num_computed_tokens
+                if request.status == RequestStatus.RUNNING
+                else request.num_prompt_tokens
+            )
+            histories[bucket] = max(histories[bucket], history)
+        snapshot = BudgetSnapshot(
+            self.prefill_progress_epoch,
+            wave,
+            step,
+            cfg.fingerprint,
+            self.max_num_scheduled_tokens,
+            tuple(BucketDemand(q, h, n) for q, h, n in zip(tokens, histories, counts)),
+            tuple(self.shared_ep_charged_tokens),
+            tuple(self.shared_ep_charged_histories),
+            supported,
+            tuple(self.shared_ep_charged_requests),
+        )
+        self.shared_ep_charged_tokens = [0] * 4
+        self.shared_ep_charged_histories = [0] * 4
+        self.shared_ep_charged_requests = [0] * 4
+        self.shared_ep_actual_supported = True
+        return snapshot
+
+    def apply_shared_ep_decision(self, decision, rank: int) -> None:
+        if decision.fallback is not None:
+            reason = decision.fallback
+            self.shared_ep_fallbacks[reason] = (
+                self.shared_ep_fallbacks.get(reason, 0) + 1
+            )
+        self.local_ep_actual_tokens = [0] * 4
+        self.local_ep_actual_histories = [0] * 4
+        self.local_ep_actual_requests = [0] * 4
+        self.shared_ep_grants = (
+            list(decision.grants[rank]) if decision.fallback is None else None
+        )
+        self.shared_ep_order = decision.order
+        self.shared_ep_observation = {
+            "mode": decision.mode,
+            "fallback": decision.fallback,
+            "budget_ms": decision.budget_ms,
+            "predicted_ms": decision.predicted_ms,
+            "grants": decision.grants[rank],
+        }
+        if decision.fallback is not None:
+            self.running.sort(key=lambda r: r.arrival_time)
+            waiting = sorted(self.waiting, key=lambda r: r.arrival_time)
+            self.waiting = create_request_queue(self.policy)
+            for request in waiting:
+                self.waiting.add_request(request)
+
+    def _shared_ep_cap(
+        self, request: Request, tokens: int, check_query: bool = False
+    ) -> int:
+        if self.shared_ep_grants is None:
+            return tokens
+        from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+        cap = min(tokens, self.shared_ep_grants[BUCKETS.index(request.prefill_bucket)])
+        cfg = self.shared_ep_config
+        assert cfg is not None
+        if (
+            self.local_ep_budget is not None
+            and check_query
+            and 0 < cap < cfg.query_minimum
+        ):
+            # A newly confirmed prefix can expose a smaller query than the
+            # pre-admission estimate. Single-DP has no peer decision to undo;
+            # abandon this quota without rewinding visited requests or KV.
+            self.shared_ep_grants = None
+            reason = "actual_query_below_calibration_range"
+            self.shared_ep_fallbacks[reason] = (
+                self.shared_ep_fallbacks.get(reason, 0) + 1
+            )
+            assert self.shared_ep_observation is not None
+            self.shared_ep_observation.update(
+                mode="fallback",
+                fallback="actual_query_below_calibration_range",
+                budget_ms=0,
+                predicted_ms=0,
+                grants=[0] * 4,
+            )
+            return tokens
+        return cap
+
+    def _shared_ep_consume(
+        self, request: Request, tokens: int, history: int | None = None
+    ) -> None:
+        if self.shared_ep_grants is not None:
+            from vllm.v1.core.sched.shared_ep_budget import BUCKETS
+
+            bucket = BUCKETS.index(request.prefill_bucket)
+            self.shared_ep_grants[bucket] -= tokens
+            if self.local_ep_budget is not None:
+                self.local_ep_actual_requests[bucket] += 1
+                self.local_ep_actual_tokens[bucket] += tokens
+                self.local_ep_actual_histories[bucket] = max(
+                    self.local_ep_actual_histories[bucket],
+                    request.num_computed_tokens if history is None else history,
+                )
+
+    def _borrow_local_ep_grants(self, remaining: set[str]) -> None:
+        """Refit unconsumed grants after real KV denial, without issuing credit."""
+        if self.local_ep_budget is None or self.shared_ep_grants is None:
+            return
+        cfg = self.shared_ep_config
+        assert cfg is not None and self.shared_ep_observation is not None
+        actual = self.local_ep_actual_tokens
+        unconsumed_before_refit = list(self.shared_ep_grants)
+        if any(0 < q < cfg.query_minimum for q in actual):
+            return
+        snapshot = self.get_shared_ep_snapshot(0, self.current_step, remaining)
+        if not snapshot.supported:
+            return
+        histories = [
+            max(d.history, h)
+            for d, h in zip(snapshot.demands, self.local_ep_actual_histories)
+        ]
+        if any(h > cfg.history_limit for h in histories):
+            return
+        grants = [0] * 4
+        budget = self.shared_ep_observation["budget_ms"]
+        limit = min(snapshot.token_limit, cfg.query_limit) - sum(actual)
+        while True:
+            progressed = False
+            for bucket in self.shared_ep_order:
+                delta = min(
+                    cfg.quantum,
+                    snapshot.demands[bucket].tokens - grants[bucket],
+                    limit - sum(grants),
+                )
+                if delta < cfg.query_minimum:
+                    continue
+                grants[bucket] += delta
+                combined = [a + g for a, g in zip(actual, grants)]
+                counts = [
+                    n + (d.request_count if g else 0)
+                    for n, d, g in zip(
+                        self.local_ep_actual_requests, snapshot.demands, grants
+                    )
+                ]
+                if (
+                    cfg.cost_ms([combined], [histories], request_counts=[counts])
+                    > budget
+                ):
+                    grants[bucket] -= delta
+                else:
+                    progressed = True
+            if not progressed:
+                break
+        self.shared_ep_grants = grants
+        combined = [a + g for a, g in zip(actual, grants)]
+        counts = [
+            n + (d.request_count if g else 0)
+            for n, d, g in zip(self.local_ep_actual_requests, snapshot.demands, grants)
+        ]
+        self.shared_ep_observation.update(
+            grants=combined,
+            predicted_ms=cfg.cost_ms([combined], [histories], request_counts=[counts]),
+            borrowed=True,
+            unconsumed_before_refit=unconsumed_before_refit,
+            actual_before_refit=list(actual),
+        )
+
+    def _prefill_request_snapshot(self, request: Request) -> dict[str, Any]:
+        confirmed = min(
+            request.num_prompt_tokens,
+            max(
+                0,
+                request.num_computed_tokens
+                - max(request.num_in_flight_tokens, request.num_output_placeholders),
+            ),
+        )
+        return {
+            "request_id": request.external_req_id,
+            "internal_request_id": request.request_id,
+            "bucket": request.prefill_bucket,
+            "input_tokens": request.num_prompt_tokens,
+            "cached_tokens": request.prefill_cached_tokens,
+            "confirmed_tokens": confirmed,
+            "in_flight_tokens": request.num_in_flight_tokens,
+            "remaining_tokens": max(0, request.num_prompt_tokens - confirmed),
+            "status": request.status.name,
+            "terminal": request.is_finished(),
+            "drained": False,
+        }
+
+    def get_prefill_progress(self, request_ids: list[str]) -> dict[str, Any]:
+        """A bounded CPU snapshot; unknown requests never imply an idle engine."""
+        if not envs.VLLM_ENABLE_PREFILL_PROGRESS:
+            raise RuntimeError("Prefill progress is disabled")
+        if len(request_ids) > 128:
+            raise ValueError("At most 128 request IDs may be queried")
+        self.prefill_progress_seq += 1
+        snapshots = []
+        for request_id in request_ids:
+            internal_ids = self.prefill_external_ids.get(request_id)
+            if internal_ids:
+                snapshots.extend(
+                    self._prefill_request_snapshot(self.requests[internal_id])
+                    for internal_id in sorted(internal_ids)
+                )
+            elif request_id in self.prefill_terminal:
+                snapshot = dict(self.prefill_terminal[request_id])
+                fence = snapshot.pop("release_fence")
+                completion_fence = snapshot.pop("completion_fence")
+                snapshot["drained"] = (
+                    completion_fence <= self.prefill_processed_step_seq
+                    and (not self.defer_block_free or fence <= self.processed_step_seq)
+                )
+                if snapshot["drained"]:
+                    snapshot["in_flight_tokens"] = 0
+                snapshots.append(snapshot)
+            else:
+                snapshots.append({"request_id": request_id, "status": "UNKNOWN"})
+        queues = {
+            bucket: {"waiting": 0, "running": 0}
+            for bucket in ("short", "medium", "long", "very_long")
+        }
+        for request in self.requests.values():
+            if request.is_finished() or request.num_output_tokens:
+                continue
+            state = "running" if request.status == RequestStatus.RUNNING else "waiting"
+            queues[request.prefill_bucket][state] += 1
+        return {
+            "schema_version": 1,
+            "epoch": self.prefill_progress_epoch,
+            "dp_rank": self.parallel_config.data_parallel_rank,
+            "seq": self.prefill_progress_seq,
+            "scheduler_step": self.current_step,
+            "scheduled_step_seq": self.prefill_scheduled_step_seq,
+            "processed_step_seq": self.prefill_processed_step_seq,
+            "requests": snapshots,
+            "queues": queues,
+            "free_kv_blocks": self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            "shared_ep_budget": self.shared_ep_observation,
+            "shared_ep_fallbacks": dict(self.shared_ep_fallbacks),
+        }
 
     @property
     def pause_state(self) -> PauseState:

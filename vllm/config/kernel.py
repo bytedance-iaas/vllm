@@ -177,6 +177,7 @@ SparseIndexerTopkBackend = Literal[
     "per_row",
     "flashinfer",
     "flashinfer_gvr2",
+    "flashinfer_sm120",
     "torch",
     "aiter",
 ]
@@ -269,6 +270,12 @@ LinearBackend = Literal[
     "xpu_woq",
 ]
 
+MlaBmmBackend = Literal[
+    "auto",
+    "torch",
+    "flashinfer_cudnn",
+]
+
 
 RDNAHybridW4A16PrefillDequantMode = Literal["enable", "disable"]
 
@@ -295,6 +302,34 @@ class KernelConfig:
     Disabled by default because profiling can increase startup time. Requires
     enable_flashinfer_autotune and Model Runner V2. Skipped when
     skip_mm_profiling is set."""
+
+    mla_bmm_backend: MlaBmmBackend = "auto"
+    """Backend for the BF16 query-absorb and value-up BMMs in MLA.
+
+    - "auto" / "torch": use ``torch.bmm``.
+    - "flashinfer_cudnn": use FlashInfer's cuDNN BF16 BMM for 1024-token
+      full chunks. The two exact MLA shapes are tuned once during weight
+      post-processing without enabling full-model FlashInfer autotuning;
+      other token counts retain ``torch.bmm``.
+    """
+
+    enable_sparse_indexer_remap_reuse: bool = False
+    """Reuse SM120 logical-to-physical mappings within an eager forward and
+    indexer generation, with identical page-table identity/layout and stream.
+    HiSparse and captured execution retain the original mapping path.
+    """
+
+    enable_pp_indexer_handoff: bool = False
+    """Send logical TopK indices with hidden/residual tensors for DSA pipeline
+    boundaries. Each outgoing microbatch owns its TopK copy; physical remapping
+    remains local to the receiving stage. Requires runtime PP/PCP validation.
+    """
+
+    enable_idle_dp_draft_skip: bool = False
+    """Let idle DP workers agree to skip unused MTP drafts on Model Runner V2.
+    Experimental: single-module MTP, EP and eager execution only. Real ranks
+    retain the all-rank agreement; the zero-count draft prefill still runs.
+    """
 
     enable_rocm_segmented_attn_autotune: bool = False
     """If True, autotune ROCm segmented attention during kernel warmup on RDNA GPUs."""
@@ -392,6 +427,9 @@ class KernelConfig:
       {512, 1024, 2048}. Also routes prefill chunks of >= 1024 row-relative
       rows to gvr_2. Its latency depends on the logit distribution (rows with
       strong position skew or many ties at the k-th value are slower)
+    - "flashinfer_sm120": Fuse FP8 index scoring and exact top-k with
+      FlashInfer's experimental SM120 DSA indexer for Prefill. Decode keeps
+      the automatic vLLM top-k path.
     - "torch": Use a plain torch.topk implementation (debug reference)
     - "aiter": Use AITER's top_k_per_row_decode kernel (ROCm gfx950 only,
       requires VLLM_ROCM_USE_AITER)
@@ -482,6 +520,13 @@ class KernelConfig:
     @field_validator("linear_backend", mode="before")
     @classmethod
     def _normalize_linear_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower().replace("-", "_")
+        return value
+
+    @field_validator("mla_bmm_backend", mode="before")
+    @classmethod
+    def _normalize_mla_bmm_backend(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
         return value

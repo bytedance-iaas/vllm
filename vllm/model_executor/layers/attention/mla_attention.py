@@ -205,6 +205,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
+from importlib.metadata import version
 from math import lcm
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast
 
@@ -268,7 +269,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
-from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.flashinfer import (
+    autotune as flashinfer_autotune,
+)
+from vllm.utils.flashinfer import (
+    flashinfer_bf16_bmm,
+    has_flashinfer,
+    is_flashinfer_bf16_bmm_supported,
+)
 from vllm.utils.math_utils import cdiv, round_down, round_up
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
@@ -330,6 +338,51 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+_FLASHINFER_MLA_BMM_TUNED: set[tuple[Any, ...]] = set()
+_FLASHINFER_MLA_BMM_ROWS = (1024, 432, 224, 16)
+
+
+def _mla_bmm_rows(
+    max_num_batched_tokens: int, pcp_size: int, block_size: int
+) -> tuple[int, ...]:
+    local_max = cdiv(max_num_batched_tokens, pcp_size)
+    local_block = cdiv(block_size, pcp_size)
+    # Cache-block tails share one policy across requests and measurement points.
+    # Unaligned tails keep the torch fallback.
+    rows = set(range(local_block, local_max + 1, local_block))
+    rows.add(local_max)
+    rows.update(m for m in _FLASHINFER_MLA_BMM_ROWS if m <= local_max)
+    return tuple(sorted(rows, reverse=True))
+
+
+def _mla_bmm_signature(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> tuple:
+    return (
+        a.device,
+        a.dtype,
+        b.dtype,
+        out.dtype,
+        a.shape,
+        b.shape,
+        out.shape,
+        a.stride(),
+        b.stride(),
+        out.stride(),
+    )
+
+
+def run_mla_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    backend: str,
+    tuned_shapes: set[tuple],
+) -> torch.Tensor:
+    if backend == "flashinfer_cudnn" and _mla_bmm_signature(a, b, out) in tuned_shapes:
+        return flashinfer_bf16_bmm(a, b, out, backend="cudnn")
+    return torch.bmm(a, b, out=out)
+
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -665,6 +718,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
+        self.mla_bmm_backend = vllm_config.kernel_config.mla_bmm_backend
+        self.mla_bmm_tuned_shapes: set[tuple] = set()
+        self.mla_bmm_rows = _mla_bmm_rows(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.parallel_config.prefill_context_parallel_size,
+            vllm_config.cache_config.block_size,
+        )
+        if self.mla_bmm_backend == "flashinfer_cudnn" and not (
+            is_flashinfer_bf16_bmm_supported("cudnn")
+        ):
+            raise ValueError(
+                "mla_bmm_backend=flashinfer_cudnn requires a FlashInfer "
+                "build whose bmm_bf16 API supports cuDNN on this GPU."
+            )
         parallel_config = vllm_config.parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
@@ -1418,7 +1485,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                 mqa_ql_nope.resize_((N, B, L))
                 # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                self._mla_bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
             elif (
@@ -1433,7 +1500,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # concat is ~1 ms per layer of a 32k-token prefill).
                 R = mqa_q_pe.shape[-1]
                 mqa_q_cat = mqa_q_nope.new_empty((B, N, L + R))
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1))
+                self._mla_bmm(mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1))
                 mqa_q_cat[..., L:].copy_(mqa_q_pe)
                 mqa_ql_nope, mqa_q_pe = mqa_q_cat, mqa_q_pe[..., :0]
             else:
@@ -1442,7 +1509,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # contiguous; a NoPE model (qk_rope_head_dim == 0) then
                 # needs no concat at all.
                 mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
+                self._mla_bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
 
         if fused_q_heads is None:
             if fp8_attention and self.impl.supports_quant_query_input:
@@ -1602,6 +1669,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     get_dcp_group().all_gather(self.W_UV.contiguous(), dim=0),
                 )
 
+            self._tune_flashinfer_mla_bmm(act_dtype)
+
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
         # for more details.
@@ -1681,7 +1750,83 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+            self._mla_bmm(x, self.W_UV, out=out.transpose(0, 1))
+
+    def _mla_bmm(
+        self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        return run_mla_bmm(
+            a,
+            b,
+            out,
+            backend=self.mla_bmm_backend,
+            tuned_shapes=self.mla_bmm_tuned_shapes,
+        )
+
+    def _tune_flashinfer_mla_bmm(self, act_dtype: torch.dtype) -> None:
+        if self.mla_bmm_backend != "flashinfer_cudnn":
+            return
+        if act_dtype != torch.bfloat16:
+            raise ValueError(
+                "mla_bmm_backend=flashinfer_cudnn requires bfloat16 activations."
+            )
+
+        key = (
+            self.W_UK_T.device,
+            self.num_heads,
+            self.qk_nope_head_dim,
+            self.kv_lora_rank,
+            self.v_head_dim,
+            self.qk_head_dim,
+            self.W_UK_T.stride(),
+            self.W_UV.stride(),
+            self.W_UK_T.dtype,
+            self.W_UV.dtype,
+            act_dtype,
+            current_platform.get_device_capability(self.W_UK_T.device.index),
+            version("flashinfer-python"),
+            torch.backends.cudnn.version(),
+            self.mla_bmm_rows,
+        )
+
+        # Match the runtime token-major activation and output views exactly.
+        # The context is limited to these two calls, so the full-model warmup
+        # does not profile unrelated FlashInfer MoE kernels or their workspace.
+        q_widths = tuple(dict.fromkeys((self.qk_nope_head_dim, self.qk_head_dim)))
+
+        def operands():
+            for m in self.mla_bmm_rows:
+                for q_width in q_widths:
+                    q_token = self.W_UK_T.new_empty((m, self.num_heads, q_width))
+                    q_out_token = self.W_UK_T.new_empty(
+                        (m, self.num_heads, self.kv_lora_rank)
+                    )
+                    yield (
+                        q_token[..., : self.qk_nope_head_dim].transpose(0, 1),
+                        self.W_UK_T,
+                        q_out_token.transpose(0, 1),
+                    )
+                v_token = self.W_UV.new_empty((m, self.num_heads, self.kv_lora_rank))
+                v_out_token = self.W_UV.new_empty((m, self.num_heads, self.v_head_dim))
+                yield v_token.transpose(0, 1), self.W_UV, v_out_token.transpose(0, 1)
+
+        for a, b, out in operands():
+            self.mla_bmm_tuned_shapes.add(_mla_bmm_signature(a, b, out))
+        if key in _FLASHINFER_MLA_BMM_TUNED:
+            return
+        with flashinfer_autotune(tune_mode=True):
+            for a, b, out in operands():
+                flashinfer_bf16_bmm(a, b, out, backend="cudnn")
+        torch.accelerator.synchronize(self.W_UK_T.device)
+        _FLASHINFER_MLA_BMM_TUNED.add(key)
+        logger.info_once(
+            "Tuned FlashInfer cuDNN MLA BMMs for M=%s, Q=(%d,%d), V=(%d,%d).",
+            self.mla_bmm_rows,
+            self.qk_nope_head_dim,
+            self.kv_lora_rank,
+            self.kv_lora_rank,
+            self.v_head_dim,
+        )
 
 
 def unified_mla_kv_cache_update(

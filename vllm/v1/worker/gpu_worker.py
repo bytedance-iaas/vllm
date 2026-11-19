@@ -117,7 +117,10 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import report_usage_stats
+from vllm.v1.utils import (
+    record_function_or_nullcontext,
+    report_usage_stats,
+)
 from vllm.v1.worker.extensible_kv_cache import (
     extend_kv_cache,
     kv_cache_export_handle_types,
@@ -245,6 +248,27 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
         self._external_weight_charges = ExternalWeightCharges()
+
+        self.idle_dp_draft_skip = vllm_config.kernel_config.enable_idle_dp_draft_skip
+        if self.idle_dp_draft_skip:
+            spec = vllm_config.speculative_config
+            if not (
+                current_platform.is_cuda()
+                and spec is not None
+                and spec.method == "mtp"
+                and getattr(
+                    self.model_config.hf_text_config, "num_nextn_predict_layers", 0
+                )
+                == 1
+                and self.parallel_config.data_parallel_size > 1
+                and self.parallel_config.enable_expert_parallel
+                and not self.parallel_config.enable_elastic_ep
+                and vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            ):
+                raise ValueError(
+                    "Idle DP draft skip requires CUDA V2, single-module MTP, "
+                    "static EP/DP and eager execution"
+                )
 
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
@@ -1496,7 +1520,26 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        with record_function_or_nullcontext("gpu_worker: sample_and_draft"):
+            recorder = self.model_runner.prefill_timing
+            step = recorder.begin_sample()
+            result = self.model_runner.sample_tokens(grammar_output)
+            recorder.end_sample(step)
+            return result
+
+    def start_prefill_timing(self, max_steps: str = "32") -> None:
+        self.model_runner.prefill_timing.start(int(max_steps))
+
+    def read_prefill_timing(self, stop: str = "true") -> dict:
+        if stop not in ("true", "false"):
+            raise ValueError("Expected a true/false stop argument")
+        result = self.model_runner.prefill_timing.read(stop=stop == "true")
+        result.update(
+            dp=self.parallel_config.data_parallel_rank,
+            pp=get_pp_group().rank_in_group,
+            pcp=get_pcp_group().rank_in_group,
+        )
+        return result
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1638,12 +1681,23 @@ class Worker(WorkerBase):
         )
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(
-            self.model_runner.decode_query_len,
-            uniform_decode=True,
-            randomize_inputs=self.randomize_dummy_inputs,
-            num_active_loras=0,
-        )
+        skip_kwargs = {"allow_skip_drafts": True} if self.idle_dp_draft_skip else {}
+        with record_function_or_nullcontext("gpu_worker: dp_dummy"):
+            self.model_runner._dummy_run(
+                self.model_runner.decode_query_len,
+                uniform_decode=True,
+                randomize_inputs=self.randomize_dummy_inputs,
+                num_active_loras=0,
+                **skip_kwargs,
+            )
+        if (
+            self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.pipeline_parallel_size == 1
+        ):
+            # Idle DP ranks must participate in EP, but must not enqueue an
+            # unbounded number of dummy forwards ahead of KV-ready requests.
+            # PP ranks need their existing pipeline progress ordering.
+            torch.cuda.current_stream(self.device).synchronize()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

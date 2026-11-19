@@ -191,6 +191,8 @@ class ForwardContext:
     moe_layer_index: int = 0
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
+    sparse_indexer_generation: int = 0
+    sparse_indexer_remaps: dict[tuple, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (

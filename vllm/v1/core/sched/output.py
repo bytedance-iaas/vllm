@@ -329,6 +329,10 @@ class SchedulerOutput:
     # drafter can skip proposing them.
     skip_drafts: bool = False
 
+    # Optional engine-coordinated identity for diagnostic stage measurements.
+    # A request-wave epoch and one engine-loop step, not a GPU wall timestamp.
+    shared_ep_step: tuple[int, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

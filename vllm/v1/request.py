@@ -84,8 +84,10 @@ class Request:
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
         block_hashes: list["BlockHash"] | None = None,
+        external_req_id: str | None = None,
     ) -> None:
         self.request_id = request_id
+        self.external_req_id = external_req_id or request_id
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -189,6 +191,7 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        self.prefill_cached_tokens: int | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
@@ -262,6 +265,7 @@ class Request:
     ) -> "Request":
         return cls(
             request_id=request.request_id,
+            external_req_id=request.external_req_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
@@ -398,6 +402,18 @@ class Request:
             return None
         events, self.events = self.events, []
         return events
+
+    @property
+    def prefill_bucket(self) -> str:
+        """Classify the full input, including its cached prefix."""
+        for limit, bucket in (
+            (16384, "short"),
+            (65536, "medium"),
+            (262144, "long"),
+        ):
+            if self.num_prompt_tokens < limit:
+                return bucket
+        return "very_long"
 
     def take_prefill_stats(self) -> PrefillStats | None:
         if self.prefill_stats is None:
