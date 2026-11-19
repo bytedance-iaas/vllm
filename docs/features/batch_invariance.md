@@ -149,6 +149,19 @@ Other models may also work, but these have been explicitly validated. If you enc
 
 ## Implementation Details
 
+### Deterministic sparse-indexer top-k
+
+`VLLM_DETERMINISTIC_SPARSE_TOPK=1` enables canonical top-k selection independently
+of batch invariance. Sparse indexers keep all candidates above the cutoff score,
+then the lowest-index candidates tied at the cutoff, and return the selected
+indices in ascending order. This also runs when `VLLM_BATCH_INVARIANT=1`.
+
+The shared row-relative prefill and decode paths are covered. Fused prefill
+selection and approximate BF16 DeepSelect ranking are disabled under this flag
+so the canonical pass can use the exact scores. DCP top-k merging and XPU
+absolute-column prefill are outside its coverage. The flag keeps the existing
+attention and MoE backends; it does not make every model operator batch invariant.
+
 When batch invariance is enabled, vLLM:
 
 1. Uses deterministic kernel implementations for attention and other operations

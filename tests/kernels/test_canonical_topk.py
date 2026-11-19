@@ -127,8 +127,6 @@ def test_sparse_indexer_topk_is_canonical(
     selector = get_indexer_topk(backend)
     try:
         selector(logits.to(DEVICE), seq_lens.to(DEVICE), 1, indices, k, cols)
-    except RuntimeError as e:  # backend not available on this device
-        pytest.skip(str(e))
     finally:
         get_indexer_topk.cache_clear()
     torch.testing.assert_close(indices.cpu(), expected, rtol=0, atol=0)
