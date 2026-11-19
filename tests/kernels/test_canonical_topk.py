@@ -6,7 +6,7 @@ same result: candidates above the k-th score plus the lowest-index ties, ascendi
 import pytest
 import torch
 
-from vllm.model_executor.layers.canonical_topk import _ordered_key, canonicalize_topk_
+from vllm.model_executor.layers.canonical_topk import canonicalize_topk_
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -15,15 +15,14 @@ DEVICE = torch.device("cuda")
 
 
 def _reference(logits: torch.Tensor, row_ends: torch.Tensor, k: int) -> torch.Tensor:
-    """Canonical top-k on CPU: rank by (key desc, index asc), keep k, sort ascending."""
+    """Independent CPU oracle: stable value sort, then ascending selected indices."""
     out = torch.full((logits.shape[0], k), -1, dtype=torch.int32)
-    keys = _ordered_key(logits.cpu())
+    scores = logits.cpu().float()
     for r in range(logits.shape[0]):
         n = int(row_ends[r])
-        cols = torch.arange(n)
-        order = sorted(cols.tolist(), key=lambda c: (-int(keys[r, c]), c))
-        keep = sorted(order[: min(k, n)])
-        out[r, : len(keep)] = torch.tensor(keep, dtype=torch.int32)
+        order = torch.argsort(scores[r, :n], descending=True, stable=True)
+        keep = order[: min(k, n)].sort().values.to(torch.int32)
+        out[r, : len(keep)] = keep
     return out
 
 
@@ -33,12 +32,12 @@ def _scrambled_topk(
     """A valid top-k that resolves ties at the k-th score at random, in random
     order, with empty slots scattered (as an atomic radix top-k may produce)."""
     out = torch.full((logits.shape[0], k), -1, dtype=torch.int32)
-    keys = _ordered_key(logits.cpu())
+    scores = logits.cpu().float()
     for r in range(logits.shape[0]):
         n = int(row_ends[r])
         if n == 0:
             continue
-        rk = keys[r, :n]
+        rk = scores[r, :n]
         m = min(k, n)
         kth = torch.sort(rk, descending=True).values[m - 1]
         above = torch.nonzero(rk > kth).flatten()
@@ -141,13 +140,12 @@ def test_determinism_disables_fused_mqa_topk(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(envs, "VLLM_USE_FUSED_MQA_TOPK", True, raising=False)
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False, raising=False)
     monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_SPARSE_TOPK", False, raising=False)
-    monkeypatch.setattr(fused, "fused_mqa_topk_available", lambda: True)
     eligible = dict(
         query_shape=(fused.FUSED_MQA_TOPK_HEADS, fused.FUSED_MQA_TOPK_HEAD_DIM),
         topk=max(fused.FUSED_MQA_TOPK_TOPKS),
         fp4_cache=False,
         full_context=True,
     )
-    assert fused.use_fused_mqa_topk(**eligible)
+    assert fused.use_fused_mqa_topk(**eligible) == fused.fused_mqa_topk_available()
     monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_SPARSE_TOPK", True, raising=False)
     assert not fused.use_fused_mqa_topk(**eligible)
