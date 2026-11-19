@@ -11,6 +11,7 @@ steps:
   source_file_dependencies:
   - vllm/plugins/
   - tests/plugins/
+  - tests/plugins_tests/test_moe_autotune_cache.py
   # Import-time platform resolution (see test_import_vllm_does_not_resolve_platform)
   - vllm/__init__.py
   - vllm/env_override.py
@@ -51,6 +52,7 @@ steps:
   - pip uninstall vllm_add_dummy_endpoint_plugin -y
   # end endpoint plugins test
   # other tests continue here:
+  - pytest -v -s plugins_tests/test_moe_autotune_cache.py
   - pytest -v -s plugins_tests/test_scheduler_plugins.py
   - pip install -e ./plugins/vllm_add_dummy_model
   - pytest -v -s distributed/test_distributed_oot.py
@@ -68,6 +70,7 @@ steps:
       source_file_dependencies:
       - vllm/plugins/
       - tests/plugins/
+      - tests/plugins_tests/test_moe_autotune_cache.py
       - vllm/platforms/rocm.py
       - vllm/__init__.py
       - vllm/env_override.py
