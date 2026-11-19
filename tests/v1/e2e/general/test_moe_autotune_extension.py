@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from pathlib import Path
 
 import httpx
@@ -8,7 +9,7 @@ import pytest
 
 from tests.utils import RemoteOpenAIServer
 
-MODEL = "facebook/opt-125m"
+MODEL = os.environ.get("VLLM_TEST_MOE_CACHE_MODEL", "facebook/opt-125m")
 EXTENSION = "vllm.plugins.tk300_moe_cache.MoEAutotuneCacheWorker"
 
 

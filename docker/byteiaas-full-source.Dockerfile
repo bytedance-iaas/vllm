@@ -7,21 +7,32 @@ LABEL org.opencontainers.image.source="https://github.com/bytedance-iaas/vllm" \
       org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
       org.byteiaas.flashinfer.revision="${FLASHINFER_BUILD_COMMIT}"
 
+ENV VIRTUAL_ENV="/opt/byteiaas/.venv" \
+    PATH="/opt/byteiaas/.venv/bin:${PATH}" \
+    PYTHONPATH=""
+WORKDIR /opt/byteiaas
+
 COPY --from=byteiaas-wheels wheel.sha256 source-commit /opt/byteiaas/vllm/
 COPY --from=byteiaas-flashinfer-wheels wheel.sha256 source-commit /opt/byteiaas/flashinfer/
 RUN --mount=type=bind,from=byteiaas-wheels,target=/wheels/vllm \
     --mount=type=bind,from=byteiaas-flashinfer-wheels,target=/wheels/flashinfer \
     set -eu; \
+    uv venv --python /usr/bin/python3 --system-site-packages "${VIRTUAL_ENV}"; \
+    uv pip check --python "${VIRTUAL_ENV}/bin/python" > /tmp/byteiaas-base-dependencies 2>&1 || test "$?" -eq 1; \
+    sed -n '/^The package /p' /tmp/byteiaas-base-dependencies | sort > /opt/byteiaas/base-dependency-conflicts.txt; \
     test "$(cat /wheels/vllm/source-commit)" = "${VLLM_BUILD_COMMIT}"; \
     test "$(cat /wheels/flashinfer/source-commit)" = "${FLASHINFER_BUILD_COMMIT}"; \
     test -n "${VLLM_BUILD_COMMIT}"; test -n "${FLASHINFER_BUILD_COMMIT}"; \
     cd /wheels/vllm; sha256sum --check --strict wheel.sha256; \
     set -- vllm-*.whl; test "$#" -eq 1; \
-    uv pip install --system --no-deps --reinstall "$1"; \
+    uv pip install --python "${VIRTUAL_ENV}/bin/python" --no-deps --reinstall "$1"; \
     cd /wheels/flashinfer; sha256sum --check --strict wheel.sha256; \
     set -- flashinfer_python-*.whl; test "$#" -eq 1; \
-    uv pip install --system --no-deps --reinstall "$1"; \
-    uv pip check --system; \
+    uv pip install --python "${VIRTUAL_ENV}/bin/python" --no-deps --reinstall "$1"; \
+    uv pip check --python "${VIRTUAL_ENV}/bin/python" > /tmp/byteiaas-source-dependencies 2>&1 || test "$?" -eq 1; \
+    sed -n '/^The package /p' /tmp/byteiaas-source-dependencies | sort > /opt/byteiaas/source-dependency-conflicts.txt; \
+    diff -u /opt/byteiaas/base-dependency-conflicts.txt /opt/byteiaas/source-dependency-conflicts.txt; \
+    cat /opt/byteiaas/source-dependency-conflicts.txt; \
     rm -rf /opt/tk300-overlay/vllm /opt/tk300-overlay/flashinfer
 
 RUN VLLM_BUILD_COMMIT="${VLLM_BUILD_COMMIT}" FLASHINFER_BUILD_COMMIT="${FLASHINFER_BUILD_COMMIT}" python3 - <<'PY'
@@ -48,6 +59,4 @@ if record["packages"]["vllm"]["version"] != "0.33.0":
 Path("/opt/byteiaas/source-provenance.json").write_text(json.dumps(record, indent=2) + "\n")
 PY
 
-ENV PYTHONPATH=""
-WORKDIR /vllm-workspace
 ENTRYPOINT ["vllm", "serve"]
