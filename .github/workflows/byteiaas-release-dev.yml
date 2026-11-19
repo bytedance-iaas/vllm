@@ -14,6 +14,17 @@ on:
         default: ""
         type: string
 
+      flashinfer_commit:
+        description: Optional full FlashInfer source SHA; empty retains the original base dependency path
+        required: false
+        default: ""
+        type: string
+      flashinfer_ref:
+        description: FlashInfer integration branch containing the selected source SHA
+        required: false
+        default: poc_tk300_h20
+        type: string
+
 permissions:
   contents: read
 
@@ -101,6 +112,7 @@ jobs:
     env:
       BASE_IMAGE: ${{ inputs.base_image }}
       IMAGE_TAG: ${{ inputs.image_tag }}
+      FLASHINFER_BUILD_COMMIT: ${{ inputs.flashinfer_commit }}
       CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
@@ -123,6 +135,41 @@ jobs:
           cd byteiaas-wheel-dist
           test "$(cat source-commit)" = "${GITHUB_SHA}"
           sha256sum --check --strict wheel.sha256
+
+      - name: Checkout full FlashInfer source
+        if: inputs.flashinfer_commit != ''
+        uses: actions/checkout@v4
+        with:
+          repository: bytedance-iaas/flashinfer
+          ref: ${{ inputs.flashinfer_commit }}
+          path: byteiaas-flashinfer-source
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build the pinned FlashInfer wheel
+        if: inputs.flashinfer_commit != ''
+        env:
+          FLASHINFER_COMMIT: ${{ inputs.flashinfer_commit }}
+          FLASHINFER_REF: ${{ inputs.flashinfer_ref }}
+        run: |
+          set -euo pipefail
+          [[ "${FLASHINFER_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C byteiaas-flashinfer-source rev-parse HEAD)" = "${FLASHINFER_COMMIT}"
+          git -C byteiaas-flashinfer-source merge-base --is-ancestor "${FLASHINFER_COMMIT}" "origin/${FLASHINFER_REF}"
+          mkdir -p byteiaas-flashinfer-dist
+          docker run --rm --network host --entrypoint bash \
+            -e HTTP_PROXY -e HTTPS_PROXY -e ALL_PROXY -e NO_PROXY \
+            -e CUDA_VISIBLE_DEVICES= -e BUILD_NVEP=0 \
+            -v "${PWD}/byteiaas-flashinfer-source:/source:ro" \
+            -v "${PWD}/byteiaas-flashinfer-dist:/out" \
+            "${BASE_IMAGE}" -c 'set -e; cp -a /source /tmp/flashinfer-source; cd /tmp/flashinfer-source; uv pip install --system --no-deps "setuptools>=77" wheel; uv build --wheel --no-build-isolation --out-dir /out'
+          cd byteiaas-flashinfer-dist
+          shopt -s nullglob
+          wheels=(flashinfer_python-*.whl)
+          test "${#wheels[@]}" -eq 1
+          sha256sum "${wheels[@]}" > wheel.sha256
+          printf '%s\n' "${FLASHINFER_COMMIT}" > source-commit
 
       - name: Resolve publish target
         run: |
@@ -147,8 +194,15 @@ jobs:
       - name: Build and push image using the wheel
         run: |
           set -euo pipefail
+          dockerfile=docker/byteiaas.Dockerfile
+          extra_args=()
+          if [[ -n "${FLASHINFER_BUILD_COMMIT}" ]]; then
+            dockerfile=docker/byteiaas-full-source.Dockerfile
+            extra_args+=(--build-context byteiaas-flashinfer-wheels=./byteiaas-flashinfer-dist
+              --build-arg FLASHINFER_BUILD_COMMIT="${FLASHINFER_BUILD_COMMIT}")
+          fi
           docker buildx build --push --platform linux/amd64 \
-            -f docker/byteiaas.Dockerfile \
+            -f "${dockerfile}" "${extra_args[@]}" \
             --build-context byteiaas-wheels=./byteiaas-wheel-dist \
             --build-arg BASE_IMAGE="${BASE_IMAGE}" \
             --build-arg VLLM_BUILD_COMMIT="${GITHUB_SHA}" \

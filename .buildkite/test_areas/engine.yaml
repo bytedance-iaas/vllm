@@ -91,6 +91,7 @@ steps:
   source_file_dependencies:
     - vllm/v1/
     - tests/v1/e2e/general/
+    - vllm/plugins/tk300_moe_cache.py
   commands:
     - pytest -v -s v1/e2e/general/test_async_scheduling.py
   mirror:
@@ -113,6 +114,7 @@ steps:
   source_file_dependencies:
     - vllm/v1/
     - tests/v1/e2e/general/
+    - vllm/plugins/tk300_moe_cache.py
   commands:
     - pytest -v -s v1/e2e/general/test_async_scheduling_accuracy.py
   mirror:
@@ -135,6 +137,7 @@ steps:
   source_file_dependencies:
     - vllm/v1/
     - tests/v1/e2e/general/
+    - vllm/plugins/tk300_moe_cache.py
   commands:
     - >-
       pytest -v -s
@@ -163,6 +166,7 @@ steps:
       source_file_dependencies:
       - vllm/v1/
       - tests/v1/e2e/general/
+      - vllm/plugins/tk300_moe_cache.py
       - vllm/platforms/rocm.py
 
 # Keep the large Gemma-3n and Mamba MRV2 warmup allocations on 35GB slices.
@@ -176,6 +180,7 @@ steps:
     - vllm/model_executor/layers/mamba/gdn/
     - vllm/third_party/flash_linear_attention/ops/
     - tests/v1/e2e/general/
+    - vllm/plugins/tk300_moe_cache.py
   commands:
     - pytest -v -s v1/e2e/general/test_kv_sharing_fast_prefill.py
     - >-
@@ -199,6 +204,7 @@ steps:
       - vllm/model_executor/layers/mamba/gdn/
       - vllm/third_party/flash_linear_attention/ops/
       - tests/v1/e2e/general/
+      - vllm/plugins/tk300_moe_cache.py
       - vllm/platforms/rocm.py
       commands:
       - pytest -v -s v1/e2e/general/test_kv_sharing_fast_prefill.py
