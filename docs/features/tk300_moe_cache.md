@@ -28,6 +28,12 @@ existing BMM cache. The baseline without a sampling-policy configuration
 field has the existing legacy policy; an explicit policy still must match
 the qualified recipe.
 
+The original `0.7.2.post1+tk3005.1de96ee5` cache declares16/28 native
+GEMM1/GEMM2 tactics. The qualified complete-source `0.7.2.post1` build
+declares16/32; its real-input replay still selects10/41. The manifest count
+must match its qualified library identity. Regenerate the native artifact and
+verify its numeric/hit/fallback behavior when switching between these builds.
+
 Leave `TK300_MOE_AUTOTUNE_MANIFEST` unset to disable loading. Changing the
 software, checkpoint, device or parallel recipe requires requalification;
 TK300 tactics must not be reused on H20 solely because the code shares an
