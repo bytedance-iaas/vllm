@@ -1,0 +1,158 @@
+name: ByteIAAS TK300 H20 Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: ByteIAAS runtime base with matching PyTorch/CUDA and serving dependencies
+        required: true
+        default: iaas-gpu-cn-beijing.cr.volces.com/serving/vllm@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3
+        type: string
+      image_tag:
+        description: Optional image tag; defaults to poc-tk300-h20-<commit SHA>
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: byteiaas-tk300-h20-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HTTP_PROXY: http://100.68.162.211:3128
+  HTTPS_PROXY: http://100.68.162.211:3128
+  ALL_PROXY: http://100.68.162.211:3128
+  NO_PROXY: localhost,127.0.0.1,::1,.ivolces.com,.volceapi.com,.byted.org,mirrors.volces.com,iaas-gpu-cn-beijing.cr.volces.com
+
+jobs:
+  build-wheel:
+    if: github.repository == 'bytedance-iaas/vllm'
+    runs-on: [self-hosted, x64-vllm-wheel-build-node, vllm-byteiaas-build-01]
+    timeout-minutes: 1440
+    outputs:
+      artifact_name: ${{ steps.wheel.outputs.artifact_name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Build vLLM wheel
+        run: |
+          set -euo pipefail
+          docker buildx build --load --network=host \
+            --target build -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.3 \
+            --build-arg 'torch_cuda_arch_list=9.0 12.0' \
+            --build-arg max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-32}" \
+            --build-arg nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-4}" \
+            --build-arg HTTP_PROXY --build-arg HTTPS_PROXY \
+            --build-arg ALL_PROXY --build-arg NO_PROXY \
+            --build-arg RUN_WHEEL_CHECK=false \
+            -t "local/byteiaas-tk300-h20-wheel:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" .
+
+      - name: Export wheel and source identity
+        id: wheel
+        run: |
+          set -euo pipefail
+          wheel_dir="${RUNNER_TEMP}/byteiaas-wheel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${wheel_dir}"
+          container="$(docker create "local/byteiaas-tk300-h20-wheel:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")"
+          trap 'docker rm -f "${container}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container}:/workspace/dist/." "${wheel_dir}/"
+          cd "${wheel_dir}"
+          shopt -s nullglob
+          wheels=(vllm-*.whl)
+          test "${#wheels[@]}" -eq 1
+          sha256sum "${wheels[@]}" > wheel.sha256
+          printf '%s\n' "${GITHUB_SHA}" > source-commit
+          echo "BYTEIAAS_WHEEL_DIR=${wheel_dir}" >> "${GITHUB_ENV}"
+          echo "artifact_name=byteiaas-vllm-wheel-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.wheel.outputs.artifact_name }}
+          path: |
+            ${{ env.BYTEIAAS_WHEEL_DIR }}/vllm-*.whl
+            ${{ env.BYTEIAAS_WHEEL_DIR }}/wheel.sha256
+            ${{ env.BYTEIAAS_WHEEL_DIR }}/source-commit
+          if-no-files-found: error
+          retention-days: 14
+
+  build-image:
+    if: github.repository == 'bytedance-iaas/vllm'
+    needs: build-wheel
+    runs-on: [self-hosted, x64-vllm-docker-build-node, vllm-byteiaas-build-02]
+    timeout-minutes: 120
+    env:
+      BASE_IMAGE: ${{ inputs.base_image }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'vllm' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download same-run wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-wheel.outputs.artifact_name }}
+          path: byteiaas-wheel-dist
+
+      - name: Verify wheel
+        run: |
+          set -euo pipefail
+          cd byteiaas-wheel-dist
+          test "$(cat source-commit)" = "${GITHUB_SHA}"
+          sha256sum --check --strict wheel.sha256
+
+      - name: Resolve publish target
+        run: |
+          set -euo pipefail
+          : "${CR_REGISTRY:?Set VOLCENGINE_CR_REGISTRY}"
+          : "${CR_NAMESPACE:?Set VOLCENGINE_CR_NAMESPACE}"
+          image="${CR_REGISTRY}/${CR_NAMESPACE}/${CR_REPOSITORY}:${IMAGE_TAG:-poc-tk300-h20-${GITHUB_SHA:0:12}}"
+          echo "BYTEIAAS_IMAGE=${image}" >> "${GITHUB_ENV}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Login to Volcengine CR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.CR_REGISTRY }}
+          username: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+          password: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+
+      - name: Build and push image using the wheel
+        run: |
+          set -euo pipefail
+          docker buildx build --push --platform linux/amd64 \
+            -f docker/byteiaas.Dockerfile \
+            --build-context byteiaas-wheels=./byteiaas-wheel-dist \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            --build-arg VLLM_BUILD_COMMIT="${GITHUB_SHA}" \
+            --build-arg HTTP_PROXY --build-arg HTTPS_PROXY \
+            --build-arg ALL_PROXY --build-arg NO_PROXY \
+            -t "${BYTEIAAS_IMAGE}" .
+          echo "Published: \`${BYTEIAAS_IMAGE}\`" >> "${GITHUB_STEP_SUMMARY}"

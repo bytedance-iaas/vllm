@@ -1,5 +1,6 @@
 /.venv
 /build
+/byteiaas-wheel-dist/
 /.rocm-version/
 /.rocm-wheel/
 /.rocm-kernel-map/
