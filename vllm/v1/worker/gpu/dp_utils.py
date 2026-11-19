@@ -100,58 +100,47 @@ def sync_cudagraph_and_dp_padding(
         )
         return synced_desc, None
 
-    if torch.all(allow_ubatching_across_dp == 1):
-        # This rank voted too, so its caller passed a config.
+    # This experiment admits only uniform FULL target forwards with real work
+    # in both microbatches on every rank. Other steps retain unsplit consensus.
+    if (
+        torch.all(allow_ubatching_across_dp == 1)
+        and synced_uniform_token_count is not None
+        and uniform_decode
+        and torch.all(cg_mode_across_dp == CUDAGraphMode.FULL.value)
+    ):
         assert parallel_config is not None
-        # A uniform decode only if every rank runs the same uniform query
-        # length, so every rank reaches the same answer here.
-        uniform_decode_across_dp = uniform_decode and torch.all(
-            uniform_token_counts_across_dp == (uniform_token_count or 0)
-        )
+        min_tokens = int(num_tokens_across_dp.min())
         if check_ubatch_thresholds(
-            parallel_config,
-            # Thresholds only grow with the token count, so holding the smallest
-            # rank to them holds every rank to them.
-            int(num_tokens_across_dp.min()),
-            uniform_decode=uniform_decode_across_dp,
-        ):
-            # Expert all-to-all requires every rank to split and pad equally.
-            # Empty microbatches run as dummy batches.
-            ubatch_num_tokens = int(num_tokens_across_dp.max())
+            parallel_config, min_tokens, uniform_decode=True
+        ) and cudagraph_manager is not None:
             num_ubatches = get_num_ubatches(parallel_config)
-            ubatch_desc = None
-            if cudagraph_manager is not None:
-                # Match a FULL microbatched CUDA graph, falling back to an eager
-                # descriptor if no graph matches.
-                ubatch_desc = cudagraph_manager.dispatch(
-                    num_reqs,
-                    ubatch_num_tokens,
-                    synced_uniform_token_count,
-                    num_active_loras=num_active_loras,
-                    num_ubatches=num_ubatches,
-                )
-                if 2 * int(num_tokens_across_dp.min()) < ubatch_desc.num_tokens:
-                    # If one rank has an empty second microbatch, run without
-                    # CUDA graphs.
-                    ubatch_desc = None
-            if ubatch_desc is None:
-                ubatch_desc = BatchExecutionDescriptor(
-                    cg_mode=CUDAGraphMode.NONE,
-                    num_tokens=ubatch_num_tokens,
-                    num_reqs=num_reqs,
-                    num_ubatches=num_ubatches,
-                )
-            # Refresh the token count to include CUDA graph padding.
-            ubatch_num_tokens = ubatch_desc.num_tokens
-            return ubatch_desc, DPSyncState(
-                num_tokens_across_dp=torch.full_like(
-                    num_tokens_across_dp, ubatch_num_tokens
-                ),
-                uniform_token_count=synced_uniform_token_count,
-                eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
-                num_reqs=int(num_reqs_across_dp.max()),
-                skip_drafts=skip_drafts,
+            ubatch_desc = cudagraph_manager.dispatch(
+                num_reqs,
+                int(num_tokens_across_dp.max()),
+                synced_uniform_token_count,
+                num_active_loras=num_active_loras,
+                num_ubatches=num_ubatches,
             )
+            split = (
+                ubatch_desc.num_tokens
+                // (synced_uniform_token_count * num_ubatches)
+                * synced_uniform_token_count
+            )
+            if (
+                ubatch_desc.cg_mode == CUDAGraphMode.FULL
+                and ubatch_desc.num_ubatches == num_ubatches
+                and split > 0
+                and min_tokens > split * (num_ubatches - 1)
+            ):
+                return ubatch_desc, DPSyncState(
+                    num_tokens_across_dp=torch.full_like(
+                        num_tokens_across_dp, ubatch_desc.num_tokens
+                    ),
+                    uniform_token_count=synced_uniform_token_count,
+                    eager=False,
+                    num_reqs=int(num_reqs_across_dp.max()),
+                    skip_drafts=skip_drafts,
+                )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
 

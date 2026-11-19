@@ -410,7 +410,7 @@ class DeepseekV32Attention(MLAAttention):
             indexer_k_norm_bias,
             indexer_k_norm_eps,
             indexer_k_rope_cos_sin_cache,
-            self.topk_indices_buffer,
+            self.impl.topk_indices_buffer,  # type: ignore[attr-defined]
             slot_mapping=mla_slot,
             indexer_slot_mapping=indexer_slot,
             indexer_k_cache=indexer_k_cache,
@@ -441,14 +441,20 @@ class DeepseekV32Attention(MLAAttention):
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         if prepare_mqa_query:
-            ql_nope = q_nope.new_empty(
-                (q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank)
-            )
-            self._mla_bmm(
-                q_nope.transpose(0, 1),
-                self.W_UK_T,
-                out=ql_nope.transpose(0, 1),
-            )
+            if self.mla_bmm_backend == "flashinfer_cudnn":
+                ql_nope = q_nope.new_empty(
+                    (q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank)
+                )
+                self._mla_bmm(
+                    q_nope.transpose(0, 1),
+                    self.W_UK_T,
+                    out=ql_nope.transpose(0, 1),
+                )
+            else:
+                # Keep the torch query-absorb layout used by Decode.
+                ql_nope = torch.bmm(
+                    q_nope.transpose(0, 1), self.W_UK_T
+                ).transpose(0, 1)
         else:
             ql_nope = q_nope
 
@@ -525,7 +531,7 @@ class DeepseekV32Attention(MLAAttention):
                 self.indexer.head_dim,
                 self.indexer.max_model_len,
                 self.indexer.max_total_seq_len,
-                self.topk_indices_buffer,
+                self.impl.topk_indices_buffer,  # type: ignore[attr-defined]
                 skip_k_cache_insert=not self.use_pcp,
                 use_pcp=self.use_pcp,
                 pcp_shard_decode_requests=self.pcp_shard_decode_requests,
