@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 ARG BASE_IMAGE=iaas-gpu-cn-beijing.cr.volces.com/serving/vllm@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3
 FROM ${BASE_IMAGE}
 
