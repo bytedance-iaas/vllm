@@ -64,7 +64,11 @@ jobs:
       - name: Build vLLM wheel
         run: |
           set -euo pipefail
-          docker buildx build --load --network=host \
+          version_args=()
+          if [[ -n "${{ inputs.flashinfer_commit }}" ]]; then
+            version_args+=(--build-arg VLLM_VERSION_OVERRIDE=0.33.0)
+          fi
+          docker buildx build --load --network=host "${version_args[@]}" \
             --target build -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.3 \
             --build-arg 'torch_cuda_arch_list=9.0 12.0' \

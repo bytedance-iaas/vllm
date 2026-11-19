@@ -583,6 +583,9 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
 
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
+# Optional fixed compatibility identity; empty keeps the original version path.
+ARG VLLM_VERSION_OVERRIDE=""
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
 ARG TARGETPLATFORM
 ARG INSTALL_RUBIN_PRERELEASE
 
