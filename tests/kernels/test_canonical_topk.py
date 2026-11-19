@@ -106,11 +106,14 @@ def test_torch_topk_with_signed_zeros_keeps_the_maximum():
 
 @pytest.mark.parametrize("backend", ["persistent", "cooperative", "per_row", "torch"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_sparse_indexer_topk_is_canonical(
+def test_sparse_indexer_topk_respects_dtype_and_is_canonical(
     monkeypatch: pytest.MonkeyPatch, workspace_init, backend, dtype
 ):
-    """With VLLM_DETERMINISTIC_SPARSE_TOPK every decode top-k backend returns the
-    canonical result, whatever its own tie choice and order."""
+    """Supported decode inputs are canonical; per_row retains its FP32 contract.
+
+    The native per_row kernel reads const_data_ptr<float>() in sampler.cu.
+    Enabling canonicalization must not imply BF16 support for that kernel.
+    """
     import vllm.envs as envs
     from vllm.model_executor.layers.indexer_topk import get_indexer_topk
 
@@ -125,6 +128,14 @@ def test_sparse_indexer_topk_is_canonical(
     indices = torch.full((rows, k), -1, dtype=torch.int32, device=DEVICE)
     selector = get_indexer_topk(backend)
     try:
+        if backend == "per_row" and dtype == torch.bfloat16:
+            with pytest.raises(
+                RuntimeError,
+                match=r"expected scalar type .*Float but found BFloat16",
+            ):
+                selector(logits.to(DEVICE), seq_lens.to(DEVICE), 1, indices, k, cols)
+            assert torch.all(indices == -1)
+            return
         selector(logits.to(DEVICE), seq_lens.to(DEVICE), 1, indices, k, cols)
     finally:
         get_indexer_topk.cache_clear()
