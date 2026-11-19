@@ -162,6 +162,19 @@ so the canonical pass can use the exact scores. DCP top-k merging and XPU
 absolute-column prefill are outside its coverage. The flag keeps the existing
 attention and MoE backends; it does not make every model operator batch invariant.
 
+### Deterministic single-group MoE routing
+
+`VLLM_DETERMINISTIC_GROUPED_TOPK=1` keeps CUDA single-group routing with
+256 through 1023 experts on its native block kernel. Large routing batches
+are processed in chunks of at most 1024 tokens, matching the weights used for
+short batches. The default native block/warp transition can change unbiased
+weights even when the selected expert IDs are identical.
+
+This switch is independent of full batch invariance and also applies under
+`VLLM_BATCH_INVARIANT=1`. It preserves the attention, quantization, MoE dispatch
+and speculative-decoding backends. Other model operations still need their own
+invariance validation; the switch alone does not guarantee model-wide equality.
+
 When batch invariance is enabled, vLLM:
 
 1. Uses deterministic kernel implementations for attention and other operations

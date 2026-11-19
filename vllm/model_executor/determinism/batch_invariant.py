@@ -629,6 +629,7 @@ def softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         output.stride(0),
         n_cols,
         BLOCK_SIZE=1024,
+        LOG=False,
     )
     return output.reshape(original_shape)
 
