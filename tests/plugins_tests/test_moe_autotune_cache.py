@@ -16,7 +16,12 @@ def artifacts(tmp_path):
         f"('trtllm::fused_moe::{stage}', 'MoERunner', {SHAPES}, {EXTRAS})"
         for stage in ("gemm1", "gemm2")
     ]
-    cache = {"_metadata": {"gpu": "TK300 72G"}}
+    cache = {
+        "_metadata": {
+            "gpu": "TK300 72G",
+            "flashinfer_version": "0.7.2.post1+tk3005.1de96ee5",
+        }
+    }
     for key, tactic in zip(keys, (10, 41), strict=True):
         cache[key] = [
             "MoERunner",
@@ -42,8 +47,18 @@ def artifacts(tmp_path):
     return path, manifest, cache
 
 
-def test_verified_native_pair_can_be_loaded_without_rewriting_artifacts(tmp_path):
+@pytest.mark.parametrize("counts", [[16, 28], [16, 32]])
+def test_verified_native_pair_can_be_loaded_without_rewriting_artifacts(
+    tmp_path, counts
+):
     path, manifest, cache = artifacts(tmp_path)
+    manifest["native_profile_counts"] = counts
+    if counts == [16, 32]:
+        cache["_metadata"]["flashinfer_version"] = "0.7.2.post1"
+    raw = json.dumps(cache).encode()
+    (tmp_path / "native.json").write_bytes(raw)
+    manifest["cache_sha256"] = hashlib.sha256(raw).hexdigest()
+    path.write_text(json.dumps(manifest))
     raw, readback = read_manifest(path, {"q": 8192})
     assert readback["profile_ids"] == [10, 41]
     assert json.loads(raw) == cache
@@ -52,7 +67,18 @@ def test_verified_native_pair_can_be_loaded_without_rewriting_artifacts(tmp_path
 
 @pytest.mark.parametrize(
     "change",
-    ["schema", "recipe", "checksum", "stage", "shape", "policy", "extra_op", "type"],
+    [
+        "schema",
+        "recipe",
+        "checksum",
+        "stage",
+        "shape",
+        "policy",
+        "extra_op",
+        "type",
+        "counts",
+        "library_counts",
+    ],
 )
 def test_rejects_unverified_cache_before_native_loading(tmp_path, change):
     path, manifest, cache = artifacts(tmp_path)
@@ -64,6 +90,10 @@ def test_rejects_unverified_cache_before_native_loading(tmp_path, change):
         manifest["cache_sha256"] = "0" * 64
     elif change == "stage":
         manifest["profile_ids"] = [41, 10]
+    elif change == "counts":
+        manifest["native_profile_counts"] = [16, 33]
+    elif change == "library_counts":
+        cache["_metadata"]["flashinfer_version"] = "0.7.2.post1"
     elif change == "shape":
         key = manifest["native_file_keys"][0]
         new_key = key.replace("(8192, 3072)", "(4096, 3072)")

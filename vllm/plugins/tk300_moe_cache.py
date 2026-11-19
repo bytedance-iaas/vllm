@@ -41,8 +41,8 @@ def read_manifest(path: Path, recipe: dict) -> tuple[bytes, dict]:
     if manifest.get("native_bucket_interval") != [4097, 8192]:
         raise ValueError("Unexpected native bucket mapping")
     counts = manifest.get("native_profile_counts")
-    if counts != [16, 28]:
-        raise ValueError("Unexpected pinned SM120 NVFP4 tactic counts")
+    if counts not in ([16, 28], [16, 32]):
+        raise ValueError("Unexpected qualified SM120 NVFP4 tactic counts")
     profiles = manifest.get("profile_ids")
     if not isinstance(profiles, list) or len(profiles) != 2:
         raise ValueError("MoE manifest needs two profile IDs")
@@ -59,6 +59,12 @@ def read_manifest(path: Path, recipe: dict) -> tuple[bytes, dict]:
     entries = json.loads(raw)
     if not isinstance(entries.get("_metadata"), dict):
         raise TypeError("MoE cache has no native environment identity")
+    expected_counts = {
+        "0.7.2.post1+tk3005.1de96ee5": [16, 28],
+        "0.7.2.post1": [16, 32],
+    }.get(entries["_metadata"].get("flashinfer_version"))
+    if counts != expected_counts:
+        raise ValueError("MoE tactic counts do not match the qualified library")
     keys = [key for key in entries if not key.startswith("_")]
     if sorted(keys) != sorted(manifest.get("native_file_keys", [])) or len(keys) != 2:
         raise ValueError("MoE cache must contain exactly the two verified GEMM entries")
