@@ -301,6 +301,10 @@ class EngineClient(ABC):
         """Get supported tasks."""
         raise NotImplementedError
 
+    async def get_prefill_progress(self, request_ids: list[str]) -> list[dict]:
+        """Read bounded engine snapshots for an internal prefill router."""
+        raise NotImplementedError
+
     async def init_weight_transfer_engine(
         self, init_request: WeightTransferInitRequest
     ) -> None:

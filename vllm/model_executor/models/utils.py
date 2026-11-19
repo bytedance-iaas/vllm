@@ -952,7 +952,11 @@ def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
     )
 
 
-def make_empty_intermediate_tensors_factory(keys: list[str], hidden_size: int):
+def make_empty_intermediate_tensors_factory(
+    keys: list[str], hidden_size: int, buffers: dict[str, torch.Tensor] | None = None
+):
+    buffers = buffers or {}
+
     def make_empty_intermediate_tensors(
         batch_size: int,
         dtype: torch.dtype,
@@ -962,6 +966,12 @@ def make_empty_intermediate_tensors_factory(keys: list[str], hidden_size: int):
             {
                 key: torch.zeros((batch_size, hidden_size), dtype=dtype, device=device)
                 for key in keys
+            }
+            | {
+                key: torch.zeros(
+                    (batch_size, *buffer.shape[1:]), dtype=buffer.dtype, device=device
+                )
+                for key, buffer in buffers.items()
             }
         )
 

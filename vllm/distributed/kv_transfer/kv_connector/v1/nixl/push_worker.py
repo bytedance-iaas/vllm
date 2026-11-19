@@ -191,6 +191,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """Pre-process metadata; defer NIXL ops to the writer thread."""
         if self.pcp_rank > 0 and not self.pcp_dcp_sharded:
+            # Only rank 0 pushes, but every worker must complete the send fence.
+            self._replicated_pcp_done_sending.update(metadata.reqs_to_send)
             return
 
         # D-side: track reqs waiting for P to push.

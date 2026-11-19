@@ -394,6 +394,9 @@ class AsyncLLM(EngineClient):
 
         return self._supported_tasks
 
+    async def get_prefill_progress(self, request_ids: list[str]) -> list[dict]:
+        return await self.engine_core.get_prefill_progress_async(request_ids)
+
     async def add_request(
         self,
         request_id: str,

@@ -435,6 +435,12 @@ class EngineCore:
         self._log_pooler_config(supported_tasks)
         return supported_tasks
 
+    def get_prefill_progress(self, request_ids: list[str]) -> dict[str, Any]:
+        snapshot = self.scheduler.get_prefill_progress(request_ids)
+        snapshot["dp_wave"] = getattr(self, "current_wave", None)
+        snapshot["dp_step"] = getattr(self, "step_counter", None)
+        return snapshot
+
     def _log_pooler_config(self, supported_tasks: tuple[SupportedTask, ...]) -> None:
         if self._pooler_config_logged:
             return
@@ -2329,6 +2335,20 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
         )
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.core.sched.shared_ep_budget import SharedEPBudget
+
+        self.shared_ep_scheduler = (
+            self.scheduler if isinstance(self.scheduler, Scheduler) else None
+        )
+        cfg = (
+            self.shared_ep_scheduler.shared_ep_config
+            if self.shared_ep_scheduler is not None
+            else None
+        )
+        if cfg is not None and not vllm_config.parallel_config.enable_expert_parallel:
+            raise ValueError("Shared EP budgets require an expert domain")
+        self.shared_ep_budget = SharedEPBudget(cfg) if cfg is not None else None
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
@@ -2461,6 +2481,34 @@ class DPEngineCoreProc(EngineCoreProc):
             and self.step_counter % self.prefill_schedule_interval != 0
         )
 
+    def _prepare_shared_ep_budget(self) -> None:
+        if self.shared_ep_budget is None:
+            return
+        # Match the same running/idle edge as GPU/dummy participation. Never
+        # condition a collective on this rank having a nonempty local queue.
+        # Finished notifications/connector cleanup can step only one idle rank.
+        # They must not enter a collective after the shared wave has ended.
+        if not self.engines_running and not self.scheduler.has_unfinished_requests():
+            return
+        import torch.distributed as dist
+
+        from vllm.v1.core.sched.shared_ep_budget import BudgetSnapshot
+
+        scheduler = self.shared_ep_scheduler
+        assert scheduler is not None
+        local = scheduler.get_shared_ep_snapshot(self.current_wave, self.step_counter)
+        snapshots: list[BudgetSnapshot] = [local] * self.dp_size
+        dist.all_gather_object(snapshots, local, group=self.dp_group)
+        decision = self.shared_ep_budget.decide(snapshots)
+        scheduler.apply_shared_ep_decision(decision, self.dp_rank)
+        assert scheduler.shared_ep_observation is not None
+        scheduler.shared_ep_observation.update(
+            wave=self.current_wave,
+            step=self.step_counter,
+            deficits_ms=list(self.shared_ep_budget.deficits),
+            ages_steps=list(self.shared_ep_budget.ages),
+        )
+
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
@@ -2491,6 +2539,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 elif not state.commit_requested and state.is_ready_for_switch():
                     self.process_input_queue_block = True
 
+            self._prepare_shared_ep_budget()
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 

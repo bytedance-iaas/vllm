@@ -473,6 +473,10 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
 
+    # Query-segment boundaries corresponding to cu_seq_lens. Query slices may
+    # leave empty segments, which are valid and ignored by the fused indexer.
+    cu_query_lens: torch.Tensor | None = None
+    min_visible_keys: int = 0
     pcp_deinterleave_idx: torch.Tensor | None = None
 
 
@@ -1026,6 +1030,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             else 0
         )
         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
+        self.sm120_prefill = (
+            self.vllm_config.kernel_config.sparse_indexer_topk_backend
+            == "flashinfer_sm120"
+            and self.dcp_world_size == 1
+            and self.tp_size == 1
+            and self.compress_ratio == 1
+            and not self.indexer_uses_fp4
+        )
 
         next_n = self.num_speculative_tokens + 1
         self.decode_threshold = next_n
@@ -1362,11 +1374,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         workspace_size: int,
         max_logits_bytes: int,
         request_offset: int = 0,
+        min_visible_keys_cpu: torch.Tensor | None = None,
     ) -> list[tuple[slice, slice]]:
         """Split this step's prefill requests into chunks, respecting:
         - N constraint: total_seq_lens <= workspace_size (existing O(N)
           workspace)
-        - Logits constraint: M * N * 4 <= max_logits_bytes
+        - Dense fallback: M * N * 4 <= max_logits_bytes
+        - SM120 long rows: the startup scratch reservation bounds query rows;
+          only exact CPU metadata certifies omission of resident scratch.
 
         When a single request-level chunk still exceeds the logits budget,
         sub-chunks on the query dimension (M) to bound peak memory.
@@ -1380,6 +1395,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         while end < n:
             start, chunk_m, chunk_n = end, 0, 0
+            fused = (
+                min_visible_keys_cpu is not None
+                and min_visible_keys_cpu[start].item() > 49152
+            )
 
             while end < n:
                 q, s = (
@@ -1387,7 +1406,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     compressed_seq_lens_cpu[end].item(),
                 )
                 new_m, new_n = chunk_m + q, chunk_n + s
-                if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+                next_fused = (
+                    min_visible_keys_cpu is not None
+                    and min_visible_keys_cpu[end].item() > 49152
+                )
+                if (
+                    next_fused == fused
+                    and new_n <= workspace_size
+                    and (fused or new_m * new_n <= max_logits_elems)
+                ):
                     chunk_m, chunk_n = new_m, new_n
                     end += 1
                 else:
@@ -1403,9 +1430,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 end += 1
 
             req_slice = slice(start + request_offset, end + request_offset)
-            max_q = (
-                max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)
-            )
+            max_q = max(1, chunk_m)
+            if not fused and chunk_n > 0:
+                max_q = max(1, max_logits_elems // chunk_n)
             for q_off in range(0, chunk_m, max_q):
                 sub_m = min(max_q, chunk_m - q_off)
                 chunks.append((req_slice, slice(q_off, q_off + sub_m)))
@@ -1541,6 +1568,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.max_prefill_buffer_size,
                     max_logits_bytes,
                     request_offset=num_decodes,
+                    min_visible_keys_cpu=(
+                        compressed_seq_lens_cpu[num_decodes:]
+                        - prefill_query_lens_cpu
+                        + 1
+                        if self.sm120_prefill
+                        else None
+                    ),
                 )
 
             chunks = []
@@ -1571,6 +1605,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     dcp_world_size=self.dcp_world_size,
                     cp_kv_cache_interleave_size=self.compressed_cp_interleave_size,
                     pcp_plan=pcp_plan,
+                    certify_visible_keys=self.sm120_prefill,
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
@@ -1852,6 +1887,8 @@ def build_prefill_chunk_metadata(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     pcp_plan: PCPGlobalChunkPlan | None = None,
+    certify_visible_keys: bool = False,
+    build_query_segments: bool = False,
 ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
     if pcp_plan is not None:
         total_seq_lens = pcp_plan.total
@@ -1914,6 +1951,30 @@ def build_prefill_chunk_metadata(
         f"{total_query_len} tokens; the metadata tail would stay uninitialized"
     )
 
+    cu_query_lens = None
+    if certify_visible_keys or build_query_segments:
+        query_cu_cpu = (
+            query_start_loc_cpu[start_idx : end_idx + 1]
+            - query_start_loc_cpu[start_idx]
+        )
+        query_cu_cpu = query_cu_cpu.clamp(min=qs_start, max=qs_stop) - qs_start
+        cu_query_lens = async_tensor_h2d(query_cu_cpu, device=device, dtype=torch.int32)
+    min_visible_keys = 0
+    if certify_visible_keys:
+        assert compress_ratio == 1 and dcp_world_size == 1 and pcp_plan is None
+        full_query_cu = (
+            query_start_loc_cpu[start_idx : end_idx + 1]
+            - query_start_loc_cpu[start_idx]
+        )
+        full_query_lens = torch.diff(full_query_cu)
+        active = torch.diff(query_cu_cpu) > 0
+        first_row = (qs_start - full_query_cu[:-1]).clamp_min(0)
+        visible = (
+            compressed_seq_lens_cpu[start_idx:end_idx] - full_query_lens + first_row + 1
+        )
+        if active.any():
+            min_visible_keys = max(0, int(visible[active].min()))
+
     cu_seq_len_ks = torch.empty(output_query_len, dtype=torch.int32, device=device)
     cu_seq_len_ke = torch.empty(output_query_len, dtype=torch.int32, device=device)
 
@@ -1957,6 +2018,8 @@ def build_prefill_chunk_metadata(
         cu_seqlen_ks=cu_seq_len_ks,
         cu_seqlen_ke=cu_seq_len_ke,
         cu_seq_lens=cu_seq_lens,
+        cu_query_lens=cu_query_lens,
+        min_visible_keys=min_visible_keys,
         token_to_seq=token_to_seq,
         total_seq_lens=total_seq_lens,
         max_seqlen_k=int(compressed_seq_lens_cpu[start_idx:end_idx].max()),

@@ -323,6 +323,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         self.step_timing = StepTimingCollector()
+        from vllm.v1.worker.gpu.prefill_timing import PrefillTimingRecorder
+
+        self.prefill_timing = PrefillTimingRecorder()
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -847,6 +850,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        allow_skip_drafts: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -898,6 +902,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output = SchedulerOutput.make_empty()
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+        dummy_scheduler_output.skip_drafts = allow_skip_drafts and not is_profile
 
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
@@ -961,6 +966,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             with use_workspace_lane(self._draft_workspace_lane):
+                draft_kwargs = (
+                    {"num_speculative_tokens": 0}
+                    if allow_skip_drafts
+                    and not is_profile
+                    and dp_sync_state is not None
+                    and dp_sync_state.skip_drafts
+                    else {}
+                )
                 self.speculator.propose(
                     input_batch=input_batch,
                     attn_metadata=attn_metadata,
@@ -982,6 +995,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     skip_attn_for_dummy_run=skip_attn,
                     mm_inputs=mm_inputs,
                     is_profile=is_profile,
+                    **draft_kwargs,
                 )
             self.step_timing.drafter_end()
 
@@ -2047,6 +2061,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        timing_step = None
+        if self.prefill_timing.active and not dummy_run:
+            computed = {
+                r.req_id: r.num_computed_tokens
+                for r in scheduler_output.scheduled_new_reqs
+            }
+            computed.update(
+                zip(
+                    scheduler_output.scheduled_cached_reqs.req_ids,
+                    scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+                )
+            )
+            pairs = [
+                {"request_id": rid, "query": q, "history": computed.get(rid)}
+                for rid, q in scheduler_output.num_scheduled_tokens.items()
+            ]
+            timing_step = self.prefill_timing.begin_target(
+                {
+                    "requests": pairs,
+                    "shared_ep_step": scheduler_output.shared_ep_step,
+                    "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+                    "local_tokens": input_batch.num_tokens,
+                    "local_tokens_padded": input_batch.num_tokens_after_padding,
+                    "dp_local_tokens": (
+                        dp_sync_state.num_tokens_across_dp.tolist()
+                        if dp_sync_state is not None
+                        else None
+                    ),
+                    "cudagraph_mode": batch_desc.cg_mode.name,
+                    "skip_drafts": (
+                        dp_sync_state.skip_drafts
+                        if dp_sync_state is not None
+                        else scheduler_output.skip_drafts
+                    ),
+                }
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2097,6 +2148,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        self.prefill_timing.end_target(timing_step)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
