@@ -329,6 +329,116 @@ def test_grouped_topk_single_group_large_batch():
     torch.testing.assert_close(actual_values, expected_values, atol=2e-5, rtol=0)
 
 
+@pytest.mark.parametrize("rows", [1024, 1025, 2523, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_grouped_topk_independent_determinism_preserves_weights(
+    monkeypatch, rows, dtype, scoring_func, renormalize
+):
+    """The same token keeps bitwise weights across native block/warp boundaries.
+
+    A cached prompt can reduce 2523 prefill rows to 27 remaining rows. Keep
+    routing invariant independently of attention/quantization BI restrictions.
+    """
+    if not current_platform.is_cuda():
+        pytest.skip("This native routing regression requires CUDA")
+    monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_GROUPED_TOPK", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(envs, "VLLM_USE_FUSED_MOE_GROUPED_TOPK", True)
+    gen = torch.Generator().manual_seed(0)
+    logits = (torch.randn((rows, 256), generator=gen) - 4).to(dtype).cuda()
+    bias = (torch.randn(256, generator=gen) * 8).cuda()
+    hidden = torch.empty((rows, 0), dtype=dtype, device="cuda")
+    router = GroupedTopKRouter(
+        top_k=8,
+        global_num_experts=256,
+        num_expert_group=1,
+        topk_group=1,
+        e_score_correction_bias=bias,
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+    )
+    full = router.select_experts(hidden, logits)
+    tail = router.select_experts(hidden[-27:], logits[-27:])
+    for actual, expected in zip(full, tail):
+        torch.testing.assert_close(actual[-27:], expected, rtol=0, atol=0)
+    for row in (0, 1023, min(1024, rows - 1)):
+        alone = router.select_experts(hidden[row : row + 1], logits[row : row + 1])
+        for actual, expected in zip(full, alone):
+            torch.testing.assert_close(actual[row : row + 1], expected, rtol=0, atol=0)
+
+
+def test_grouped_topk_independent_determinism_keeps_padding_mask(monkeypatch):
+    """Chunked routing masks padded rows on both sides of the 1024 boundary."""
+    if not current_platform.is_cuda():
+        pytest.skip("This native routing regression requires CUDA")
+    monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_GROUPED_TOPK", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(envs, "VLLM_USE_FUSED_MOE_GROUPED_TOPK", True)
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn((2523, 256), generator=gen).cuda()
+    hidden = torch.empty((2523, 0), device="cuda")
+    router = GroupedTopKRouter(
+        top_k=8,
+        global_num_experts=256,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",
+        e_score_correction_bias=torch.randn(256, generator=gen).cuda(),
+        skip_padding=True,
+    )
+    baseline_weights, baseline_ids = router.select_experts(hidden, logits)
+    padding = torch.zeros(2523, dtype=torch.bool, device="cuda")
+    padding[[0, 1023, 1024, 2522]] = True
+    with set_forward_context(None, VllmConfig(), is_padding=padding):
+        weights, ids = router.select_experts(hidden, logits)
+    assert torch.all(weights[padding] == 0)
+    assert torch.all(ids[padding] == -1)
+    torch.testing.assert_close(
+        weights[~padding], baseline_weights[~padding], rtol=0, atol=0
+    )
+    torch.testing.assert_close(ids[~padding], baseline_ids[~padding], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 10, 16])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])
+def test_grouped_topk_independent_determinism_cuda_graph(
+    monkeypatch, rows, scoring_func
+):
+    """The independent score/routing path remains replayable under CUDA Graphs."""
+    if not current_platform.is_cuda():
+        pytest.skip("This routing capture regression requires CUDA")
+    monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_GROUPED_TOPK", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(envs, "VLLM_USE_FUSED_MOE_GROUPED_TOPK", True)
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn((rows, 256), generator=gen).cuda()
+    hidden = torch.empty((rows, 0), device="cuda")
+    router = GroupedTopKRouter(
+        top_k=8,
+        global_num_experts=256,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func=scoring_func,
+        e_score_correction_bias=torch.randn(256, generator=gen).cuda(),
+    )
+    expected = tuple(x.clone() for x in router.select_experts(hidden, logits))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        router.select_experts(hidden, logits)
+        router.select_experts(hidden, logits)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = router.select_experts(hidden, logits)
+    graph.replay()
+    for actual, reference in zip(captured, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
 )

@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_DETERMINISTIC_SPARSE_TOPK: bool = False
+    VLLM_DETERMINISTIC_GROUPED_TOPK: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -691,6 +692,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_BATCH_INVARIANT.
     "VLLM_DETERMINISTIC_SPARSE_TOPK": lambda: bool(
         int(os.getenv("VLLM_DETERMINISTIC_SPARSE_TOPK", "0"))
+    ),
+    "VLLM_DETERMINISTIC_GROUPED_TOPK": lambda: bool(
+        int(os.getenv("VLLM_DETERMINISTIC_GROUPED_TOPK", "0"))
     ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
