@@ -48,6 +48,10 @@ class GateLinear(ReplicatedLinear):
 
     `VLLM_BATCH_INVARIANT` also disables tiers 1-5: they pick kernels and
     split-K from the token count and skip the batch-invariant linear path.
+
+    `VLLM_DETERMINISTIC_MOE_GATE` independently uses persistent GEMM for
+    unbiased SM90 gates with bf16 weights, bf16 inputs, fp32 logits and
+    dimensions `[6144, 256]`. Other configurations retain their dispatch.
     """
 
     # (hidden_size, num_experts) pairs with an instantiated fp32 kernel.
@@ -114,6 +118,14 @@ class GateLinear(ReplicatedLinear):
         # tier below is disabled and forward falls back to ReplicatedLinear.
         self.is_unquantized = isinstance(self.quant_method, UnquantizedLinearMethod)
         can_use_specialized_kernels &= self.is_unquantized
+        self._use_deterministic_moe_gate = (
+            envs.VLLM_DETERMINISTIC_MOE_GATE
+            and current_platform.is_cuda()
+            and is_hopper
+            and self.is_unquantized
+            and not bias
+            and (input_size, output_size) == (6144, 256)
+        )
 
         self.allow_specialized_router_gemm = can_use_specialized_kernels
 
@@ -301,6 +313,21 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if (
+            self._use_deterministic_moe_gate
+            and x.is_cuda
+            and x.dim() == 2
+            and x.dtype == self.weight.dtype == torch.bfloat16
+            and self.out_dtype == torch.float32
+        ):
+            from vllm.model_executor.determinism.batch_invariant import (
+                matmul_persistent,
+            )
+
+            return self._return(
+                matmul_persistent(x, self.weight.T, out_dtype=torch.float32)
+            )
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, bf16 in, fp32 out,
         # any dims w/ K divisible by 8)
         if (

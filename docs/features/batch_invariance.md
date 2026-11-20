@@ -175,6 +175,20 @@ This switch is independent of full batch invariance and also applies under
 and speculative-decoding backends. Other model operations still need their own
 invariance validation; the switch alone does not guarantee model-wide equality.
 
+### Deterministic MoE gate projection
+
+`VLLM_DETERMINISTIC_MOE_GATE=1` independently makes unbiased SM90 gates with
+bf16 input and weight, fp32 output, and dimensions `[6144, 256]` use the existing
+persistent GEMM. This avoids changes in fp32 logits caused by token-count-based
+kernel selection and split-K reduction. The output remains fp32, including
+when `GateLinear.set_out_dtype` enables fp32 output after construction.
+
+The switch defaults to off. Biased, quantized, other-dtype, other-dimension and
+other-device gates retain their existing paths. This is separate from grouped
+top-k: a stable top-k reduction also needs stable input logits. FP8 model
+weights, KV cache formats, attention, expert dispatch and speculative decoding
+keep their configurations. Model-wide invariance requires model validation.
+
 When batch invariance is enabled, vLLM:
 
 1. Uses deterministic kernel implementations for attention and other operations

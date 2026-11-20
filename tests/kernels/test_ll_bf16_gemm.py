@@ -69,6 +69,160 @@ def _gemm(a, b):
     return ll_bf16_gemm(a, b)
 
 
+@pytest.fixture
+def _real_gate_parallel_state():
+    """A replicated gate needs real TP state, but no model or peer GPU."""
+    import tempfile
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    with (
+        set_current_vllm_config(VllmConfig()),
+        tempfile.TemporaryDirectory() as store_dir,
+    ):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{store_dir}/store",
+        )
+        initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        try:
+            yield
+        finally:
+            cleanup_dist_env_and_memory()
+
+
+def _real_deterministic_gate(monkeypatch, *, enabled=True, **kwargs):
+    import vllm.envs as envs
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    # The before-fix source must fail on numerical output, not a missing env var.
+    monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_MOE_GATE", enabled, raising=False)
+    kwargs.setdefault("input_size", 6144)
+    kwargs.setdefault("output_size", 256)
+    kwargs.setdefault("params_dtype", torch.bfloat16)
+    kwargs.setdefault("out_dtype", torch.float32)
+    gate = GateLinear(**kwargs).cuda()
+    with torch.no_grad():
+        torch.manual_seed(17)
+        gate.weight.normal_(std=0.02)
+        if gate.bias is not None:
+            gate.bias.fill_(0.125)
+    return gate
+
+
+@pytest.mark.parametrize(
+    "cold_rows,hot_rows", [(5361, 49), (5904, 16), (7885, 13), (2523, 27)]
+)
+@torch.inference_mode()
+def test_gate_linear_deterministic_logits_across_prefix_batch_shapes(
+    monkeypatch, _real_gate_parallel_state, cold_rows, hot_rows
+):
+    """A restored suffix must get the same fp32 logits as its full input rows."""
+    gate = _real_deterministic_gate(monkeypatch)
+    torch.manual_seed(23)
+    full = torch.randn(cold_rows, 6144, device="cuda", dtype=torch.bfloat16)
+    short = full[-hot_rows:].clone()
+    actual, bias = gate(short)
+    assert actual.dtype == torch.float32 and bias is None
+    if torch.cuda.get_device_capability() == (9, 0):
+        expected, _ = gate(full)
+        torch.testing.assert_close(actual, expected[-hot_rows:], rtol=0, atol=0)
+    else:
+        # The opt-in scope is SM90; other hardware keeps its real legacy path.
+        legacy = _real_deterministic_gate(monkeypatch, enabled=False)
+        legacy.weight.copy_(gate.weight)
+        expected, _ = legacy(short)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_gate_linear_deterministic_fp32_dot_product_contract(
+    monkeypatch, _real_gate_parallel_state
+):
+    """Two power-of-two-scaled basis vectors give an exact independent oracle."""
+    gate = _real_deterministic_gate(monkeypatch, return_bias=False)
+    x = torch.zeros(49, 6144, device="cuda", dtype=torch.bfloat16)
+    x[:, 257] = 0.5
+    x[:, 3096] = -2.0
+    expected = gate.weight[:, 257].float() * 0.5 - gate.weight[:, 3096].float() * 2
+    out = gate(x)
+    assert isinstance(out, torch.Tensor) and out.dtype == torch.float32
+    torch.testing.assert_close(out, expected.expand_as(out), rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_gate_linear_deterministic_late_fp32_output(
+    monkeypatch, _real_gate_parallel_state
+):
+    """Changing the public output dtype must activate the fp32 gate contract."""
+    gate = _real_deterministic_gate(monkeypatch, out_dtype=None)
+    x = torch.zeros(49, 6144, device="cuda", dtype=torch.bfloat16)
+    x[:, 257] = 2
+    before, _ = gate(x)
+    assert before.dtype == torch.bfloat16
+    gate.set_out_dtype(torch.float32)
+    out, bias = gate(x)
+    assert out.dtype == torch.float32 and bias is None
+    expected = gate.weight[:, 257].float() * 2
+    torch.testing.assert_close(out, expected.expand_as(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kwargs,dtype",
+    [
+        ({"bias": True}, torch.bfloat16),
+        ({"output_size": 128}, torch.bfloat16),
+        ({"params_dtype": torch.float16}, torch.float16),
+    ],
+)
+@torch.inference_mode()
+def test_gate_linear_deterministic_preserves_excluded_projection(
+    monkeypatch, _real_gate_parallel_state, kwargs, dtype
+):
+    """Bias, other shapes and other weight dtypes must retain legacy results."""
+    gate = _real_deterministic_gate(monkeypatch, **kwargs)
+    legacy = _real_deterministic_gate(monkeypatch, enabled=False, **kwargs)
+    legacy.weight.copy_(gate.weight)
+    if gate.bias is not None:
+        legacy.bias.copy_(gate.bias)
+    x = torch.randn(49, 6144, device="cuda", dtype=dtype)
+    actual, actual_bias = gate(x)
+    expected, expected_bias = legacy(x)
+    assert actual_bias is expected_bias is None
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("requests", [1, 4, 10, 16])
+@torch.inference_mode()
+def test_gate_linear_deterministic_mtp_cuda_graph_replay(
+    monkeypatch, _real_gate_parallel_state, requests
+):
+    """MTP5 graph shapes must replay fresh input values with exact fp32 output."""
+    gate = _real_deterministic_gate(monkeypatch)
+    x = torch.zeros(requests * 6, 6144, device="cuda", dtype=torch.bfloat16)
+    x[:, 257] = 0.5
+    gate(x)  # Resolve the kernel before capture.
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, bias = gate(x)
+    assert bias is None and out.dtype == torch.float32
+    for value in (2.0, -0.5):
+        x[:, 257] = value
+        graph.replay()
+        expected = gate.weight[:, 257].float() * value
+        torch.testing.assert_close(out, expected.expand_as(out), rtol=0, atol=0)
+
+
 def test_c1_pdl_kernel_is_selected_automatically(monkeypatch):
     from vllm.model_executor.kernels.linear.cute_dsl import ll_bf16
 
