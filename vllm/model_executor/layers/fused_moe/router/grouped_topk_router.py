@@ -354,7 +354,7 @@ class GroupedTopKRouter(BaseRouter):
             and is_forward_context_available()
         ):
             is_padding = get_forward_context().is_padding
-            if is_padding is not None:
+            if is_padding is not None and is_padding.shape[0] >= topk_ids.shape[0]:
                 is_padding = is_padding[: topk_ids.shape[0]].unsqueeze(1)
                 topk_weights = topk_weights.masked_fill(is_padding, 0)
                 topk_ids = topk_ids.masked_fill(is_padding, -1)

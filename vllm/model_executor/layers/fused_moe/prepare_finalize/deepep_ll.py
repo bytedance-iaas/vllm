@@ -151,7 +151,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _map_global_to_physical_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         if self.global_to_physical is None:
             return topk_ids
-        return self.global_to_physical[topk_ids]
+        physical_ids = self.global_to_physical[topk_ids]
+        # DeepEP skips -1; PyTorch indexing would map it to the last expert.
+        return physical_ids.masked_fill_(topk_ids == -1, -1)
 
     def _do_quant(
         self,

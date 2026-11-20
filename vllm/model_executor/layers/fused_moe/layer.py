@@ -222,7 +222,8 @@ def FusedMoEFactory(
         routed_experts_cls: Custom RoutedExperts class (None = use default)
         moe_config_cls: Custom FusedMoEConfig class (None = use default)
         routed_experts_args: Additional arguments for routed_experts constructor
-        skip_padding: Whether grouped routing should invalidate padding rows.
+        skip_padding: Whether the model opts into grouped padding masks on
+            DeepEP v2. DeepEP low-latency dispatch handles them by default.
 
     Returns:
         MoERunner: Configured MoE execution pipeline ready for forward passes
@@ -324,7 +325,10 @@ def FusedMoEFactory(
             else 1.0,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=num_fused_shared_experts,
-            skip_padding=(skip_padding and moe_parallel_config.use_deepep_v2_kernels),
+            skip_padding=(
+                moe_parallel_config.use_deepep_ll_kernels
+                or (skip_padding and moe_parallel_config.use_deepep_v2_kernels)
+            ),
             # Fused shared-expert slot weight. With apply_routed_scale_to_output
             # the runner scales the combined output by routed_scaling_factor, so
             # the shared slot weight must be 1/routed_scaling_factor for its net

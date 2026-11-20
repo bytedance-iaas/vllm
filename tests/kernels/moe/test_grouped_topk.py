@@ -5,6 +5,8 @@
 Run `pytest tests/kernels/moe/test_grouped_topk.py`.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -16,13 +18,39 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopk,
     GroupedTopKRouter,
     fused_grouped_topk,
 )
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
+
+
+@pytest.mark.skipif(not has_deep_ep(), reason="DeepEP is not installed")
+def test_low_latency_dispatch_keeps_padding_expert_ids():
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
+        DeepEPLLPrepareAndFinalize,
+    )
+
+    buffer = Mock()
+    buffer.low_latency_dispatch.return_value = (None, None, None, None, None)
+    dispatcher = DeepEPLLPrepareAndFinalize(
+        buffer, 16, 1, global_to_physical=torch.tensor([2, 3, 0, 1])
+    )
+    dispatcher.prepare_async(
+        torch.zeros((2, 6144)),
+        torch.tensor([[0.4, 0.6], [0.0, 0.0]]),
+        torch.tensor([[0, 3], [-1, -1]]),
+        num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
+    )
+    mapped_ids = buffer.low_latency_dispatch.call_args.args[1]
+    assert torch.equal(mapped_ids, torch.tensor([[2, 1], [-1, -1]]))
 
 
 def _run_single_group_topk(
