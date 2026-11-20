@@ -35,6 +35,7 @@ class Dsv41StoreScheduler:
         extra = config.kv_transfer_config.kv_connector_extra_config
         self.prefill = extra["pd_role"] == "prefill"
         self.save_decode = not self.prefill and extra.get("save_decode_cache", False)
+        self.save_decode_prompt_cache = extra.get("save_decode_prompt_cache", True)
         self.capacity_only = not self.prefill and not self.save_decode
         self.pending_finish = []
         self.admitted = set()
@@ -142,7 +143,16 @@ class Dsv41StoreScheduler:
             return None
         end = min(end, len(request.block_hashes) * self.hash_tokens)
         end = end // self.chunk_tokens * self.chunk_tokens
-        start = self.saved.get(request.request_id, 0)
+        # Prefill may leave its last canonical chunk incomplete. Keep that
+        # bridge chunk when Decode saves only the newly generated suffix.
+        default_start = 0
+        if self.save_decode and not self.save_decode_prompt_cache:
+            default_start = (
+                max(0, request.num_prompt_tokens - 1)
+                // self.chunk_tokens
+                * self.chunk_tokens
+            )
+        start = self.saved.get(request.request_id, default_start)
         if end <= start:
             return None
         ids = []
