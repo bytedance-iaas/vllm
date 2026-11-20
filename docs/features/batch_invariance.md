@@ -44,6 +44,22 @@ VLLM_BATCH_INVARIANT=1 vllm serve Qwen/Qwen3-1.7B \
 
 ## Enabling Batch Invariance
 
+### Fixed sparse FP8 KV reduction on Hopper
+
+For `FLASHMLA_SPARSE` with `fp8_ds_mla` on SM90, set
+`VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT=1` to keep each request's entire
+selected KV in one reduction. The default is `0`, which retains FlashMLA's
+query-size-dependent split plan. The option preserves the FP8 cache and
+native kernel; smaller query batches may lose split-KV parallelism.
+
+This option controls the attention reduction only. Exact whole-model output
+also depends on projections, indexer selection, routing and collectives, and
+must be validated with the intended model and topology. It operates
+independently of `VLLM_BATCH_INVARIANT`. Other GPU families and KV formats
+are rejected when the option is enabled.
+
+### Global batch invariance
+
 Batch invariance can be enabled by setting the `VLLM_BATCH_INVARIANT` environment variable to `1`:
 
 ```bash
