@@ -58,6 +58,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
+    get_base_request_id,
     get_representative_spec_type,
     zmq_ctx,
 )
@@ -3378,26 +3379,32 @@ class NixlBaseConnectorWorker:
             done_sending.add(req_id)
 
     def _handle_heartbeat(self, payload: str) -> None:
-        """Extend leases for requests referenced in a heartbeat.
-
-        Args:
-            payload: comma-separated P-side request IDs, e.g.
-                     "req_abc,req_def".
-
-        """
+        """Extend the leases addressed by a P-side or Push D-side heartbeat."""
         new_expiry = time.perf_counter() + self._lease_extension
-        for req_id in payload.split(","):
-            if req_id in self._reqs_to_send:
-                old = self._reqs_to_send[req_id]
-                self._reqs_to_send[req_id] = max(old, new_expiry)
-                logger.debug(
-                    "Heartbeat extended lease for request %s "
-                    "by %ds (old_expiry=%.1f, new_expiry=%.1f)",
-                    req_id,
-                    self._lease_extension,
-                    old,
-                    new_expiry,
-                )
+        leases_by_base: dict[str, ReqId | None] = {}
+        if self._TRANSFER_MODE == "push":
+            for req_id in self._reqs_to_send:
+                base_id = get_base_request_id(req_id)
+                # A concurrent request can reuse an external request ID.
+                leases_by_base[base_id] = None if base_id in leases_by_base else req_id
+
+        for heartbeat_id in payload.split(","):
+            req_id = heartbeat_id
+            if req_id not in self._reqs_to_send:
+                matched = leases_by_base.get(get_base_request_id(heartbeat_id))
+                if matched is None:
+                    continue
+                req_id = matched
+            old = self._reqs_to_send[req_id]
+            self._reqs_to_send[req_id] = max(old, new_expiry)
+            logger.debug(
+                "Heartbeat extended lease for request %s "
+                "by %ds (old_expiry=%.1f, new_expiry=%.1f)",
+                req_id,
+                self._lease_extension,
+                old,
+                new_expiry,
+            )
 
     def _pop_done_transfers(
         self, transfers: dict[str, list[int]]

@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
+from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
@@ -43,6 +44,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
+    NixlPushConnectorScheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
@@ -57,10 +61,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
-from .utils import create_request, expand_strided_descs, make_nixl_push_scheduler
+from .utils import (
+    create_request,
+    expand_strided_descs,
+    make_kv_cache_config,
+    make_nixl_push_scheduler,
+)
 
 # ----------------------------------------------------------------- #
 #  Helpers / fakes                                                   #
@@ -131,6 +143,43 @@ def _stub_sw_clipping(scheduler) -> None:
 
 
 class TestPushScheduler:
+    @pytest.mark.cpu_test
+    def test_push_heartbeat_uses_decode_registration_identity(self):
+        config = VllmConfig(
+            cache_config=CacheConfig(block_size=16),
+            device_config=DeviceConfig("cpu"),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="NixlPushConnector", kv_role="kv_consumer"
+            ),
+        )
+        scheduler = NixlPushConnectorScheduler(
+            config, "decode-engine", make_kv_cache_config(block_size=16)
+        )
+        request = Request(
+            request_id="chatcmpl-shared-bbbbbbbb",
+            prompt_token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(
+                max_tokens=1,
+                extra_args={
+                    "kv_transfer_params": {
+                        "do_remote_prefill": True,
+                        "remote_engine_id": "prefill-engine",
+                        "remote_request_id": "shared",
+                        "remote_host": "127.0.0.1",
+                        "remote_port": 5600,
+                        "tp_size": 1,
+                    }
+                },
+            ),
+            pooling_params=None,
+        )
+
+        scheduler.on_new_request(request)
+        meta = scheduler.build_connector_meta(SchedulerOutput.make_empty())
+        assert meta.heartbeat_by_engine["prefill-engine"].req_ids == {
+            request.request_id
+        }
+
     def test_p_side_mamba_truncates_before_cache_lookup(self):
         """Push mode normalizes P-side Mamba requests before cache lookup."""
         sched = make_nixl_push_scheduler(has_mamba=True)
