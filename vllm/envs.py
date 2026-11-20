@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_DETERMINISTIC_SPARSE_TOPK: bool = False
     VLLM_DETERMINISTIC_GROUPED_TOPK: bool = False
     VLLM_DETERMINISTIC_MOE_GATE: bool = False
+    VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -699,6 +700,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DETERMINISTIC_MOE_GATE": lambda: bool(
         int(os.getenv("VLLM_DETERMINISTIC_MOE_GATE", "0"))
+    ),
+    # SM90 fp8_ds_mla: keep every request's entire selected KV in one
+    # reduction, independently of query batch size. Does not enable global BI.
+    "VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT", "0"))
     ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")

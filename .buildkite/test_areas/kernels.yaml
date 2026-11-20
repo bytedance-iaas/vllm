@@ -536,6 +536,19 @@ steps:
       commands:
       - pytest -v -s kernels/attention/test_triton_unified_attention_diffkv.py
 
+- label: ":nvidia: (H100) Sparse FlashMLA Single KV Split"
+  key: kernels-flashmla-single-split-h100
+  timeout_in_minutes: 10
+  device: h100
+  num_devices: 1
+  source_file_dependencies:
+  - vllm/envs.py
+  - vllm/v1/attention/backends/mla/flashmla_sparse.py
+  - vllm/v1/attention/backends/mla/flashmla_sparse_scheduler.py
+  - tests/kernels/attention/test_flashmla_single_split.py
+  commands:
+    - pytest -v -s kernels/attention/test_flashmla_single_split.py
+
 - label: ":nvidia: (H100) MLA Kernel Test"
   key: kernels-flashmla-test-h100
   automatic_shard: true
