@@ -13,9 +13,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+_GLM53_PREFILL_RMS_NORM_ROWS = 256
 
 
 def poly_norm(
@@ -60,6 +62,13 @@ class RMSNorm(CustomOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
+        self._glm53_prefill_rms_norm = (
+            envs.VLLM_GLM53_PREFILL_DETERMINISTIC_OPS
+            and hidden_size == 6144
+            and self.variance_size_override is None
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(90)
+        )
         weight_dtype = dtype or torch.get_default_dtype()
         self.has_weight = has_weight
         self.weight = torch.ones(hidden_size, dtype=weight_dtype)
@@ -75,6 +84,40 @@ class RMSNorm(CustomOp):
         # op priority when weight=None is unsupported.
         self.pass_weight = self.has_weight
         self.pass_weight_add = self.has_weight
+
+    def uses_glm53_prefill_rms_norm(self, x: torch.Tensor) -> bool:
+        return (
+            self._glm53_prefill_rms_norm
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and x.shape[1] == self.hidden_size
+            and 0 < x.shape[0] < _GLM53_PREFILL_RMS_NORM_ROWS
+        )
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if not self.uses_glm53_prefill_rms_norm(x):
+            return super().forward(x, residual)
+
+        # Preserve the native large-batch reduction order when only the
+        # uncached suffix is computed. Other layers see only the real rows.
+        from vllm import _custom_ops as ops
+
+        rows = x.shape[0]
+        padding = (0, 0, 0, _GLM53_PREFILL_RMS_NORM_ROWS - rows)
+        padded = F.pad(x, padding)
+        if residual is None:
+            output = torch.empty_like(padded)
+            weight = self.weight.data if self.pass_weight else None
+            ops.rms_norm(output, padded, weight, self.variance_epsilon)
+            return output[:rows]
+
+        padded_residual = F.pad(residual, padding)
+        weight = self.weight.data if self.pass_weight_add else None
+        ops.fused_add_rms_norm(padded, padded_residual, weight, self.variance_epsilon)
+        return padded[:rows], padded_residual[:rows]
 
     def forward_native(
         self,

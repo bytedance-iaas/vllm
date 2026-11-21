@@ -44,6 +44,22 @@ VLLM_BATCH_INVARIANT=1 vllm serve Qwen/Qwen3-1.7B \
 
 ## Enabling Batch Invariance
 
+### Fixed sparse FP8 KV reduction on Hopper
+
+For `FLASHMLA_SPARSE` with `fp8_ds_mla` on SM90, set
+`VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT=1` to keep each request's entire
+selected KV in one reduction. The default is `0`, which retains FlashMLA's
+query-size-dependent split plan. The option preserves the FP8 cache and
+native kernel; smaller query batches may lose split-KV parallelism.
+
+This option controls the attention reduction only. Exact whole-model output
+also depends on projections, indexer selection, routing and collectives, and
+must be validated with the intended model and topology. It operates
+independently of `VLLM_BATCH_INVARIANT`. Other GPU families and KV formats
+are rejected when the option is enabled.
+
+### Global batch invariance
+
 Batch invariance can be enabled by setting the `VLLM_BATCH_INVARIANT` environment variable to `1`:
 
 ```bash
@@ -148,6 +164,63 @@ Batch invariance has been tested and verified on the following models:
 Other models may also work, but these have been explicitly validated. If you encounter issues with a specific model, please report them on the [GitHub issue tracker](https://github.com/vllm-project/vllm/issues/new/choose).
 
 ## Implementation Details
+
+### Deterministic sparse-indexer top-k
+
+`VLLM_DETERMINISTIC_SPARSE_TOPK=1` enables canonical top-k selection independently
+of batch invariance. Sparse indexers keep all candidates above the cutoff score,
+then the lowest-index candidates tied at the cutoff, and return the selected
+indices in ascending order. This also runs when `VLLM_BATCH_INVARIANT=1`.
+
+The shared row-relative prefill and decode paths are covered. Fused SM120
+prefill selection and approximate BF16 DeepSelect ranking are disabled under
+this flag so the canonical pass can use the exact scores. DCP top-k merging and XPU
+absolute-column prefill are outside its coverage. The flag keeps the existing
+attention and MoE backends; it does not make every model operator batch invariant.
+
+### Deterministic single-group MoE routing
+
+`VLLM_DETERMINISTIC_GROUPED_TOPK=1` keeps CUDA single-group routing with
+256 through 1023 experts on its native block kernel. Large routing batches
+are processed in chunks of at most 1024 tokens, matching the weights used for
+short batches. The default native block/warp transition can change unbiased
+weights even when the selected expert IDs are identical.
+
+This switch is independent of full batch invariance and also applies under
+`VLLM_BATCH_INVARIANT=1`. It preserves the attention, quantization, MoE dispatch
+and speculative-decoding backends. Other model operations still need their own
+invariance validation; the switch alone does not guarantee model-wide equality.
+
+### Deterministic MoE gate projection
+
+`VLLM_DETERMINISTIC_MOE_GATE=1` independently makes unbiased SM90 gates with
+bf16 input and weight, fp32 output, and dimensions `[6144, 256]` use the existing
+persistent GEMM. This avoids changes in fp32 logits caused by token-count-based
+kernel selection and split-K reduction. The output remains fp32, including
+when `GateLinear.set_out_dtype` enables fp32 output after construction.
+
+The switch defaults to off. Biased, quantized, other-dtype, other-dimension and
+other-device gates retain their existing paths. This is separate from grouped
+top-k: a stable top-k reduction also needs stable input logits. FP8 model
+weights, KV cache formats, attention, expert dispatch and speculative decoding
+keep their configurations. Model-wide invariance requires model validation.
+
+### GLM-5.3 Prefill operator selection on SM90
+
+`VLLM_GLM53_PREFILL_DETERMINISTIC_OPS=1` uses the existing fixed-order linear
+kernel for the `(160, 6144)` BF16 indexer projection. For BF16 RMSNorm with
+hidden size 6,144 and fewer than 256 rows, it uses the native large-batch
+reduction by padding only the normalization inputs. The backbone completes the
+TP all-reduce before residual addition and normalization on that path.
+
+The switch defaults to off. Enable it only on the Prefill process of the
+SM90 GLM-5.3 deployment. For FP8 sparse MLA, configure the attention route
+independently with `attention_config.sparse_mla_force_mqa`. Verify generation
+against the deployment's cache precision, attention backend, and topology.
+
+`VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT=1` selects one KV split per request for
+SM90 FP8 sparse FlashMLA with `fp8_ds_mla` KV. This keeps the attention reduction
+partition fixed as the query shape changes. The switch defaults to off.
 
 When batch invariance is enabled, vLLM:
 

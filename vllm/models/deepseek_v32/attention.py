@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
@@ -19,6 +21,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -78,6 +81,16 @@ def get_pp_indexer_handoff_directions(
     return receives, sends
 
 
+class _DeterministicIndexerLinear(UnquantizedLinearMethod):
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return linear_batch_invariant(x, layer.weight, bias)
+
+
 class DeepseekV32Indexer(nn.Module):
     indexer_cache_cls = DeepseekV32IndexerCache
 
@@ -115,6 +128,20 @@ class DeepseekV32Indexer(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
+        if envs.VLLM_GLM53_PREFILL_DETERMINISTIC_OPS:
+            projection = self.wk_weights_proj
+            if (
+                not current_platform.is_cuda()
+                or not current_platform.is_device_capability_family(90)
+                or tuple(projection.weight.shape) != (160, 6144)
+                or projection.weight.dtype != torch.bfloat16
+                or type(projection.quant_method) is not UnquantizedLinearMethod
+            ):
+                raise ValueError(
+                    "VLLM_GLM53_PREFILL_DETERMINISTIC_OPS requires the SM90 "
+                    "GLM-5.3 BF16 fused indexer projection (160, 6144)"
+                )
+            projection.quant_method = _DeterministicIndexerLinear()
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -452,9 +479,7 @@ class DeepseekV32Attention(MLAAttention):
                 )
             else:
                 # Keep the torch query-absorb layout used by Decode.
-                ql_nope = torch.bmm(
-                    q_nope.transpose(0, 1), self.W_UK_T
-                ).transpose(0, 1)
+                ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
         else:
             ql_nope = q_nope
 

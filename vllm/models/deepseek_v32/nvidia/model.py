@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_norm,
@@ -56,6 +56,15 @@ from vllm.v1.attention.backends.mla.index_group import (
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
+
+
+def _allreduce_rms_norm(
+    hidden_states: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if norm.uses_glm53_prefill_rms_norm(hidden_states):
+        # Match the large-batch path's standalone TP reduction before RMSNorm.
+        return norm(tensor_model_parallel_all_reduce(hidden_states), residual)
+    return fused_allreduce_rms_norm(hidden_states, residual, norm)
 
 
 class DeepseekV32DecoderLayer(torch.nn.Module):
@@ -145,7 +154,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         else:
             # The previous layer's MLP/MoE output is left un-reduced; fuse its
             # all-reduce into this input_layernorm.
-            hidden_states, residual = fused_allreduce_rms_norm(
+            hidden_states, residual = _allreduce_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
         if self.use_sequence_parallel:
@@ -159,7 +168,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 hidden_states, residual
             )
         else:
-            hidden_states, residual = fused_allreduce_rms_norm(
+            hidden_states, residual = _allreduce_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
 
@@ -346,9 +355,7 @@ class DeepseekV32Model(torch.nn.Module):
             else:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         else:
-            hidden_states, _ = fused_allreduce_rms_norm(
-                hidden_states, residual, self.norm
-            )
+            hidden_states, _ = _allreduce_rms_norm(hidden_states, residual, self.norm)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

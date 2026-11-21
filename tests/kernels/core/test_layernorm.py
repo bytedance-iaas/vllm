@@ -6,6 +6,7 @@ import torch
 
 from tests.kernels.quant_utils import FP8_DTYPE
 from tests.kernels.utils import fp8_allclose, fp8_ulp_distance, opcheck
+from vllm import _custom_ops as ops
 from vllm import ir
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.platforms import current_platform
@@ -30,6 +31,37 @@ CUDA_DEVICES = [
 
 def _rms_norm_tolerance(dtype: torch.dtype) -> dict[str, float]:
     return ir.ops.rms_norm.get_tolerance(dtype)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not current_platform.is_device_capability_family(90),
+    reason="GLM-5.3 Prefill reduction selection is specific to SM90.",
+)
+@pytest.mark.parametrize("add_residual", [False, True])
+@torch.inference_mode()
+def test_glm53_prefill_rms_norm_reuses_large_batch_reduction(
+    default_vllm_config, monkeypatch, add_residual: bool
+) -> None:
+    monkeypatch.setenv("VLLM_GLM53_PREFILL_DETERMINISTIC_OPS", "1")
+    set_random_seed(17)
+    norm = RMSNorm(6144, dtype=torch.bfloat16).cuda()
+    norm.weight.data.normal_(mean=1.0, std=0.1)
+    x = torch.randn(256, 6144, device="cuda", dtype=torch.bfloat16)
+    tail = x[:255].clone()
+    if add_residual:
+        residual = torch.randn_like(x)
+        tail_residual = residual[:255].clone()
+        ops.fused_add_rms_norm(x, residual, norm.weight.data, norm.variance_epsilon)
+        actual, updated = norm(tail, tail_residual)
+        assert torch.equal(updated, residual[:255])
+        expected = x[:255]
+    else:
+        reference = torch.empty_like(x)
+        ops.rms_norm(reference, x, norm.weight.data, norm.variance_epsilon)
+        actual = norm(tail)
+        expected = reference[:255]
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)

@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""canonicalize_topk_ turns any valid top-k (any tie choice, any order) into the
+same result: candidates above the k-th score plus the lowest-index ties, ascending."""
+
+import pytest
+import torch
+
+from vllm.model_executor.layers.canonical_topk import canonicalize_topk_
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+
+DEVICE = torch.device("cuda")
+
+
+def _reference(logits: torch.Tensor, row_ends: torch.Tensor, k: int) -> torch.Tensor:
+    """Independent CPU oracle: stable value sort, then ascending selected indices."""
+    out = torch.full((logits.shape[0], k), -1, dtype=torch.int32)
+    scores = logits.cpu().float()
+    for r in range(logits.shape[0]):
+        n = int(row_ends[r])
+        order = torch.argsort(scores[r, :n], descending=True, stable=True)
+        keep = order[: min(k, n)].sort().values.to(torch.int32)
+        out[r, : len(keep)] = keep
+    return out
+
+
+def _scrambled_topk(
+    logits: torch.Tensor, row_ends: torch.Tensor, k: int, gen: torch.Generator
+) -> torch.Tensor:
+    """A valid top-k that resolves ties at the k-th score at random, in random
+    order, with empty slots scattered (as an atomic radix top-k may produce)."""
+    out = torch.full((logits.shape[0], k), -1, dtype=torch.int32)
+    scores = logits.cpu().float()
+    for r in range(logits.shape[0]):
+        n = int(row_ends[r])
+        if n == 0:
+            continue
+        rk = scores[r, :n]
+        m = min(k, n)
+        kth = torch.sort(rk, descending=True).values[m - 1]
+        above = torch.nonzero(rk > kth).flatten()
+        tied = torch.nonzero(rk == kth).flatten()
+        tied = tied[torch.randperm(len(tied), generator=gen)][: m - len(above)]
+        chosen = torch.cat([above, tied])
+        chosen = chosen[torch.randperm(len(chosen), generator=gen)]
+        slots = torch.randperm(k, generator=gen)[: len(chosen)]
+        out[r, slots] = chosen.to(torch.int32)
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("levels", [4, 64, None])
+@pytest.mark.parametrize("cols, k", [(3000, 128), (5000, 2048), (700, 1024)])
+def test_canonical_topk_matches_reference(dtype, levels, cols, k):
+    gen = torch.Generator().manual_seed(cols + k + (levels or 0))
+    rows = 6
+    logits = torch.randn(rows, cols, generator=gen)
+    if levels is not None:
+        # Few distinct scores: many ties at the k-th one.
+        logits = torch.round(logits * levels / 4) / levels
+    logits = logits.to(dtype)
+    # Mixed row lengths, including a short row (fewer than k candidates) and an
+    # empty one.
+    row_ends = torch.tensor(
+        [cols, cols - 1, cols // 2, min(k, cols) // 3, 0, cols], dtype=torch.int32
+    )
+    expected = _reference(logits, row_ends, k)
+    for _ in range(3):
+        indices = _scrambled_topk(logits, row_ends, k, gen).to(DEVICE)
+        canonicalize_topk_(logits.to(DEVICE), indices, row_ends.to(DEVICE))
+        torch.testing.assert_close(indices.cpu(), expected, rtol=0, atol=0)
+
+
+def test_signed_zero_and_nan_rank_by_value():
+    # -0.0 ties with +0.0 and NaN ranks above +inf, as in torch.topk.
+    logits = torch.tensor(
+        [[0.0, -0.0, float("nan"), 1.0, -0.0, 0.0, float("inf")]], dtype=torch.float32
+    )
+    row_ends = torch.tensor([7], dtype=torch.int32)
+    # Top-4 = NaN, +inf, 1.0, then one zero of either sign (the lowest index, 0).
+    for picked in ([5, 2, 6, 3], [1, 2, 6, 3], [3, 4, 2, 6]):
+        out = torch.tensor([picked], dtype=torch.int32, device=DEVICE)
+        canonicalize_topk_(logits.to(DEVICE), out, row_ends.to(DEVICE))
+        torch.testing.assert_close(
+            out.cpu(), torch.tensor([[0, 2, 3, 6]], dtype=torch.int32), rtol=0, atol=0
+        )
+
+
+def test_torch_topk_with_signed_zeros_keeps_the_maximum():
+    # torch.topk treats -0.0 and +0.0 as equal, so its top-k may keep negative
+    # zeros over positive ones; the single positive score must survive.
+    k = 2048
+    logits = torch.cat(
+        [torch.zeros(2048), torch.full((2047,), -0.0), torch.tensor([1.0])]
+    ).unsqueeze(0)
+    row_ends = torch.tensor([logits.shape[1]], dtype=torch.int32)
+    picked = logits.topk(k, dim=-1).indices.to(torch.int32).to(DEVICE)
+    canonicalize_topk_(logits.to(DEVICE), picked, row_ends.to(DEVICE))
+    expected = torch.cat([torch.arange(k - 1), torch.tensor([logits.shape[1] - 1])])
+    torch.testing.assert_close(
+        picked.cpu(), expected.to(torch.int32).unsqueeze(0), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("backend", ["persistent", "cooperative", "per_row", "torch"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sparse_indexer_topk_respects_dtype_and_is_canonical(
+    monkeypatch: pytest.MonkeyPatch, workspace_init, backend, dtype
+):
+    """Supported decode inputs are canonical; per_row retains its FP32 contract.
+
+    The native per_row kernel reads const_data_ptr<float>() in sampler.cu.
+    Enabling canonicalization must not imply BF16 support for that kernel.
+    """
+    import vllm.envs as envs
+    from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+
+    monkeypatch.setattr(envs, "VLLM_DETERMINISTIC_SPARSE_TOPK", True, raising=False)
+    get_indexer_topk.cache_clear()
+    gen = torch.Generator().manual_seed(7)
+    rows, cols, k = 4, 8192, 2048
+    # Few distinct scores, so many candidates tie with the k-th one.
+    logits = (torch.round(torch.randn(rows, cols, generator=gen) * 4) / 4).to(dtype)
+    seq_lens = torch.tensor([8192, 5000, 3001, 2100], dtype=torch.int32)
+    expected = _reference(logits, seq_lens, k)
+    indices = torch.full((rows, k), -1, dtype=torch.int32, device=DEVICE)
+    selector = get_indexer_topk(backend)
+    try:
+        if backend == "per_row" and dtype == torch.bfloat16:
+            with pytest.raises(
+                RuntimeError,
+                match=r"expected scalar type .*Float but found BFloat16",
+            ):
+                selector(logits.to(DEVICE), seq_lens.to(DEVICE), 1, indices, k, cols)
+            assert torch.all(indices == -1)
+            return
+        selector(logits.to(DEVICE), seq_lens.to(DEVICE), 1, indices, k, cols)
+    finally:
+        get_indexer_topk.cache_clear()
+    torch.testing.assert_close(indices.cpu(), expected, rtol=0, atol=0)

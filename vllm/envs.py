@@ -92,6 +92,11 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_DETERMINISTIC_SPARSE_TOPK: bool = False
+    VLLM_DETERMINISTIC_GROUPED_TOPK: bool = False
+    VLLM_DETERMINISTIC_MOE_GATE: bool = False
+    VLLM_GLM53_PREFILL_DETERMINISTIC_OPS: bool = False
+    VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -637,6 +642,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # If set, the sparse-attention indexer top-k (DeepSeek-V3.2/V4.1, GLM-5.x,
+    # Qwen4Exp QSA) returns a deterministic set in ascending index order: ties
+    # with the k-th score keep the lowest indices. On by default with
+    # VLLM_BATCH_INVARIANT.
+    "VLLM_DETERMINISTIC_SPARSE_TOPK": lambda: bool(
+        int(os.getenv("VLLM_DETERMINISTIC_SPARSE_TOPK", "0"))
+    ),
+    "VLLM_DETERMINISTIC_GROUPED_TOPK": lambda: bool(
+        int(os.getenv("VLLM_DETERMINISTIC_GROUPED_TOPK", "0"))
+    ),
+    "VLLM_DETERMINISTIC_MOE_GATE": lambda: bool(
+        int(os.getenv("VLLM_DETERMINISTIC_MOE_GATE", "0"))
+    ),
+    "VLLM_GLM53_PREFILL_DETERMINISTIC_OPS": lambda: bool(
+        int(os.getenv("VLLM_GLM53_PREFILL_DETERMINISTIC_OPS", "0"))
+    ),
+    # SM90 fp8_ds_mla: keep every request's entire selected KV in one
+    # reduction, independently of query batch size. Does not enable global BI.
+    "VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT", "0"))
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),
