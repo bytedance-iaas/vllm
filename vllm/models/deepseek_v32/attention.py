@@ -56,34 +56,15 @@ if TYPE_CHECKING:
     )
 
 
-def is_index_producing_layer(
-    config: DeepseekV2Config | DeepseekV3Config, layer_id: int
-) -> bool:
-    index_topk_freq = getattr(config, "index_topk_freq", 1)
-    index_topk_pattern = getattr(config, "index_topk_pattern", None)
-    index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
-    if index_topk_pattern is None:
-        skip_topk = max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
-    elif 0 <= layer_id < len(index_topk_pattern):
-        skip_topk = index_topk_pattern[layer_id] == "S"
-    else:
-        skip_topk = False
-
-    num_hidden_layers = getattr(config, "num_hidden_layers", None)
-    is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
-    return not skip_topk or is_mtp_layer
-
-
 def get_pp_indexer_handoff_directions(
     config: DeepseekV2Config | DeepseekV3Config,
     start_layer: int,
     end_layer: int,
 ) -> tuple[bool, bool]:
     num_hidden_layers = config.num_hidden_layers
-    receives = start_layer > 0 and not is_index_producing_layer(config, start_layer)
-    sends = end_layer < num_hidden_layers and not is_index_producing_layer(
-        config, end_layer
-    )
+    skip_topk = compute_skip_topk_layers(config)
+    receives = start_layer > 0 and start_layer in skip_topk
+    sends = end_layer < num_hidden_layers and end_layer in skip_topk
     return receives, sends
 
 
@@ -229,7 +210,7 @@ class DeepseekV32Attention(MLAAttention):
 
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
-        skip_topk = not is_index_producing_layer(config, layer_id)
+        skip_topk = layer_id in compute_skip_topk_layers(config)
 
         kv_b_proj = ColumnParallelLinear(
             kv_lora_rank,
@@ -510,9 +491,7 @@ class DeepseekV32Attention(MLAAttention):
                 )
             else:
                 # Keep the torch query-absorb layout used by Decode.
-                ql_nope = torch.bmm(
-                    q_nope.transpose(0, 1), self.W_UK_T
-                ).transpose(0, 1)
+                ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
         else:
             ql_nope = q_nope
 

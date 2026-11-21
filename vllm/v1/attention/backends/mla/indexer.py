@@ -1059,6 +1059,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.sm120_prefill = (
             self.vllm_config.kernel_config.sparse_indexer_topk_backend
             == "flashinfer_sm120"
+            and not (envs.VLLM_DETERMINISTIC_SPARSE_TOPK or envs.VLLM_BATCH_INVARIANT)
             and self.dcp_world_size == 1
             and self.tp_size == 1
             and self.compress_ratio == 1

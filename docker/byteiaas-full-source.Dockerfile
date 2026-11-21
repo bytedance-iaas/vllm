@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=iaas-gpu-cn-beijing.cr.volces.com/serving/vllm@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 ARG VLLM_BUILD_COMMIT
@@ -53,8 +53,6 @@ for name, variable in (("vllm", "VLLM_BUILD_COMMIT"), ("flashinfer", "FLASHINFER
     record["packages"][name] = {"commit": os.environ[variable],
                                "version": importlib.metadata.version(distribution),
                                "files": files}
-if record["packages"]["vllm"]["version"] != "0.33.0":
-    raise ValueError("Preserve the qualified vLLM/NIXL version identity")
 Path("/opt/byteiaas/source-provenance.json").write_text(json.dumps(record, indent=2) + "\n")
 PY
 

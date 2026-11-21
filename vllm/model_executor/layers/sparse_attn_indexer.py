@@ -1080,7 +1080,9 @@ def sparse_attn_indexer(
                         else:
                             q_scale_rows, chunk_weights = mqa_logits_mx_inputs(
                                 q_slice_cast[rows],
-                                q_scale_slice[rows] if q_scale_slice is not None else None,
+                                q_scale_slice[rows]
+                                if q_scale_slice is not None
+                                else None,
                                 prefill_weights[tokens],
                                 logits_dtype,
                             )

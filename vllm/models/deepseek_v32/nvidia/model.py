@@ -266,20 +266,25 @@ class DeepseekV32Model(torch.nn.Module):
         receives_topk, sends_topk = get_pp_indexer_handoff_directions(
             config, self.start_layer, self.end_layer
         )
-        self.pp_receives_indexer_handoff = self.pp_indexer_handoff_enabled and receives_topk
+        self.pp_receives_indexer_handoff = (
+            self.pp_indexer_handoff_enabled and receives_topk
+        )
         self.pp_sends_indexer_handoff = self.pp_indexer_handoff_enabled and sends_topk
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.pp_buffers = (
-            {"topk_indices": self.topk_indices_buffer}
-            if self.pp_receives_indexer_handoff
-            else {}
-        ) if self.pp_indexer_handoff_enabled else pp_topk_buffers(
-            config, self.topk_indices_buffer, range(config.num_hidden_layers)
-        )
+        if self.pp_indexer_handoff_enabled:
+            self.pp_buffers = (
+                {"topk_indices": self.topk_indices_buffer}
+                if self.pp_receives_indexer_handoff
+                else {}
+            )
+        else:
+            self.pp_buffers = pp_topk_buffers(
+                config, self.topk_indices_buffer, range(config.num_hidden_layers)
+            )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"]
             if self.pp_indexer_handoff_enabled

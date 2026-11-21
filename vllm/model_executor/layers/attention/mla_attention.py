@@ -1500,7 +1500,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # concat is ~1 ms per layer of a 32k-token prefill).
                 R = mqa_q_pe.shape[-1]
                 mqa_q_cat = mqa_q_nope.new_empty((B, N, L + R))
-                self._mla_bmm(mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1))
+                self._mla_bmm(
+                    mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1)
+                )
                 mqa_q_cat[..., L:].copy_(mqa_q_pe)
                 mqa_ql_nope, mqa_q_pe = mqa_q_cat, mqa_q_pe[..., :0]
             else:

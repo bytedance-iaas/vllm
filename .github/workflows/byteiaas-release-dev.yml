@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: ByteIAAS runtime base with matching PyTorch/CUDA and serving dependencies
+        description: Immutable ByteIAAS runtime base with Torch 2.14/CUDA 13.2 and serving dependencies
         required: true
-        default: iaas-gpu-cn-beijing.cr.volces.com/serving/vllm@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3
         type: string
       image_tag:
         description: Optional image tag; defaults to poc-tk300-h20-<commit SHA>
@@ -64,13 +63,8 @@ jobs:
       - name: Build vLLM wheel
         run: |
           set -euo pipefail
-          version_args=()
-          if [[ -n "${{ inputs.flashinfer_commit }}" ]]; then
-            version_args+=(--build-arg VLLM_VERSION_OVERRIDE=0.33.0)
-          fi
-          docker buildx build --load --network=host "${version_args[@]}" \
+          docker buildx build --load --network=host \
             --target build -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.3 \
             --build-arg 'torch_cuda_arch_list=9.0 12.0' \
             --build-arg max_jobs="${BYTEIAAS_BUILD_MAX_JOBS:-32}" \
             --build-arg nvcc_threads="${BYTEIAAS_BUILD_NVCC_THREADS:-4}" \

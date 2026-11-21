@@ -34,7 +34,6 @@ class UbatchTopkState:
     physical_topk_ready: torch.Event
 
 
-
 @dataclass
 class SparseMLAIndexGroup:
     """Layers that consume one sparse-indexer result."""
@@ -432,7 +431,6 @@ class SparseMLAIndexGroupBuilder:
         if group_index == 1 and self.num_ubatches > 1:
             self._add_ubatch_state(group)
         return group, group_index
-
 
     def _add_ubatch_state(self, group: SparseMLAIndexGroup) -> None:
         num_extra = self.num_ubatches - 1

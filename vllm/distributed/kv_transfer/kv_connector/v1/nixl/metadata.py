@@ -187,21 +187,21 @@ def compute_nixl_compatibility_hash(
     is_hma_enabled = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
 
     # Match the two packed MLA layouts supported by the 2P4D GLM-5.3 chart.
-    if __import__("os").environ.get("TK300_GLM53_NIXL_COMPAT") == "1":
-        if (
-            model_config.model == "/model"
-            and model_config.hf_text_config.model_type == "glm_moe_dsa"
-            and cache_config.cache_dtype == "fp8_ds_mla"
-            and transfer_mode == "push"
-        ):
-            backend_aliases = {
-                "FLASHINFER_MLA_SPARSE_SM120": "GLM53_PACKED_MLA_SMOKE",
-                "FLASHMLA_SPARSE": "GLM53_PACKED_MLA_SMOKE",
-            }
-            attn_backend_name = ",".join(sorted(
-                backend_aliases.get(name, name)
-                for name in attn_backend_name.split(",")
-            ))
+    if __import__("os").environ.get("TK300_GLM53_NIXL_COMPAT") == "1" and (
+        model_config.model == "/model"
+        and model_config.hf_text_config.model_type == "glm_moe_dsa"
+        and cache_config.cache_dtype == "fp8_ds_mla"
+        and transfer_mode == "push"
+    ):
+        backend_aliases = {
+            "FLASHINFER_MLA_SPARSE_SM120": "GLM53_PACKED_MLA_SMOKE",
+            "FLASHMLA_SPARSE": "GLM53_PACKED_MLA_SMOKE",
+        }
+        attn_backend_name = ",".join(
+            sorted(
+                backend_aliases.get(name, name) for name in attn_backend_name.split(",")
+            )
+        )
 
     factors = {
         # Version compatibility

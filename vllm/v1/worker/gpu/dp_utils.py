@@ -134,9 +134,10 @@ def sync_cudagraph_and_dp_padding(
     ):
         assert parallel_config is not None
         min_tokens = int(num_tokens_across_dp.min())
-        if check_ubatch_thresholds(
-            parallel_config, min_tokens, uniform_decode=True
-        ) and cudagraph_manager is not None:
+        if (
+            check_ubatch_thresholds(parallel_config, min_tokens, uniform_decode=True)
+            and cudagraph_manager is not None
+        ):
             num_ubatches = get_num_ubatches(parallel_config)
             ubatch_desc = cudagraph_manager.dispatch(
                 num_reqs,
