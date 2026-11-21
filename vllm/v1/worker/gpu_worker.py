@@ -61,6 +61,7 @@ from vllm.distributed.parallel_state import (
     suspend_device_comms,
 )
 from vllm.distributed.pp_transport import (
+    PP_TP_ALL_GATHER_OVERRIDES,
     PPTransport,
     RowSpec,
     check_intermediate_tensors,
@@ -1518,6 +1519,7 @@ class Worker(WorkerBase):
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
+                    all_gather_tensors=PP_TP_ALL_GATHER_OVERRIDES,
                 )
             )
             assert tensor_dict is not None
@@ -1558,6 +1560,7 @@ class Worker(WorkerBase):
             handles = get_pp_group().isend_tensor_dict(
                 output.tensors,
                 all_gather_group=get_tp_group(),
+                all_gather_tensors=PP_TP_ALL_GATHER_OVERRIDES,
             )
             self._pp_send_work = handles[1:]
 

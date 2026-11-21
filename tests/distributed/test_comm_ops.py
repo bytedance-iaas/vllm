@@ -17,6 +17,7 @@ import torch
 from vllm.distributed import (
     broadcast_tensor_dict,
     get_pp_group,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
@@ -28,6 +29,7 @@ from vllm.distributed.parallel_state import (
     TensorMetadata,
     single_pp_stage,
 )
+from vllm.distributed.pp_transport import PP_TP_ALL_GATHER_OVERRIDES
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from ..utils import (
@@ -208,6 +210,41 @@ def send_recv_tensor_dict_test_worker(
         assert recv_dict["d"] == test_dict["d"]
         assert recv_dict["e"] == test_dict["e"]
         torch.testing.assert_close(recv_dict["f"], test_dict["f"])
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def send_recv_rank_local_topk_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    pp_group, tp_group = get_pp_group(), get_tp_group()
+    hidden = torch.arange(16, device=device, dtype=torch.bfloat16).reshape(4, 4)
+    topk = torch.arange(16, device=device, dtype=torch.int32).reshape(4, 4)
+    topk += 16 * tp_group.rank_in_group
+    if pp_group.is_first_rank:
+        handles = pp_group.isend_tensor_dict(
+            {"hidden_states": hidden, "topk_indices": topk},
+            all_gather_group=tp_group,
+            all_gather_tensors=PP_TP_ALL_GATHER_OVERRIDES,
+        )
+        for handle in handles:
+            handle.wait()
+    else:
+        received = pp_group.recv_tensor_dict(
+            all_gather_group=tp_group,
+            all_gather_tensors=PP_TP_ALL_GATHER_OVERRIDES,
+        )
+        assert received is not None
+        assert torch.equal(received["hidden_states"], hidden)
+        assert torch.equal(received["topk_indices"], topk)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -883,6 +920,7 @@ def test_multi_process_pipeline_parallel(
     [
         send_recv_test_worker,
         send_recv_tensor_dict_test_worker,
+        send_recv_rank_local_topk_worker,
         all_reduce_test_worker,
         all_gather_test_worker,
         broadcast_tensor_dict_test_worker,
