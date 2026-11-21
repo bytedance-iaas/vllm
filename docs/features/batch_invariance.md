@@ -205,6 +205,19 @@ top-k: a stable top-k reduction also needs stable input logits. FP8 model
 weights, KV cache formats, attention, expert dispatch and speculative decoding
 keep their configurations. Model-wide invariance requires model validation.
 
+### GLM-5.3 Prefill operator selection on SM90
+
+`VLLM_GLM53_PREFILL_DETERMINISTIC_OPS=1` uses the existing fixed-order linear
+kernel for the `(160, 6144)` BF16 indexer projection. For BF16 RMSNorm with
+hidden size 6,144 and fewer than 256 rows, it uses the native large-batch
+reduction by padding only the normalization inputs. The backbone completes the
+TP all-reduce before residual addition and normalization on that path.
+
+The switch defaults to off. Enable it only on the Prefill process of the
+SM90 GLM-5.3 deployment. For FP8 sparse MLA, configure the attention route
+independently with `attention_config.sparse_mla_force_mqa`. Verify generation
+against the deployment's cache precision, attention backend, and topology.
+
 When batch invariance is enabled, vLLM:
 
 1. Uses deterministic kernel implementations for attention and other operations
