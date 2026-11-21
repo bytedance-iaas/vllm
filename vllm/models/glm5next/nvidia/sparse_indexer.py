@@ -11,7 +11,11 @@ from vllm.distributed import get_dcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+from vllm.model_executor.layers.canonical_topk import canonicalize_topk_
+from vllm.model_executor.layers.indexer_topk import (
+    deterministic_sparse_topk,
+    get_indexer_topk,
+)
 from vllm.model_executor.layers.sparse_attn_indexer import (
     PrefillRowShard,
     _merge_dcp_topk_global,
@@ -400,6 +404,8 @@ def sparse_attn_indexer_kpool(
                     logits.stride(1),
                     select_k,
                 )
+                if deterministic_sparse_topk():
+                    canonicalize_topk_(logits, topk_dst, row_ends)
             # Local pool ids -> request-relative global pool ids.
             _merge_dcp_topk_global(
                 logits,

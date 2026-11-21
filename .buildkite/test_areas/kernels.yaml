@@ -40,8 +40,17 @@ steps:
   - tests/kernels/core
   - tests/kernels/test_concat_mla_q.py
   - tests/kernels/test_fused_qk_norm_rope_gate.py
+  - tests/kernels/test_canonical_topk.py
+  - vllm/model_executor/layers/canonical_topk.py
+  - vllm/model_executor/layers/indexer_topk.py
   commands:
-    - pytest -v -s kernels/core --ignore=kernels/core/test_minimax_reduce_rms.py kernels/test_concat_mla_q.py kernels/test_fused_qk_norm_rope_gate.py
+    - >-
+      pytest -v -s
+      kernels/core
+      --ignore=kernels/core/test_minimax_reduce_rms.py
+      kernels/test_concat_mla_q.py
+      kernels/test_fused_qk_norm_rope_gate.py
+      kernels/test_canonical_topk.py
   mirror:
     amd:
       label: ":amd: (MI300) Core Operation Kernels"
@@ -384,6 +393,19 @@ steps:
       commands:
       - pytest -v -s kernels/attention/test_triton_unified_attention_diffkv.py
 
+- label: ":nvidia: (H100) Sparse FlashMLA Single KV Split"
+  key: kernels-flashmla-single-split-h100
+  timeout_in_minutes: 10
+  device: h100
+  num_devices: 1
+  source_file_dependencies:
+  - vllm/envs.py
+  - vllm/v1/attention/backends/mla/flashmla_sparse.py
+  - vllm/v1/attention/backends/mla/flashmla_sparse_scheduler.py
+  - tests/kernels/attention/test_flashmla_single_split.py
+  commands:
+    - pytest -v -s kernels/attention/test_flashmla_single_split.py
+
 - label: ":nvidia: (H100) MLA Kernel Test"
   key: kernels-flashmla-test-h100
   timeout_in_minutes: 25
@@ -718,6 +740,8 @@ steps:
   - vllm/model_executor/kernels/linear/cute_dsl/_ll_bf16_dotprod.py
   - vllm/model_executor/kernels/linear/cute_dsl/_ll_bf16_splitk.py
   - tests/kernels/test_ll_bf16_gemm.py
+  - vllm/model_executor/determinism/batch_invariant.py
+  - vllm/envs.py
   - vllm/model_executor/kernels/linear/cute_dsl/ll_fp32w.py
   - vllm/model_executor/kernels/linear/cute_dsl/_ll_fp32w_dotprod.py
   - tests/kernels/test_ll_fp32w_gemm.py

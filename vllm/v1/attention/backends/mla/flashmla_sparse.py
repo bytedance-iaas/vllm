@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -32,6 +33,9 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     CommonAttentionMetadata,
     MultipleOf,
+)
+from vllm.v1.attention.backends.mla.flashmla_sparse_scheduler import (
+    single_split_flashmla_schedule,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -753,6 +757,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Prefill BF16 kernel requires 64 heads on Hopper and Blackwell.
         self.prefill_padding = 64
         self.fp8_decode_padded_heads = self._compute_fp8_decode_padded_heads(num_heads)
+        self.single_kv_split = envs.VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT
+        if self.single_kv_split and (
+            not current_platform.is_device_capability_family(90)
+            or kv_cache_dtype != "fp8_ds_mla"
+        ):
+            raise ValueError(
+                "VLLM_FLASHMLA_SPARSE_SINGLE_KV_SPLIT requires SM90 and fp8_ds_mla"
+            )
 
         # The kernels read queries as wide as the cache rows. A NoPE model on
         # fp8_ds_mla keeps the DeepSeek 576 layout: the cache writer zero-fills
@@ -1301,13 +1313,28 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             q_padded[:, :, :actual_num_heads, :] = q
             q = q_padded
 
+        scheduler_metadata = kernel_metadata.scheduler_metadata
+        if self.single_kv_split and not scheduler_metadata.have_initialized:
+            (
+                scheduler_metadata.tile_scheduler_metadata,
+                scheduler_metadata.num_splits,
+            ) = single_split_flashmla_schedule(
+                q.shape[0],
+                q.shape[1],
+                q.shape[2],
+                topk_indices.shape[-1],
+                num_compute_units(q.device.index),
+                q.device,
+            )
+            logger.info_once("SM90 sparse FlashMLA uses one KV split per request")
+
         out, lse = flash_mla_with_kvcache(
             q=q,
             k_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(-2),
             block_table=kernel_metadata.dummy_block_table,
             head_dim_v=512,
             cache_seqlens=kernel_metadata.cache_lens,
-            tile_scheduler_metadata=kernel_metadata.scheduler_metadata,
+            tile_scheduler_metadata=scheduler_metadata,
             is_fp8_kvcache=True,
             indices=topk_indices,
             softmax_scale=self.softmax_scale,

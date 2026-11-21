@@ -73,6 +73,10 @@ class GraphCaptureContext:
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# Shared sparse-attention top-k rows can be packed in TP rank-local order.
+# Send the full buffer only to the matching TP rank of the next PP stage.
+PP_TP_ALL_GATHER_OVERRIDES = {"topk_indices": False}
+
 
 class Handle(Protocol):
     """Minimal async work handle used by P2P send/recv methods."""

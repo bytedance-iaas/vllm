@@ -10,6 +10,9 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.determinism.batch_invariant import (
+    softmax as batch_invariant_softmax,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
@@ -24,6 +27,20 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
+
+
+def _routing_softmax(logits: torch.Tensor, num_expert_group: int) -> torch.Tensor:
+    if (
+        envs.VLLM_DETERMINISTIC_GROUPED_TOPK
+        and current_platform.is_cuda()
+        and num_expert_group == 1
+        and 256 <= logits.shape[1] < 1024
+    ):
+        # torch.softmax can change its FP32 reduction across batch sizes even
+        # below the native grouped-topk block/warp transition. Reuse the
+        # existing row-independent BI score kernel without enabling all BI.
+        return batch_invariant_softmax(logits, dim=-1)
+    return torch.softmax(logits, dim=-1)
 
 
 def fused_grouped_topk(
@@ -54,7 +71,7 @@ def fused_grouped_topk(
     elif scoring_func == "softmax":
         # Apply softmax in Python, then use fused kernel
         # TODO: Add support for softmax in kernel
-        scores = torch.softmax(gating_output, dim=-1)
+        scores = _routing_softmax(gating_output, num_expert_group)
         topk_values, topk_indices = ops.grouped_topk(
             scores,  # pre-computed scores
             num_expert_group,
@@ -111,7 +128,7 @@ def grouped_topk(
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
     if scoring_func == "softmax":
-        scores = torch.softmax(gating_output, dim=-1)
+        scores = _routing_softmax(gating_output, num_expert_group)
     elif scoring_func == "sigmoid":
         scores = gating_output.sigmoid()
     else:
@@ -160,6 +177,25 @@ def grouped_topk(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _grouped_topk_block_chunks(
+    *,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep single-group routing on the native block kernel across batch sizes."""
+    chunks = [
+        grouped_topk(
+            hidden_states=hidden_states[start : start + 1024],
+            gating_output=gating_output[start : start + 1024],
+            **kwargs,
+        )
+        for start in range(0, gating_output.shape[0], 1024)
+    ]
+    weights, ids = zip(*chunks)
+    return torch.cat(weights), torch.cat(ids)
 
 
 # --8<-- [start:grouped_topk]
@@ -335,6 +371,19 @@ class GroupedTopKRouter(BaseRouter):
             )
         else:
             grouped_topk_impl = grouped_topk
+            # Native single-group routing switches block -> warp above 1024
+            # tokens, changing unbiased weights despite identical expert IDs.
+            # Reuse the upstream BI chunk design independently for FP8 DSA/MTP
+            # deployments that cannot enable the complete BI mode.
+            if (
+                (envs.VLLM_DETERMINISTIC_GROUPED_TOPK or envs.VLLM_BATCH_INVARIANT)
+                and current_platform.is_cuda()
+                and self.num_expert_group == 1
+                and self.topk_group == 1
+                and 256 <= router_logits.shape[1] < 1024
+                and router_logits.shape[0] > 1024
+            ):
+                grouped_topk_impl = _grouped_topk_block_chunks
 
         topk_weights, topk_ids = grouped_topk_impl(
             hidden_states=hidden_states,

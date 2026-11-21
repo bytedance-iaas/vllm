@@ -29,8 +29,10 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
+from vllm.model_executor.layers.canonical_topk import canonicalize_topk_
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
+    deterministic_sparse_topk,
     get_indexer_topk,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -506,6 +508,16 @@ def sparse_attn_indexer(
         )
         assert candidate_block_size > 0
 
+    deterministic = deterministic_sparse_topk()
+    if deterministic:
+        if topk_backend in ("deep_select", "flashinfer_sm120"):
+            # Canonical selection needs the raw FP32 scores.
+            topk_backend = "auto"
+        if dcp_world_size != 1:
+            logger.warning_once(
+                "VLLM_DETERMINISTIC_SPARSE_TOPK does not cover the decode context "
+                "parallel top-k merge; its result keeps the merge's order."
+            )
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
@@ -887,6 +899,8 @@ def sparse_attn_indexer(
                         logits.stride(1),
                         topk_tokens,
                     )
+                    if deterministic and row_starts is None:
+                        canonicalize_topk_(logits, topk_indices, row_ends)
 
             if deinterleave_idx is None and not fused_sm120:
                 # Under the PCP path the top-k already ran over the whole
