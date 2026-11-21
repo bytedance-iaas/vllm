@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# ShardQ packs the shared sparse-attention top-k rows in TP rank-local order.
+# Forward each buffer to the matching TP rank of the next PP stage.
+PP_TP_ALL_GATHER_OVERRIDES = {"topk_indices": False}
+
 # A received tensor's dtype and per-token shape.
 RowSpec = tuple[torch.dtype, tuple[int, ...]]
 
