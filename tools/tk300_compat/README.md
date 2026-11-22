@@ -31,6 +31,9 @@ writer metadata, write submission and handle retirement, notification source
 agent and arrival, engine consumption, the existing producer barrier report,
 KV-ready scheduling, and first model-executor dispatch and result processing.
 They retain wall and monotonic clock anchors without logging prompts or tokens.
+Opaque native handles and byte-valued agents are serialized as strings so they
+cannot silently drop a whole event. Producer records include the initialized
+pipeline rank when available; registration records retain the peer rank tuple.
 With the diagnostic flag enabled, each Decode-capacity snapshot also returns
 `handoff_clock` with integer wall/monotonic nanoseconds and the local anchor
 bracket. A target-runtime client can bound clock offset using the request's

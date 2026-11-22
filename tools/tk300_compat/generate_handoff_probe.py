@@ -39,13 +39,19 @@ def _vrdma_e2e(stage, rid, **values):
         import json
         import socket
         import time
+        if "pcp" in values:
+            try:
+                from vllm.distributed import get_pp_group
+                values["pp"] = get_pp_group().rank_in_group
+            except Exception:
+                values["pp"] = None
         wall_ns = time.time_ns()
         logger.info("VRDMA_E2E %s", json.dumps(dict(
             schema=2, stage=stage, rid=rid, epoch=wall_ns/1e9,
             epoch_ns=wall_ns, monotonic_ns=time.monotonic_ns(),
             pid=_tk300_trace_os.getpid(), host=socket.gethostname(),
             run_id=_tk300_trace_os.environ.get("TK300_HANDOFF_RUN_ID", ""),
-            **values), separators=(",", ":")))
+            **values), separators=(",", ":"), default=str))
     except Exception:
         return
 """
@@ -121,7 +127,8 @@ def instrument(name, text):
             old
             + """                if _HANDOFF_DIAGNOSTIC_ENABLED:
                     _vrdma_e2e("decoder_registration_sent", req_id,
-                               producer_engine=engine_id, producer_agent=agent_name)
+                               producer_engine=engine_id, producer_agent=agent_name,
+                               producer_rank=rank)
 """,
         )
         old = "            self.nixl_wrapper.transfer(handle)\n"
