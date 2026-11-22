@@ -597,68 +597,35 @@ def make_nixl_push_scheduler(
     is_bidirectional_kv_xfer_enabled: bool = False,
     has_mamba: bool = False,
 ):
-    """Create a NixlPushConnectorScheduler via __new__ (skipping __init__).
-
-    The push scheduler can't reuse :func:`make_nixl_scheduler` because it
-    is a different class (``NixlPushConnectorScheduler`` vs
-    ``NixlConnectorScheduler``) and carries push-specific state. Only the
-    fields touched by the unit tests are populated.
-    """
-    from unittest.mock import MagicMock
-
+    """Construct the push scheduler through its real configuration path."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
         NixlPushConnectorScheduler,
     )
 
-    sched = object.__new__(NixlPushConnectorScheduler)
-
-    # Base scheduler fields (shared with pull / heartbeat path).
-    sched._reqs_need_recv = {}
-    sched._reqs_need_send = {}
-    sched._reqs_in_batch = set()
-    sched._reqs_not_processed = set()
-    sched._reqs_need_save = {}
-    sched._kv_lease_duration = 30
-    sched.decoder_kv_blocks_ttl = decoder_kv_blocks_ttl
-    sched.use_host_buffer = False
-    sched.engine_id = "decode-engine"
-    sched.transfer_tp_size = 1
-    sched.side_channel_host = "127.0.0.1"
-    sched.side_channel_port = 5600
-    sched.is_bidirectional_kv_xfer_enabled = is_bidirectional_kv_xfer_enabled
-    sched._has_mamba = has_mamba
-    sched._bounded_replay = False
-    sched.kv_cache_config = make_kv_cache_config(
-        block_size=16,
-        mamba_enabled=has_mamba,
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        scheduler_config=SchedulerConfig(max_model_len=1024, is_encoder_decoder=False),
+        device_config=DeviceConfig(device="cpu"),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlPushConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={
+                "kv_lease_duration": 30,
+                "decoder_kv_blocks_ttl": decoder_kv_blocks_ttl,
+                "push_registration_timeout": (
+                    decoder_kv_blocks_ttl
+                    if push_registration_timeout is None
+                    else push_registration_timeout
+                ),
+                "bidirectional_kv_xfer": is_bidirectional_kv_xfer_enabled,
+            },
+        ),
     )
-
-    # vllm_config is consulted for parallel_config.tensor_parallel_size, and by
-    # `_prefill_backoff` on both the P and D prefill paths.
-    vllm_config = MagicMock()
-    vllm_config.parallel_config.tensor_parallel_size = 1
-    vllm_config.num_prefill_lookahead_tokens = 0
-    sched.vllm_config = vllm_config
-
-    # Push-specific state.
-    sched._push_pending_registrations = {}
-    sched._push_registration_deadlines = {}
-    sched._finished_request_blocks = {}
-    sched._newly_finished_push_blocks = {}
-    sched._push_registration_timeout = (
-        push_registration_timeout
-        if push_registration_timeout is not None
-        else decoder_kv_blocks_ttl
+    return NixlPushConnectorScheduler(
+        config,
+        "decode-engine",
+        make_kv_cache_config(block_size=16, mamba_enabled=has_mamba),
     )
-
-    # Heartbeat fields touched by base request_finished /
-    # update_connector_output.
-    sched._heartbeat_by_engine = {}
-    sched._heartbeat_req_engine = {}
-    sched._last_heartbeat_time = 0.0
-    sched.blocks_per_sw = []
-
-    return sched
 
 
 def make_moriio_writer(fake_worker: Any) -> Any:

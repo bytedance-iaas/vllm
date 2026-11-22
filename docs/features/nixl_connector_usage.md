@@ -108,6 +108,33 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --decoder-ports 8200
 ```
 
+## Step-wise push
+
+`NixlPushConnector` can publish completed prompt blocks from each prefill step,
+after that step's KV save event, instead of waiting for the request's terminal
+metadata. Enable it only on the producer:
+
+```json
+{"kv_connector":"NixlPushConnector","kv_role":"kv_producer","kv_connector_extra_config":{"enable_chunked_push":true}}
+```
+
+This option is disabled by default. It uses one full-attention transfer group,
+a device KV buffer, TP=1 and DCP=1. The producer mapping must be PP=1/PCP=1 or
+PP=4/PCP=4 with replicated PCP; only PCP rank zero exports each pipeline stage's
+KV. The decoder must use TP=1, DCP=1, PP=1 and matching block sizes. Other
+configurations retain whole-request push.
+
+MTP keeps its existing save-finalization order: the event is recorded after the
+draft forward when finalization is deferred. A stage notifies the decoder once
+its last job and all earlier WRITEs have completed. The decoder's existing
+producer quorum still waits for every stage. Source block ownership remains on
+the normal terminal request and KV lease path.
+
+Preemption and abort settle outstanding WRITEs before source blocks can be
+reused. A retirement timeout refuses block reuse. An uncertain completion
+notification is not retried into the decoder's counted quorum; the decoder
+retains its existing timeout behavior.
+
 ## Environment Variables
 
 - `VLLM_NIXL_SIDE_CHANNEL_PORT`: Port for NIXL handshake communication

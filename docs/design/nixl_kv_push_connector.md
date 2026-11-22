@@ -67,6 +67,33 @@ sequenceDiagram
     Proxy-->>Client: response
 ```
 
+## Step-wise producer jobs
+
+The opt-in `enable_chunked_push` path offers completed full prompt blocks in
+the current scheduler output. The final job also includes the prompt's partial
+last block. The worker publishes jobs to the existing writer after recording
+the KV save event; the model runner's deferred finalization keeps this after
+MTP writes. Replicated PCP exports through rank zero of each PP stage, using
+the existing layer-range mapping.
+
+Intermediate jobs carry no completion notification. The last job waits for
+earlier jobs to settle. Its notification is sent separately after NIXL reports
+all sibling WRITE handles as `DONE`, once per target. A failed job can use
+whole-request fallback after all its handles settle; uncertain notification
+delivery is never retried into the decoder's counted producer quorum.
+
+Completed early jobs do not free the producer request's blocks. Normal terminal
+metadata and finished-sending reporting retain the existing lease lifecycle.
+Preemption, abort and expired source leases retire queued jobs and settle
+outstanding WRITEs before block reuse. A retirement timeout raises instead of
+continuing with potentially active reads.
+
+The implementation adapts the job/event lifecycle from
+[PR 67203](https://github.com/vllm-project/vllm/pull/67203) and the explicit-DONE
+notification boundary from
+[PR 68686](https://github.com/vllm-project/vllm/pull/68686). The option leaves the
+default whole-request path unchanged; the receiver wire format is shared.
+
 ## Threads
 
 ``NixlPushConnectorWorker`` introduces a single dedicated background
@@ -74,14 +101,17 @@ thread per worker (i.e. per TP rank), named ``nixl-push-writer``.
 Each owns the new push-specific NIXL operations on its rank:
 
 * ``nixl_wrapper.get_new_notifs()`` — receive notifications.
-* ``nixl_wrapper.send_notif(...)`` for the ``PUSH_REG:<msgpack>`` (D
-  side) and for the per-WRITE completion notif (P side).
+* ``nixl_wrapper.send_notif(...)`` for ``PUSH_REG:<msgpack>`` on D.
 * ``nixl_wrapper.make_prepped_xfer(...) / transfer(...)`` — submit the
   WRITE itself.
 
 Heartbeats continue to go out from the engine main thread via the
 existing base-worker ``_send_heartbeats`` plumbing inside
 ``start_load_kv``.
+
+Step-wise completion notifications can be claimed by the writer poll or the
+engine thread's final-DONE hook. A separate completion lock makes the claim
+once per target, after all sibling handles report DONE.
 
 ### Wake model
 

@@ -266,6 +266,17 @@ class ReqMeta:
     region_blocks_to_zero: BlockIds | None = None
 
 
+@dataclass(frozen=True)
+class NixlPushChunkJob:
+    """Prompt blocks completed by one step, published after its save event."""
+
+    request_id: ReqId
+    block_ids: list[int]
+    start_block: int
+    end_block: int
+    total_blocks: int
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
@@ -287,6 +298,11 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Push mode (P side): computed prompt blocks to send before the request
+        # finishes, and requests preempted in this step, whose chunk WRITEs are
+        # settled before their blocks are reused.
+        self.push_chunk_jobs: list[NixlPushChunkJob] = []
+        self.push_chunk_preemptions: set[ReqId] = set()
 
     def _add_new_req(
         self,

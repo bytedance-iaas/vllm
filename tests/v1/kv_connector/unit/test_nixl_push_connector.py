@@ -32,7 +32,14 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
-from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVTransferConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
@@ -62,10 +69,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
 from vllm.sampling_params import SamplingParams
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from .utils import (
     create_request,
@@ -494,6 +503,112 @@ def _registration_data(
         "remote_port": remote_port,
         "remote_tp_size": remote_tp_size,
     }
+
+
+class TestChunkedPushScheduler:
+    @staticmethod
+    def make_sender(enabled=True, pp=1, pcp=1):
+        config = VllmConfig(
+            cache_config=CacheConfig(block_size=64),
+            device_config=DeviceConfig(device="cpu"),
+            scheduler_config=SchedulerConfig(
+                max_model_len=1024, is_encoder_decoder=False
+            ),
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=pp,
+                prefill_context_parallel_size=pcp,
+                tensor_parallel_size=1,
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="NixlPushConnector",
+                kv_role="kv_producer",
+                kv_buffer_device="cpu",
+                kv_connector_extra_config={"enable_chunked_push": enabled},
+            ),
+        )
+        sender = NixlPushConnectorScheduler(
+            config, "chunk-prefill", make_kv_cache_config(block_size=64)
+        )
+        request = create_request(num_tokens=160, block_size=64, do_remote_decode=True)
+        blocks = KVCacheBlocks(([KVCacheBlock(i) for i in (1, 2, 3)],))
+        sender.update_state_after_alloc(request, blocks, 0)
+        output = SchedulerOutput.make_empty()
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={request.request_id},
+            resolve_block_ids=lambda _: blocks.get_block_ids(),
+            boundary_state_offloads={},
+        )
+        return sender, request, blocks, output
+
+    @pytest.mark.parametrize("pp,pcp", [(1, 1), (4, 4)])
+    def test_complete_blocks_publish_before_terminal_metadata(self, pp, pcp):
+        sender, request, _, output = self.make_sender(pp=pp, pcp=pcp)
+        output.num_scheduled_tokens = {request.request_id: 128}
+        first = sender.build_connector_meta(output)
+        jobs = getattr(first, "push_chunk_jobs", [])
+        assert len(jobs) == 1, "Completed blocks must publish before terminal metadata"
+        (job,) = jobs
+        assert (job.start_block, job.end_block, job.block_ids) == (0, 2, [1, 2])
+        assert first.push_finished_blocks == {}
+
+        request.num_computed_tokens = 128
+        output.num_scheduled_tokens = {request.request_id: 32}
+        last = sender.build_connector_meta(output)
+        (job,) = last.push_chunk_jobs
+        assert (job.start_block, job.end_block, job.block_ids, job.total_blocks) == (
+            2,
+            3,
+            [3],
+            3,
+        )
+        assert last.push_finished_blocks == {}
+        sender.shutdown()
+
+    def test_disabled_mode_keeps_original_terminal_submission(self):
+        sender, request, blocks, output = self.make_sender(enabled=False)
+        output.num_scheduled_tokens = {request.request_id: 160}
+        assert sender.build_connector_meta(output).push_chunk_jobs == []
+        request.num_computed_tokens = 160
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        held, _ = sender.request_finished(request, blocks.get_block_ids())
+        assert held
+        meta = sender.build_connector_meta(output)
+        assert meta.push_finished_blocks[request.request_id] == blocks.get_block_ids()
+        assert meta.push_chunk_jobs == []
+        sender.shutdown()
+
+    def test_preempted_request_republishes_from_first_block(self):
+        sender, request, blocks, output = self.make_sender()
+        output.num_scheduled_tokens = {request.request_id: 128}
+        sender.build_connector_meta(output)
+        output.preempted_req_ids = {request.request_id}
+        output.num_scheduled_tokens = {}
+        assert sender.build_connector_meta(output).push_chunk_preemptions == {
+            request.request_id
+        }
+        sender.update_state_after_alloc(request, blocks, 0)
+        output.preempted_req_ids = set()
+        output.num_scheduled_tokens = {request.request_id: 128}
+        (job,) = sender.build_connector_meta(output).push_chunk_jobs
+        assert (job.start_block, job.end_block) == (0, 2)
+        sender.shutdown()
+
+    def test_unvalidated_parallel_mapping_falls_back(self):
+        sender, request, _, output = self.make_sender(pp=2)
+        output.num_scheduled_tokens = {request.request_id: 160}
+        assert sender.build_connector_meta(output).push_chunk_jobs == []
+        sender.shutdown()
+
+    def test_terminal_only_step_preserves_original_finished_blocks(self):
+        sender, request, blocks, _ = self.make_sender()
+        request.num_computed_tokens = 160
+        request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        held, _ = sender.request_finished(request, blocks.get_block_ids())
+        assert held
+        meta = sender.build_connector_meta(SchedulerOutput.make_empty())
+        assert meta.push_chunk_jobs == []
+        assert meta.push_finished_blocks[request.request_id] == blocks.get_block_ids()
+        sender.shutdown()
 
 
 class TestPushWriterRegSend:
