@@ -292,6 +292,14 @@ class EngineCoreClient(ABC):
     async def get_prefill_progress_async(self, request_ids: list[str]) -> list[dict]:
         raise NotImplementedError
 
+    async def get_decode_capacity_async(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> list[dict]:
+        raise NotImplementedError
+
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
@@ -1341,6 +1349,19 @@ class AsyncMPClient(MPClient):
 
     async def get_prefill_progress_async(self, request_ids: list[str]) -> list[dict]:
         return await self.call_utility_all_async("get_prefill_progress", request_ids)
+
+    async def get_decode_capacity_async(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> list[dict]:
+        return await self.call_utility_all_async(
+            "get_decode_capacity",
+            request_ids_by_rank,
+            close_ids_by_rank,
+            expected_epochs,
+        )
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index

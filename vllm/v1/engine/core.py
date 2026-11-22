@@ -441,6 +441,16 @@ class EngineCore:
         snapshot["dp_step"] = getattr(self, "step_counter", None)
         return snapshot
 
+    def get_decode_capacity(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        return self.scheduler.get_decode_capacity(
+            request_ids_by_rank, close_ids_by_rank, expected_epochs
+        )
+
     def _log_pooler_config(self, supported_tasks: tuple[SupportedTask, ...]) -> None:
         if self._pooler_config_logged:
             return

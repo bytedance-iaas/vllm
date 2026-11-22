@@ -608,6 +608,171 @@ def test_prefill_progress_cancel_waits_for_submitted_outputs(monkeypatch, tmp_pa
     assert settled["confirmed_tokens"] == 0
 
 
+def test_decode_capacity_keeps_unknown_and_reconciles_physical_pages(
+    monkeypatch, tmp_path
+):
+    """Router obligations can distinguish unallocated, held and retired pages."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        num_blocks=32,
+        skip_tokenizer_init=True,
+    )
+    request = create_requests(1, num_tokens=32, req_ids=["managed"])[0]
+    other = create_requests(1, num_tokens=16, req_ids=["unmanaged"])[0]
+    scheduler.add_request(request)
+    scheduler.add_request(other)
+    query = {0: [request.external_req_id, "unknown"], 1: [other.external_req_id]}
+    queued = scheduler.get_decode_capacity(query)
+    assert queued["total_kv_blocks"] == 32
+    assert queued["free_kv_blocks"] == 31
+    assert queued["group_block_sizes"] == [16]
+    assert queued["unmanaged_requests"] == 1
+    assert queued["requests"][0]["allocated_pages"] == 0
+    assert queued["requests"][1] == {
+        "request_id": "unknown",
+        "status": "UNKNOWN",
+        "allocated_pages": None,
+    }
+    output = scheduler.schedule()
+    allocated = scheduler.get_decode_capacity(query)
+    assert allocated["epoch"] == queued["epoch"]
+    assert allocated["seq"] > queued["seq"]
+    assert allocated["requests"][0]["allocated_pages"] == 1
+    assert allocated["free_kv_blocks"] == 30
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        ),
+    )
+    scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+    retired = scheduler.get_decode_capacity(query)
+    assert retired["requests"][0]["allocated_pages"] == 0
+    assert retired["requests"][0]["terminal"]
+    assert retired["requests"][0]["drained"]
+    assert retired["free_kv_blocks"] == 31
+    restarted = create_scheduler(
+        model=str(tmp_path), max_model_len=128, skip_tokenizer_init=True
+    ).get_decode_capacity({0: [request.external_req_id]})
+    assert restarted["epoch"] != retired["epoch"]
+    assert restarted["requests"][0]["allocated_pages"] is None
+
+
+def test_decode_capacity_cancel_preserves_completion_fence(monkeypatch, tmp_path):
+    """Zero physical allocation alone does not prove an in-flight step drained."""
+    from transformers import OPTConfig
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        skip_tokenizer_init=True,
+    )
+    request = create_requests(1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+    pending = scheduler.get_decode_capacity({0: [request.external_req_id]})
+    assert pending["requests"][0]["terminal"]
+    assert not pending["requests"][0]["drained"]
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        ),
+    )
+    settled = scheduler.get_decode_capacity({0: [request.external_req_id]})
+    assert settled["requests"][0]["drained"]
+    assert settled["requests"][0]["allocated_pages"] == 0
+
+
+@pytest.mark.parametrize("managed", [True, False])
+def test_decode_capacity_close_blocks_late_registration(monkeypatch, tmp_path, managed):
+    """A cancellation acknowledged before arrival must prevent later allocation."""
+    from transformers import OPTConfig
+
+    from vllm.v1.request import Request
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
+    scheduler = create_scheduler(
+        model=str(tmp_path), max_model_len=128, skip_tokenizer_init=True
+    )
+    epoch = scheduler.get_decode_capacity({})["epoch"]
+    external_id = "chatcmpl-late"
+    before = scheduler.get_decode_capacity({0: [external_id]})
+    closed = scheduler.get_decode_capacity(
+        {0: [external_id]}, {0: [external_id]}, {0: epoch}
+    )
+    assert closed["closed_request_ids"] == [external_id]
+    late = Request(
+        request_id="late-internal",
+        external_req_id=external_id,
+        prompt_token_ids=[1] * 32,
+        sampling_params=SamplingParams(
+            max_tokens=16,
+            extra_args={"kv_transfer_params": {"router_admission_epoch": epoch}}
+            if managed
+            else None,
+        ),
+        pooling_params=None,
+    )
+    scheduler.add_request(late)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    after = scheduler.get_decode_capacity({0: [external_id]})
+    assert after["free_kv_blocks"] == before["free_kv_blocks"]
+    assert after["requests"][0]["status"] == "FINISHED_ABORTED"
+    assert after["requests"][0]["allocated_pages"] == 0
+    repeated = scheduler.get_decode_capacity(
+        {0: [external_id]}, {0: [external_id]}, {0: epoch}
+    )
+    assert repeated["closed_request_ids"] == [external_id]
+
+
+def test_decode_capacity_old_epoch_cannot_cancel_new_request(monkeypatch, tmp_path):
+    """Old-generation closure cannot affect the same ID in a replacement engine."""
+    from transformers import OPTConfig
+
+    from vllm.v1.request import Request
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setenv("VLLM_ENABLE_PREFILL_PROGRESS", "1")
+    scheduler = create_scheduler(
+        model=str(tmp_path), max_model_len=128, skip_tokenizer_init=True
+    )
+    epoch = scheduler.get_decode_capacity({})["epoch"]
+    external_id = "chatcmpl-reused"
+    request = Request(
+        request_id="new-internal",
+        external_req_id=external_id,
+        prompt_token_ids=[1] * 32,
+        sampling_params=SamplingParams(
+            max_tokens=16,
+            extra_args={"kv_transfer_params": {"router_admission_epoch": epoch}},
+        ),
+        pooling_params=None,
+    )
+    scheduler.add_request(request)
+    snapshot = scheduler.get_decode_capacity(
+        {0: [external_id]}, {0: [external_id]}, {0: "a" * 32}
+    )
+    assert not snapshot["closed_request_ids"]
+    assert not snapshot["requests"][0]["terminal"]
+    assert scheduler.schedule().total_num_scheduled_tokens > 0
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

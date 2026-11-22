@@ -77,3 +77,51 @@ async def kv_event_sources(raw_request: Request):
     """KV-event publisher config per DP rank; empty on render-only servers."""
     client: EngineClient | None = raw_request.app.state.engine_client
     return client.get_kv_event_sources() if client is not None else {}
+
+
+@router.post("/internal/decode/capacity")
+async def get_decode_capacity(request: Request):
+    if not envs.VLLM_ENABLE_PREFILL_PROGRESS:
+        raise HTTPException(status_code=404, detail="Request progress is disabled")
+    body = await request.json()
+    requested = body.get("request_ids_by_rank") if isinstance(body, dict) else None
+    if not isinstance(requested, dict) or len(requested) > 64:
+        raise HTTPException(status_code=400, detail="Expected request IDs by rank")
+    client = engine_client(request)
+    if client is None:
+        raise HTTPException(status_code=503, detail="Engine is unavailable")
+    rank_count = client.vllm_config.parallel_config.data_parallel_size
+
+    def parse_groups(value):
+        if not isinstance(value, dict) or len(value) > 64:
+            raise HTTPException(status_code=400, detail="Invalid capacity query")
+        grouped = {}
+        for rank, ids in value.items():
+            try:
+                numeric_rank = int(rank)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid rank") from exc
+            if (
+                numeric_rank < 0
+                or numeric_rank >= rank_count
+                or str(numeric_rank) != rank
+                or not isinstance(ids, list)
+                or len(ids) > 128
+                or any(not isinstance(item, str) or len(item) > 256 for item in ids)
+            ):
+                raise HTTPException(status_code=400, detail="Invalid capacity query")
+            grouped[numeric_rank] = ids
+        return grouped
+
+    grouped = parse_groups(requested)
+    closing = parse_groups(body.get("close_request_ids_by_rank", {}))
+    epochs = body.get("expected_epochs_by_rank", {})
+    if not isinstance(epochs, dict) or any(
+        str(rank) not in epochs
+        or not isinstance(epochs[str(rank)], str)
+        or len(epochs[str(rank)]) != 32
+        for rank in closing
+    ):
+        raise HTTPException(status_code=400, detail="Closing requires each rank epoch")
+    expected = {rank: epochs[str(rank)] for rank in closing}
+    return {"engines": await client.get_decode_capacity(grouped, closing, expected)}

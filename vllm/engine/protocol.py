@@ -305,6 +305,15 @@ class EngineClient(ABC):
         """Read bounded engine snapshots for an internal prefill router."""
         raise NotImplementedError
 
+    async def get_decode_capacity(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> list[dict]:
+        """Read coherent request allocations for each Decode rank."""
+        raise NotImplementedError
+
     async def init_weight_transfer_engine(
         self, init_request: WeightTransferInitRequest
     ) -> None:

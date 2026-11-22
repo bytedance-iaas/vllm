@@ -397,6 +397,16 @@ class AsyncLLM(EngineClient):
     async def get_prefill_progress(self, request_ids: list[str]) -> list[dict]:
         return await self.engine_core.get_prefill_progress_async(request_ids)
 
+    async def get_decode_capacity(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> list[dict]:
+        return await self.engine_core.get_decode_capacity_async(
+            request_ids_by_rank, close_ids_by_rank, expected_epochs
+        )
+
     async def add_request(
         self,
         request_id: str,

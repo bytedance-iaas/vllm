@@ -229,6 +229,7 @@ class Scheduler(SchedulerInterface):
         self.prefill_processed_step_seq = 0
         self.prefill_terminal: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.prefill_external_ids: dict[str, set[str]] = defaultdict(set)
+        self.decode_admission_closed: set[str] = set()
         from vllm.v1.core.sched.shared_ep_budget import SharedEPBudgetConfig
 
         extra = vllm_config.additional_config
@@ -3097,6 +3098,28 @@ class Scheduler(SchedulerInterface):
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
+        params = request.kv_transfer_params or {}
+        admission_epoch = params.get("router_admission_epoch")
+        managed = admission_epoch is not None
+        reject_managed = (
+            request.external_req_id in self.decode_admission_closed
+            or managed
+            and (
+                not envs.VLLM_ENABLE_PREFILL_PROGRESS
+                or admission_epoch != self.prefill_progress_epoch
+                or (
+                    existing is None
+                    and (
+                        request.external_req_id in self.prefill_external_ids
+                        or request.external_req_id in self.prefill_terminal
+                    )
+                )
+            )
+        )
+        if managed and existing is not None:
+            if reject_managed:
+                self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+            return
         if existing is not None:
             update = StreamingUpdate.from_request(request)
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -3131,6 +3154,8 @@ class Scheduler(SchedulerInterface):
                     self._set_kv_fetch_stage(request, KV_FETCH_WAITING_TO_START)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+        if reject_managed:
+            self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -3495,6 +3520,75 @@ class Scheduler(SchedulerInterface):
             "drained": False,
         }
 
+    def get_decode_capacity(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        """Join allocations and free pages without interleaving scheduler work."""
+        rank = self.parallel_config.data_parallel_rank
+        request_ids = request_ids_by_rank.get(rank, [])
+        close_ids = (close_ids_by_rank or {}).get(rank, [])
+        if (
+            len(request_ids_by_rank) > 64
+            or len(request_ids) > 128
+            or len(close_ids) > 128
+        ):
+            raise ValueError("Capacity queries are limited to 128 IDs per rank")
+        if not envs.VLLM_ENABLE_PREFILL_PROGRESS:
+            raise RuntimeError("Request progress is disabled")
+        closed = []
+        refused = []
+        if (expected_epochs or {}).get(rank) == self.prefill_progress_epoch:
+            for external_id in close_ids:
+                if (
+                    external_id not in self.decode_admission_closed
+                    and len(self.decode_admission_closed) >= 4096
+                ):
+                    refused.append(external_id)
+                    continue
+                self.decode_admission_closed.add(external_id)
+                self.finish_requests(
+                    self.prefill_external_ids.get(external_id, ()),
+                    RequestStatus.FINISHED_ABORTED,
+                )
+                closed.append(external_id)
+        snapshot = self.get_prefill_progress(request_ids)
+        pool = self.kv_cache_manager.block_pool
+        for record in snapshot["requests"]:
+            if record["status"] == "UNKNOWN":
+                record["allocated_pages"] = None
+            elif record.get("internal_request_id") not in self.requests:
+                # Retained terminal records are created after block release.
+                record["allocated_pages"] = 0
+            else:
+                blocks = self.kv_cache_manager.get_blocks(record["internal_request_id"])
+                record["allocated_pages"] = len(
+                    {
+                        block.block_id
+                        for group in blocks.blocks
+                        for block in group
+                        if not block.is_null and block.ref_cnt > 0
+                    }
+                )
+        queried = set(request_ids)
+        snapshot.update(
+            capacity_schema_version=1,
+            closed_request_ids=closed,
+            refused_close_ids=refused,
+            total_kv_blocks=pool.num_gpu_blocks,
+            group_block_sizes=[
+                group.kv_cache_spec.block_size
+                for group in self.kv_cache_manager.kv_cache_config.kv_cache_groups
+            ],
+            unmanaged_requests=sum(
+                not request.is_finished() and request.external_req_id not in queried
+                for request in self.requests.values()
+            ),
+        )
+        return snapshot
+
     def get_prefill_progress(self, request_ids: list[str]) -> dict[str, Any]:
         """A bounded CPU snapshot; unknown requests never imply an idle engine."""
         if not envs.VLLM_ENABLE_PREFILL_PROGRESS:
@@ -3502,7 +3596,7 @@ class Scheduler(SchedulerInterface):
         if len(request_ids) > 128:
             raise ValueError("At most 128 request IDs may be queried")
         self.prefill_progress_seq += 1
-        snapshots = []
+        snapshots: list[dict[str, Any]] = []
         for request_id in request_ids:
             internal_ids = self.prefill_external_ids.get(request_id)
             if internal_ids:

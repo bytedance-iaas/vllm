@@ -1,0 +1,37 @@
+{
+  "base_image": "sha256:ce429874fcb2f22e87abec76226e454b90390720c14fc3e5238d0ec564008a27",
+  "files": {
+    "vllm/engine/protocol.py": {
+      "base_sha256": "e3e6a49b38241301df8fa2e4c950b4e125dd02b7041b13931e9133aaaeaf2b84",
+      "candidate_sha256": "2c8ba78e4747919098fa3fee5d78f99659b66538675f7937267c88c77787351a"
+    },
+    "vllm/entrypoints/serve/instrumentator/basic.py": {
+      "base_sha256": "7dd3c6253a43055f8c1da3e81c5b22b7e9d03000d4a59a1655a4efab6162868e",
+      "candidate_sha256": "a2e4ab5f410b50a71bc42a317e957fb9f1605e00e9e2f3c42b14f2bd8ec870b5"
+    },
+    "vllm/v1/core/sched/scheduler.py": {
+      "base_sha256": "2857c482d99a28cebf176b76ad7cf2692e14fd7395e3c423c27eaba8a6663c71",
+      "candidate_sha256": "b3f29046e1a79a724b54c9ec3a68373393992f0374eda1c0236d0261222f39d3"
+    },
+    "vllm/v1/core/sched/interface.py": {
+      "base_sha256": "db890886d31eeb611d3fc86e9ded75a7e0d1fba4a200eb1dc7c6d3dfb327687f",
+      "candidate_sha256": "5b464a37996085edc2896a51a5dd5e807912a2afc28c1489633bd9714ca76e2f"
+    },
+    "vllm/v1/engine/async_llm.py": {
+      "base_sha256": "73ef3bfe5352efa4104fd36a6053e5044f5347b36b197a745361dfe195d5800e",
+      "candidate_sha256": "8a133575409025a6f9fe16acbf35949c67f98096378a47629465a9f309f0dadf"
+    },
+    "vllm/v1/engine/core.py": {
+      "base_sha256": "d02d32df5d15f0a8b8ffc731ed4bc6f7fcb68b8a9273ec5e4c5d1ab4bd7d7e01",
+      "candidate_sha256": "915f8f0db7e7f064704ab3ea2fd8fccc41784c9411248b41d329ee23d7fb6d61"
+    },
+    "vllm/v1/engine/core_client.py": {
+      "base_sha256": "a94b13d205356e052d4447a1ba8dccd87f5925da0aad9d288c05ee4145eb418a",
+      "candidate_sha256": "e7b640b0b829021e5a2d2514ba03ff0e7a4936f1bfb88295d5e5183110bbb0e9"
+    },
+    "vllm/v1/request.py": {
+      "base_sha256": "dd7c30bf8b0894dc123a739c299c0133566f8cc075b081e45905f1c29506e69d",
+      "candidate_sha256": "a3b4d6e82da382f757406a3dd3e1a1f4677c5dbf112195d24aef6427283f6f93"
+    }
+  }
+}

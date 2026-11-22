@@ -3,7 +3,7 @@
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 
@@ -252,6 +252,19 @@ class SchedulerInterface(ABC):
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return 0.0
+
+    def get_prefill_progress(self, request_ids: list[str]) -> dict[str, Any]:
+        """Read request progress and execution-release fences."""
+        raise NotImplementedError
+
+    def get_decode_capacity(
+        self,
+        request_ids_by_rank: dict[int, list[str]],
+        close_ids_by_rank: dict[int, list[str]] | None = None,
+        expected_epochs: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        """Read coherent page allocations and apply generation-scoped closure."""
+        raise NotImplementedError
 
     @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
