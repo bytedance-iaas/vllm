@@ -1,0 +1,49 @@
+# TK300 role compatibility and diagnostic tools
+
+`apply_page_admission_patch.py` applies the minimal API backport to the exact
+older Decode source version recorded in `h20-page-admission-manifest.json`.
+Keep the role's compute files and customized NIXL `base_worker.py` intact.
+
+`generate_handoff_probe.py` generates diagnostic logs from captured Prefill and
+Decode NIXL sources and a fixed API delivery package. It checks original file
+hashes, reuses existing request wait probes when present, and changes only
+logging in `push_worker.py`, `base_scheduler.py`, `scheduler.py`, and `core.py`.
+It creates no serving resources and makes no performance or correctness claim.
+
+```bash
+.venv/bin/python tools/tk300_compat/generate_handoff_probe.py \
+  --runtime-source-root /artifacts/handoff-runtime-source \
+  --delivery-root /artifacts/delivery-page-r2 \
+  --output-root /artifacts/handoff-probe
+```
+
+The captured source manifest contains `roles` entries for `P0` and `D0`, each
+with per-file SHA256 values. The API delivery manifest records Prefill and Decode
+files under `roles.P` and `roles.D`. The output includes original and generated
+hashes; it does not overwrite a different existing probe. Keep captured runtime
+source, models, request logs, credentials, and generated deployment artifacts in
+the task's evidence directory rather than committing them with this tool.
+
+Enable logs only in a separate diagnostic runtime with
+`TK300_HANDOFF_TRACE=1` and a unique `TK300_HANDOFF_RUN_ID`. Legacy
+`vrdmae2e-` request tags remain supported. Logs record registration, scheduler and
+writer metadata, write submission and handle retirement, notification source
+agent and arrival, engine consumption, the existing producer barrier report,
+KV-ready scheduling, and first model-executor dispatch and result processing.
+They retain wall and monotonic clock anchors without logging prompts or tokens.
+
+Model dispatch timestamps describe the real CPU entry into the executor, not a
+GPU kernel timestamp. Retired handles do not establish the exact instant when
+remote data became readable. A notification count alone does not establish four
+independent producer stages: join source agents, request IDs, producer logs and
+engine generations. The generator adds no polling, wakeup, GPU synchronization
+or completion notification; the existing transfer and scheduling rules remain.
+
+Validate the generated sources in each exact role image, then verify real
+request output and complete event coverage before using the timeline. Record
+cross-host clock error before subtracting wall timestamps. Disable probes for
+formal performance windows and restore the fixed delivery package afterward.
+The upstream completion-order design at
+[vLLM PR 68686](https://github.com/vllm-project/vllm/pull/68686) is a correctness
+reference; this tool neither applies that fix nor proves its failure mechanism
+occurs in a particular deployment.
