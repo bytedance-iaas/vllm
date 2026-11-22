@@ -196,6 +196,32 @@ def instrument(name, text):
                 ".data_parallel_rank, load_failed=load_failed)\n"
             ),
         )
+        methods = [
+            node
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.FunctionDef) and node.name == "get_decode_capacity"
+        ]
+        assert len(methods) == 1
+        final_return = methods[0].body[-1]
+        assert isinstance(final_return, ast.Return)
+        assert isinstance(final_return.value, ast.Name)
+        assert final_return.value.id == "snapshot"
+        lines = text.splitlines(keepends=True)
+        clock = (
+            "        if _HANDOFF_DIAGNOSTIC_ENABLED:\n"
+            "            _clock_before = time.time_ns()\n"
+            "            _clock_mono = time.monotonic_ns()\n"
+            "            _clock_after = time.time_ns()\n"
+            '            snapshot["handoff_clock"] = {\n'
+            '                "epoch_ns": (_clock_before + _clock_after) // 2,\n'
+            '                "monotonic_ns": _clock_mono,\n'
+            '                "anchor_bracket_ns": _clock_after - _clock_before,\n'
+            '                "run_id": _tk300_trace_os.environ.get(\n'
+            '                    "TK300_HANDOFF_RUN_ID", ""),\n'
+            "            }\n"
+        )
+        text = "".join(lines[: final_return.lineno - 1]) + clock
+        text += "".join(lines[final_return.lineno - 1 :])
     elif name == CORE:
         old = (
             "        future = self.model_executor.execute_mod"

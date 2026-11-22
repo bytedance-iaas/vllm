@@ -31,6 +31,11 @@ writer metadata, write submission and handle retirement, notification source
 agent and arrival, engine consumption, the existing producer barrier report,
 KV-ready scheduling, and first model-executor dispatch and result processing.
 They retain wall and monotonic clock anchors without logging prompts or tokens.
+With the diagnostic flag enabled, each Decode-capacity snapshot also returns
+`handoff_clock` with integer wall/monotonic nanoseconds and the local anchor
+bracket. A target-runtime client can bound clock offset using the request's
+send/receive interval. This is a read-only clock echo, not a clock adjustment;
+the field is absent when probes are disabled.
 
 Model dispatch timestamps describe the real CPU entry into the executor, not a
 GPU kernel timestamp. Retired handles do not establish the exact instant when
