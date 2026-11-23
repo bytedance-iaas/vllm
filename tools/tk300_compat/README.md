@@ -17,6 +17,13 @@ hashes, reuses existing request wait probes when present, and changes only
 logging in `push_worker.py`, `base_scheduler.py`, `scheduler.py`, and `core.py`.
 It creates no serving resources and makes no performance or correctness claim.
 
+For step-wise producers, long-request logs include each published block range,
+registration matching, waits for earlier WRITEs, job completion, and the final
+notification. Wait records are deduplicated by job state and restricted to
+requests with at least 4,096 blocks. Opaque or malformed optional diagnostic
+fields cannot interrupt execution. These logs describe reported transfer state;
+they do not independently establish GPU kernel or DMA timing bounds.
+
 ```bash
 .venv/bin/python tools/tk300_compat/generate_handoff_probe.py \
   --runtime-source-root /artifacts/handoff-runtime-source \

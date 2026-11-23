@@ -20,6 +20,32 @@ HELPER = """
 import os as _tk300_trace_os
 _HANDOFF_DIAGNOSTIC_ENABLED = _tk300_trace_os.environ.get("TK300_HANDOFF_TRACE") == "1"
 _HANDOFF_LOGGED_ONCE = set()
+_HANDOFF_CHUNK_WAIT_ONCE = set()
+
+def _vrdma_block_count(blocks):
+    try:
+        if not blocks:
+            return 0
+        first = blocks[0]
+        return len(first) if hasattr(first, "__len__") else len(blocks)
+    except Exception:
+        return None
+
+def _vrdma_notif_request(msg):
+    try:
+        return msg.decode("utf-8").rsplit(":", 1)[0]
+    except Exception:
+        return None
+
+def _vrdma_chunk_wait(stage, rid, **values):
+    if not _HANDOFF_DIAGNOSTIC_ENABLED or values.get("total_blocks", 0) < 4096:
+        return
+    key = (stage, rid, values.get("start_block"), values.get("end_block"),
+           values.get("pending_jobs"), values.get("reason"))
+    if key in _HANDOFF_CHUNK_WAIT_ONCE or len(_HANDOFF_CHUNK_WAIT_ONCE) >= 65536:
+        return
+    _HANDOFF_CHUNK_WAIT_ONCE.add(key)
+    _vrdma_e2e(stage, rid, **values)
 
 def _vrdma_e2e(stage, rid, **values):
     # Diagnostic logging must never change request execution or notification flow.
@@ -81,6 +107,8 @@ def add_helper(text):
 def instrument(name, text):
     assert "_HANDOFF_DIAGNOSTIC_ENABLED" not in text
     if name.endswith("push_worker.py"):
+        if "def finish_chunk_step(" in text:
+            text = instrument_chunks(text)
         old = "                self._finished_blocks_inbox.put((req_id, block_ids))\n"
         text = replace(
             text,
@@ -255,6 +283,146 @@ def instrument(name, text):
     else:
         raise ValueError(name)
     return add_helper(text)
+
+
+def instrument_chunks(text):
+    """Record long-request job state without changing calls or branch outcomes."""
+    old = "            self._chunk_job_inbox.put((job, event))\n"
+    text = replace(
+        text,
+        old,
+        old
+        + """            if _HANDOFF_DIAGNOSTIC_ENABLED and job.total_blocks >= 4096:
+                _vrdma_e2e("producer_chunk_published", job.request_id,
+                           engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                           start_block=job.start_block, end_block=job.end_block,
+                           total_blocks=job.total_blocks,
+                           block_count=len(job.block_ids))
+""",
+    )
+    old = "            self._chunk_deferred.append(_ChunkTask(job, event, state))\n"
+    text = replace(
+        text,
+        old,
+        old
+        + """            if _HANDOFF_DIAGNOSTIC_ENABLED and job.total_blocks >= 4096:
+                _vrdma_e2e("producer_chunk_received", job.request_id,
+                           engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                           start_block=job.start_block, end_block=job.end_block,
+                           total_blocks=job.total_blocks,
+                           block_count=len(job.block_ids),
+                           pending_jobs=state.pending_jobs)
+""",
+    )
+    old = "            if last and state.pending_jobs > 1:\n"
+    text = replace(
+        text,
+        old,
+        old
+        + """                _vrdma_chunk_wait("producer_chunk_wait", job.request_id,
+                                  engine_id=self.engine_id, pcp=self.pcp_rank,
+                                  start_block=job.start_block, end_block=job.end_block,
+                                  total_blocks=job.total_blocks,
+                                  pending_jobs=state.pending_jobs,
+                                  reason="prior_WRITEs")
+""",
+    )
+    old = (
+        "            if reg_data is None:\n"
+        "                self._chunk_deferred.append(task)\n"
+    )
+    text = replace(
+        text,
+        old,
+        """            if reg_data is None:
+                _vrdma_chunk_wait("producer_chunk_wait", job.request_id,
+                                  engine_id=self.engine_id, pcp=self.pcp_rank,
+                                  start_block=job.start_block, end_block=job.end_block,
+                                  total_blocks=job.total_blocks,
+                                  pending_jobs=state.pending_jobs,
+                                  reason="registration")
+                self._chunk_deferred.append(task)
+""",
+    )
+    old = "            if not self._chunk_path_supported(job, reg_data):\n"
+    text = replace(
+        text,
+        old,
+        """            _handoff_supported = self._chunk_path_supported(job, reg_data)
+            if _HANDOFF_DIAGNOSTIC_ENABLED and job.total_blocks >= 4096:
+                _vrdma_e2e("producer_chunk_path", job.request_id,
+                           engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                           start_block=job.start_block, end_block=job.end_block,
+                           total_blocks=job.total_blocks,
+                                  pending_jobs=state.pending_jobs,
+                           supported=_handoff_supported,
+                           remote_blocks=_vrdma_block_count(
+                               reg_data.get("local_block_ids")))
+            if not _handoff_supported:
+""",
+    )
+    old = "        task.state.failed |= failed\n"
+    text = replace(
+        text,
+        old,
+        old
+        + """        if _HANDOFF_DIAGNOSTIC_ENABLED and task.job.total_blocks >= 4096:
+            _vrdma_e2e("producer_chunk_finished", task.job.request_id,
+                       engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                       start_block=task.job.start_block, end_block=task.job.end_block,
+                       total_blocks=task.job.total_blocks,
+                       pending_jobs=task.state.pending_jobs,
+                       failed=task.state.failed)
+""",
+    )
+    old = "        state.finished_blocks = block_ids\n"
+    text = replace(
+        text,
+        old,
+        old
+        + """        if _HANDOFF_DIAGNOSTIC_ENABLED:
+            _vrdma_e2e("producer_terminal_chunk_state", req_id,
+                       engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                       pending_jobs=state.pending_jobs,
+                       has_registration=state.reg_data is not None,
+                       notified=state.notified, failed=state.failed)
+""",
+    )
+    old = (
+        "            self.nixl_wrapper.send_notif("
+        "ready.agent, notif_msg=ready.key[2])\n"
+    )
+    text = replace(
+        text,
+        old,
+        old
+        + """            if _HANDOFF_DIAGNOSTIC_ENABLED:
+                _vrdma_e2e("producer_completion_notified", request_id,
+                           engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                           decoder_request_id=_vrdma_notif_request(ready.key[2]),
+                           remote_rank=ready.key[1], agent=ready.agent)
+""",
+    )
+    old = "        match = self._pop_matching_finished_blocks(rid)\n"
+    text = replace(
+        text,
+        old,
+        """        if _HANDOFF_DIAGNOSTIC_ENABLED:
+            _vrdma_e2e("producer_registration_received", rid,
+                       engine_id=self.engine_id, tp=self.tp_rank,
+                           pcp=self.pcp_rank,
+                       decode_engine=reg_data.get("decode_engine_id"),
+                       blocks=_vrdma_block_count(reg_data.get("local_block_ids")))
+"""
+        + old,
+    )
+    return text
 
 
 def step_events(stage, indent):
