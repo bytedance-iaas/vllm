@@ -4780,6 +4780,56 @@ def test_scheduler_advertises_transfer_topology(
 
 
 @pytest.mark.parametrize(
+    "enabled,model,model_type,cache_dtype,transfer_mode,compatible",
+    [
+        (False, "/model", "glm_moe_dsa", "fp8_ds_mla", "push", False),
+        (True, "/model", "glm_moe_dsa", "fp8_ds_mla", "push", True),
+        (True, "/other", "glm_moe_dsa", "fp8_ds_mla", "push", False),
+        (True, "/model", "glm_moe", "fp8_ds_mla", "push", False),
+        (True, "/model", "glm_moe_dsa", "auto", "push", False),
+        (True, "/model", "glm_moe_dsa", "fp8_ds_mla", "pull", False),
+    ],
+)
+def test_tk300_glm53_packed_backend_compatibility(
+    monkeypatch,
+    tmp_path,
+    enabled,
+    model,
+    model_type,
+    cache_dtype,
+    transfer_mode,
+    compatible,
+):
+    from transformers import OPTConfig
+
+    if enabled:
+        monkeypatch.setenv("TK300_GLM53_NIXL_COMPAT", "1")
+    else:
+        monkeypatch.delenv("TK300_GLM53_NIXL_COMPAT", raising=False)
+    OPTConfig().save_pretrained(tmp_path)
+    config = create_vllm_config(
+        model=str(tmp_path),
+        max_model_len=128,
+        cache_dtype=cache_dtype,
+        disable_hybrid_kv_cache_manager=True,
+    )
+    # Exercise the hash guard without loading GLM weights in the unit suite.
+    config.model_config.model = model
+    config.model_config.hf_text_config.model_type = model_type
+    producer = compute_nixl_compatibility_hash(
+        config, "FLASHINFER_MLA_SPARSE_SM120", transfer_mode=transfer_mode
+    )
+    consumer = compute_nixl_compatibility_hash(
+        config, "FLASHMLA_SPARSE", transfer_mode=transfer_mode
+    )
+    unrelated = compute_nixl_compatibility_hash(
+        config, "FLASH_ATTN", transfer_mode=transfer_mode
+    )
+    assert (producer == consumer) is compatible
+    assert producer != unrelated and consumer != unrelated
+
+
+@pytest.mark.parametrize(
     "mismatch_type,config_overrides,version_override,should_fail,enforce_handshake_compat",
     [
         ("vllm_version", {}, {"vllm_version": "0.6.1"}, True, True),
