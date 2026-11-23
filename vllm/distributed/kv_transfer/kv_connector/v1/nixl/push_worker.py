@@ -207,6 +207,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         self._chunk_transfers: dict[str, list[TransferHandle]] = {}
         self._chunk_transfer_tasks: dict[str, _ChunkTask] = {}
         self._next_chunk_transfer_id = 0
+        self._first_chunk_submission_logged = False
         self._push_completion_lock = threading.Lock()
         self._push_completion_notifs: dict[TransferHandle, _PushCompletion] = {}
         self._push_completion_groups: dict[tuple[str, int, bytes], _PushCompletion] = {}
@@ -641,12 +642,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 request_id=reg_data["request_id"],
             ),
         )
-        return self._xfer_blocks_for_req(
+        handles = self._xfer_blocks_for_req(
             req_id=job.request_id,
             meta=push_meta,
             notif_msg=None if notify else b"",
             track_request=False,
         )
+        if handles and not self._first_chunk_submission_logged:
+            logger.info(
+                "NIXL step-wise push submitted first producer job (engine=%s, pcp=%d)",
+                self.engine_id,
+                self.pcp_rank,
+            )
+            self._first_chunk_submission_logged = True
+        return handles
 
     @staticmethod
     def _chunk_block_ranges(
