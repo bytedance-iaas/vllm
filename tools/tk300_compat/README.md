@@ -4,6 +4,13 @@
 older Decode source version recorded in `h20-page-admission-manifest.json`.
 Keep the role's compute files and customized NIXL `base_worker.py` intact.
 
+`build_timely_push_package.py` packages the five fixed producer modules for
+step-wise push. It requires the exact bound runtime metadata hash and preserves
+only its already-deployed compatibility hash function after verifying that the
+rest matches the fixed baseline. It never copies producer modules to H20. The
+manifest records canonical and delivered hashes; GPU serving remains a separate
+validation gate.
+
 `generate_handoff_probe.py` generates diagnostic logs from captured Prefill and
 Decode NIXL sources and a fixed API delivery package. It checks original file
 hashes, reuses existing request wait probes when present, and changes only
