@@ -179,17 +179,14 @@ class NixlBaseConnectorWorker:
         if region_num_blocks and not use_layer_name_routing:
             num_desc_regions = len(region_num_blocks)
         assert len(region_num_blocks) == num_desc_regions
+        if use_layer_name_routing:
+            return self._layer_desc_ids(
+                tuple(block_ids[g] for g in self._transfer_layer_group_ids),
+                region_num_blocks,
+            )
+
         region_offsets = np.cumsum([0, *region_num_blocks[:-1]])
         num_fa_descs = sum(region_num_blocks)
-
-        if use_layer_name_routing:
-            # Descriptors in layer order, using each layer's KV-cache group.
-            return np.concatenate(
-                [
-                    np.asarray(block_ids[g], dtype=np.int32) + region_offsets[k]
-                    for k, g in enumerate(self._transfer_layer_group_ids)
-                ]
-            )
 
         # All-attention fast path.
         if num_ssm_regions == 0:
@@ -519,7 +516,12 @@ class NixlBaseConnectorWorker:
             nixl_agent_meta.region_num_blocks = [
                 nixl_agent_meta.region_num_blocks[i] for i in remote_regions
             ]
-        if nixl_agent_meta.region_group_ids is not None:
+        if self._is_csa_linear:
+            nixl_agent_meta.region_group_ids = [
+                nixl_agent_meta.transfer_group_by_layer[name]
+                for name in self._transfer_layer_names
+            ]
+        elif nixl_agent_meta.region_group_ids is not None:
             nixl_agent_meta.region_group_ids = [
                 nixl_agent_meta.region_group_ids[i] for i in remote_regions
             ]
@@ -1554,8 +1556,18 @@ class NixlBaseConnectorWorker:
             and self.use_mla
             and not self._has_mamba
         )
+        replicated_specs: tuple[type[KVCacheSpec], ...] = (
+            MLAAttentionSpec,
+            SlidingWindowMLASpec,
+        )
+        if (
+            self._is_csa_linear
+            and self.model_config.hf_text_config.model_type == "deepseek_v41"
+        ):
+            # The compressor KV and gate projection is replicated across TP.
+            replicated_specs += (CircularBufferSpec,)
         if route_packed_layers and any(
-            not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+            not isinstance(spec, replicated_specs)
             for spec in self._layer_specs.values()
         ):
             raise NotImplementedError("PP push with packed KV caches requires MLA")
@@ -1613,9 +1625,7 @@ class NixlBaseConnectorWorker:
                 if isinstance(layer_spec, MambaSpec)
                 else logical_num_blocks * self._physical_blocks_per_logical_kv_block
             )
-            is_mla_region = isinstance(
-                layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
-            )
+            is_mla_region = isinstance(layer_spec, replicated_specs)
             logger.debug(
                 "Registering layer %s with cache shape: %s", layer_name, cache.shape
             )
@@ -1926,6 +1936,11 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=self._packed_member_layouts,
+            transfer_group_by_layer=(
+                self.kv_cache_config.transfer_group_index_by_layer
+                if track_region_layers and self._is_csa_linear
+                else {}
+            ),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -3692,6 +3707,18 @@ class NixlBaseConnectorWorker:
         if num_remote_blocks is not None and matched_blocks < len(local_slice):
             raise ValueError("Remote KV pages do not cover the requested range")
         return local_slice[:matched_blocks], remote_slice[:matched_blocks]
+
+    @staticmethod
+    def _layer_desc_ids(
+        block_ids_by_layer: BlockIds, region_num_blocks: list[int]
+    ) -> np.ndarray:
+        offsets = np.cumsum([0, *region_num_blocks[:-1]])
+        return np.concatenate(
+            [
+                np.asarray(ids, dtype=np.int32) + offset
+                for ids, offset in zip(block_ids_by_layer, offsets, strict=True)
+            ]
+        )
 
     @staticmethod
     def _block_ids_by_region(

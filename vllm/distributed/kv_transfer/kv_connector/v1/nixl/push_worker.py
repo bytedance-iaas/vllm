@@ -586,6 +586,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         num_groups = len(local_block_ids)
 
         def group_ids(block_ids: BlockIds, rank: int) -> BlockIds:
+            if self._is_csa_linear and self._transfer_layer_group_ids:
+                return block_ids
             return [
                 list(block_ids[g])
                 if (self._is_csa_linear and tp_ratio < 0)
@@ -684,48 +686,69 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.warning("No blocks to push for request %s", request_id)
             return None
 
-        # Prefix caching: D allocated only uncached blocks, so on a partial hit it
-        # sends fewer than P's. End-trim P's blocks to that same suffix so we WRITE only
-        # the uncomputed tail into D's slots. Runs on kernel ids, post-expansion.
-        remote_block_ids, local_block_ids = self._apply_prefix_caching(
-            decode_block_ids=remote_block_ids,
-            prefill_block_ids=local_block_ids,
-            decode_physical_per_logical=remote_info.remote_physical_blocks_per_logical,
-            prefill_physical_per_logical=self._physical_blocks_per_logical_kv_block,
-        )
-
-        local_block_ids = list(local_block_ids)
-        remote_block_ids = list(remote_block_ids)
-        assert len(local_block_ids) == len(remote_block_ids), (
-            f"push group-count mismatch for {request_id}: {len(local_block_ids)} "
-            f"local vs {len(remote_block_ids)} remote groups"
-        )
-        for i in range(len(local_block_ids)):
-            assert len(local_block_ids[i]) == len(remote_block_ids[i]), (
-                f"push block-count mismatch for {request_id} group {i}: "
-                f"{len(local_block_ids[i])} local vs "
-                f"{len(remote_block_ids[i])} remote blocks"
+        if self._is_csa_linear and self._transfer_layer_group_ids:
+            # PP stages and Decode can pack the same layer into different groups.
+            prefill_layers = tuple(
+                local_block_ids[group] for group in self._transfer_layer_group_ids
+            )
+            decode_layers = tuple(
+                remote_block_ids[group]
+                for group in self.dst_region_group_ids[dst_engine_id]
+            )
+            decode_layers, prefill_layers = self._apply_prefix_caching_by_region(
+                decode_layers, prefill_layers
+            )
+            local_block_descs_ids = self._layer_desc_ids(
+                prefill_layers, self.dst_region_num_blocks[self.engine_id]
+            )
+            remote_block_descs_ids = self._layer_desc_ids(
+                decode_layers, self.dst_region_num_blocks[dst_engine_id]
+            )
+        else:
+            # Decode may already have some prefix pages. Pair its uncached
+            # blocks with the corresponding suffix of Prefill's kernel blocks.
+            remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
+            remote_block_ids, local_block_ids = self._apply_prefix_caching(
+                decode_block_ids=remote_block_ids,
+                prefill_block_ids=local_block_ids,
+                decode_physical_per_logical=remote_physical_per_logical,
+                prefill_physical_per_logical=self._physical_blocks_per_logical_kv_block,
             )
 
-        # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
-            region_group_ids=self.dst_region_group_ids[dst_engine_id],
-            uses_region_group_mapping=self.dst_uses_region_group_mapping[dst_engine_id],
-        )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=self.dst_region_num_blocks[self.engine_id],
-            region_group_ids=self.region_group_ids,
-            uses_region_group_mapping=self._uses_region_group_mapping,
-        )
+            local_block_ids = list(local_block_ids)
+            remote_block_ids = list(remote_block_ids)
+            assert len(local_block_ids) == len(remote_block_ids), (
+                f"push group-count mismatch for {request_id}: {len(local_block_ids)} "
+                f"local vs {len(remote_block_ids)} remote groups"
+            )
+            for i in range(len(local_block_ids)):
+                assert len(local_block_ids[i]) == len(remote_block_ids[i]), (
+                    f"push block-count mismatch for {request_id} group {i}: "
+                    f"{len(local_block_ids[i])} local vs "
+                    f"{len(remote_block_ids[i])} remote blocks"
+                )
+
+            # Get descs ids.
+            remote_block_descs_ids = self._compute_desc_ids(
+                block_ids=remote_block_ids,
+                dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+                block_size_ratio=None,
+                physical_blocks_per_logical=remote_physical_per_logical,
+                region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
+                region_group_ids=self.dst_region_group_ids[dst_engine_id],
+                uses_region_group_mapping=self.dst_uses_region_group_mapping[
+                    dst_engine_id
+                ],
+            )
+            local_block_descs_ids = self._compute_desc_ids(
+                block_ids=local_block_ids,
+                dst_num_blocks=self.dst_num_blocks[self.engine_id],
+                block_size_ratio=block_size_ratio,
+                physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+                region_num_blocks=self.dst_region_num_blocks[self.engine_id],
+                region_group_ids=self.region_group_ids,
+                uses_region_group_mapping=self._uses_region_group_mapping,
+            )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 

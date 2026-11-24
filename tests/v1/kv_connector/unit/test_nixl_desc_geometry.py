@@ -32,7 +32,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -132,18 +134,29 @@ def _make_packed_mla_view_worker(
     pp_size=1,
     backend_names=("FLASHMLA",),
     worker_cls=NixlPushConnectorWorker,
+    compressor_layers=(),
 ):
     """Register real strided views; only NIXL and distributed runtime are fake."""
     block_size = 16
     raw = torch.zeros(num_blocks * block_stride, dtype=torch.int8)
     tensors, groups, caches = [], [], {}
     for name, (offset, page_size) in layouts.items():
-        spec = MLAAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=page_size // block_size,
-            dtype=torch.uint8,
-        )
+        if name in compressor_layers:
+            ring_size = 8
+            spec = CircularBufferSpec(
+                block_size=ring_size,
+                num_kv_heads=1,
+                head_size=page_size // ring_size,
+                head_size_v=0,
+                dtype=torch.uint8,
+            )
+        else:
+            spec = MLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=page_size // block_size,
+                dtype=torch.uint8,
+            )
         tensor = KVCacheTensor(
             size=raw.nbytes,
             layers=[name],
@@ -158,6 +171,8 @@ def _make_packed_mla_view_worker(
         )
 
     config = create_vllm_config(block_size=block_size)
+    if compressor_layers:
+        config.model_config.hf_text_config.model_type = "deepseek_v41"
     config.parallel_config.pipeline_parallel_size = pp_size
     config.kv_transfer_config.kv_role = "kv_producer"
     config.cache_config.kv_cache_layout = "BLHNC"
@@ -322,6 +337,52 @@ def test_packed_mla_pp_pairs_asymmetric_strides_and_overlapping_layers(
         aligned = msgspec.msgpack.encode(metadata)
         producer._align_remote_regions_by_layer(metadata)
         assert msgspec.msgpack.encode(metadata) == aligned
+
+
+@pytest.mark.cpu_test
+def test_packed_csa_pp_routes_compressor_ring_to_decode_group():
+    producer, p_raw = _make_packed_mla_view_worker(
+        {"target": (0, 128), "target.state": (128, 64)},
+        192,
+        pp_size=2,
+        compressor_layers=("target.state",),
+    )
+    consumer, d_raw = _make_packed_mla_view_worker(
+        {"other": (0, 64), "target.state": (64, 64), "target": (128, 128)},
+        256,
+        compressor_layers=("target.state",),
+    )
+    remote = msgspec.msgpack.decode(
+        consumer.xfer_handshake_metadata.agent_metadata_bytes,
+        type=NixlAgentMetadata,
+    )
+    producer.add_remote_agent(remote, remote_tp_rank=0, remote_tp_size=2)
+    assert producer._transfer_layer_group_ids == (0, 1)
+    assert remote.region_group_ids == [2, 1]
+    local_handle = producer.src_xfer_handles_by_block_size[producer.block_size]
+    remote_handle = producer.dst_xfer_side_handles[consumer.engine_id][0]
+    producer._xfer_blocks(
+        ReadSpec(
+            remote_rank=0,
+            local_block_ids=([0, 1], [2]),
+            remote_block_ids=([0], [3], [2]),
+        ),
+        request_id="prefill",
+        dst_engine_id=consumer.engine_id,
+        remote_request_id="decode",
+        local_xfer_side_handle=local_handle,
+        remote_xfer_side_handle=remote_handle,
+    )
+    op, _, local_ids, _, remote_ids = producer.nixl_wrapper.xfers[-1]
+    assert op == "WRITE"
+    assert producer.nixl_wrapper.dlists[local_handle][local_ids].tolist() == [
+        [p_raw.data_ptr() + 192, 128, 0],
+        [p_raw.data_ptr() + 2 * 192 + 128, 64, 0],
+    ]
+    assert producer.nixl_wrapper.dlists[remote_handle][remote_ids].tolist() == [
+        [d_raw.data_ptr() + 2 * 256 + 128, 128, 0],
+        [d_raw.data_ptr() + 3 * 256 + 64, 64, 0],
+    ]
 
 
 @pytest.mark.cpu_test
