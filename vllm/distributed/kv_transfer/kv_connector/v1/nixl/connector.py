@@ -415,6 +415,14 @@ class NixlPushConnector(NixlBaseConnector):
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
 
+    def get_finished_count(self) -> int | None:
+        parallel = self._vllm_config.parallel_config
+        pcp_size = parallel.prefill_context_parallel_size
+        if self.kv_transfer_config.kv_role == "kv_producer" and pcp_size > 1:
+            # Each PP stage sends replicated KV from PCP rank zero for each TP rank.
+            return parallel.pipeline_parallel_size * parallel.tensor_parallel_size
+        return None
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Drive push processing on the worker.
 

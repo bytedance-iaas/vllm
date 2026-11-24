@@ -25,6 +25,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import (
@@ -134,6 +135,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         return True
 
     @classmethod
+    def supports_pcp(cls) -> bool:
+        return current_platform.is_device_capability_family(120)
+
+    @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major in [10, 12]
 
@@ -238,6 +243,10 @@ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekV41SparseSWAMetadataBui
 
 
 class DeepseekSparseSWAFlashInferBackend(DeepseekSparseSWABackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return current_platform.is_device_capability_family(120)
+
     @staticmethod
     def get_builder_cls() -> type[DeepseekSparseSWAFlashInferMetadataBuilder]:
         return DeepseekSparseSWAFlashInferMetadataBuilder
@@ -681,7 +690,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_only: bool,
     ) -> None:
         num_decode_tokens = swa_metadata.num_decode_tokens
-        if swa_metadata.num_prefills > 0:
+        if swa_metadata.num_prefill_tokens > 0:
             self._forward_prefill(
                 q=q[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
@@ -690,7 +699,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
             )
-        if swa_metadata.num_decodes > 0:
+        if num_decode_tokens > 0:
             self._forward_decode(
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,
@@ -744,6 +753,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+
+        if self.use_pcp:
+            num_tokens = (
+                swa_metadata.num_decode_tokens + swa_metadata.num_prefill_tokens
+            )
+            output[num_tokens:].zero_()
+            if num_tokens == 0:
+                return
+            q = q[:num_tokens]
+            output = output[:num_tokens]
 
         swa_only = self.compress_ratio == 0
         # SWA-only layers have no compressed KV cache; consumers read the kv

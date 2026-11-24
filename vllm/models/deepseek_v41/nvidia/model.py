@@ -208,18 +208,29 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
+    device_capability = current_platform.get_device_capability()
+    is_sm120 = device_capability is not None and device_capability.major == 12
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
-        if backend not in (
+        if is_sm120:
+            if backend in (
+                None,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41,
+            ):
+                return DeepseekV4FlashInferSM120Attention
+            raise NotImplementedError(
+                "DeepSeek-V4.1 PCP on SM120 requires FLASHINFER_MLA_SPARSE_DSV41."
+            )
+        if backend in (
             None,
             AttentionBackendEnum.FLASHMLA_SPARSE,
             AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
             AttentionBackendEnum.FLASHMLA_SPARSE_DSV41,
         ):
-            raise NotImplementedError(
-                "DeepSeek-V4.1 PCP requires FlashMLA sparse attention."
-            )
-        return DeepseekV4FlashMLAAttention
-    device_capability = current_platform.get_device_capability()
+            return DeepseekV4FlashMLAAttention
+        raise NotImplementedError(
+            "DeepSeek-V4.1 PCP requires FlashMLA sparse attention on this device."
+        )
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -233,7 +244,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41,
     ):
-        if device_capability is not None and device_capability.major == 12:
+        if is_sm120:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
     if backend is AttentionBackendEnum.FLASHMLA_MEGA_ATTN_DSV41:
@@ -245,7 +256,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
-    if device_capability is not None and device_capability.major == 12:
+    if is_sm120:
         return DeepseekV4FlashInferSM120Attention
     # Mega attention is the SM100 default: it fuses Q RoPE, sparse attention,
     # the output's inverse RoPE and its FP8 cast into one launch, and brings
@@ -264,8 +275,7 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
         vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
     )
     return (
-        parallel_config.pipeline_parallel_size == 1
-        and parallel_config.enable_expert_parallel
+        parallel_config.enable_expert_parallel
         and parallel_config.tensor_parallel_size > 1
         and (moe_needs_token_sharded_input or parallel_config.data_parallel_size > 1)
     )
@@ -705,13 +715,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
+        kv_transfer = vllm_config.kv_transfer_config
         if self.parallel_config.prefill_context_parallel_size > 1 and (
-            self.parallel_config.pipeline_parallel_size != 1
-            or self.parallel_config.data_parallel_size != 1
+            self.parallel_config.data_parallel_size != 1
             or self.parallel_config.decode_context_parallel_size != 1
             or self.parallel_config.use_ubatching
             or vllm_config.speculative_config is not None
-            or vllm_config.kv_transfer_config is not None
             or (
                 vllm_config.cache_config.enable_prefix_caching
                 and not vllm_config.cache_config.swa_bounded_replay
@@ -719,9 +728,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             or vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         ):
             raise NotImplementedError(
-                "DeepSeek-V4.1 PCP currently requires PP=DP=DCP=1, with no "
-                "microbatching, speculative decoding, KV transfer, or MegaMoE. "
+                "DeepSeek-V4.1 PCP currently requires DP=DCP=1, with no "
+                "microbatching, speculative decoding, or MegaMoE. "
                 "Prefix caching requires SWA bounded replay."
+            )
+        if (
+            self.parallel_config.prefill_context_parallel_size > 1
+            and kv_transfer is not None
+            and (
+                kv_transfer.kv_connector != "NixlPushConnector"
+                or kv_transfer.kv_role != "kv_producer"
+                or kv_transfer.kv_buffer_device != "cuda"
+            )
+        ):
+            raise NotImplementedError(
+                "DeepSeek-V4.1 PCP KV transfer requires a CUDA NixlPushConnector "
+                "prefill producer."
             )
         self.use_native_mega_moe = (
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
@@ -1084,6 +1106,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+            if self.use_sequence_parallel:
+                pre_mix = sp_shard(pre_mix)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
             range(self.start_layer, self.decoder_replay_start),
@@ -1128,6 +1152,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ] + late_aux
 
         if not get_pp_group().is_last_rank:
+            # PP transports tensors replicated across TP ranks.
+            if self.use_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+                pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
             )

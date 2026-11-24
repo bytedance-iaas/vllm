@@ -32,12 +32,19 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
-from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    KVOutputAggregator,
+    TransferTopology,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+    NixlPushConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
@@ -57,10 +64,46 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
-from .utils import create_request, expand_strided_descs, make_nixl_push_scheduler
+from .utils import (
+    create_request,
+    create_vllm_config,
+    expand_strided_descs,
+    make_nixl_push_scheduler,
+)
+
+
+def test_pp_pcp_push_releases_prefill_after_both_stage_writers():
+    config = create_vllm_config(kv_connector="NixlPushConnector", kv_role="kv_producer")
+    config.parallel_config.pipeline_parallel_size = 2
+    config.parallel_config.prefill_context_parallel_size = 4
+    connector = NixlPushConnector(
+        config,
+        KVConnectorRole.SCHEDULER,
+        KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[]),
+    )
+    try:
+        aggregator = KVOutputAggregator.from_connector(connector, world_size=8)
+        for stage_root in (0, 4):
+            outputs = [
+                ModelRunnerOutput(
+                    req_ids=[],
+                    req_id_to_index={},
+                    kv_connector_output=KVConnectorOutput(
+                        finished_sending={"prefill"} if rank == stage_root else None
+                    ),
+                )
+                for rank in range(8)
+            ]
+            output = aggregator.aggregate(outputs)
+            assert output is not None and output.kv_connector_output is not None
+            expected = {"prefill"} if stage_root == 4 else None
+            assert output.kv_connector_output.finished_sending == expected
+    finally:
+        connector.shutdown()
+
 
 # ----------------------------------------------------------------- #
 #  Helpers / fakes                                                   #
