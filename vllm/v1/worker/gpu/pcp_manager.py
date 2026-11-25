@@ -169,7 +169,7 @@ class PCPManager:
             raise NotImplementedError(
                 "MRV2 PCP does not support encoder-decoder models yet."
             )
-        if supports_mm_inputs:
+        if supports_mm_inputs and not vllm_config.is_dsv41_encoder_only_prefill:
             raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")

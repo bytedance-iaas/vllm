@@ -154,6 +154,18 @@ def _gather(
     )
 
 
+def test_empty_encoder_window_inside_image():
+    image = _feature("h0", offset=4, length=8)
+    runner = _make_runner([image], cached=[image])
+
+    embeds, embed_mask = _gather(
+        runner, num_scheduled=0, draft_lookahead=0, num_computed=6
+    )
+
+    assert embeds == []
+    assert embed_mask.numel() == 0
+
+
 def test_draft_lookahead_uses_boundary_feature_when_cached():
     """The drafter's +1 look-ahead can reach the feature at offset ==
     processed_end (the next chunk). When its encoder output is already cached

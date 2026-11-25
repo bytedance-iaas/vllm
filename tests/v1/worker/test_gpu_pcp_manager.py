@@ -72,6 +72,16 @@ def test_validate_config_accepts_decode_only_full_graphs(cudagraph_mode):
     PCPManager.validate_config(_make_config(cudagraph_mode), supports_mm_inputs=False)
 
 
+def test_validate_config_allows_multimodal_only_for_encoder_only_prefill():
+    config = _make_config(CUDAGraphMode.NONE)
+    config.is_dsv41_encoder_only_prefill = False
+    with pytest.raises(NotImplementedError, match="does not support MM"):
+        PCPManager.validate_config(config, supports_mm_inputs=True)
+
+    config.is_dsv41_encoder_only_prefill = True
+    PCPManager.validate_config(config, supports_mm_inputs=True)
+
+
 def test_validate_config_rejects_full_graph_for_prefills():
     with pytest.raises(NotImplementedError, match="decode-only routines"):
         PCPManager.validate_config(
