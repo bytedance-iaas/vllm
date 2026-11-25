@@ -1108,9 +1108,17 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             self._check_gin_support(buffer_kwargs["group"])
             self._gin_checked = True
         logger.debug("DeepEP v2 all2all args %s", buffer_kwargs)
-        handle: deep_ep.ElasticBuffer = self.handle_cache.get_or_create(
-            buffer_kwargs, deep_ep.ElasticBuffer
-        )
+        buffer_cls = deep_ep.ElasticBuffer
+        if envs.VLLM_DEEPEP_V2_USE_PCIE:
+            from vllm.distributed.device_communicators.deepep_v2_pcie import (
+                DeepEPV2PCIeBuffer,
+            )
+            from vllm.platforms import current_platform
+
+            if not current_platform.is_device_capability_family(120):
+                raise ValueError("The DeepEP v2 PCIe adapter requires SM120.")
+            buffer_cls = DeepEPV2PCIeBuffer
+        handle = self.handle_cache.get_or_create(buffer_kwargs, buffer_cls)
         if self._num_sms is None:
             self._num_sms = handle.get_theoretical_num_sms(
                 num_experts=num_experts,

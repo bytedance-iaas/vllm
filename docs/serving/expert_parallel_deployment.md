@@ -319,3 +319,14 @@ except Exception as e:
 - To simulate the decode deployment of disaggregated serving, pass `--kv-transfer-config '{"kv_connector":"DecodeBenchConnector","kv_role":"kv_both"}'` to the `vllm serve` invocation. The connector populates KV cache with random values so decode can be profiled in isolation. Add `"kv_connector_extra_config":{"startup_fill":true}` to fill the whole KV cache once at startup instead of in the decode steps that admit new requests (see the connector docstring for its limitations).
 
 - **CUDAGraph capture**: Use `--compilation_config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'` to enable CUDA graph capture for decode only and save KV cache.
+
+### DeepSeek V4.1 Decode on SM120 PCIe GPUs
+
+For a single-node, TP1 DP8/EP8 DeepSeek-V4.1 Decode group, build the
+[DeepEP v2 PCIe Magic extension](../../tools/ep_kernels/deepep_sm120_pcie)
+against the serving image's CUDA, PyTorch and NCCL. Select
+`--all2all-backend deepep_v2` with `VLLM_DEEPEP_V2_USE_PCIE=1` and
+`VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0`. The adapter uses the Decode layout
+and supports CUDA Graph replay. Allow RDMA device access for GIN communicator
+setup. On the validated TK300, the default eight-rank LSA team uses PCIe P2P
+for expert payload transfers.

@@ -291,6 +291,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
     VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL: bool = False
+    VLLM_DEEPEP_V2_USE_PCIE: bool = False
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
     VLLM_DEEPEP_V2_PREFER_OVERLAP: bool = False
     VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION: bool = False
@@ -2051,6 +2052,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   * hybrid mode = multi-node RDMA
     #   * non hybrid mode = nvlink
     # Set to 1 (the default) to allow DeepEP to autoselect hybrid vs non-hybrid.
+    # Select the SM120 PCIe Magic adapter for DeepEP v2 Decode.
+    "VLLM_DEEPEP_V2_USE_PCIE": lambda: bool(
+        int(os.getenv("VLLM_DEEPEP_V2_USE_PCIE", "0"))
+    ),
     # Set to 0 to disable hybrid mode.
     "VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE", "1"))
