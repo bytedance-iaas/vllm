@@ -7,7 +7,7 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 """
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import msgspec
 import pytest
@@ -230,6 +230,43 @@ def test_metadata_hma_block_ids():
     assert len(stored_blocks) == 2
     assert stored_blocks[0] == fa_blocks
     assert stored_blocks[1] == sw_blocks
+
+
+@pytest.mark.cpu_test
+@pytest.mark.asyncio
+async def test_decoder_first_unclaimed_transfer_expires(
+    monkeypatch, mooncake_cpu_device
+):
+    monkeypatch.setenv("VLLM_MOONCAKE_ORPHAN_TRANSFER_TIMEOUT", "0")
+    cfg = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer", block_size=128
+    )
+    caches = make_kv_cache_config(block_size=128, swa_enabled=False)
+    pull = MooncakeXferMetadata(
+        remote_hostname="decoder",
+        remote_port=10,
+        remote_tp_rank=0,
+        remote_tp_size=1,
+        req_blocks={"decoder-request": ("pending-transfer", [[1]])},
+        kv_caches_base_addr=[],
+        block_lens=[],
+        kv_block_lens=[],
+    )
+    with set_current_vllm_config(cfg), patch_worker_dependencies():
+        connector = MooncakeConnector(cfg, KVConnectorRole.WORKER, caches)
+        worker = connector.connector_worker
+        assert worker is not None
+        socket = AsyncMock()
+        with patch.object(
+            worker, "_prepare_transfer_regions", return_value=([], [], None)
+        ):
+            await worker.send_kv_to_decode(b"decoder", socket, pull)
+        _, body = socket.send_multipart.await_args.args[0]
+        response = msgspec.msgpack.decode(body, type=MooncakeXferResponse)
+        assert response.err_reqs == ["decoder-request"]
+        assert response.err_msg == "Timeout waiting for P side ready."
+        assert "pending-transfer" not in worker.reqs_need_send
+        del connector, worker
 
 
 # ---------------------------------------------------------------------------
