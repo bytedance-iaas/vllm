@@ -759,6 +759,7 @@ def sparse_attn_indexer(
                             row_ends,
                             chunk_candidates,
                             candidate_block_size,
+                            in_range_only=True,
                         )
                 ops.top_k_per_row_prefill(
                     logits,
@@ -919,6 +920,7 @@ def sparse_attn_indexer(
                     decode_candidates,
                     candidate_block_size,
                     row_repeat,
+                    in_range_only=True,
                 )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 

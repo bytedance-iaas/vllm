@@ -52,6 +52,115 @@ def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 FP8 indexer"
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_dsv41_adaptive_indexer_replays_device_query_lengths(ratio):
+    import os
+
+    from vllm.config import set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    config = EngineArgs(
+        model=os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-V4.1-Flash"),
+        skip_tokenizer_init=True,
+        block_size=128,
+        max_model_len=1024,
+        max_num_batched_tokens=128,
+        max_num_seqs=8,
+        kv_cache_dtype="fp8_ds_mla",
+        speculative_config={
+            "method": "dspark",
+            "num_speculative_tokens": 5,
+            "enable_adaptive_verification": True,
+        },
+        compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
+    ).create_engine_config()
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=ratio,
+    )
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    with set_current_vllm_config(config):
+        assert DeepseekV41IndexerBackend.supports_device_cpu_query_lens_mismatch()
+        builder = DeepseekV41IndexerBackend.get_builder_cls()(
+            spec, ["indexer.k_cache"], config, device, block_table_width=3
+        )
+    torch.manual_seed(41)
+    num_rows = 8
+    q = torch.randn(num_rows, 1, 32, 128, device=device).to(torch.float8_e4m3fn)
+    weights = torch.rand(num_rows, 32, device=device)
+    cache = kv_cache_cast_to_fp8(
+        torch.randn(12, spec.num_states, 1, 128, device=device)
+    )
+    pages = torch.tensor([[1, 6, 3], [4, 5, 2], [0, 0, 0]], device=device).int()
+    qsl = torch.tensor([0, 3, 6, 6], device=device, dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl.cpu(),
+        seq_lens=torch.tensor([135, 260, 0], device=device, dtype=torch.int32),
+        num_reqs=3,
+        num_actual_tokens=num_rows,
+        max_query_len=6,
+        max_seq_len=260,
+        block_table_tensor=pages,
+        slot_mapping=torch.arange(num_rows, device=device, dtype=torch.int64),
+    )
+
+    def logits(lens, tables, schedule):
+        return fp8_fp4_paged_mqa_logits(
+            (q, None), cache, weights, lens, tables, schedule, max_model_len=384
+        )
+
+    md = builder.build(0, common).decode
+    assert md is not None and md.indices is None and not md.requires_padding
+    rank = get_indexer_topk("torch")
+    observed_topk = torch.empty((num_rows, 8), device=device, dtype=torch.int32)
+    warmup = logits(md.seq_lens, md.block_table, md.schedule_metadata)
+    rank(warmup, md.seq_lens, 1, observed_topk, 8, common.max_seq_len)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = logits(md.seq_lens, md.block_table, md.schedule_metadata)
+        rank(captured, md.seq_lens, 1, observed_topk, 8, common.max_seq_len)
+
+    for first, second in ((5, 1), (1, 5), (2, 5)):
+        n = first + second
+        qsl.copy_(torch.tensor([0, first, n, n], device=device))
+        # The CPU knows the total, but distributes it evenly across requests.
+        common.query_start_loc_cpu.copy_(torch.tensor([0, n // 2, n, n]))
+        pages[:2].copy_(pages[:2].flip(0))
+        fresh = builder.build(0, common).decode
+        assert fresh is not None and fresh.indices is None
+        assert md.block_table.data_ptr() == fresh.block_table.data_ptr()
+        assert md.seq_lens.data_ptr() == fresh.seq_lens.data_ptr()
+        assert md.schedule_metadata.data_ptr() == fresh.schedule_metadata.data_ptr()
+        graph.replay()
+        lengths = [*range(136 - first, 136), *range(261 - second, 261)]
+        lens = (
+            torch.tensor(lengths + [0] * (num_rows - n), device=device).int() // ratio
+        )
+        owners = [0] * first + [1] * second + [2] * (num_rows - n)
+        expected_pages = pages[owners]
+        torch.testing.assert_close(fresh.seq_lens.flatten(), lens)
+        torch.testing.assert_close(fresh.block_table, expected_pages)
+        lens = lens[:, None]
+        schedule = get_paged_mqa_logits_metadata(lens, spec.num_states, get_num_sms())
+        reference = logits(lens, expected_pages, schedule)
+        valid = torch.arange(reference.shape[1], device=device) < lens
+        torch.testing.assert_close(captured[valid], reference[valid], rtol=0, atol=0)
+        expected_topk = reference.masked_fill(~valid, -torch.inf).topk(8).indices.int()
+        expected_topk[n:].fill_(-1)
+        torch.testing.assert_close(observed_topk, expected_topk)
+
+
 def per_custom_dims_cast_to_fp8(
     x: torch.Tensor, dims: tuple, use_ue8m0: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:

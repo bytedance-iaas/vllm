@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL: bool = False
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
@@ -1103,6 +1104,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Clamped to max_model_len - query_len. Default: 8192 tokens
     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+    ),
+    "VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL": lambda: bool(
+        int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -2439,6 +2443,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",

@@ -40,6 +40,8 @@ class DPSyncState:
     # Whether every rank's scheduler found that none of its requests can use this
     # step's drafts, so all ranks skip drafting together.
     skip_drafts: bool = False
+    # An actual prefill on any rank excludes post-DP verification budget refill.
+    has_prefill: bool = False
 
 
 def sync_cudagraph_and_dp_padding(
@@ -56,6 +58,7 @@ def sync_cudagraph_and_dp_padding(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
+    has_prefill: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
 
@@ -65,7 +68,7 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    tensor = torch.zeros(7, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(8, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
@@ -73,6 +76,7 @@ def sync_cudagraph_and_dp_padding(
     tensor[4][dp_rank] = int(allow_ubatching)
     tensor[5][dp_rank] = num_reqs
     tensor[6][dp_rank] = int(allow_skip_drafts)
+    tensor[7][dp_rank] = int(has_prefill)
     if should_skip_dp_coordination():
         tensor[:] = tensor[:, dp_rank, None].clone()
     else:
@@ -86,6 +90,7 @@ def sync_cudagraph_and_dp_padding(
     num_reqs_across_dp = tensor[5]
     allow_skip_drafts_across_dp = tensor[6]
     skip_drafts = bool(torch.all(allow_skip_drafts_across_dp == 1))
+    any_prefill = bool(torch.any(tensor[7]))
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -151,6 +156,7 @@ def sync_cudagraph_and_dp_padding(
                 eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
                 num_reqs=int(num_reqs_across_dp.max()),
                 skip_drafts=skip_drafts,
+                has_prefill=any_prefill,
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min()))
@@ -170,6 +176,7 @@ def sync_cudagraph_and_dp_padding(
                 eager=True,
                 num_reqs=int(num_reqs_across_dp.max()),
                 skip_drafts=skip_drafts,
+                has_prefill=any_prefill,
             ),
         )
 
@@ -205,6 +212,7 @@ def sync_cudagraph_and_dp_padding(
         eager=False,
         num_reqs=int(num_reqs_across_dp.max()),
         skip_drafts=skip_drafts,
+        has_prefill=any_prefill,
     )
 
 
@@ -223,6 +231,7 @@ def dispatch_cg_and_sync_dp(
     uniform_decode: bool = False,
     allow_skip_drafts: bool = False,
     dp_sync_state: DPSyncState | None = None,
+    has_prefill: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
@@ -256,6 +265,7 @@ def dispatch_cg_and_sync_dp(
         allow_skip_drafts: Whether this rank allows skipping drafts, because
             none of its requests can use this step's drafts. Agreed across ranks
             (all must allow it) into `DPSyncState.skip_drafts`.
+        has_prefill: Whether this rank has any requests still in prefill.
         dp_sync_state: Agreement from a prior dispatch over this same batch, to reuse.
             Must come from a batch with this same padded `num_tokens` and the
             same `uniform_token_count`; `num_reqs` may differ, as neither
@@ -300,6 +310,7 @@ def dispatch_cg_and_sync_dp(
             dp_sync_state.uniform_token_count is None
             or uniform_token_count == dp_sync_state.uniform_token_count
         ), "reusing a DP sync taken over a different batch"
+        assert not has_prefill or dp_sync_state.has_prefill
         if not dp_sync_state.eager and batch_desc.num_tokens != num_tokens:
             # Capture sizes can differ between managers, so this one may
             # pad further. Every rank pads alike, so report what will run.
@@ -325,4 +336,5 @@ def dispatch_cg_and_sync_dp(
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
         allow_skip_drafts=allow_skip_drafts,
+        has_prefill=has_prefill,
     )

@@ -28,6 +28,8 @@ _PROFILE_REPLAYS = 5
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.dp_utils import DPSyncState
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
     from vllm.v1.worker.utils import AttentionGroup
@@ -371,6 +373,55 @@ class AdaptiveVerificationManager:
             draft_budget,
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+
+    def maybe_refill_post_dp_budget(
+        self,
+        local_tokens: int,
+        graph: "BatchExecutionDescriptor",
+        dp_state: "DPSyncState",
+    ) -> int:
+        """Verify extra scheduled drafts that fit the agreed decode graph."""
+        if (
+            self._batch_budget is None
+            or graph.cg_mode != CUDAGraphMode.FULL
+            or graph.num_ubatches != 1
+            or dp_state.eager
+            or dp_state.has_prefill
+            or graph.num_reqs is None
+        ):
+            return local_tokens
+        drafts, non_drafts, budget = self._batch_budget
+        num_reqs = len(drafts)
+        num_non_drafts = sum(non_drafts.values())
+        if (
+            local_tokens != num_non_drafts + budget
+            or graph.num_reqs < max(num_reqs, dp_state.num_reqs)
+            or (
+                graph.max_query_len is not None
+                and any(
+                    non_drafts[req] + count > graph.max_query_len
+                    for req, count in drafts.items()
+                )
+            )
+        ):
+            return local_tokens
+        new_budget = min(
+            sum(drafts.values()),
+            self._max_total_logits - num_reqs * self.num_bonus_tokens,
+            graph.num_tokens - num_non_drafts,
+        )
+        if new_budget <= budget:
+            return local_tokens
+        self._batch_budget = drafts, non_drafts, new_budget
+        logger.debug(
+            "Refilled adaptive verification budget from %d to %d drafts "
+            "for %d requests in a %d-token DP graph",
+            budget,
+            new_budget,
+            num_reqs,
+            graph.num_tokens,
+        )
+        return num_non_drafts + new_budget
 
     def compact_batch(
         self,

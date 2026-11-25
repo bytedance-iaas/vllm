@@ -183,6 +183,51 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert num_non_draft_tokens == {"low": 1, "high": 1}
 
 
+@pytest.mark.parametrize(
+    "mode,peer_prefill,peer_reqs,graph_rows,width,logit_cap,expected",
+    [
+        (CUDAGraphMode.FULL, False, 2, 8, 3, 8, 6),
+        (CUDAGraphMode.FULL, False, 2, 5, 3, 8, 5),
+        (CUDAGraphMode.FULL, False, 2, 8, 3, 4, 4),
+        (CUDAGraphMode.FULL, False, 2, 8, 2, 8, 3),
+        (CUDAGraphMode.FULL, False, 3, 8, 3, 8, 3),
+        (CUDAGraphMode.FULL, True, 2, 8, 3, 8, 3),
+        (CUDAGraphMode.PIECEWISE, False, 2, 8, 3, 8, 3),
+    ],
+)
+def test_refill_respects_agreed_graph_and_sampler_capacity(
+    mode, peer_prefill, peer_reqs, graph_rows, width, logit_cap, expected
+):
+    import torch
+
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.dp_utils import DPSyncState
+
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]]),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+    )
+    manager._max_total_logits = logit_cap
+    local = manager.get_num_tokens(
+        {"low": 3, "high": 3}, {"low": [1, 2], "high": [3, 4]}
+    )
+    assert local == 3
+    desc = BatchExecutionDescriptor(mode, graph_rows, 2, max_query_len=width)
+    sync = DPSyncState(
+        torch.tensor([graph_rows, graph_rows]),
+        None,
+        False,
+        peer_reqs,
+        has_prefill=peer_prefill,
+    )
+    assert manager.maybe_refill_post_dp_budget(local, desc, sync) == expected
+    compacted, _ = manager.compact_batch(
+        np.array([2, 2]), np.array([3, 3]), np.array([0, 3, 6])
+    )
+    assert compacted.sum() == expected
+    assert (compacted <= 3).all()
+
+
 def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)

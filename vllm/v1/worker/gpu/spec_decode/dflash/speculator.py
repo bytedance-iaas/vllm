@@ -213,6 +213,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         aux_hidden_states: list[torch.Tensor] | None,
         num_rejected: torch.Tensor,
         dummy_run: bool,
+        context_rows: torch.Tensor | None = None,
     ) -> None:
         """Eager work before a FULL replay: stage the inputs _prepare_graph_forward
         reads and store the context rows past the graph's num_context rows."""
@@ -220,12 +221,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_target_tokens = input_batch.num_tokens
         num_context = self._num_graph_context_tokens(num_graph_reqs)
         self._store_hidden_states(
-            num_target_tokens, last_hidden_states, aux_hidden_states, num_context
+            num_target_tokens,
+            last_hidden_states,
+            aux_hidden_states,
+            0 if context_rows is not None else num_context,
         )
         if self._num_rejected is not None:
             self._num_rejected[:num_reqs].copy_(num_rejected[:num_reqs])
         if dummy_run:
             # Dummy block tables are placeholders: write no context K/V.
+            self._context_slot_mappings[:, :num_context].fill_(PAD_SLOT_ID)
+        elif context_rows is not None:
+            self._precompute_context_kv(0, num_target_tokens, rows=context_rows)
             self._context_slot_mappings[:, :num_context].fill_(PAD_SLOT_ID)
         elif num_target_tokens <= num_context:
             # Rows past the batch keep stale positions but write no K/V.
@@ -372,12 +379,20 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs, self.num_speculative_steps
         )
 
+    def _context_rows(self, input_batch: InputBatch) -> torch.Tensor | None:
+        """Rows whose context KV this drafter can still read; None for all."""
+        return None
+
     def _num_graph_context_tokens(self, num_reqs: int) -> int:
         # Context rows a captured draft step stores: one full verify per request.
         return min(num_reqs * (self.num_speculative_steps + 1), self.max_num_tokens)
 
     def _precompute_context_kv(
-        self, start: int, end: int, dummy_run: bool = False
+        self,
+        start: int,
+        end: int,
+        dummy_run: bool = False,
+        rows: torch.Tensor | None = None,
     ) -> None:
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
@@ -388,9 +403,22 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][start:end]
+        context_hidden = self.hidden_states[start:end]
+        context_positions = self.context_positions[start:end]
+        if rows is not None:
+            assert start == 0
+            context_hidden = context_hidden.index_select(0, rows)
+            context_positions = context_positions.index_select(0, rows)
+            if isinstance(context_slots, list):
+                context_slots = [
+                    None if slots is None else slots.index_select(0, rows)
+                    for slots in context_slots
+                ]
+            elif context_slots is not None:
+                context_slots = context_slots.index_select(0, rows)
         self.model.precompute_and_store_context_kv(
-            self.hidden_states[start:end],
-            self.context_positions[start:end],
+            context_hidden,
+            context_positions,
             context_slots,
         )
 
@@ -543,13 +571,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_reqs,
             )
 
+        context_rows = None if dummy_run else self._context_rows(input_batch)
         if num_speculative_tokens == 0:
             # No drafts are needed: store the context K/V to keep the drafter in
             # sync, and skip the query pass.
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )
-            self._precompute_context_kv(0, num_target_tokens, dummy_run)
+            self._precompute_context_kv(0, num_target_tokens, dummy_run, context_rows)
             return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
@@ -586,6 +615,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 aux_hidden_states,
                 num_rejected,
                 dummy_run,
+                context_rows,
             )
         else:
             self._store_hidden_states(
@@ -594,7 +624,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.prepare_context_anchor(
                 num_reqs, input_batch.query_start_loc, num_rejected
             )
-            self._precompute_context_kv(0, num_target_tokens, dummy_run)
+            self._precompute_context_kv(0, num_target_tokens, dummy_run, context_rows)
 
         is_full_cudagraph = batch_desc.cg_mode == CUDAGraphMode.FULL
         # During FULL cudagraph with a model that supports decode metadata updates,

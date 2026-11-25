@@ -7,7 +7,12 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher, zip_inputs
@@ -358,6 +363,12 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
 
 class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        return super().supports_device_cpu_query_lens_mismatch() or (
+            _sm120_dsv41_supports_flattened_decode(get_current_vllm_config_or_none())
+        )
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_V41_INDEXER"
@@ -969,6 +980,20 @@ def _supports_native_decode(next_n: int) -> bool:
     return next_n in (1, 2)
 
 
+def _sm120_dsv41_supports_flattened_decode(vllm_config: VllmConfig | None) -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and vllm_config is not None
+        and vllm_config.model_config is not None
+        and vllm_config.model_config.hf_text_config.model_type == "deepseek_v41"
+        and vllm_config.parallel_config.decode_context_parallel_size == 1
+        and vllm_config.parallel_config.prefill_context_parallel_size == 1
+        and not dsa_indexer_uses_fp4(vllm_config)
+        and has_deep_gemm()
+    )
+
+
 def _use_flattening(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     next_n = 1 + vllm_config.num_speculative_tokens
@@ -977,6 +1002,7 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
         and speculative_config.enable_adaptive_verification
         and (
             _supports_flattened_device_query_lens()
+            or _sm120_dsv41_supports_flattened_decode(vllm_config)
             or _rocm_supports_flattened_device_query_lens(vllm_config)
         )
     )
@@ -1032,6 +1058,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.reorder_batch_threshold = None
         self.use_flattening = _use_flattening(self.vllm_config)
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
+        spec_config = self.vllm_config.speculative_config
+        self.use_device_decode_metadata = self.supports_varlen or bool(
+            spec_config
+            and spec_config.enable_adaptive_verification
+            and _sm120_dsv41_supports_flattened_decode(self.vllm_config)
+        )
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
             "(next_n=%d, use_fp4_cache=%s)",
@@ -1598,7 +1630,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
-            if not self.supports_varlen:
+            if not self.use_device_decode_metadata:
                 torch.diff(
                     common_attn_metadata.query_start_loc[: num_decodes + 1],
                     out=self.decode_lens_buffer[:num_decodes],
@@ -1641,7 +1673,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and step_next_n_ok
             )
 
-            if not self.supports_varlen:
+            if not self.use_device_decode_metadata:
                 global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
                     global_seq_lens=global_seq_lens_for_decode,
                     decode_lens=decode_lens,
@@ -1653,7 +1685,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
 
             decode_indices = None
-            if self.supports_varlen:
+            if self.use_device_decode_metadata:
                 from vllm.v1.attention.ops.metadata import (
                     _indexer_decode_metadata_kernel,
                 )
@@ -1683,7 +1715,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
-                decode_indices = self.decode_indices_buffer[:num_decode_tokens]
+                # SM120 uses the expanded block-table row and context length
+                # for each token with its existing fixed next_n=1 logits kernel.
+                if self.supports_varlen:
+                    decode_indices = self.decode_indices_buffer[:num_decode_tokens]
                 requires_padding = False
                 if global_seq_lens_for_decode is not None and max_decode_len > 1:
                     self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(

@@ -12,6 +12,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as dsv4_dspark
+from vllm.models.deepseek_v41.nvidia import dspark as dsv41_dspark
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
 
@@ -234,6 +235,14 @@ def test_v41_dspark_loads_linear_scales(
         param.copy_(weight)
 
     param.weight_loader = load_scale
+    params = {runtime_name: param}
+    context_param = None
+    if ".attn.wkv." in checkpoint_name:
+        context_param = nn.Parameter(
+            torch.empty_like(checkpoint_scale), requires_grad=False
+        )
+        context_param.weight_loader = load_scale
+        params[f"model.context_wkv_proj.{scale_name}"] = context_param
     draft = SimpleNamespace(
         config=SimpleNamespace(num_attention_heads=4, n_routed_experts=1),
         quant_config=SimpleNamespace(
@@ -252,7 +261,7 @@ def test_v41_dspark_loads_linear_scales(
             ],
             confidence_head=None,
         ),
-        named_parameters=lambda: [(runtime_name, param)],
+        named_parameters=lambda: params.items(),
         process_weights_after_loading=lambda: None,
     )
     draft._remap_dspark_name = lambda name: (
@@ -266,8 +275,12 @@ def test_v41_dspark_loads_linear_scales(
         draft, [(checkpoint_name, checkpoint_scale)]
     )
 
-    assert loaded == {runtime_name}
-    assert shards == [() if shard_id is None else (shard_id,)]
+    assert loaded == set(params)
+    expected_shards = [() if shard_id is None else (shard_id,)]
+    if context_param is not None:
+        expected_shards.append((0,))
+        torch.testing.assert_close(context_param, checkpoint_scale)
+    assert shards == expected_shards
     torch.testing.assert_close(param, checkpoint_scale)
 
 
@@ -344,7 +357,8 @@ def test_dsv4_context_wkv_weights_are_duplicated_by_draft_layer():
     assert duplicated[3][1].data_ptr() == duplicated[4][1].data_ptr()
 
 
-def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
+@pytest.mark.parametrize("dspark_module", [dsv4_dspark, dsv41_dspark])
+def test_context_kv_uses_one_stacked_wkv_projection(monkeypatch, dspark_module):
     calls = []
     stacked_output = torch.arange(24, dtype=torch.float32).view(2, 12)
 
@@ -370,14 +384,14 @@ def test_dsv4_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     )
     slot_mappings = [torch.tensor([0, 1]), None, torch.tensor([4, 5])]
     monkeypatch.setattr(
-        dsv4_dspark,
+        dspark_module,
         "_insert_context_kv",
         lambda attn, kv, positions, slots: calls.append(
             (attn, kv.clone(), positions, slots)
         ),
     )
 
-    dsv4_dspark.DSparkDeepseekV4Model.precompute_and_store_context_kv(
+    dspark_module.DSparkDeepseekV4Model.precompute_and_store_context_kv(
         model,
         torch.zeros(2, 5),
         torch.tensor([7, 8]),

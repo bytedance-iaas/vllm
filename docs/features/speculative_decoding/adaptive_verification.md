@@ -50,6 +50,12 @@ vllm serve MiMo-V2.5-Pro-FP4-DFlash \
 
 Set `enable_adaptive_verification: false` to verify the full block for every request.
 
+With data parallelism, set `VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL=1` to
+verify additional scheduled drafts when they fit the FULL decode graph selected
+across ranks. The refill uses the existing sampler budget and runs only on
+decode-only steps with a single microbatch and no prefill context parallelism.
+It is disabled by default.
+
 ## Requirements and limitations
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.

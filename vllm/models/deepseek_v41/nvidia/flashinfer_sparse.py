@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -608,6 +609,65 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             )
 
 
+@dataclass
+class _SM120DecodeTopk:
+    indices: torch.Tensor
+    unmasked_lens: torch.Tensor
+    lens_by_swa: dict[int, torch.Tensor]
+
+
+def _get_sm120_decode_topk(
+    local_topk: torch.Tensor,
+    swa: "DeepseekSparseSWAMetadata",
+    compressed: DeepseekV4FlashMLAMetadata,
+    compress_ratio: int,
+    index_source: int,
+    kv_source: int,
+    *,
+    is_index_source: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert swa.is_valid_token is not None and swa.token_to_req_indices is not None
+    num_tokens = swa.num_decode_tokens
+    state = get_forward_context().additional_kwargs
+    cache: dict[tuple[int, ...], _SM120DecodeTopk] = state.setdefault(
+        "dsv41_sm120_decode_topk", {}
+    )
+    # The indexer overwrites local_topk before attention. Refresh even when
+    # eager warmup and the subsequent capture share a forward context.
+    if is_index_source:
+        cache.clear()
+    key = (
+        index_source,
+        kv_source,
+        compress_ratio,
+        id(local_topk),
+        id(compressed),
+        swa.num_decodes,
+        num_tokens,
+        swa.token_to_req_indices.data_ptr(),
+    )
+    table = cache.get(key)
+    swa_group = id(swa)
+    if table is None:
+        unmasked_lens = local_topk.new_empty(num_tokens, dtype=torch.int32)
+        indices, lens = compute_global_topk_indices_and_lens(
+            local_topk[:num_tokens],
+            swa.token_to_req_indices,
+            compressed.block_table[: swa.num_decodes],
+            compressed.block_size // compress_ratio,
+            swa.is_valid_token[:num_tokens],
+            unmasked_lens_out=unmasked_lens,
+        )
+        cache[key] = _SM120DecodeTopk(indices, unmasked_lens, {swa_group: lens})
+        return indices, lens
+    if swa_group not in table.lens_by_swa:
+        # Only the valid-row mask depends on the SWA cache group's slots.
+        table.lens_by_swa[swa_group] = torch.where(
+            swa.is_valid_token[:num_tokens], table.unmasked_lens, 0
+        )
+    return table.indices, table.lens_by_swa[swa_group]
+
+
 class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
 
@@ -802,7 +862,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_only: bool,
         output: torch.Tensor,
     ) -> None:
-        num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
         extra_sparse_indices = None
@@ -820,15 +879,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed-layer decode requires top-k indices from the indexer."
                 )
-            # Local indices filled by the index-source layer's indexer.
-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            block_size = attn_metadata.block_size // self.compress_ratio
-            global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
-                self.topk_indices_buffer[:num_decode_tokens],
-                swa_metadata.token_to_req_indices,
-                attn_metadata.block_table[:num_decodes],
-                block_size,
-                is_valid,
+            assert self.index_source_layer_id is not None
+            assert self.kv_source_layer_id is not None
+            global_indices, extra_sparse_lengths = _get_sm120_decode_topk(
+                self.topk_indices_buffer,
+                swa_metadata,
+                attn_metadata,
+                self.compress_ratio,
+                self.index_source_layer_id,
+                self.kv_source_layer_id,
+                is_index_source=self.is_index_source,
             )
             extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
 

@@ -1851,7 +1851,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
             allow_skip_drafts=scheduler_output.skip_drafts,
+            has_prefill=batch_req_state is not None and batch_req_state.has_prefill,
         )
+        if (
+            envs.VLLM_ADAPTIVE_VERIFICATION_POST_DP_REFILL
+            and self.adaptive_verification is not None
+            and dp_sync_state is not None
+            and batch_req_state is not None
+            and self.pcp_manager is None
+            and num_toks == batch_req_state.num_tokens
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            new_tokens = self.adaptive_verification.maybe_refill_post_dp_budget(
+                num_toks, batch_desc, dp_sync_state
+            )
+            if new_tokens > num_toks:
+                num_toks = new_tokens
+                batch_req_state = batch_req_state._replace(num_tokens=new_tokens)
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.

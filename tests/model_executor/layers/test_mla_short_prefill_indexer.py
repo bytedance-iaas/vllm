@@ -403,8 +403,9 @@ def test_candidate_selection_keeps_valid_blocks_with_nan_scores(score, start):
         (32768, 8, 2048, True),
     ],
 )
+@pytest.mark.parametrize("in_range_only", [False, True])
 def test_candidate_kernels_preserve_packed_bounds_and_padding(
-    width, block_size, k, decode
+    width, block_size, k, decode, in_range_only
 ):
     """Preserve top-k ties, newest blocks, empty rows and candidate clamping."""
     from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
@@ -419,6 +420,9 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
     logits[2, 5] = float("nan")
     starts = torch.tensor([0, 5, 3, 0, 7, 1], device="cuda", dtype=torch.int32)
     ends = torch.tensor([0, width, width - 1, 1, 11, width], device="cuda")
+    # Pin a packed block beyond the clipped row but within the score buffer.
+    starts[-1] = width - 2 * block_size
+    ends[-1] = width + block_size
     repeat = 1
     if decode:
         starts = None
@@ -465,19 +469,40 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         include_self=True,
     )
     reference = logits.masked_fill((keep == 0) | ~valid, -torch.inf)
-    apply_candidate_mask(logits, starts, ends, candidates, block_size, repeat)
-    torch.testing.assert_close(logits, reference, rtol=0, atol=0, equal_nan=True)
+
+    def apply():
+        apply_candidate_mask(
+            logits,
+            starts,
+            ends,
+            candidates,
+            block_size,
+            repeat,
+            in_range_only=in_range_only,
+        )
+
+    def check(expected, bounds):
+        if in_range_only:
+            torch.testing.assert_close(
+                logits[bounds], expected[bounds], rtol=0, atol=0, equal_nan=True
+            )
+        else:
+            torch.testing.assert_close(logits, expected, rtol=0, atol=0, equal_nan=True)
+
+    apply()
+    check(reference, valid)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        apply_candidate_mask(logits, starts, ends, candidates, block_size, repeat)
+        apply()
     for block in (1, -1):
+        ends.copy_(ends.roll(1))
+        valid = (cols >= ks[:, None]) & (cols < ends.repeat_interleave(repeat)[:, None])
         candidates.fill_(-1)
         candidates[:, 0] = block
         logits.fill_(3.0)
         graph.replay()
         keep = valid & (block >= 0) & ((cols - ks[:, None]) // block_size == block)
-        reference = torch.where(keep, 3.0, -torch.inf)
-        torch.testing.assert_close(logits, reference, rtol=0, atol=0)
+        check(torch.where(keep, 3.0, -torch.inf), valid)
 
 
 # --- DeepGEMM sparse-MQA indexer path (V4.1 two-level candidate filtering) ---

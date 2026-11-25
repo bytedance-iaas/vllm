@@ -330,3 +330,10 @@ against the serving image's CUDA, PyTorch and NCCL. Select
 and supports CUDA Graph replay. Allow RDMA device access for GIN communicator
 setup. On the validated TK300, the default eight-rank LSA team uses PCIe P2P
 for expert payload transfers.
+
+For encoder-only P/D on TK300, `VLLM_DSV41_MIXED_REPLAY_GRAPH=1` enables
+dedicated replay graphs for mixed live Decode and resumed Prefill rows with
+`FULL_DECODE_ONLY` and TP/PP/PCP/DCP all set to one on Decode. DP ranks agree
+on the graph decision and bucket. Configure `decoder_replay_cudagraph_capture_sizes`
+separately from ordinary Decode buckets. The validated deployment uses SM120
+FP8 indexer support for adaptive verification and enables post-DP refill.

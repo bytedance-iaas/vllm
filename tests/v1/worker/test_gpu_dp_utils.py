@@ -11,7 +11,9 @@ from vllm.v1.worker.gpu import dp_utils
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 
-def _run_sync(local_allow_skip: bool, other_allow_skip: bool) -> bool:
+def _run_sync(
+    local_allow_skip: bool, other_allow_skip: bool, other_has_prefill: bool = False
+) -> dp_utils.DPSyncState:
     """Run sync_cudagraph_and_dp_padding as dp rank 0 of 2, with rank 1's
     all_reduce contribution simulated."""
 
@@ -23,6 +25,7 @@ def _run_sync(local_allow_skip: bool, other_allow_skip: bool) -> bool:
         tensor[4][1] = 0  # allow_ubatching
         tensor[5][1] = 2  # rank 1 num_reqs
         tensor[6][1] = int(other_allow_skip)
+        tensor[7][1] = int(other_has_prefill)
 
     desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=2
@@ -40,14 +43,19 @@ def _run_sync(local_allow_skip: bool, other_allow_skip: bool) -> bool:
             allow_skip_drafts=local_allow_skip,
         )
     assert sync is not None
-    return sync.skip_drafts
+    return sync
 
 
 def test_skip_drafts_requires_all_ranks():
-    assert _run_sync(True, True)
-    assert not _run_sync(True, False)
-    assert not _run_sync(False, True)
-    assert not _run_sync(False, False)
+    assert _run_sync(True, True).skip_drafts
+    assert not _run_sync(True, False).skip_drafts
+    assert not _run_sync(False, True).skip_drafts
+    assert not _run_sync(False, False).skip_drafts
+
+
+def test_peer_prefill_is_visible_for_adaptive_budget_refill():
+    assert _run_sync(False, True, other_has_prefill=True).has_prefill
+    assert not _run_sync(False, True).has_prefill
 
 
 def test_dispatch_dp1_returns_no_sync():

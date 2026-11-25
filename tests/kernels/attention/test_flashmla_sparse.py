@@ -78,6 +78,106 @@ def test_deepseek_v4_c128a_adaptive_width_has_capture_stable_stride(
     assert torch.all(prefill_buffer[:, 128:] == -99)
 
 
+def test_dsv41_sm120_decode_topk_refreshes_eager_and_graph():
+    from dataclasses import replace
+
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.deepseek_v41.common.ops import compute_global_topk_indices_and_lens
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import _get_sm120_decode_topk
+    from vllm.models.deepseek_v41.sparse_mla import DeepseekV4FlashMLAMetadata
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+    device = torch.device("cuda")
+    rows, width = 6, 1025
+    local = torch.empty((rows, width + 1), dtype=torch.int32, device=device)[:, 1:]
+    req = torch.empty(rows, dtype=torch.int32, device=device)
+    blocks = torch.empty((2, 3), dtype=torch.int32, device=device)
+    slots = torch.arange(rows, dtype=torch.int64, device=device)
+    seq_lens = torch.empty(2, dtype=torch.int32, device=device)
+    valid_a = torch.empty(rows, dtype=torch.bool, device=device)
+    valid_b = torch.empty_like(valid_a)
+    swa_a = DeepseekSparseSWAMetadata(
+        block_table=blocks,
+        slot_mapping=slots,
+        block_size=32,
+        seq_lens=seq_lens,
+        is_valid_token=valid_a,
+        token_to_req_indices=req,
+        num_decodes=2,
+        num_decode_tokens=rows,
+    )
+    swa_b = replace(swa_a, is_valid_token=valid_b)
+    compressed = DeepseekV4FlashMLAMetadata(
+        num_reqs=2,
+        max_query_len=4,
+        max_seq_len=192,
+        num_actual_tokens=rows,
+        query_start_loc=torch.tensor([0, 2, 6], dtype=torch.int32, device=device),
+        slot_mapping=slots,
+        block_table=blocks,
+        req_id_per_token=req,
+        block_size=128,
+        topk_tokens=width,
+    )
+
+    def set_inputs(step):
+        # Keep addresses and padded shape while request boundaries, pages,
+        # valid top-k counts and each group's padding change between steps.
+        split = 2 + step % 3
+        row = torch.arange(rows, device=device)
+        req.copy_((row >= split).int())
+        compressed.query_start_loc[1] = split
+        seq_lens.copy_(torch.tensor([65 + step, 140 - step], device=device))
+        blocks.copy_(torch.arange(6, device=device).view(2, 3) + 10 * step)
+        candidates = torch.tensor([0, 63, 64, 129], device=device) + step
+        active = candidates < seq_lens[req.long(), None]
+        local.fill_(-1)
+        local[:, [0, 1, 2, width - 1]] = torch.where(active, candidates, -1).int()
+        valid_a.copy_((row + step) % 3 != 0)
+        valid_b.copy_(~valid_a)
+
+    def run():
+        def remap(swa, ratio=2, producer=False):
+            return _get_sm120_decode_topk(
+                local, swa, compressed, ratio, 1, 1, is_index_source=producer
+            )
+
+        source_ids, lens_a = remap(swa_a, producer=True)
+        shared_ids, lens_b = remap(swa_b)
+        assert shared_ids is source_ids
+        assert remap(swa_b)[1] is lens_b
+        other_ids, other_lens = remap(swa_a, ratio=1)
+        return source_ids, lens_a, shared_ids, lens_b, other_ids, other_lens
+
+    def check(actual):
+        expected: list[torch.Tensor] = []
+        for swa, ratio in ((swa_a, 2), (swa_b, 2), (swa_a, 1)):
+            expected.extend(
+                compute_global_topk_indices_and_lens(
+                    local,
+                    req,
+                    blocks,
+                    compressed.block_size // ratio,
+                    swa.is_valid_token,
+                )
+            )
+        for observed, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(observed, reference, rtol=0, atol=0)
+
+    context = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    with override_forward_context(context):
+        for step in (0, 1):
+            set_inputs(step)
+            check(run())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        for step in (2, 3, 4):
+            set_inputs(step)
+            graph.replay()
+            check(captured)
+
+
 def test_sparse_flashmla_metadata_smoke():
     import vllm.v1.attention.ops.flashmla as fm
 

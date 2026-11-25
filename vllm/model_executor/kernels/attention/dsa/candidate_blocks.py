@@ -9,8 +9,11 @@ from vllm.model_executor.layers.indexer_topk import (
     get_deep_select_stride_requirement,
     is_deep_select_supported,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+
+_ROW_PROGRAMS = 32
 
 
 @triton.jit
@@ -37,6 +40,7 @@ def _block_scores_kernel(
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
     FULL_WIDTH: tl.constexpr,
+    ROW_LOCAL_TORCH_TOPK: tl.constexpr = False,
 ):
     # Writes each row's valid block count; FULL_WIDTH also scores the -inf tail.
     row = tl.program_id(0).to(tl.int64)
@@ -46,7 +50,7 @@ def _block_scores_kernel(
     num_valid = tl.cdiv(tl.maximum(col_end - start, 0), BLOCK_SIZE)
     if tl.program_id(1) == 0:
         tl.store(valid_blocks + row, num_valid)
-    num_blocks = nblocks if FULL_WIDTH else num_valid
+    num_blocks = nblocks if FULL_WIDTH and not ROW_LOCAL_TORCH_TOPK else num_valid
     offsets = tl.arange(0, triton.next_power_of_2(BLOCK_SIZE))
     num_tiles = tl.cdiv(num_blocks, TILE)
     for tile_id in range(tl.program_id(1), num_tiles, tl.num_programs(1)):
@@ -65,6 +69,17 @@ def _block_scores_kernel(
             pinned |= reduced != reduced
         reduced = tl.where(pinned, float("inf"), reduced)
         tl.store(scores + row * stride_scores + blocks, reduced, blocks < num_blocks)
+    if ROW_LOCAL_TORCH_TOPK:
+        # torch.topk sees the full score row, including a raw-end pin beyond
+        # the clipped packed range. The rest of that tail was initialized to -inf.
+        pin = (end - start - 1) // BLOCK_SIZE
+        if (
+            (tl.program_id(1) == 0)
+            & (end > start)
+            & (pin >= num_valid)
+            & (pin < nblocks)
+        ):
+            tl.store(scores + row * stride_scores + pin, float("inf"))
 
 
 @triton.jit(do_not_specialize=["k"])
@@ -104,13 +119,22 @@ def _candidate_flags_kernel(
     K: tl.constexpr,
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
+    ends=None,
+    stride_end=0,
+    ROW_LOCAL: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
-    offsets = tl.arange(0, 1024)
-    for tile in range(tl.cdiv(nblocks + 1, 1024)):
-        slots = tile * 1024 + offsets
-        tl.store(flags + row * (nblocks + 1) + slots, 0, slots <= nblocks)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    if ROW_LOCAL:
+        end = tl.minimum(tl.load(ends + row // ROW_REPEAT * stride_end), width)
+        count = tl.cdiv(tl.maximum(end - start, 0), BLOCK_SIZE)
+        tl.store(flags + row * (nblocks + 1) + nblocks, 0)
+    else:
+        count = nblocks + 1
+    offsets = tl.arange(0, 1024)
+    for tile in range(tl.cdiv(count, 1024)):
+        slots = tile * 1024 + offsets
+        tl.store(flags + row * (nblocks + 1) + slots, 0, slots < count)
     cols = tl.arange(0, triton.next_power_of_2(K))
     block = tl.load(
         candidates + row * stride_row + cols * stride_col, cols < K, other=-1
@@ -137,21 +161,27 @@ def _mask_candidates_kernel(
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
+    ROW_LOCAL: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
-    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
     end = tl.load(ends + row // ROW_REPEAT * stride_end)
-    valid = (cols >= start) & (cols < end) & (cols < width)
-    block = (cols - start) // BLOCK_SIZE
-    keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+    base = tl.program_id(1) * TILE
+    step = tl.num_programs(1) * TILE
+    if ROW_LOCAL:
+        base += start
+        count = tl.cdiv(tl.maximum(tl.minimum(end, width) - base, 0), step)
+    else:
+        count = 1
     edge = tl.load(flags + row * (nblocks + 1) + nblocks)
-    keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
-    tl.store(
-        logits + row * stride_row + cols * stride_col,
-        -float("inf"),
-        (cols < width) & ~(valid & keep),
-    )
+    for i in range(count):
+        cols = base + i * step + tl.arange(0, TILE)
+        valid = (cols >= start) & (cols < end) & (cols < width)
+        block = (cols - start) // BLOCK_SIZE
+        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+        write = valid & ~keep if ROW_LOCAL else (cols < width) & ~(valid & keep)
+        tl.store(logits + row * stride_row + cols * stride_col, -float("inf"), write)
 
 
 def select_candidate_blocks(
@@ -179,6 +209,9 @@ def select_candidate_blocks(
     # Logits are max_model_len wide (CUDA-graph static) but rows are shorter:
     # DeepSelect stops at each row's valid block count. Order does not matter.
     use_deep_select = has_deep_select() and nblocks >= topk_blocks
+    row_local = (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+    )
     if use_deep_select:
         in_align, out_align = get_deep_select_stride_requirement()
         padded = round_up(nblocks, in_align // logits.element_size())
@@ -188,10 +221,13 @@ def select_candidate_blocks(
             and out.stride(0) * out.element_size() % out_align == 0
             and is_deep_select_supported(scores, topk_blocks)
         )
+    elif row_local:
+        scores = logits.new_full((rows, nblocks), -float("inf"))
     else:
         scores = logits.new_empty((rows, nblocks))
     valid_blocks = torch.empty(rows, dtype=torch.int32, device=logits.device)
-    _block_scores_kernel[(rows, 32)](
+    grid_cols = min(_ROW_PROGRAMS, triton.cdiv(nblocks, 128)) if row_local else 32
+    _block_scores_kernel[(rows, grid_cols)](
         logits,
         row_ks,
         row_ke,
@@ -208,6 +244,7 @@ def select_candidate_blocks(
         row_repeat,
         TILE=128,
         FULL_WIDTH=not use_deep_select,
+        ROW_LOCAL_TORCH_TOPK=row_local,
     )
     if use_deep_select:
         deep_select_topk(scores, topk_blocks, end=valid_blocks, output_idx=out)
@@ -232,14 +269,24 @@ def apply_candidate_mask(
     candidate_blocks: torch.Tensor,
     block_size: int,
     row_repeat: int = 1,
+    *,
+    in_range_only: bool = False,
 ) -> None:
-    """Mask packed logits outside causal bounds and request-local candidates."""
+    """Mask logits to request-local candidates.
+
+    Callers that only read within each row's bounds may leave its tail untouched.
+    """
     assert logits.is_cuda
     rows, width = logits.shape
     if not rows or not width:
         return
     nblocks = triton.cdiv(width, block_size)
     flags = torch.empty((rows, nblocks + 1), device=logits.device, dtype=torch.uint8)
+    row_local = (
+        in_range_only
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    )
     start_stride = row_ks.stride(0) if row_ks is not None else 0
     _candidate_flags_kernel[(rows,)](
         candidate_blocks,
@@ -253,8 +300,14 @@ def apply_candidate_mask(
         candidate_blocks.shape[1],
         row_ks is not None,
         row_repeat,
+        ends=row_ke,
+        stride_end=row_ke.stride(0),
+        ROW_LOCAL=row_local,
     )
-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
+    grid_cols = triton.cdiv(width, 1024)
+    if row_local:
+        grid_cols = min(_ROW_PROGRAMS, grid_cols)
+    _mask_candidates_kernel[(rows, grid_cols)](
         logits,
         row_ks,
         row_ke,
@@ -268,4 +321,5 @@ def apply_candidate_mask(
         row_ks is not None,
         row_repeat,
         1024,
+        ROW_LOCAL=row_local,
     )

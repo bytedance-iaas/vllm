@@ -10,10 +10,12 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.config import CUDAGraphMode
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.forward_context import (
     BatchDescriptor,
     ForwardContext,
+    get_forward_context,
     override_forward_context,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -22,6 +24,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -61,6 +65,7 @@ REPLAY_ROWS = [0, *range(301 - WINDOW, 301), *range(301, 401)]
 @pytest.fixture
 def state(monkeypatch, request):
     """A DeepseekV41ModelState whose attention builds are recorded, not run."""
+    monkeypatch.delenv("VLLM_DSV41_MIXED_REPLAY_GRAPH", raising=False)
     cfg = MagicMock()
     cfg.model_config.enable_prompt_embeds = False
     cfg.model_config.uses_mrope = False
@@ -548,3 +553,141 @@ def test_dp_ranks_pad_to_one_replay_graph(dp_state):
     assert replay.forward_context.batch_descriptor.num_tokens == 512
     dp_metadata = replay.forward_context.dp_metadata
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [512, 512]
+
+
+@torch.inference_mode()
+def test_mixed_graph_replays_resumed_rows_with_live_padding(
+    state, monkeypatch, dist_init
+):
+    # The step is shorter than the replay window, so the default eager path
+    # keeps the original batch. The opt-in graph must work without any trim.
+    def add_resumed_request(model_state):
+        model_state.add_request(
+            1,
+            NewRequestData(
+                req_id="resumed",
+                prompt_token_ids=[0] * 300,
+                mm_features=[],
+                sampling_params=SamplingParams(),
+                pooling_params=None,
+                block_ids=([], []),
+                num_computed_tokens=200,
+                lora_request=None,
+                replay_start=200,
+            ),
+        )
+
+    batch = _input_batch([1, 100], [500, 300], [False, True])
+    add_resumed_request(state)
+    assert _prepare(state, batch, CUDAGraphMode.NONE) == (None, None)
+
+    @eager_break_during_capture
+    def double(x):
+        x.mul_(2)
+
+    def run_layers(hidden, *states):
+        x = hidden + 1
+        double(x)
+        # A captured consumer of the mask must see each replay's live row count.
+        return (x + get_forward_context().is_padding.sum(),)
+
+    cfg = state.vllm_config
+    cfg.compilation_config = CompilationConfig(
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decoder_replay_cudagraph_capture_sizes=[256],
+        fast_moe_cold_start=False,
+    )
+    cfg.parallel_config.tensor_parallel_size = 1
+    cfg.parallel_config.pipeline_parallel_size = 1
+    cfg.parallel_config.decode_context_parallel_size = 1
+    cfg.model_config.hf_config.hc_mult = 1
+    cfg.model_config.hf_config.hidden_size = 2
+    cfg.model_config.dtype = torch.float32
+    cfg.kernel_config.moe_backend = "auto"
+    cfg.use_cumem_cudagraph_pool = False
+    cfg.cache_config.use_kda_recoverssm = False
+    cfg.speculative_config = None
+    cfg.lora_config = None
+    state.model.decoder_replay_layers = DecoderReplayLayers(
+        WINDOW, run_layers, None, set(), "swa"
+    )
+    monkeypatch.setenv("VLLM_DSV41_MIXED_REPLAY_GRAPH", "1")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    mixed = DeepseekV41ModelState(cfg, state.model, None, DEVICE)
+    mixed.builds = state.builds
+    add_resumed_request(mixed)
+    # The runtime may see an eligible batch before the bucket is captured.
+    assert _prepare(mixed, batch, CUDAGraphMode.NONE) == (None, None)
+    buffers = InputBuffers(16, 1024, DEVICE)
+    tables = BlockTables([32, 32], 16, 1024, [32, 32], DEVICE)
+    mixed.capture_inner_cudagraphs(buffers, tables, [], GROUPS)
+    manager = mixed.replay_cudagraphs
+    assert manager is not None
+    for query_len in (100, 80):
+        batch = _input_batch([1, query_len], [500, 300], [False, True])
+        replay, _ = _prepare(mixed, batch, CUDAGraphMode.NONE)
+        assert replay is not None and replay.run_graph is not None
+        assert replay.forward_context.batch_descriptor.num_tokens == 256
+        inputs = tuple(
+            torch.ones_like(buf[: batch.num_tokens]) for buf in manager.input_buffers
+        )
+        with override_forward_context(replay.forward_context):
+            (actual,) = replay.run_graph(replay.rows, inputs)
+        torch.testing.assert_close(
+            actual, torch.full_like(inputs[0], 4 + 256 - batch.num_tokens)
+        )
+    assert _prepare(mixed, batch, CUDAGraphMode.FULL) == (None, None)
+    # A resumed prefill by itself also keeps the existing path.
+    assert _prepare(
+        mixed, _input_batch([1, 80], [500, 300], [True, True]), CUDAGraphMode.NONE
+    ) == (None, None)
+
+    # A local idle rank must follow a peer into the same bucket. If any rank
+    # lacks a graph, every rank takes the same fallback.
+    cfg.parallel_config.data_parallel_size = 2
+    cfg.parallel_config.data_parallel_rank = 0
+    cfg.parallel_config.is_moe_model = True
+    dummy = _input_batch([6], [6], [False])
+    peer_eligible, peer_bucket = True, 256
+
+    def reduce_with_peer(values, group):
+        if values.ndim == 2:
+            values[:, 1] = torch.tensor([False, True, peer_eligible, 129])
+        else:
+            values[1] = peer_bucket
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_with_peer)
+    replay, _ = _prepare(mixed, dummy, CUDAGraphMode.NONE)
+    assert replay is not None and replay.rows.numel() == 1
+    assert replay.run_graph is not None
+    assert replay.forward_context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [
+        256,
+        256,
+    ]
+    peer_eligible = False
+    assert _prepare(mixed, dummy, CUDAGraphMode.NONE) == (None, None)
+    peer_eligible, peer_bucket = True, 0
+    assert _prepare(mixed, dummy, CUDAGraphMode.NONE) == (None, None)
+    peer_bucket = 192
+    assert _prepare(mixed, dummy, CUDAGraphMode.NONE) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "parallel_field",
+    [
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+    ],
+)
+def test_mixed_graph_rejects_sharded_workers(state, monkeypatch, parallel_field):
+    cfg = state.vllm_config
+    cfg.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    cfg.parallel_config.tensor_parallel_size = 1
+    cfg.parallel_config.pipeline_parallel_size = 1
+    cfg.parallel_config.decode_context_parallel_size = 1
+    setattr(cfg.parallel_config, parallel_field, 2)
+    monkeypatch.setenv("VLLM_DSV41_MIXED_REPLAY_GRAPH", "1")
+    with pytest.raises(ValueError, match=parallel_field):
+        DeepseekV41ModelState(cfg, state.model, None, DEVICE)
