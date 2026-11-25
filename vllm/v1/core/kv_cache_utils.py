@@ -1095,6 +1095,8 @@ def get_max_concurrency_for_kv_cache_config(
 
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
+    *,
+    merge_pp_transfer_groups: bool = False,
 ) -> KVCacheConfig:
     """Generate the KV cache configuration for the scheduler."""
     assert all(
@@ -1107,6 +1109,38 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    if merge_pp_transfer_groups:
+        if any(
+            len(worker.kv_cache_groups) != len(cfg.kv_cache_groups)
+            for worker in kv_cache_configs
+        ):
+            raise ValueError("DeepSeek-V4.1 PP workers must share global group IDs.")
+        for group_index, group in enumerate(cfg.kv_cache_groups):
+            worker_groups = [
+                worker.kv_cache_groups[group_index] for worker in kv_cache_configs
+            ]
+            group.layer_names = list(
+                dict.fromkeys(
+                    layer_name
+                    for worker_group in worker_groups
+                    for layer_name in worker_group.layer_names
+                )
+            )
+            group.enable_kv_transfer = any(
+                worker_group.enable_kv_transfer for worker_group in worker_groups
+            )
+            if not group.layer_names:
+                raise ValueError(
+                    "DeepSeek-V4.1 Prefill PP cache group has no owner on any stage."
+                )
+        for property_name in (
+            "transfer_group_ids",
+            "transfer_groups",
+            "transfer_group_index_by_layer",
+            "prefix_cacheable_group_ids",
+            "prefix_cacheable_groups",
+        ):
+            cfg.__dict__.pop(property_name, None)
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,

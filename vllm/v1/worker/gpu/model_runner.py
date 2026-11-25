@@ -92,6 +92,7 @@ from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
+    AsyncCacheOnlyOutput,
     AsyncOutput,
     AsyncPoolingOutput,
     StepTimingCollector,
@@ -991,6 +992,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        if (
+            self.vllm_config.is_dsv41_encoder_only_prefill
+            or self.vllm_config.is_dsv41_encoder_only_prefill_benchmark
+        ):
+            return
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
         dummy_input_batch = InputBatch.make_dummy(
@@ -2148,7 +2154,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @step_eplb_after()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> AsyncOutput | ModelRunnerOutput | None:
+    ) -> AsyncOutput | AsyncCacheOnlyOutput | ModelRunnerOutput | None:
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -2164,6 +2170,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
+
+        if (
+            self.vllm_config.is_dsv41_encoder_only_prefill
+            or self.vllm_config.is_dsv41_encoder_only_prefill_benchmark
+        ):
+            if self.pcp_manager is not None:
+                input_batch = self.pcp_manager.global_batch
+            self.postprocess_num_computed_tokens(input_batch)
+            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            kv_output = self.kv_connector.post_forward(finished_req_ids)
+            if self.is_last_pp_rank:
+                output = ModelRunnerOutput(
+                    req_ids=input_batch.req_ids,
+                    req_id_to_index={
+                        rid: i for i, rid in enumerate(input_batch.req_ids)
+                    },
+                    sampled_token_ids=[[] for _ in input_batch.req_ids],
+                    kv_connector_output=kv_output,
+                    cudagraph_stats=cudagraph_stats,
+                )
+            else:
+                output = ModelRunnerOutput.with_kv_conn_output_only(kv_output)
+            return AsyncCacheOnlyOutput(output, self.main_stream)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
@@ -2320,6 +2349,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_speculative_tokens=num_spec_tokens,
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
+                )
+            if self.pcp_manager is not None:
+                self.pcp_manager.sync_drafts(
+                    draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
                 )
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1

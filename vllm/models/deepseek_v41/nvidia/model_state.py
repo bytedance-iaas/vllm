@@ -602,16 +602,17 @@ class DeepseekV41ModelState(DefaultModelState):
         )
         # The first replay layer wrote every row's window KV: its window starts
         # are the batch's.
-        first_swa = layers.first_swa_prefix
-        attn_metadata[first_swa] = super().prepare_attn(
-            kept_batch,
-            CUDAGraphMode.NONE,
-            block_tables,
-            kept_slot_mappings,
-            first_swa_groups,
-            kv_cache_config,
-            model_specific_attn_metadata=ReplayAttnMetadata(replay_start),
-        )[first_swa]
+        if layers.write_batch_kv is not None:
+            first_swa = layers.first_swa_prefix
+            attn_metadata[first_swa] = super().prepare_attn(
+                kept_batch,
+                CUDAGraphMode.NONE,
+                block_tables,
+                kept_slot_mappings,
+                first_swa_groups,
+                kv_cache_config,
+                model_specific_attn_metadata=ReplayAttnMetadata(replay_start),
+            )[first_swa]
         layers.replay_batch = ReplayBatch(
             self._kept_rows[:num_tokens],
             create_forward_context(

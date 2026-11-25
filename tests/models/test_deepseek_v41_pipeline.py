@@ -68,3 +68,41 @@ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
     mhc_residual, mhc_pre_mix = mhc_pre_calls[0]
     torch.testing.assert_close(mhc_residual, hidden + 10)
     assert mhc_pre_mix is pre_mix
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("partition", "expected"),
+    [
+        ((5, 5, 5, 25), (2, 8, 14)),
+        ((10, 30), (8,)),
+    ],
+)
+def test_encoder_only_pipeline_partition_and_relay(monkeypatch, partition, expected):
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.models.deepseek_v41.nvidia.pipeline import (
+        PipelineBoundary,
+        get_pipeline_boundaries,
+    )
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+    config = DeepseekV41Config(
+        text_config={
+            "num_hidden_layers": 40,
+            "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+            "kv_source_layer_ids": [2, 8, 14, 20],
+            "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+            "candidate_source_layer_id": 20,
+            "candidate_topk_blocks": 2048,
+        }
+    )
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(map(str, partition)))
+    ranges = [
+        get_pp_indices(config.num_hidden_layers, rank, len(partition))
+        for rank in range(len(partition))
+    ]
+    assert tuple(end - start for start, end in ranges) == partition
+    assert ranges[-1][0] <= 20 < ranges[-1][1]
+    assert get_pipeline_boundaries(config, ranges) == tuple(
+        PipelineBoundary(kv_source=source, index_source=source) for source in expected
+    )

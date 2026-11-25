@@ -105,6 +105,17 @@ The following Prometheus metrics are exported when MooncakeConnector is active, 
     lease duration is too short for your network or workload. Increase it via
     `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`.
 
+## DeepSeek-V4.1 encoder-only handoff
+
+When the decoder rebuilds its sliding window, the scheduler rounds the
+external prefix down to a block boundary. The producer can still hold a
+partially filled page after that boundary. For encoder-only handoff, the
+decoder sends half-open logical page ranges for the missing pages in each
+transfer group. The producer maps groups by layer identity, selects those
+pages, and acknowledges the ranges before the decoder publishes the hit.
+This preserves local prefix-cache hits and respects each group's page size.
+Upgrade both endpoints together when using encoder-only handoff.
+
 ## Example Scripts/Code
 
 Refer to these example scripts in the vLLM repository:

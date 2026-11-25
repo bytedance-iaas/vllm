@@ -113,6 +113,22 @@ class StepTimingCollector:
             self._step = None
 
 
+class AsyncCacheOnlyOutput(AsyncModelRunnerOutput):
+    """Publish a cache-only result once its GPU writes have completed."""
+
+    def __init__(self, output: ModelRunnerOutput, stream: torch.cuda.Stream) -> None:
+        self.output = output
+        self.ready = torch.cuda.Event(blocking=True)
+        self.ready.record(stream)
+
+    def get_output(self) -> ModelRunnerOutput:
+        self.ready.synchronize()
+        return self.output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.output.kv_connector_output
+
+
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,

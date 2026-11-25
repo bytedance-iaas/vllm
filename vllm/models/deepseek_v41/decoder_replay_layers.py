@@ -52,7 +52,7 @@ class DecoderReplayLayers:
         self,
         window: int,
         run_layers: Callable[..., tuple[torch.Tensor, ...]],
-        write_batch_kv: Callable[..., None],
+        write_batch_kv: Callable[..., None] | None,
         metadata_prefixes: set[str],
         first_swa_prefix: str,
     ) -> None:
@@ -73,7 +73,8 @@ class DecoderReplayLayers:
     ) -> tuple[torch.Tensor, ...]:
         if self.uses_replay_batch():
             # Outside the break, so a PIECEWISE graph captures it.
-            self.write_batch_kv(hidden_states, *states)
+            if self.write_batch_kv is not None:
+                self.write_batch_kv(hidden_states, *states)
             if in_piecewise_cudagraph():
                 return self._run_in_graph_break(hidden_states, *states)
         return self._run(hidden_states, *states)

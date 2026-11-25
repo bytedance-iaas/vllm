@@ -90,6 +90,9 @@ class KVTransferConfig:
     'recompute': reschedule the request to recompute failed blocks
     'fail': immediately fail the request with an error finish reason (default)"""
 
+    dsv41_encoder_only_prefill: bool = False
+    """Enable the DeepSeek-V4.1 encoder-only Mooncake wire protocol."""
+
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
@@ -103,7 +106,11 @@ class KVTransferConfig:
         """
         # no factors to consider.
         # this config will not affect the computation graph.
-        factors: list[Any] = []
+        factors: list[Any] = (
+            [self.dsv41_encoder_only_prefill, self.kv_role]
+            if self.dsv41_encoder_only_prefill
+            else []
+        )
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 

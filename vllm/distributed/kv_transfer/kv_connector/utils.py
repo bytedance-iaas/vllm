@@ -26,6 +26,7 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -662,3 +663,40 @@ class TransferTopology:
             f"local_rank={self.tp_rank}, "
             f"remote_block_len={info.remote_block_len})"
         )
+
+
+def get_prefill_stop(request: "Request", backoff: int) -> int:
+    """Choose a shared P/D stop without splitting any multimodal item."""
+    stop = max(request.num_prompt_tokens - backoff, 0)
+    # Resolve overlapping features too, independent of their list order.
+    while True:
+        safe_stop = min(
+            (
+                feature.mm_position.offset
+                for feature in request.mm_features
+                if feature.mm_position.offset
+                < stop
+                < feature.mm_position.offset + feature.mm_position.length
+            ),
+            default=stop,
+        )
+        if safe_stop == stop:
+            return max(stop, 0)
+        stop = safe_stop
+
+
+def truncate_prompt_for_prefill(request: "Request", stop: int) -> None:
+    """Drop the producer prompt suffix and its media features together."""
+    if request.prompt_token_ids is not None:
+        request.prompt_token_ids = request.prompt_token_ids[:stop]
+    if request.prompt_embeds is not None:
+        request.prompt_embeds = request.prompt_embeds[:stop]
+    if request.prompt_is_token_ids is not None:
+        request.prompt_is_token_ids = request.prompt_is_token_ids[:stop]
+    del request._all_token_ids[stop:]
+    request.num_prompt_tokens = stop
+    request.mm_features = [
+        feature
+        for feature in request.mm_features
+        if feature.mm_position.offset + feature.mm_position.length <= stop
+    ]

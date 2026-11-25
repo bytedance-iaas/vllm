@@ -585,6 +585,27 @@ class VllmConfig:
         return bool(mm_config and mm_config.mm_encoder_only)
 
     @property
+    def uses_dsv41_encoder_only_handoff(self) -> bool:
+        kv_config = self.kv_transfer_config
+        return bool(kv_config and kv_config.dsv41_encoder_only_prefill)
+
+    @property
+    def is_dsv41_encoder_only_prefill_benchmark(self) -> bool:
+        config = self.additional_config
+        return isinstance(config, dict) and bool(
+            config.get("dsv41_encoder_only_prefill_benchmark")
+        )
+
+    @property
+    def is_dsv41_encoder_only_prefill(self) -> bool:
+        kv_config = self.kv_transfer_config
+        return bool(
+            kv_config
+            and kv_config.dsv41_encoder_only_prefill
+            and kv_config.kv_role == "kv_producer"
+        )
+
+    @property
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.

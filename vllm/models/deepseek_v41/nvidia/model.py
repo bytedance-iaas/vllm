@@ -20,6 +20,7 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import (
     get_forward_context,
     in_piecewise_cudagraph,
@@ -68,6 +69,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -116,6 +118,7 @@ from .ops.mhc import (
     supports_mhc_all_reduce,
     supports_mhc_overlap,
 )
+from .pipeline import PipelineBoundary, PipelineRelay, get_pipeline_boundaries
 from .specialized_decode import specialized_decode_config
 
 if typing.TYPE_CHECKING:
@@ -333,8 +336,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         run_gemm_rs: bool = False,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
+        encoder_kv_only: bool = False,
     ):
         super().__init__()
+        self.encoder_kv_only = encoder_kv_only
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
@@ -371,12 +376,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # forward keeps the separate reduce-scatter below.
                 self.attn.bind_gemm_rs()
         self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)
-        self.ffn = DeepseekV4MoE(
-            vllm_config,
-            prefix=f"{prefix}.ffn",
-            use_sequence_parallel=self.use_sequence_parallel,
-            reduce_results=not fuse_mhc_all_reduce,
-        )
+        if encoder_kv_only:
+            self.ffn = PPMissingLayer()
+            self.attn.prune_to_global_cache_writer()
+        else:
+            self.ffn = DeepseekV4MoE(
+                vllm_config,
+                prefix=f"{prefix}.ffn",
+                use_sequence_parallel=self.use_sequence_parallel,
+                reduce_results=not fuse_mhc_all_reduce,
+            )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -492,6 +501,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        if encoder_kv_only:
+            del self.ffn_norm, self.hc_ffn_fn, self.hc_ffn_base, self.hc_ffn_scale
 
     def forward(
         self,
@@ -703,10 +714,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=self.attn_norm.variance_epsilon,
             reduce_results=self.fuse_mhc_all_reduce,
         )
-        self.attn.forward_kv(positions, x)
+        if self.encoder_kv_only:
+            self.attn.write_global_cache(positions, x)
+        else:
+            self.attn.forward_kv(positions, x)
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -716,11 +732,85 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
         kv_transfer = vllm_config.kv_transfer_config
+        speculative = vllm_config.speculative_config
+        pp_size = self.parallel_config.pipeline_parallel_size
+        stage_ranges = [
+            get_pp_indices(config.num_hidden_layers, rank, pp_size)
+            for rank in range(pp_size)
+        ]
+        self.encoder_only_boundary: int | None = None
+        if (
+            vllm_config.is_dsv41_encoder_only_prefill
+            or vllm_config.is_dsv41_encoder_only_prefill_benchmark
+        ):
+            if (
+                (pp_size, self.parallel_config.prefill_context_parallel_size)
+                not in ((4, 2), (2, 4))
+                or self.parallel_config.tensor_parallel_size != 1
+                or self.parallel_config.data_parallel_size != 1
+                or self.parallel_config.decode_context_parallel_size != 1
+                or self.parallel_config.enable_expert_parallel
+                or vllm_config.speculative_config is not None
+                or (
+                    kv_transfer is not None
+                    and not vllm_config.is_dsv41_encoder_only_prefill
+                )
+                or not vllm_config.use_v2_model_runner
+                or not vllm_config.model_config.enforce_eager
+                or vllm_config.scheduler_config.async_scheduling
+                or config.num_hidden_layers != 40
+                or tuple(config.kv_source_layer_ids) != (2, 8, 14, 20)
+                or 20 not in config.index_source_layer_ids
+                or 20 in config.engram_layer_ids
+                or [start for start, _ in stage_ranges]
+                != ([0, 5, 10, 15] if pp_size == 4 else [0, 10])
+            ):
+                raise ValueError(
+                    "The encoder-only benchmark requires eager, synchronous "
+                    "DSv4.1-Flash PP4/PCP2 or PP2/PCP4 with uniform encoder stages."
+                )
+            self.encoder_only_boundary = 20
+        boundaries = (
+            get_pipeline_boundaries(config, stage_ranges) if pp_size > 1 else ()
+        )
+        needs_relay = any(boundary.needs_relay for boundary in boundaries)
+        if needs_relay and (
+            self.parallel_config.decode_context_parallel_size != 1
+            or self.parallel_config.use_ubatching
+            or (
+                kv_transfer is not None
+                and not vllm_config.is_dsv41_encoder_only_prefill
+            )
+            or _select_dsv4_attn_cls(vllm_config)
+            is not DeepseekV4FlashInferSM120Attention
+            or vllm_config.cache_config.cache_dtype != "fp8_ds_mla"
+        ):
+            raise NotImplementedError(
+                "DeepSeek-V4.1 cross-stage cache relay requires SM120 FlashInfer "
+                "packed MLA with DCP=1, without microbatching or KV transfer."
+            )
+        pp_rank = get_pp_group().rank_in_group if needs_relay else 0
+        self.pipeline_relay = (
+            PipelineRelay(
+                vllm_config,
+                prefix,
+                boundaries[pp_rank - 1] if pp_rank > 0 else PipelineBoundary(),
+                boundaries[pp_rank] if pp_rank < pp_size - 1 else PipelineBoundary(),
+            )
+            if needs_relay
+            else None
+        )
         if self.parallel_config.prefill_context_parallel_size > 1 and (
             self.parallel_config.data_parallel_size != 1
             or self.parallel_config.decode_context_parallel_size != 1
             or self.parallel_config.use_ubatching
-            or vllm_config.speculative_config is not None
+            or (
+                speculative is not None
+                and (
+                    not speculative.use_dspark()
+                    or speculative.enable_adaptive_verification
+                )
+            )
             or (
                 vllm_config.cache_config.enable_prefix_caching
                 and not vllm_config.cache_config.swa_bounded_replay
@@ -729,21 +819,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ):
             raise NotImplementedError(
                 "DeepSeek-V4.1 PCP currently requires DP=DCP=1, with no "
-                "microbatching, speculative decoding, or MegaMoE. "
+                "microbatching or MegaMoE. Speculation requires fixed DSpark. "
                 "Prefix caching requires SWA bounded replay."
             )
         if (
             self.parallel_config.prefill_context_parallel_size > 1
             and kv_transfer is not None
             and (
-                kv_transfer.kv_connector != "NixlPushConnector"
+                speculative is not None
+                or (
+                    kv_transfer.kv_connector != "NixlPushConnector"
+                    and not vllm_config.is_dsv41_encoder_only_prefill
+                )
                 or kv_transfer.kv_role != "kv_producer"
                 or kv_transfer.kv_buffer_device != "cuda"
             )
         ):
             raise NotImplementedError(
                 "DeepSeek-V4.1 PCP KV transfer requires a CUDA NixlPushConnector "
-                "prefill producer."
+                "prefill producer without speculative decoding."
             )
         self.use_native_mega_moe = (
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
@@ -799,7 +893,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -839,9 +933,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks to belong to one NVLink domain. Collective: run before layers.
         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(
+        def make_local_layer(prefix: str) -> nn.Module:
+            layer_id = extract_layer_index(prefix)
+            if (
+                self.encoder_only_boundary is not None
+                and layer_id > self.encoder_only_boundary
+            ):
+                return PPMissingLayer()
+            return DeepseekV4DecoderLayer(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
@@ -852,9 +951,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 run_gemm_rs=self.run_gemm_rs,
                 mhc_stream=mhc_stream,
                 fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
-            ),
-            prefix=f"{prefix}.layers",
+                encoder_kv_only=layer_id == self.encoder_only_boundary,
+            )
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers, make_local_layer, prefix=f"{prefix}.layers"
         )
+        if self.encoder_only_boundary is not None:
+            full_layer_end = min(self.end_layer, self.encoder_only_boundary)
+            logger.info(
+                "Encoder-only benchmark PP%d: full layers %d-%d, L20 KV writer: %s",
+                get_pp_group().rank_in_group,
+                self.start_layer,
+                full_layer_end - 1,
+                self.start_layer <= self.encoder_only_boundary < self.end_layer,
+            )
+        if self.pipeline_relay is not None:
+            self.pipeline_relay.configure(
+                self.layers[self.start_layer].attn, vllm_config
+            )
         self.engram_batch = EngramBatch.create(
             [
                 layer.engram
@@ -869,9 +984,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             # replaces with its own all-reduce.
             local_layers = list(islice(self.layers, self.start_layer, self.end_layer))
             for layer, successor in zip(local_layers, local_layers[1:]):
-                assert isinstance(layer, DeepseekV4DecoderLayer)
-                assert isinstance(successor, DeepseekV4DecoderLayer)
-                if successor.engram is None:
+                if not isinstance(layer, DeepseekV4DecoderLayer) or not isinstance(
+                    successor, DeepseekV4DecoderLayer
+                ):
+                    continue
+                if successor.engram is None and not layer.encoder_kv_only:
                     layer.ffn.defer_finalize()
 
         # Decoder-side SWA bounded replay: in eager prefill steps the layers past
@@ -880,17 +997,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_layers: DecoderReplayLayers | None = None
         self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
+        replay_start = max(cut, self.start_layer)
+        shares_cut = self.start_layer <= cut < self.end_layer
         if (
-            cut < self.end_layer - 1
+            self.encoder_only_boundary is None
+            and replay_start < self.end_layer - int(shares_cut)
             and self._decoder_replay_supported(vllm_config, cut)
-            and self.layers[cut].attn.swa_cache_layer.bounded_replay
+            and self.layers[replay_start].attn.swa_cache_layer.bounded_replay
         ):
-            assert self.layers[cut].attn.compress_ratio <= 1
-            # The last KV source writes every row's KV, then replays.
-            self.decoder_replay_start = cut
+            write_batch_kv = None
+            if shares_cut:
+                assert self.layers[cut].attn.compress_ratio <= 1
+                write_batch_kv = self.layers[cut].write_kv
+            self.decoder_replay_start = replay_start
             # The attention metadata keys the replay layers read.
             metadata_prefixes = set()
-            for layer in islice(self.layers, cut, self.end_layer):
+            for layer in islice(self.layers, replay_start, self.end_layer):
                 attn = typing.cast(DeepseekV4DecoderLayer, layer).attn
                 metadata_prefixes.add(attn.swa_cache_layer.prefix)
                 if attn.compressed_cache_prefix is not None:
@@ -900,18 +1022,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.decoder_replay_layers = DecoderReplayLayers(
                 config.sliding_window,
                 self._run_replay_layers,
-                self.layers[cut].write_kv,
+                write_batch_kv,
                 metadata_prefixes,
-                self.layers[cut].attn.swa_cache_layer.prefix,
+                self.layers[replay_start].attn.swa_cache_layer.prefix,
             )
             logger.info_once(
-                "Decoder SWA bounded replay: in eager prefill steps, layer %d "
-                "writes its KV for every token, and the rest of it and layers "
-                "%d-%d run on each request's last %d tokens only.",
-                cut,
-                cut + 1,
+                "Decoder SWA bounded replay: layers %d-%d run on each request's "
+                "last %d tokens; writes full producer KV on this stage: %s.",
+                replay_start,
                 self.end_layer - 1,
                 config.sliding_window,
+                shares_cut,
+                scope="process",
             )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
@@ -945,7 +1067,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 self.engram_swa_prefix = swa_cache_module.prefix
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and self.encoder_only_boundary is None:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -978,20 +1100,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        if self.pipeline_relay is not None:
+            tensors.update(
+                self.pipeline_relay.empty_tensors(
+                    self.pipeline_relay.incoming, batch_size, device
+                )
+            )
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -1010,6 +1137,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if self.pipeline_relay is not None:
+                self.pipeline_relay.transfer(
+                    positions,
+                    self.topk_indices_buffer,
+                    self.candidate_block_buffer,
+                    intermediate_tensors,
+                )
 
         if self.use_native_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -1109,19 +1243,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.use_sequence_parallel:
                 pre_mix = sp_shard(pre_mix)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
+        layer_stop = self.decoder_replay_start
+        if self.encoder_only_boundary is not None:
+            layer_stop = min(layer_stop, self.encoder_only_boundary)
+        if self.start_layer < layer_stop:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, layer_stop),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
+        if self.encoder_only_boundary is not None and get_pp_group().is_last_rank:
+            layer = self.layers[self.encoder_only_boundary]
+            assert isinstance(layer, DeepseekV4DecoderLayer)
+            assert pre_mix is not None and post_mix is not None
+            assert residual is not None and res_mix is not None
+            layer.write_kv(
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+            )
+            return residual
+
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
@@ -1156,9 +1310,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.use_sequence_parallel:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            tensors = {
+                "hidden_states": hidden_states,
+                "pre_mix": pre_mix,
+                **self.pack_local_aux_hidden_states(aux_hidden_states),
+            }
+            if self.pipeline_relay is not None:
+                tensors.update(
+                    self.pipeline_relay.transfer(
+                        positions, self.topk_indices_buffer, self.candidate_block_buffer
+                    )
+                )
+            return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -1178,7 +1341,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-        if len(aux_hidden_states) > 0:
+        aux_hidden_states = (
+            self.collect_remote_aux_hidden_states(intermediate_tensors)
+            + aux_hidden_states
+        )
+        if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -1322,10 +1489,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         draft_window = getattr(draft_hf_config, "sliding_window", None)
         draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
         window = self.config.sliding_window
-        if self.start_layer > cut or self.end_layer < self.config.num_hidden_layers:
+        cross_stage = (
+            self.start_layer > cut or self.end_layer < self.config.num_hidden_layers
+        )
+        if cross_stage and (
+            not vllm_config.model_config.enforce_eager
+            or spec_config is not None
+            or vllm_config.kv_transfer_config is not None
+            or _select_dsv4_attn_cls(vllm_config)
+            is not DeepseekV4FlashInferSM120Attention
+            or vllm_config.cache_config.cache_dtype != "fp8_ds_mla"
+        ):
             reason = (
-                "the pipeline stage holding the last KV source layer must also "
-                "hold every layer after it"
+                "cross-stage replay requires eager SM120 FlashInfer packed MLA "
+                "without speculative decoding or external KV transfer"
             )
         elif self.use_sequence_parallel or parallel_config.use_ubatching:
             reason = (
@@ -1373,6 +1550,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            if self.encoder_only_boundary is not None and name.startswith(
+                f"layers.{self.encoder_only_boundary}."
+            ):
+                local_name = name.split(".", 2)[2]
+                if not local_name.startswith(
+                    (
+                        "attn.compressor.",
+                        "attn.indexer.wk.",
+                        "attn.indexer.k_norm.",
+                        "attn_norm.",
+                        "hc_attn_",
+                    )
+                ):
+                    continue
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
@@ -1673,7 +1864,7 @@ class DeepseekV41LLMForCausalLM(
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and self.model.encoder_only_boundary is None:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,

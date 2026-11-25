@@ -741,6 +741,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     latent, cache_positions, self.indexer_rotary_emb
                 )
 
+    def prune_to_global_cache_writer(self) -> None:
+        assert self.is_kv_source and self.indexer is not None and self.indexer.owns_k
+        for name in ("fused_wqa_wkv", "q_norm", "kv_norm", "wq_b", "wo_a", "wo_b"):
+            delattr(self, name)
+        del self.attn_sink
+        del self.indexer.weights_proj
+        del self.indexer.wq_b
+        self._static_forward_context.pop(self.swa_cache_layer.prefix)
+        del self.swa_cache_layer
+
+    def write_global_cache(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> None:
+        """Write a boundary layer's compressed Main KV and Indexer K."""
+        assert self.compressor is not None
+        assert self.indexer is not None and self.indexer.owns_k
+        kv_score = torch.mm(
+            hidden_states,
+            self.compressor.fused_wkv_wgate.weight.T,
+            out_dtype=torch.float32,
+        )
+        latent = self.compressor(kv_score, positions)
+        if self.use_pcp and latent is not None:
+            pcp = get_pcp_group()
+            latent = pcp.all_gather(latent, dim=0)
+            positions = pcp.all_gather(positions, dim=0)
+        self.compressor.insert_cache(latent, positions, self.rotary_emb)
+        self.indexer._produce_k(latent, positions, self.indexer_rotary_emb)
+
     def bind_gemm_rs(self) -> None:
         """Fuse ``wo_b`` with the sequence-parallel TP reduce-scatter.
 
@@ -1210,6 +1239,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # DeepseekV4SWACache.
         if not self.is_kv_source:
             return None
+        return self.get_compressed_kv_cache_spec(vllm_config)
+
+    def get_compressed_kv_cache_spec(self, vllm_config: VllmConfig) -> MLAAttentionSpec:
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout whose page rounds up
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
         # use natural element-size pages.

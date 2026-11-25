@@ -84,6 +84,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.cache_only import validate_dsv41_cache_only_request
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -331,7 +332,13 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+            kv_cache_configs,
+            merge_pp_transfer_groups=(
+                vllm_config.is_dsv41_encoder_only_prefill
+                and vllm_config.parallel_config.pipeline_parallel_size > 1
+            ),
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -1137,6 +1144,12 @@ class EngineCore:
                 request.mm_features
             )
 
+        if self.vllm_config.is_dsv41_encoder_only_prefill:
+            validate_dsv41_cache_only_request(
+                request.sampling_params,
+                request.pooling_params,
+                bool(request.mm_features),
+            )
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.use_structured_output:
             # Note on thread safety: no race condition.

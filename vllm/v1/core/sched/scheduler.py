@@ -2398,8 +2398,20 @@ class Scheduler(SchedulerInterface):
             prefill_stats = None
             status_before_stop = request.status
 
-            # Check for stop and update request status.
-            if new_token_ids:
+            # Cache-only prefill completes once the last prompt chunk has run.
+            if (
+                self.vllm_config.is_dsv41_encoder_only_prefill
+                or self.vllm_config.is_dsv41_encoder_only_prefill_benchmark
+            ):
+                assert not new_token_ids
+                if (
+                    not output_is_stale
+                    and request.num_in_flight_tokens == 0
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                ):
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    stopped = True
+            elif new_token_ids:
                 has_output_placeholders = request.num_output_placeholders > 0
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale

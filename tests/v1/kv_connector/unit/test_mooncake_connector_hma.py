@@ -9,6 +9,7 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 import asyncio
 from unittest.mock import patch
 
+import msgspec
 import pytest
 import torch
 
@@ -38,6 +39,18 @@ from .utils import (
     make_kv_cache_config,
     maybe_update_block_size,
 )
+
+
+@pytest.fixture
+def mooncake_cpu_device(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import mooncake_connector
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend
+
+    monkeypatch.setattr(current_platform, "set_device", lambda _: None)
+    monkeypatch.setattr(
+        mooncake_connector, "get_current_attn_backends", lambda _: [CPUAttentionBackend]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +235,175 @@ def test_metadata_hma_block_ids():
 # ---------------------------------------------------------------------------
 #  test_build_transfer_params_multi_group_trimming
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.cpu_test
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "producer_tokens,local_hit,end",
+    [
+        (260, 0, 256),
+        (260, 128, 256),
+        (256, 0, 256),
+        (256, 128, 256),
+        (260, 256, 256),
+        (36, 0, 0),
+    ],
+)
+async def test_dsv41_transfer_uses_requested_logical_pages(
+    producer_tokens, local_hit, end, mooncake_cpu_device
+):
+    """The producer may have a trailing page beyond the decoder's aligned hit."""
+    cfg = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer", block_size=128
+    )
+    cfg.kv_transfer_config.dsv41_encoder_only_prefill = True
+    cfg.parallel_config.pipeline_parallel_size = 4
+    groups = [
+        KVCacheGroupSpec(
+            [name],
+            FullAttentionSpec(
+                block_size=size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        )
+        for name, size in (
+            ("model.layers.2.attn", 128),
+            ("model.layers.2.attn.indexer.k_cache", 64),
+        )
+    ]
+    caches = KVCacheConfig(num_blocks=512, kv_cache_tensors=[], kv_cache_groups=groups)
+    source = []
+    destination = []
+    spans = []
+    regions = []
+    peers = []
+    expected_src, expected_dst = [], []
+    for i, group in enumerate(groups):
+        size = group.kv_cache_spec.block_size
+        # Separate the physical allocations so each logical page is observable.
+        pages = [100 * (i + 1) + 2 * j for j in range(-(-producer_tokens // size))]
+        start, stop = local_hit // size, end // size
+        dest = [300 + 50 * i + 2 * j for j in range(start, stop)]
+        source.append(pages)
+        destination.append(dest)
+        spans.append([(start, stop)] if start < stop else [])
+        regions.append(TransferRegion(group.layer_names[0], 2, 0, 64, 16, i))
+        peers.append(TransferRegion(group.layer_names[0], 2, 0, 64, 16, 1 - i))
+        expected_src.extend(pages[start:stop])
+        expected_dst.extend(dest)
+    send = SendBlockMeta("p", "x", source, asyncio.Event())
+    wire = msgspec.to_builtins(
+        MooncakeXferMetadata(
+            remote_hostname="decoder",
+            remote_port=10,
+            remote_tp_rank=0,
+            remote_tp_size=1,
+            req_blocks={"d": ("x", destination[::-1])},
+            kv_caches_base_addr=[],
+            block_lens=[],
+            kv_block_lens=[],
+        )
+    )
+    wire["req_block_ranges"] = {"d": spans[::-1]}
+    meta = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(wire), type=MooncakeXferMetadata
+    )
+    with set_current_vllm_config(cfg), patch_worker_dependencies():
+        conn = MooncakeConnector(cfg, KVConnectorRole.WORKER, caches)
+        worker = conn.connector_worker
+        assert worker is not None
+        try:
+            src, dst, lengths, errors, message = await worker._build_transfer_params(
+                [("d", send)], meta, regions, peers
+            )
+            assert (errors, message) == ([], None)
+            assert [p // 64 for p in src] == expected_src
+            assert [p // 64 for p in dst] == expected_dst
+            assert lengths == [16] * len(expected_src)
+        finally:
+            del conn, worker
+
+
+@pytest.mark.cpu_test
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledged", [True, False])
+async def test_dsv41_consumer_sends_missing_ranges_and_requires_ack(
+    mooncake_cpu_device, acknowledged
+):
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, KVCacheBlock
+
+    cfg = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer", block_size=128
+    )
+    cfg.kv_transfer_config.dsv41_encoder_only_prefill = True
+    groups = [
+        KVCacheGroupSpec(
+            [name],
+            FullAttentionSpec(
+                block_size=size, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+            enable_kv_transfer=transfer,
+        )
+        for name, size, transfer in (
+            ("local", 32, False),
+            ("main", 128, True),
+            ("index", 64, True),
+        )
+    ]
+    caches = KVCacheConfig(num_blocks=512, kv_cache_tensors=[], kv_cache_groups=groups)
+    scheduler = MooncakeConnectorScheduler(cfg, "d", caches)
+    request = create_request(num_tokens=260, do_remote_prefill=True)
+    assert request.kv_transfer_params is not None
+    request.kv_transfer_params.update(transfer_id="x", remote_bootstrap_addr="http://p")
+    hashed = KVCacheBlock(10)
+    hashed.set_block_hash(BlockHashWithGroupId(b"local"))
+    allocation = KVCacheBlocks(
+        (
+            [KVCacheBlock(20)],
+            [hashed, KVCacheBlock(31)],
+            [KVCacheBlock(40), KVCacheBlock(0, is_null=True), hashed, KVCacheBlock(43)],
+        )
+    )
+    scheduler.update_state_after_alloc(request, allocation, 128)
+    pending = scheduler.build_connector_meta(None).reqs_to_recv["my-engine-id"]
+    pull = pending[request.request_id]
+    pull.pull_tasks_count = 1
+    with set_current_vllm_config(cfg), patch_worker_dependencies() as external:
+        conn = MooncakeConnector(cfg, KVConnectorRole.WORKER, caches)
+        worker = conn.connector_worker
+        assert worker is not None
+        try:
+            worker.kv_caches_base_addr = []
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=[request.request_id],
+                block_ranges_applied=acknowledged,
+            )
+            sock = external["mock_socket_object"]
+            sock.recv.return_value = msgspec.msgpack.encode(response)
+            await worker.receive_kv_from_single_worker("tcp://p:1234", pending)
+            wire = msgspec.msgpack.decode(
+                sock.send.call_args.args[0], type=MooncakeXferMetadata
+            )
+            assert wire.req_blocks[request.request_id] == ("x", [[31], [40, 43]])
+            assert wire.req_block_ranges[request.request_id] == [
+                [(1, 2)],
+                [(0, 1), (3, 4)],
+            ]
+            assert pull.failed is not acknowledged
+            outcomes = worker.get_transfer_results()
+            assert outcomes.finished_recving == {request.request_id}
+            assert outcomes.failed_recving == (
+                set() if acknowledged else {request.request_id}
+            )
+        finally:
+            del conn, worker
+
+
 @pytest.mark.asyncio
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"

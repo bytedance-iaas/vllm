@@ -695,12 +695,15 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        # Preserve global group IDs across PP stages, but allocate only local layers.
+        if not group.layer_names:
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
             for layer_name, spec in group_spec.kv_cache_specs.items():
                 layers_by_spec[spec].append(layer_name)
-        elif group.layer_names:
+        else:
             layers_by_spec[group_spec].extend(group.layer_names)
 
         byte_offset = 0
@@ -1547,6 +1550,13 @@ def get_kv_cache_configs(
             builder, vllm_config, projected_groups_per_worker, check_memory
         )
 
+    if vllm_config.uses_dsv41_encoder_only_handoff:
+        for groups in projected_groups_per_worker:
+            for group in groups:
+                group.enable_kv_transfer = group.enable_kv_transfer and bool(
+                    group.layer_names
+                )
+
     # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
         if not groups:
@@ -1646,6 +1656,11 @@ def get_global_kv_cache_groups(
     global_kv_cache_groups = get_kv_cache_groups_from_builder(
         builder, vllm_config, merged_kv_cache_specs
     )
+    if vllm_config.uses_dsv41_encoder_only_handoff:
+        hf = vllm_config.model_config.hf_text_config
+        _apply_dsv41_encoder_only_transfer_profile(
+            global_kv_cache_groups, hf.kv_source_layer_ids, hf.index_source_layer_ids
+        )
     spec_config = vllm_config.speculative_config
     if spec_config is not None and spec_config.use_eagle_block_drop():
         draft_layer_names = {
@@ -1715,4 +1730,53 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
         return get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, num_blocks * bytes_per_block
+        )
+
+
+def _apply_dsv41_encoder_only_transfer_profile(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    kv_source_layer_ids: Sequence[int],
+    index_source_layer_ids: Sequence[int],
+) -> None:
+    """Select global Main-KV/Indexer-K groups; all local state stays on D."""
+    source_ids = set(kv_source_layer_ids)
+    if not source_ids or not source_ids <= set(index_source_layer_ids):
+        raise ValueError(
+            "dsv41_encoder_only_prefill requires an Indexer-K producer for "
+            "every Main-KV source."
+        )
+    expected_suffixes = {
+        suffix
+        for layer_id in source_ids
+        for suffix in (
+            f".layers.{layer_id}.attn",
+            f".layers.{layer_id}.attn.indexer.k_cache",
+        )
+    }
+    seen_suffixes: set[str] = set()
+    for group in kv_cache_groups:
+        selected = {
+            suffix
+            for name in group.layer_names
+            for suffix in expected_suffixes
+            if name.endswith(suffix)
+        }
+        if selected and (
+            len(selected) != len(group.layer_names)
+            or not group.kv_cache_spec.prefix_cacheable
+        ):
+            raise ValueError(
+                "dsv41_encoder_only_prefill requires global Main-KV/Indexer-K "
+                "groups that do not mix with local state."
+            )
+        if selected & seen_suffixes:
+            raise ValueError(
+                "dsv41_encoder_only_prefill found duplicate global cache groups."
+            )
+        group.enable_kv_transfer = bool(selected)
+        seen_suffixes.update(selected)
+    if seen_suffixes != expected_suffixes:
+        raise ValueError(
+            "dsv41_encoder_only_prefill is missing required global cache "
+            f"groups: {sorted(expected_suffixes - seen_suffixes)}."
         )

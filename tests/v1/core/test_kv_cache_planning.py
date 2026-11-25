@@ -22,6 +22,7 @@ from tests.v1.core.utils import (
 )
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -635,6 +636,29 @@ def test_get_kv_cache_configs_pp_sharding(asymmetric_memory):
             kv_cache_groups=[KVCacheGroupSpec(["layer2"], ref_kv_cache_spec)],
         ),
     ]
+
+
+def test_pp_empty_uniform_group_has_no_cache_tensor():
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.cache_config.kv_cache_layout = "LBNHC"
+    local_spec = new_kv_cache_spec()
+    remote_specs = {"remote1": local_spec, "remote2": new_kv_cache_spec(num_kv_heads=4)}
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=local_spec.block_size, kv_cache_specs=remote_specs
+    )
+    groups = kv_cache_planning._project_kv_cache_groups_to_worker(
+        [
+            KVCacheGroupSpec(list(remote_specs), uniform_spec),
+            KVCacheGroupSpec(["local"], local_spec),
+        ],
+        {"local": local_spec},
+    )
+    result = kv_cache_planning.get_kv_cache_config_from_groups(
+        config, groups, local_spec.page_size_bytes * 8
+    )
+
+    assert [group.layer_names for group in result.kv_cache_groups] == [[], ["local"]]
+    assert [tensor.layers for tensor in result.kv_cache_tensors] == [["local"]]
 
 
 def test_project_kv_cache_groups_to_worker():
