@@ -6,7 +6,9 @@ import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed.device_communicators.deepep_v2_pcie import DeepEPV2PCIeBuffer
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -23,6 +25,8 @@ from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
     dbo_enabled,
 )
+
+logger = init_logger(__name__)
 
 
 def _quantize_before_dispatch(
@@ -138,6 +142,18 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # arange(num_local_experts) + rank_expert_offset. Rank-constant, so it
         # is built once per device instead of once per layer per step.
         self._global_expert_ids_cache: torch.Tensor | None = None
+        self._tk300_dispatch_packer: Callable | None = None
+
+    def enable_tk300_dispatch_packing(self, packer: Callable) -> None:
+        # The packed path is scoped to the 512 slots of the DEP32 Magic decode.
+        if (
+            self.use_cudagraph
+            and self.dp_size == 32
+            and self.num_experts == 512
+            and self.sp_size == 1
+            and isinstance(self.buffer, DeepEPV2PCIeBuffer)
+        ):
+            self._tk300_dispatch_packer = packer
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -389,6 +405,39 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "apply_router_weight_on_input is only implemented for topk=1"
             )
             a1 = a1 * topk_weights.to(a1.dtype)
+
+        if (
+            self._tk300_dispatch_packer is not None
+            and defer_input_quant
+            and not dbo_enabled()
+            and a1.dtype == torch.bfloat16
+            and a1.dim() == 2
+            and a1.size(-1) == 5120
+        ):
+            packed, scale, secondary = self._tk300_dispatch_packer(
+                "w13", inputs=a1, quanted_input=None
+            )
+            if (
+                packed.dtype == torch.float8_e4m3fn
+                and scale is not None
+                and scale.dim() == 2
+                and (
+                    (scale.itemsize == 1 and scale.shape == (a1.size(0), 160))
+                    or (scale.dtype == torch.int32 and scale.shape == (a1.size(0), 40))
+                )
+                and secondary is None
+            ):
+                logger.info_once("TK300_PACKED_HUMMING_DISPATCH_ACTIVE")
+                return self._do_dispatch(
+                    tokens=packed,
+                    token_scales=scale.contiguous(),
+                    rank_topk_ids=topk_ids,
+                    rank_topk_weights=topk_weights,
+                    num_experts=num_experts,
+                    a1_scale=None,
+                    quant_config=quant_config,
+                    defer_input_quant=True,
+                )
 
         if _quantize_before_dispatch(quant_config, defer_input_quant):
             # Scales must be row-major [num_tokens, ...] here so each token's

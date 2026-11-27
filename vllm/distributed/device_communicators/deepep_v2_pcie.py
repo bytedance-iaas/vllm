@@ -47,22 +47,30 @@ class DeepEPV2PCIeBuffer:
         self.num_topk = num_topk
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.nccl_handle = get_nccl_comm_handle(group)
+        # The pinned Magic runtime divides each workspace into two stages and
+        # one slot per peer. Budget for a BF16 payload, routing IDs and weights,
+        # a 128-byte slot header, and the worst-case per-row bulk alignment.
+        row_bytes = hidden * 2 + num_topk * 8
+        aligned_row_bytes = (row_bytes + 127) // 128 * 128
+        rank_slot_bytes = 128 + num_max_tokens_per_rank * aligned_row_bytes
+        workspace_bytes = max(256 << 20, 2 * self.world_size * rank_slot_bytes)
         self.runtime = deep_ep_magic_C.MagicBuffer(
             self.rank,
             self.world_size,
             self.nccl_handle.get(),
             num_max_tokens_per_rank,
-            256 << 20,
+            workspace_bytes,
         )
         # Match MagicBuffer's collective lifecycle before peers can send.
         dist.barrier(group=group)
         logger.info(
             "DeepEP v2 SM120 PCIe Magic buffer initialized, rank=%d, world=%d, "
-            "capacity=%d, hidden=%d.",
+            "capacity=%d, hidden=%d, workspace_bytes=%d.",
             self.rank,
             self.world_size,
             num_max_tokens_per_rank,
             hidden,
+            workspace_bytes,
         )
 
     def get_theoretical_num_sms(self, **kwargs) -> int:

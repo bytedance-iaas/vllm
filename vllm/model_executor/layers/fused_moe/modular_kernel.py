@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1112,6 +1113,14 @@ class FusedMoEKernelModularImpl:
             and hasattr(prepare_finalize, "defer_globalize")
         ):
             prepare_finalize.defer_globalize = True
+            if os.environ.get("TK300_HUMMING_PACK_DISPATCH") == "1":
+                config = fused_experts.humming_configs["w13"]
+                if (config.shape_n, config.shape_k) == (4608, 5120):
+                    packer = getattr(
+                        prepare_finalize, "enable_tk300_dispatch_packing", None
+                    )
+                    if packer is not None:
+                        packer(fused_experts.process_input)
         self.shared_experts: SharedExperts | None = None
         moe_parallel_config = fused_experts.moe_config.moe_parallel_config
         self.moe_parallel_config = moe_parallel_config
